@@ -102,6 +102,10 @@ No warmup spins, no per cycle allocation, no shared status conditions. Ordering 
 
 Copy once at ingress is the default, not an optimization mode. The first copy happens where data enters the system, from the device or kernel buffer Weld does not own. After that everything shares by reference: multiple subscribers, history caches, retransmits, intra process handoff. One copy, reference counted, freed when the last reader releases it. Users never see loans; core picks the shared path wherever the transport allows and serializes only at the network edge.
 
+### QoS Worn as a Facade
+
+Weld speaks QoS on the wire and does not run a QoS engine inside. A Weld endpoint advertises reliable plus transient local with a bounded keep last, which satisfies every standard ROS subscription, so matching almost never fails. The profile answers only the matching question. Behavior comes from core: backpressure between Weld endpoints instead of blind drops or unbounded growth, bounded retention with explicit eviction for late joiners, drop oldest with lost counters on overflow. Deadlines are monitoring, firing alerts with topic and endpoint names, never silently unmatching a pair. The residual genuinely exotic profiles still surface loudly in logs, metrics, and CLI with the policy kind. ROS peers see a well behaved QoS citizen; inside there is delivery, retention, backpressure, and alerts, and no vendor drift because there is only one interpretation.
+
 ### Services as Calls and Actions as Workflows
 
 Services are plain RPC with context deadlines: exact one to one routing, per call timeouts, gone servers and gone clients error one call. Actions are durable workflows in core, not user assembled topics: goal admission, cancel propagation, feedback streaming with buffering before handle attachment, result caching independent of handle lifetime, terminal states guaranteed. Timeouts attach at the transition that starts them.
@@ -125,6 +129,10 @@ Why one domain matters is easiest to see with `/clock`. When sim time publishes 
 Discovery feeds one index with a generation counter and a change hook. The index is explicitly partition local: it describes the segment this node can currently see, never a global truth. No quorum is pretended, no query blocks across a dead link, and no Weld decision assumes two nodes see the same graph. Coordination that genuinely needs agreement stays out of the data plane; that is Concord's territory, not Weld's. Endpoint records carry type hash plus unique GID from day one. Strict send with tolerant receive applies to tokens and attachments. Optional static topology offers presized tables and no thread for embedded targets. Graph snapshots serve tools with hidden filtering and same name disambiguation.
 
 For an operator, this means `ros2 node list` after a flaky WiFi reconnect shows `talker` and `listener` exactly once, with generation `42` to `43` marking the flap. This eliminates stale lists, daemon divergence, invisible nodes, and missing introspection.
+
+### No Elections in the Data Plane
+
+Weld elects nothing. The data plane is leaderless by construction: publish and subscribe, services, actions, discovery, and the graph index all work with zero coordination, and a single node deployment behaves identically to a hundred node one. Every topic, service, and parameter has exactly one owner, its creator, so there is nothing to agree on and no agreement protocol. Discovery merges observations deterministically through truth tables, demangling, and hashes, never by vote. Where ROS expects exactly one of something, the lifecycle manager, the map server, the bag recorder, configuration names it explicitly; if it dies, Weld reports the absence loudly through the graph instead of holding an election nobody asked for. Bringup sequences and action preemptions follow deterministic rules over sorted names and generations, so two nodes in the same partition compute the same order independently. Placement, failover, and fleet brains are Concord running on top of Weld topics, not Weld itself: Weld moves bytes with stated semantics under partition, Concord decides what the fleet does about it.
 
 ### Types Content Addressed from Day One
 

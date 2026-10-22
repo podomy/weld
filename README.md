@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/logo.png" alt="Weld" width="30%">
+  <img src="./assets/logo.png" alt="Weld" width="20%">
 </p>
 
 <h1 align="center">Weld</h1>

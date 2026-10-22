@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/logo.png" alt="Weld" width="30%">
+</p>
+
 <h1 align="center">Weld</h1>
 
 <p align="center">

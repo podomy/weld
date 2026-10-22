@@ -5,14 +5,14 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/podomy/weld" alt="License"></a>
 </p>
 
-Weld is a ROS 2 compatible interface in Go. It talks to DDS and Zenoh
-so Go programs can join a ROS 2 system as first-class nodes, covering
-what ROS covers: topics, services, actions, and parameters.
+Weld is robotics middleware written in Go. One unified core moves topics, services, actions, and parameters across DDS, Zenoh, and MQTT transports, with structured delivery, copy once handling, and a leaderless data plane that stays correct under partition.
+
+Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as first-class nodes, verified by mixed fleet behavior.
 
 ### Documentation
 
-- [Weld design](./docs/weld-design.md): architecture, invariants, and build order.
-- [ROS reference](./docs/ros/): nineteen chapters mapping the ROS 2 stack Weld must stay compatible with, from wire protocols to Nav2, plus a failure analysis of 6000+ upstream issues that the design eliminates. Start here to understand what Weld mirrors and what it replaces.
+- [Weld design](./docs/design.md): architecture, invariants, and build order.
+- [Weld invariants](./docs/invariants.md): 250+ testable promises the system holds, drawn from 6000+ upstream ROS issues.
 
 ### Contributing
 

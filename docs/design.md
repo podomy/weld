@@ -30,7 +30,7 @@ The goals are:
 - A Go native system an operator would choose even with no ROS present: one node model, one config model, one clock model, one error model, observable by default.
 - Bit level wire compatibility with CycloneDDS, FastDDS, and `rmw_zenoh` peers, verified by interop gates, not by sharing code.
 - Nav2 and MoveIt 2 run on Weld unmodified, because the surface they touch is compatible, not because Weld imitates ROS internals.
-- Every recurring ROS 2 failure class in `docs/ros/19-failure-analysis.md` is structurally impossible in Weld, not merely handled.
+- Every recurring ROS 2 failure class from the archived reference notes is structurally impossible in Weld, not merely handled.
 
 The non goals for the first version are deliberate limits:
 
@@ -77,10 +77,12 @@ internal/transports/      /three industry buses in the box/
               attachments  will/QoS mapping
   ^
   | all three fed by
-internal/types/  (IDL registry, RIHS01 hashes, XCDR1 codec)
+internal/types/  (schema registry, type hashes, serialization codec)
 ```
 
 The rule that keeps vendor drift out is simple to state. `internal/core` never imports a transport package. Transports implement a small backend interface: publish bytes, take bytes, join discovery, report liveliness. All matching, QoS, routing, timeouts, retries, and state machines live once in core, so DDS, Zenoh, and MQTT behave identically by construction. Vendor drift, the largest ROS interop cost, has nowhere to hide.
+
+Each backend is a translator at the border, both directions. Inbound it turns ROS bytes into core messages: parse the CDR, check the type hash, match the QoS, deliver. Outbound it turns core messages into ROS bytes: serialize, announce in discovery the way ROS peers expect. Core never sees a ROS-ism and ROS peers never see Weld internals, which is why one core can sit behind three buses at once.
 
 Three buses cover the industry: DDS, Zenoh, and MQTT all ship in the box. Anything else arrives the same way everything else in this project arrives: a pull request adding a backend behind the interface, with interop tests. No plugin registry, no dynamic loading, no out of tree drivers to version skew against.
 
@@ -110,7 +112,7 @@ Weld speaks QoS on the wire and does not run a QoS engine inside. A Weld endpoin
 
 Services are plain RPC with context deadlines: exact one to one routing, per call timeouts, gone servers and gone clients error one call. Actions are durable workflows in core, not user assembled topics: goal admission, cancel propagation, feedback streaming with buffering before handle attachment, result caching independent of handle lifetime, terminal states guaranteed. Timeouts attach at the transition that starts them.
 
-The wire stays standard (request plus reply topics, goal plus feedback plus result plus status topics), but Weld users never hand roll the machine. Consider `NavigateToPose` sent to `/navigate_to_pose` with a goal UUID of `a3f1`. Feedback at 5 Hz buffers even if the client attaches late. The result survives after the server handle closes. Gone before result, feedback loss, take races, broadcast responses, and missing timeout classes disappear because the workflow owns the state.
+The wire stays standard (request plus reply topics, goal plus feedback plus result plus status topics), but Weld users never hand roll the machine. Consider `NavigateToPose` sent to `/navigate_to_pose` with a goal UUID of `a3f1`. Feedback at 5 Hz buffers even if the client attaches late. The result survives after the server handle closes. Gone before result, feedback loss, take races, broadcast responses, and missing timeout classes disappear because the workflow owns the state. Weld validates before sending: limits, joint names, touch links, QoS, and clocks are checked first, and a success arrived with dirty diagnostics is treated as failure, never silently accepted.
 
 ### Config as a Versioned Store
 
@@ -136,7 +138,7 @@ Weld elects nothing. The data plane is leaderless by construction: publish and s
 
 ### Types Content Addressed from Day One
 
-The registry keys everything by type hash with exact canonicalization. Unknown types are first class: generic byte endpoints, bag reads, and CLI echo work without codegen. Deserialization validates header plus length before parsing and fuzzes truncated input.
+The registry keys everything by type hash with exact canonicalization. Unknown types are first class: generic byte endpoints, bag reads, and CLI echo work without codegen. Deserialization validates header plus length before parsing and fuzzes truncated input. The registry resolves type support symbols, serves descriptions and introspection fields, and honors the `is_rosidl_buffer` flag on byte sequences. It reproduces string and sequence shapes, init modes, handle shapes, symbol names, hash bytes and canonicalization, description IDs, member tables, and bound kinds byte for byte without embedding ROS structs.
 
 A field example helps. A bag containing `velodyne_msgs/msg/VelodyneScan` with 300 packets recorded on another machine opens on a laptop with no Velodyne code installed. The CLI echoes the raw fields, the type hash `RIHS01_abc` matches the discovery record, and truncated packets fail with a bounds error rather than a crash. This eliminates hash mismatch, unknown type second class status, and CDR crash classes.
 
@@ -148,7 +150,7 @@ Concretely, when `/tf` from `base_link` to `odom` stops at 10 Hz, the trace show
 
 ## Compatibility Surface
 
-Weld proves each item below against real ROS 2; the list is closed, and anything unlisted is free to be Weld native. Each bullet is a promise that interop tests enforce.
+Weld proves each item below against real ROS 2; the list is closed, and anything unlisted is free to be Weld native. Each bullet is a promise that interop tests enforce. IDL adapters, parsers, templates, build glue, CLI tooling, C++ helpers, and validation helpers need no port; only their wire-visible output matters.
 
 - RTPS discovery and liveliness with domain isolation, localhost modes, and multi NIC.
 - Topic and type naming with namespace avoidance rules, demangling both directions. For example `/cmd_vel` maps to its RTPS name and back without loss.
@@ -164,13 +166,21 @@ Weld proves each item below against real ROS 2; the list is closed, and anything
 - Launch argument acceptance with full fidelity.
 - CLI verbs: list, echo, pub, info, call, params, doctor checks, node info.
 
-The contract is interaction, not structure. A program written against `rclcpp` or `rclpy` interacts with Weld flawlessly: same topic names and types, same service and action exchanges, same parameters, same graph answers, same TF behavior. Underneath, Weld carries no `rcl` equivalent structs: no node handles mirroring `rcl_node_t`, no wait sets, no callback groups, no allocator plumbing. Any struct that exists only to serve ROS internals rather than the interaction simply does not exist in Weld. Compatibility is proven by mixed fleet behavior, never by shape matching.
+The whole list reduces further. Everything ROS is collapses to eight jobs: matching (QoS offer versus request plus type hash before first byte), packaging, sending, discovery plus graph, sequence paired services, action state machines, versioned parameters, and one clock domain. Serialization is standard and boring by design: a schema declares the shape, the codec flattens it to bytes, the bytes feed Zenoh or DDS. On the ROS wire the schema language is IDL and the bytes are CDR, but those are just the local names for the same two jobs. There is no other machinery. One Go binary does the eight jobs; no C linkage crosses the boundary.
+
+Support follows the same boundary: anything built purely on the `rclcpp` or `rclpy` interaction surface works by construction, which is nodes, topics, services, actions, params, TF, launch, bags, RViz, Nav2, MoveIt, and drivers. The exceptions are things that reach past the client library into memory layout: custom `rmw` implementations, intra process pointer passing, loaned messages, and in process C++ type adapter plugins. Those need explicit Weld side work later and are tracked as such, not silently half supported.
+
+The contract is interaction, not structure. A program written against `rclcpp` or `rclpy` interacts with Weld flawlessly: same topic names and types, same service and action exchanges, same parameters, same graph answers, same TF behavior. Underneath, Weld carries no `rcl` equivalent structs: no node handles, no wait sets, no callback groups, no allocator plumbing. Any struct that exists only to serve ROS internals rather than the interaction simply does not exist in Weld. Compatibility is proven by mixed fleet behavior, never by shape matching.
+
+### One Binary Across All ROS Releases
+
+Weld ships no C ABI, so there is nothing to version that way and nothing that breaks when ROS moves from Humble to Jazzy to Rolling. What Weld does instead is wire version awareness, quarantined in the transport backends. Each peer is negotiated individually: type hash present means Iron or newer, introspection topics mean service tracing is available, message hashes identify exact field sets, and Weld speaks that peer's variant. The type registry keys every message by name plus hash, so a Humble publisher and a Rolling subscriber each match their own version simultaneously. Parsing stays tolerant and sending stays strict, so new keys and fields never break old peers. The release matrix in CI runs interop against every supported distro, and the table of verified distros ships in the repo. One binary, all supported distros, per peer negotiation with a tested matrix behind it. The version patchwork lives at the border behind the backend interface; the core and the Go API stay single and coherent.
 
 ## Packages
 
 Packages follow the architecture diagram. Each package has one job and one direction of dependency.
 
-- `internal/types`: registry, hashes, descriptions, XCDR1 codec, dynamic access, fuzz corpus.
+- `internal/types`: schema registry, hashes, descriptions, serialization codec, dynamic access, fuzz corpus.
 - `internal/transports`: backend interface plus `dds`, `zenoh`, and `mqtt` implementations. No core logic. New buses arrive as pull requests against the interface, with interop tests, never as plugins.
 - `internal/core`: entities, RxO matcher, router, service calls, action workflows, config store, clock domain, graph index, supervision groups.
 - `internal/time`: clock sources, fake clocks, jump handling, rate policies.

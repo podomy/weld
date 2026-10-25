@@ -6,7 +6,7 @@ Why this comparison matters can be seen in a concrete deployment. Imagine a ware
 
 What stays compatible is the wire and the surface that tools touch. This includes DDS RTPS with XCDR1 CDR, Zenoh keys with liveliness tokens and attachments, SPDP and SEDP discovery, topic and type naming, type hashes, graph queries, standard messages, services, actions, parameters, TF topics, `/clock`, bags on disk, launch arguments, and every `ros2cli` verb. A Weld node and an `rclcpp` node on the same domain discover each other and exchange data with no forked protocol.
 
-What gets thrown away is everything that never appeared on the wire. This includes the `rmw` handle model, the `rcl` wait set mechanics, the executor plus callback group split, the Node versus LifecycleNode duality, global error state, allocator plumbing, fixed size parsing, per vendor QoS drift, silent mismatch, and daemon cached graphs. None of that is wire. All of it is replaceable. Full evidence appears in the companion chapters on the ROS world, and in the chapter that distills the cross repository issue analysis.
+What gets thrown away is everything that never appeared on the wire. This includes the `rmw` handle model, the `rcl` wait set mechanics, the executor plus callback group split, the Node versus LifecycleNode duality, global error state, allocator plumbing, fixed size parsing, per vendor QoS drift, silent mismatch, and daemon cached graphs. None of that is wire. All of it is replaceable.
 
 ```
   operator view (unchanged)          system view (replaced)
@@ -30,7 +30,7 @@ The goals are:
 - A Go native system an operator would choose even with no ROS present: one node model, one config model, one clock model, one error model, observable by default.
 - Bit level wire compatibility with CycloneDDS, FastDDS, and `rmw_zenoh` peers, verified by interop gates, not by sharing code.
 - Nav2 and MoveIt 2 run on Weld unmodified, because the surface they touch is compatible, not because Weld imitates ROS internals.
-- Every recurring ROS 2 failure class from the archived reference notes is structurally impossible in Weld, not merely handled.
+- Every recurring ROS 2 failure class is structurally impossible in Weld, not merely handled.
 
 The non goals for the first version are deliberate limits:
 
@@ -108,6 +108,8 @@ Copy once at ingress is the default, not an optimization mode. The first copy ha
 
 Weld speaks QoS on the wire and does not run a QoS engine inside. A Weld endpoint advertises reliable plus transient local with a bounded keep last, which satisfies every standard ROS subscription, so matching almost never fails. The profile answers only the matching question. Behavior comes from core: backpressure between Weld endpoints instead of blind drops or unbounded growth, bounded retention with explicit eviction for late joiners, drop oldest with lost counters on overflow. Deadlines are monitoring, firing alerts with topic and endpoint names, never silently unmatching a pair. The residual genuinely exotic profiles still surface loudly in logs, metrics, and CLI with the policy kind. Best available resolves once at endpoint creation from currently visible peers, stores the resolved profile, exposes it through actual QoS getters, and records which peers were visible at resolve time. ROS peers see a well behaved QoS citizen; inside there is delivery, retention, backpressure, and alerts, and no vendor drift because there is only one interpretation.
 
+The split behind the facade is intent versus mechanism, and it follows the TCP lesson. Congestion control works because the transport adapts its own window instead of asking the application for one; nobody tunes a window per web page. ROS inverted that: it exposed depths, blocking modes, and vendor mapped reliability, asking roboticists to be transport engineers, and the issue corpus is the receipt. Weld exposes only intent, which no transport can infer, and intent is three values. Guarantee covers reliability: retry or not, with ordering inherent and needing no knob. Retention bound covers history depth, durability, and lifespan as one rule: how many to keep, for whom, and when a message expires, since three knobs described one decision. Liveness covers endpoint aliveness plus lease plus deadline in both directions: offered deadline as a promise and requested deadline as an expectation are the same freshness contract read from opposite ends. Priority across topics is deliberately outside the three: beating telemetry with control traffic under contention is scheduling, not transport, and it belongs to the supervision groups with their serial versus pooled modes. A knob that asks the user to do the transport's job is a failed abstraction and does not ship.
+
 ### Services as Calls and Actions as Workflows
 
 Services are plain RPC with context deadlines: exact one to one routing, per call timeouts, gone servers and gone clients error one call. Actions are durable workflows in core, not user assembled topics: goal admission, cancel propagation, feedback streaming with buffering before handle attachment, result caching independent of handle lifetime, terminal states guaranteed. Timeouts attach at the transition that starts them.
@@ -166,7 +168,7 @@ Weld proves each item below against real ROS 2; the list is closed, and anything
 - Launch argument acceptance with full fidelity.
 - CLI verbs: list, echo, pub, info, call, params, doctor checks, node info.
 
-The whole list reduces further. Everything ROS is collapses to eight jobs: matching (QoS offer versus request plus type hash before first byte), packaging, sending, discovery plus graph, sequence paired services, action state machines, versioned parameters, and one clock domain. Serialization is standard and boring by design: a schema declares the shape, the codec flattens it to bytes, the bytes feed Zenoh or DDS. On the ROS wire the schema language is IDL and the bytes are CDR, but those are just the local names for the same two jobs. There is no other machinery. One Go binary does the eight jobs; no C linkage crosses the boundary.
+The whole list reduces further. Everything ROS is collapses to eight jobs: matching (QoS offer versus request plus type hash before first byte), packaging, sending, discovery plus graph, sequence paired services, action state machines, versioned parameters, and one clock domain. Serialization is standard and boring by design: a schema declares the shape, the codec flattens it to bytes, the bytes feed Zenoh or DDS. On the ROS wire the schema language is IDL and the bytes are CDR, but those are just the local names for the same two jobs. There is no other machinery. One Go core does the eight jobs. Transports integrate with existing implementations rather than reimplementing protocols: pure Go libraries where they are mature, C libraries behind a quarantined cgo boundary where they are not. No transport dependency leaks into core; the backend interface stays the only crossing.
 
 Support follows the same boundary: anything built purely on the `rclcpp` or `rclpy` interaction surface works by construction, which is nodes, topics, services, actions, params, TF, launch, bags, RViz, Nav2, MoveIt, and drivers. The exceptions are things that reach past the client library into memory layout: custom `rmw` implementations, intra process pointer passing, loaned messages, and in process C++ type adapter plugins. Those need explicit Weld side work later and are tracked as such, not silently half supported.
 
@@ -190,7 +192,7 @@ Packages follow the architecture diagram. Each package has one job and one direc
 
 ## Proof Plan
 
-Each feature ships with three gates, all green before merge. First comes unit tables with fake clocks, where time jumps and partitions are deterministic. Then come interop runs against `rclcpp` nodes on both DDS vendors plus Zenoh peers with `ros2cli` as the harness, for example echoing `/chatter` as strings at 10 Hz across implementations. A cgo harness that calls `rcl` directly from Go verifies Weld's bytes against the C stack without shipping it: conformance tooling only, never the product path. Finally come chaos runs under race detection with loss, large message matrices, late joiners, discovery flaps, teardown mid run, and clock jumps.
+Each feature ships with three gates, all green before merge. First comes unit tables with fake clocks, where time jumps and partitions are deterministic. Then come interop runs against `rclcpp` nodes on both DDS vendors plus Zenoh peers with `ros2cli` as the harness, for example echoing `/chatter` as strings at 10 Hz across implementations. A cgo harness that calls `rcl` directly from Go verifies Weld's bytes against the C stack. cgo is a tool, not a sin: permitted in conformance tooling and inside transport backends that wrap vendor C libraries, forbidden in core. Core stays pure Go with no C linkage; the backend interface stays the only crossing. Finally come chaos runs under race detection with loss, large message matrices, late joiners, discovery flaps, teardown mid run, and clock jumps.
 
 Nav2 plus MoveIt 2 soak runs with RViz rendering close the loop per release. A typical soak drives a simulated TurtleBot through three goals while MoveIt plans five arm motions, with RViz rendering `/tf` and `/scan`. Green means no mismatch silence, no crash on teardown, and byte identical replays.
 
@@ -220,9 +222,12 @@ Finally, fidelity and soak. Bags, launch args, TF exactness, and `/clock` land t
 
 ## Open Questions
 
-These are decisions recorded early so later work does not reopen them silently. Each names the default and the test that will settle it.
+These are decisions recorded early so later work does not reopen them silently. Each names the default and the test that will settle it. Resolved items move to the invariants; what remains here is genuinely open.
 
-- Zenoh domain isolation by key prefix versus separate sessions. Users expect real isolation; default to separate sessions unless interop forces prefix mode.
+- RESOLVED: Zenoh domain isolation is separate sessions. Users expect real isolation; prefix mode needs interop proof to be reconsidered.
+- RESOLVED: v1 interoperates with Humble, Jazzy, and Rolling against CycloneDDS as the reference peer. Humble pins the pre hash wire variants; Jazzy and Rolling pin current behavior.
+- RESOLVED: CycloneDDS runs as a sidecar process, not cgo linked. No license mixing, no C toolchain in Weld builds; Weld talks to it over localhost.
+- RESOLVED: v1 scope is CDR plus types plus DDS unreliable round trip plus CLI echo plus one green interop test.
 - MQTT mapping for the three buses: topic mapping, retained messages for latched state, will messages for liveliness, QoS mapping onto the core model. Design with the DDS and Zenoh backends, never after.
 - Static transform overwrite and clear semantics. Pin replace on rebroadcast and sticky across clear with tests. For example repeated `/tf_static` from `map` to `odom` with translation `x` equal to 1.0 must replace, not duplicate.
 - `/tf` reliability default under lossy links. Match reliable volatile depth 100, revisit with loss matrix results.

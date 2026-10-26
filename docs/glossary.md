@@ -1,0 +1,25 @@
+# Glossary
+
+Plain words first, then the technical term.
+
+- Message: one sample on a topic, e.g. `Twist` on `/cmd_vel`. Bytes on the wire, struct in code.
+- Topic: named stream of messages. `/chatter` maps to DDS `rt/chatter`.
+- Service: one request gets one reply, e.g. `/add_two_ints` with `a=2 b=3` returns `5`. Request topic plus reply topic.
+- Action: long task with feedback and a final result, e.g. `NavigateToPose`. Goal plus feedback plus result plus status topics.
+- IDL: interface definition language. The schema file that declares fields, constants, and defaults.
+- CDR: common data representation. The byte layout for fields. Weld uses XCDR1 only.
+- XCDR1: CDR version 1. Aligned primitives, length prefixes for strings and sequences, 4 byte envelope header.
+- RMW: ROS middleware layer. The vendor binding (CycloneDDS, FastDDS, Zenoh) behind `rclcpp`.
+- RCL: ROS client library in C. Weld carries no `rcl` structs.
+- RTPS: real-time publish subscribe. The DDS discovery and data protocol.
+- SPDP and SEDP: discovery announcements for participants and endpoints.
+- GID: global id for one endpoint. 16 byte DDS participant GUID on DDS paths, derived tokens on Zenoh paths.
+- QoS: quality of service. Offer versus request matching before first byte: reliability, durability, deadline, liveliness, lease.
+- Best available: resolve once at endpoint creation from currently visible peers, then freeze.
+- Facade: Weld advertises reliable plus transient local with bounded keep last. It answers matching only.
+- Type hash: `RIHS01_` plus 64 hex chars. Name plus hash keys the registry.
+- Introspection: runtime tables describing fields, offsets, bounds, and init behavior.
+- Sidecar: CycloneDDS helper process over localhost. Weld does not link its C library.
+- Domain id: integer isolating one robot fleet on shared multicast. Set per run via `ROS_DOMAIN_ID`.
+- Liveliness: endpoint aliveness plus lease. Silence past lease means gone.
+- Backpressure: slow the producer instead of blind drops or unbounded growth. Core exposes `Full` plus eviction signals; caller slows the producer.

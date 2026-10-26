@@ -1,0 +1,32 @@
+# Type hashes
+
+Weld keys every type by name plus hash. Two peers with the same name but different fields have different hashes and never falsely match.
+
+## Format
+
+RIHS01 string form:
+
+- prefix `RIHS01_`
+- 64 lowercase hex digits (SHA-256)
+- 71 chars total
+
+Version byte `1` plus 32 hash bytes on the wire. Version `0` means unset. Parse accepts only version `1` with exact length. Uppercase hex is rejected without allocation by byte check.
+
+Code: `internal/types/hash.go`.
+
+## Computation
+
+Input is a deep copy of the description with every `default_value` deleted, then JSON dump with separators `(', ', ': ')`, unsorted keys as stored, ASCII enforced, then SHA-256 hex.
+
+Sorting is not trusted from the caller. `CanonicalJSON` clones, sorts a copy with `sortIndividuals`, validates sorted order, then encodes. `RegisterFull` follows the same normalize path, so direct `ComputeTypeHash` with unsorted references still yields the deterministic digest.
+
+Static table form emits 8 bytes per row over 4 rows for C parity. The golden test pins the exact string including single commas between rows.
+
+## Use in negotiation
+
+- Humble peers may omit hashes (hashless keys); Iron and newer include them
+- Weld treats hashless versus hashed keys as different rendezvous strings and negotiates per peer
+- Demangled names plus hash plus domain must all match before first byte flows
+- Mismatch is loud: unknown type versus mismatch versus validation error are distinct errors for logs, metrics, and CLI
+
+Related: `corpus.md` for families, `transports.md` for key placement.

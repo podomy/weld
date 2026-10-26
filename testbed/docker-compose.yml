@@ -1,0 +1,18 @@
+services:
+  weld-humble:
+    build: ./humble
+    container_name: weld-humble
+    network_mode: host
+    command: ["sleep", "infinity"]
+
+  weld-jazzy:
+    build: ./jazzy
+    container_name: weld-jazzy
+    network_mode: host
+    command: ["sleep", "infinity"]
+
+  weld-rolling:
+    build: ./rolling
+    container_name: weld-rolling
+    network_mode: host
+    command: ["sleep", "infinity"]

@@ -4,15 +4,21 @@ services:
     container_name: weld-humble
     network_mode: host
     command: ["sleep", "infinity"]
+    volumes:
+      - ./logs:/testbed/logs
 
   weld-jazzy:
     build: ./jazzy
     container_name: weld-jazzy
     network_mode: host
     command: ["sleep", "infinity"]
+    volumes:
+      - ./logs:/testbed/logs
 
   weld-rolling:
     build: ./rolling
     container_name: weld-rolling
     network_mode: host
     command: ["sleep", "infinity"]
+    volumes:
+      - ./logs:/testbed/logs

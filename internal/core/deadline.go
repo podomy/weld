@@ -10,19 +10,23 @@ import (
 
 // DeadlineTracker watches one freshness contract without touching matching.
 //
-// A missed deadline fires an alert carrying topic plus endpoint names; it
-// never unmatches the pair. Times are caller supplied nanoseconds so tests
-// stay deterministic; no clock is read here. The zero value is usable but
-// quiet: empty names with an unspecified deadline never alerts. Contains a
-// mutex guarding lastNanos for concurrent MarkSeen plus Check; do not copy
-// a tracker after first use (vet copylocks enforces this) and use a pointer.
-// All methods use pointer receivers to avoid copying the lock.
+// A missed deadline fires one alert per outage carrying topic plus endpoint
+// names; it never unmatches the pair. Repeat checks during the same outage
+// stay quiet until a sample restarts the window, so one bad spell yields
+// one alert and not one per sample. Times are caller supplied nanoseconds
+// so tests stay deterministic; no clock is read here. The zero value is
+// usable but quiet: empty names with an unspecified deadline never alerts.
+// Contains a mutex guarding lastNanos plus the outage flag for concurrent
+// MarkSeen plus Check; do not copy a tracker after first use (vet copylocks
+// enforces this) and use a pointer. All methods use pointer receivers to
+// avoid copying the lock.
 type DeadlineTracker struct {
 	mu        sync.Mutex
 	topic     string
 	endpoint  string
 	deadline  Duration
 	lastNanos int64
+	alerted   bool
 }
 
 // NewDeadlineTracker starts tracking topic plus endpoint against deadline,
@@ -49,8 +53,9 @@ func (t *DeadlineTracker) Deadline() Duration {
 // MarkSeen records a sample at nowNanos, restarting the deadline window.
 //
 // Backward samples are ignored and never rewind the window: if nowNanos is
-// earlier than the last seen time the call is a no op. Clock jumps rebase
-// through Check, not here. Safe for concurrent use with Check.
+// earlier than the last seen time the call is a no op. A forward sample
+// clears the per outage alert flag so the next lapse alerts once. Clock
+// jumps rebase through Check, not here. Safe for concurrent use with Check.
 func (t *DeadlineTracker) MarkSeen(nowNanos int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -58,17 +63,24 @@ func (t *DeadlineTracker) MarkSeen(nowNanos int64) {
 		return
 	}
 	t.lastNanos = nowNanos
+	t.alerted = false
 }
 
 // Check reports a DeadlineAlert when the window elapsed without a sample.
 //
+// Only the first Check in an outage alerts; later Checks in the same outage
+// stay quiet until MarkSeen or a backward rebase clears the flag, so one
+// bad spell yields one alert and then clears within one good period. A
+// quiet Check inside the window also clears the flag so a clock rewind to
+// the window recovers even when the target equals the last sample time.
 // Unspecified deadlines never alert. Infinite deadlines in practice never
 // alert because elapsed time stays below max int64. Negative deadlines are
 // malformed and rejected by Validate; Check treats them as unspecified and
 // never alerts so malformed input stays quiet here instead of firing false
-// alarms. A backward time jump rebases lastNanos to nowNanos and reports no
-// alert, so the next forward window recovers instead of carrying a stale
-// future timestamp. Safe for concurrent use with MarkSeen.
+// alarms. A backward time jump rebases lastNanos to nowNanos, clears the
+// outage flag, and reports no alert, so the next forward window recovers
+// without unmatching instead of carrying a stale future timestamp. Safe
+// for concurrent use with MarkSeen.
 func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -83,12 +95,18 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 	}
 	if nowNanos < t.lastNanos {
 		t.lastNanos = nowNanos
+		t.alerted = false
 		return DeadlineAlert{}, false
 	}
 	elapsed := nowNanos - t.lastNanos
 	if elapsed < t.deadline.TotalNanoseconds() {
+		t.alerted = false
 		return DeadlineAlert{}, false
 	}
+	if t.alerted {
+		return DeadlineAlert{}, false
+	}
+	t.alerted = true
 	return DeadlineAlert{Topic: t.topic, Endpoint: t.endpoint, Deadline: t.deadline, ElapsedNanos: elapsed}, true
 }
 

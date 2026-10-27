@@ -4,6 +4,7 @@ package types
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"testing"
 )
@@ -247,13 +248,21 @@ func TestCdrPrimitivesBERoundTrip(t *testing.T) {
 	t.Run("floats", func(t *testing.T) { checkBEFloats(t, dec) })
 }
 
-// TestCdrStringPadding checks length prefix, NUL, and 4 byte pad.
+// TestCdrStringPadding checks length prefix, NUL, and lazy pad.
+//
+// Lazy rule: the encoder writes length plus bytes plus NUL with no
+// trailing pad. The next member's Align absorbs any gap and Bytes pads a
+// terminal string to 4. For "hi" the buffer holds header plus length plus
+// 3 content bytes (Len 11) and Bytes pads to 12.
 func TestCdrStringPadding(t *testing.T) {
 	for _, le := range []bool{true, false} {
 		enc := NewEncoder(le)
 		err := enc.WriteString("hi")
 		if err != nil {
 			t.Fatalf("le=%v WriteString failed: %v", le, err)
+		}
+		if enc.Len() != 11 {
+			t.Fatalf("le=%v string Len %d want 11 (no eager pad)", le, enc.Len())
 		}
 		wire := enc.Bytes()
 		if len(wire) != 12 {
@@ -297,6 +306,109 @@ func TestCdrStringEmpty(t *testing.T) {
 		if s != "" {
 			t.Fatalf("le=%v empty string mismatch: %q", le, s)
 		}
+	}
+}
+
+// imageShapeWires builds the Image-shaped lazy wire for one endian.
+func imageShapeWires(le bool) []byte {
+	if le {
+		return []byte{
+			0x00, 0x01, 0x00, 0x00,
+			0xE0, 0x01, 0x00, 0x00,
+			0x80, 0x02, 0x00, 0x00,
+			0x06, 0x00, 0x00, 0x00,
+			0x6D, 0x6F, 0x6E, 0x6F, 0x38, 0x00,
+			0x01,
+			0x00,
+			0x80, 0x02, 0x00, 0x00,
+		}
+	}
+	return []byte{
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x01, 0xE0,
+		0x00, 0x00, 0x02, 0x80,
+		0x00, 0x00, 0x00, 0x06,
+		0x6D, 0x6F, 0x6E, 0x6F, 0x38, 0x00,
+		0x01,
+		0x00,
+		0x00, 0x00, 0x02, 0x80,
+	}
+}
+
+// checkImageShapeRoundTrip verifies one endian of the Image-shaped layout.
+//
+//nolint:cyclop // test helper pins Image wire shape for both endians in one helper, splitting would obscure intent
+func checkImageShapeRoundTrip(t *testing.T, le bool) {
+	t.Helper()
+	enc := NewEncoder(le)
+	enc.WriteUint32(480)
+	enc.WriteUint32(640)
+	err := enc.WriteString("mono8")
+	if err != nil {
+		t.Fatalf("le=%v WriteString failed: %v", le, err)
+	}
+	enc.WriteUint8(1)
+	enc.WriteUint32(640)
+	wire := enc.Bytes()
+	want := imageShapeWires(le)
+	if !bytes.Equal(wire, want) {
+		t.Fatalf("le=%v Image wire mismatch got %v want %v", le, wire, want)
+	}
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		t.Fatalf("le=%v NewDecoder failed: %v", le, err)
+	}
+	height, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("le=%v ReadUint32 height failed: %v", le, err)
+	}
+	if height != 480 {
+		t.Fatalf("le=%v height %d want 480", le, height)
+	}
+	width, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("le=%v ReadUint32 width failed: %v", le, err)
+	}
+	if width != 640 {
+		t.Fatalf("le=%v width %d want 640", le, width)
+	}
+	encoding, err := dec.ReadString()
+	if err != nil {
+		t.Fatalf("le=%v ReadString failed: %v", le, err)
+	}
+	if encoding != "mono8" {
+		t.Fatalf("le=%v encoding %q want %q", le, encoding, "mono8")
+	}
+	big, err := dec.ReadUint8()
+	if err != nil {
+		t.Fatalf("le=%v ReadUint8 failed: %v", le, err)
+	}
+	if big != 1 {
+		t.Fatalf("le=%v is_bigendian %d want 1", le, big)
+	}
+	step, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("le=%v ReadUint32 step failed: %v", le, err)
+	}
+	if step != 640 {
+		t.Fatalf("le=%v step %d want 640", le, step)
+	}
+	err = dec.Finish()
+	if err != nil {
+		t.Fatalf("le=%v Finish found trailing bytes: %v", le, err)
+	}
+}
+
+// TestCdrStringFollowedByUint8ImageShape pins the lazy vendor form.
+//
+// sensor_msgs/Image places uint8 is_bigendian directly after the encoding
+// string NUL when (len+1)%4==2, as with "mono8". Both live vendors emit
+// the is_bigendian byte immediately after the NUL with no pad to 4; the
+// following uint32 step Align absorbs the gap. Eager pad to 4 would shift
+// step by 4 bytes.
+func TestCdrStringFollowedByUint8ImageShape(t *testing.T) {
+	for _, le := range []bool{true, false} {
+		checkImageShapeRoundTrip(t, le)
 	}
 }
 
@@ -412,8 +524,8 @@ func checkFixedArrayEncode(t *testing.T, cov []float64, le bool) []byte {
 	enc := NewEncoder(le)
 	enc.Align(8)
 	start := enc.Len()
-	if start%8 != 0 {
-		t.Fatalf("le=%v fixed array start %d not 8 aligned", le, start)
+	if start != HeaderSize {
+		t.Fatalf("le=%v fixed array start %d want header size %d (data offset 0 needs no pad)", le, start, HeaderSize)
 	}
 	for _, v := range cov {
 		enc.WriteFloat64(v)
@@ -1185,7 +1297,11 @@ func checkStringPadCap(t *testing.T, le bool) {
 	}
 }
 
-// checkStringPadTruncated verifies truncated pad is rejected.
+// checkStringPadTruncated verifies a stripped terminal pad still decodes.
+//
+// Lazy rule: strings carry no trailing pad, so Bytes final pad is not
+// part of the string. Reading "hi" from a wire with that final pad byte
+// removed must succeed with no drop.
 func checkStringPadTruncated(t *testing.T, le bool) {
 	t.Helper()
 	enc4 := NewEncoder(le)
@@ -1199,12 +1315,19 @@ func checkStringPadTruncated(t *testing.T, le bool) {
 	if err != nil {
 		t.Fatalf("le=%v NewDecoder failed: %v", le, err)
 	}
-	_, err = decPad.ReadString()
-	if err == nil {
-		t.Fatalf("le=%v expected error on truncated string pad", le)
+	s, err := decPad.ReadString()
+	if err != nil {
+		t.Fatalf("le=%v ReadString on stripped terminal pad failed: %v", le, err)
 	}
-	if decPad.Dropped() == 0 {
-		t.Fatalf("le=%v expected drop on truncated pad", le)
+	if s != "hi" {
+		t.Fatalf("le=%v string mismatch %q want %q", le, s, "hi")
+	}
+	if decPad.Dropped() != 0 {
+		t.Fatalf("le=%v stripped terminal pad counted a drop", le)
+	}
+	err = decPad.Finish()
+	if err != nil {
+		t.Fatalf("le=%v Finish on stripped terminal pad failed: %v", le, err)
 	}
 }
 
@@ -1217,7 +1340,7 @@ func checkStringPadEndian(t *testing.T, le bool) {
 	checkStringPadTruncated(t, le)
 }
 
-// TestCdrStringPadCases checks length 0, NUL, cap, and pad errors.
+// TestCdrStringPadCases checks length 0, NUL, cap, and stripped pad.
 func TestCdrStringPadCases(t *testing.T) {
 	for _, le := range []bool{true, false} {
 		checkStringPadEndian(t, le)
@@ -1296,6 +1419,70 @@ func checkHugePrefixEndian(t *testing.T, le bool) {
 func TestCdrHugePrefixCaps(t *testing.T) {
 	for _, le := range []bool{true, false} {
 		checkHugePrefixEndian(t, le)
+	}
+}
+
+// TestCdrLargePrefix2To31Minus1 checks 2^31-1 length is rejected before allocation.
+//
+// Length 2147483647 exceeds all caps and must count a drop with ErrInvalid,
+// never panic or allocate. It covers string, wstring, and sequence for
+// both endians so TakeFrom can count the drop and continue with next sample.
+//
+//nolint:gocognit,cyclop // test pins 2^31-1 cap rejection across string, wstring, and sequence in one run, splitting would obscure intent
+func TestCdrLargePrefix2To31Minus1(t *testing.T) {
+	const huge = uint32(2147483647)
+	for _, le := range []bool{true, false} {
+		enc := NewEncoder(le)
+		enc.WriteUint32(huge)
+		wire := enc.Bytes()
+		dec, err := NewDecoder(wire)
+		if err != nil {
+			t.Fatalf("le=%v NewDecoder failed: %v", le, err)
+		}
+		if _, err := dec.ReadString(); err == nil {
+			t.Fatalf("le=%v string 2^31-1 succeeded, want cap error", le)
+		} else {
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("le=%v string 2^31-1 error = %v, want ErrInvalid", le, err)
+			}
+			if dec.Dropped() == 0 {
+				t.Fatalf("le=%v string 2^31-1 missing drop", le)
+			}
+		}
+		encW := NewEncoder(le)
+		encW.WriteUint32(huge)
+		wireW := encW.Bytes()
+		decW, err := NewDecoder(wireW)
+		if err != nil {
+			t.Fatalf("le=%v NewDecoder wstring failed: %v", le, err)
+		}
+		if _, err := decW.ReadWString(); err == nil {
+			t.Fatalf("le=%v wstring 2^31-1 succeeded, want cap error", le)
+		} else {
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("le=%v wstring 2^31-1 error = %v, want ErrInvalid", le, err)
+			}
+			if decW.Dropped() == 0 {
+				t.Fatalf("le=%v wstring 2^31-1 missing drop", le)
+			}
+		}
+		encS := NewEncoder(le)
+		encS.WriteUint32(huge)
+		wireS := encS.Bytes()
+		decS, err := NewDecoder(wireS)
+		if err != nil {
+			t.Fatalf("le=%v NewDecoder sequence failed: %v", le, err)
+		}
+		if _, err := decS.ReadSequenceLength(); err == nil {
+			t.Fatalf("le=%v sequence 2^31-1 succeeded, want cap error", le)
+		} else {
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("le=%v sequence 2^31-1 error = %v, want ErrInvalid", le, err)
+			}
+			if decS.Dropped() == 0 {
+				t.Fatalf("le=%v sequence 2^31-1 missing drop", le)
+			}
+		}
 	}
 }
 
@@ -1839,6 +2026,7 @@ func checkServiceDoubleRead(t *testing.T, le bool, guid [8]byte) {
 	if err != nil {
 		t.Fatalf("le=%v WriteServiceHeader failed: %v", le, err)
 	}
+	enc.WriteUint8(0xAA)
 	dec, err := NewDecoder(enc.Bytes())
 	if err != nil {
 		t.Fatalf("le=%v NewDecoder failed: %v", le, err)
@@ -1890,16 +2078,13 @@ func checkAlignServiceEncode(t *testing.T, le bool, guid [8]byte, seq uint64) []
 		t.Fatalf("le=%v service len %d want %d", le, enc.Len(), ServiceEnvelopeSize)
 	}
 	enc.Align(8)
-	if enc.Len() != 24 {
-		t.Fatalf("le=%v align 8 after service gives %d want 24", le, enc.Len())
+	if enc.Len() != ServiceEnvelopeSize {
+		t.Fatalf("le=%v align 8 after service gives %d want %d", le, enc.Len(), ServiceEnvelopeSize)
 	}
 	enc.WriteUint64(0x1122334455667788)
 	wire := enc.Bytes()
-	if len(wire) != 32 {
-		t.Fatalf("le=%v wire len %d want 32", le, len(wire))
-	}
-	if wire[20] != 0x00 || wire[21] != 0x00 || wire[22] != 0x00 || wire[23] != 0x00 {
-		t.Fatalf("le=%v align pad not zero %v", le, wire[20:24])
+	if len(wire) != 28 {
+		t.Fatalf("le=%v wire len %d want 28", le, len(wire))
 	}
 	return wire
 }
@@ -1922,8 +2107,8 @@ func checkAlignServiceDecode(t *testing.T, wire []byte, le bool, guid [8]byte, s
 	if err != nil {
 		t.Fatalf("le=%v Align 8 failed: %v", le, err)
 	}
-	if dec.Offset() != 24 {
-		t.Fatalf("le=%v decode offset %d want 24", le, dec.Offset())
+	if dec.Offset() != ServiceEnvelopeSize {
+		t.Fatalf("le=%v decode offset %d want %d", le, dec.Offset(), ServiceEnvelopeSize)
 	}
 	v, err := dec.ReadUint64()
 	if err != nil {

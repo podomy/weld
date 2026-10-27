@@ -3,9 +3,11 @@
 package types
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
+	"testing"
 	"unsafe"
 )
 
@@ -573,4 +575,170 @@ func ClearMessageRegistryForTest() {
 	introspectionMu.Lock()
 	defer introspectionMu.Unlock()
 	messageRegistry = map[string]*MessageMembers{}
+}
+
+// TestPointCloud2FragmentedRegression pins the 100KiB PointCloud2 XCDR1 layout.
+//
+// It mirrors the live large payload shape: 1 by 25600 cloud with one
+// float32 x field and deterministic data. The header is zero stamp plus a
+// fixed frame_id, then height plus width plus one field descriptor, then
+// bigendian plus steps plus data plus dense. The message ends with bool
+// is_dense, so Encoder.Bytes adds 3 zero pad bytes to reach a 4 byte
+// boundary. Finish must accept that pad and report zero trailing.
+//
+//nolint:gocognit,cyclop // regression test mirrors large PointCloud2 wire shape end to end in one run, splitting would obscure intent
+func TestPointCloud2FragmentedRegression(t *testing.T) {
+	frame := "pc2-regression"
+	data := make([]byte, 25600*4)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	enc := NewEncoder(true)
+	enc.WriteInt32(0)
+	enc.WriteUint32(0)
+	err := enc.WriteString(frame)
+	if err != nil {
+		t.Fatalf("encode frame: %v", err)
+	}
+	enc.WriteUint32(1)
+	enc.WriteUint32(25600)
+	err = enc.WriteSequenceLength(1)
+	if err != nil {
+		t.Fatalf("encode fields len: %v", err)
+	}
+	err = enc.WriteString("x")
+	if err != nil {
+		t.Fatalf("encode field name: %v", err)
+	}
+	enc.WriteUint32(0)
+	enc.WriteUint8(7)
+	enc.WriteUint32(1)
+	enc.WriteBool(false)
+	enc.WriteUint32(4)
+	enc.WriteUint32(102400)
+	err = enc.WriteOctetSequence(data)
+	if err != nil {
+		t.Fatalf("encode data: %v", err)
+	}
+	enc.WriteBool(true)
+	wire := enc.Bytes()
+	if len(wire)%4 != 0 {
+		t.Fatalf("wire length %d not padded to 4", len(wire))
+	}
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		t.Fatalf("NewDecoder failed: %v", err)
+	}
+	sec, err := dec.ReadInt32()
+	if err != nil {
+		t.Fatalf("decode sec: %v", err)
+	}
+	if sec != 0 {
+		t.Fatalf("sec %d wants 0", sec)
+	}
+	nsec, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode nanosec: %v", err)
+	}
+	if nsec != 0 {
+		t.Fatalf("nanosec %d wants 0", nsec)
+	}
+	gotFrame, err := dec.ReadString()
+	if err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if gotFrame != frame {
+		t.Fatalf("frame %q wants %q", gotFrame, frame)
+	}
+	height, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode height: %v", err)
+	}
+	if height != 1 {
+		t.Fatalf("height %d wants 1", height)
+	}
+	width, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode width: %v", err)
+	}
+	if width != 25600 {
+		t.Fatalf("width %d wants 25600", width)
+	}
+	n, err := dec.ReadSequenceLength()
+	if err != nil {
+		t.Fatalf("decode fields len: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("fields len %d wants 1", n)
+	}
+	name, err := dec.ReadString()
+	if err != nil {
+		t.Fatalf("decode field name: %v", err)
+	}
+	if name != "x" {
+		t.Fatalf("field name %q wants %q", name, "x")
+	}
+	off, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode offset: %v", err)
+	}
+	if off != 0 {
+		t.Fatalf("offset %d wants 0", off)
+	}
+	dt, err := dec.ReadUint8()
+	if err != nil {
+		t.Fatalf("decode datatype: %v", err)
+	}
+	if dt != 7 {
+		t.Fatalf("datatype %d wants 7", dt)
+	}
+	cnt, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode count: %v", err)
+	}
+	if cnt != 1 {
+		t.Fatalf("count %d wants 1", cnt)
+	}
+	big, err := dec.ReadBool()
+	if err != nil {
+		t.Fatalf("decode bigendian: %v", err)
+	}
+	if big {
+		t.Fatalf("bigendian true wants false")
+	}
+	step, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode point_step: %v", err)
+	}
+	if step != 4 {
+		t.Fatalf("point_step %d wants 4", step)
+	}
+	row, err := dec.ReadUint32()
+	if err != nil {
+		t.Fatalf("decode row_step: %v", err)
+	}
+	if row != 102400 {
+		t.Fatalf("row_step %d wants 102400", row)
+	}
+	got, err := dec.ReadOctetSequence()
+	if err != nil {
+		t.Fatalf("decode data: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("data bytes differ len %d wants %d", len(got), len(data))
+	}
+	dense, err := dec.ReadBool()
+	if err != nil {
+		t.Fatalf("decode dense: %v", err)
+	}
+	if !dense {
+		t.Fatalf("dense false wants true")
+	}
+	err = dec.Finish()
+	if err != nil {
+		t.Fatalf("Finish found trailing bytes: %v", err)
+	}
+	if dec.Remaining() != 0 {
+		t.Fatalf("remaining %d wants 0 after Finish", dec.Remaining())
+	}
 }

@@ -238,15 +238,13 @@ type LivelinessReport struct {
 // backends treat nil and zero length identically and must not retain
 // the caller slice in either case.
 //
-// v1 carries TopicName, TypeName, and Payload only. Type hash, QoS offer,
-// GID, and sequence number are intentionally omitted. Interop in v1 is
-// best effort on these three fields only: the backend performs no cross
-// peer QoS check and no type hash verification. A compatible v2 extension
-// adds them without breaking v1 callers, either as new optional fields
-// on these structs (TypeHash, QoSOffer, GID, SequenceNumber) or as new
-// Backend methods (for example PublishWithParams). V1 code keeps
-// compiling and v1 peers keep interoperating; only peers that opt into
-// the new fields pay for the checks.
+// v1 carries TopicName, TypeName, and Payload only, with TypeHash as an
+// optional backward compatible extension. TypeHash carries the RIHS01
+// type hash when the caller knows it, and empty when unknown. Publish
+// prefers the caller hash and falls back to a static table, then to
+// empty for truly unknown types. Empty keeps old behavior: SEDP
+// matching requires equal hashes on both sides. V1 code without the
+// field keeps compiling because the field is optional with empty default.
 type OutgoingMessage struct {
 	// TopicName is the fully qualified ROS name such as /chatter.
 	TopicName string
@@ -255,6 +253,9 @@ type OutgoingMessage struct {
 	// Payload holds the XCDR1 CDR bytes excluding any transport header.
 	// See the ownership note on the parent type. Nil means empty.
 	Payload []byte
+	// TypeHash is the optional RIHS01 type hash such as RIHS01_ plus hex.
+	// Empty means unknown and keeps the legacy empty hash announce.
+	TypeHash string
 }
 
 // IncomingMessage is one serialized message taken from a backend.

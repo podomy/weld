@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Podomy.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//nolint:cyclop // sidecar tests hold many sequential mapping assertions, high average reflects breadth
 package dds_test
 
 import (
@@ -905,8 +906,6 @@ func TestSidecarConfigDomainValidation(t *testing.T) {
 
 // TestSidecarRangeValidation checks unknown ranges are rejected.
 func TestSidecarRangeValidation(t *testing.T) {
-	t.Parallel()
-
 	bad := dds.SidecarConfig{DomainID: 0, PeerAddress: "127.0.0.1", Range: transports.DiscoveryRange(99)}
 
 	err := bad.Validate()

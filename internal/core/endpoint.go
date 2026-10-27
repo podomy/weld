@@ -477,3 +477,75 @@ func anyPeerManual(peers []Peer) bool {
 	}
 	return false
 }
+
+// PairShouldDeliver reports whether offered publisher profile can flow to
+// requested subscription profile.
+//
+// It returns CheckCompatibility(offered, requested).Compatible. Incompatible
+// pairs must stay silent with a loud event. History, depth, lifespan, and the
+// avoidance flag never affect the result.
+func PairShouldDeliver(offered, requested QoSProfile) bool {
+	report := CheckCompatibility(offered, requested)
+	return report.Compatible
+}
+
+// CheckEndpointPair checks publisher offered ActualQoS against subscriber
+// requested ActualQoS.
+//
+// The first argument is the offered side and the second is the requested
+// side regardless of EndpointKind. A nil endpoint yields an incompatible
+// report so callers stay silent instead of flowing. History, depth,
+// lifespan, and the avoidance flag never affect the result.
+func CheckEndpointPair(publisher, subscriber *Endpoint) CompatibilityReport {
+	if publisher == nil || subscriber == nil {
+		return CompatibilityReport{
+			Compatible: false,
+			Errors: []CompatibilityIssue{
+				{Kind: PolicyReliability, Detail: "nil endpoint cannot flow"},
+			},
+		}
+	}
+	return CheckCompatibility(publisher.ActualQoS(), subscriber.ActualQoS())
+}
+
+// EndpointsCanDeliver reports whether two endpoints can flow.
+//
+// It returns CheckEndpointPair(publisher, subscriber).Compatible.
+// Incompatible pairs must stay silent while the loud event from
+// CompatibilityEvents or LiveMismatchReporter carries topic plus endpoint
+// pair plus policy kind. Nil endpoints never deliver.
+func EndpointsCanDeliver(publisher, subscriber *Endpoint) bool {
+	if publisher == nil || subscriber == nil {
+		return false
+	}
+	report := CheckEndpointPair(publisher, subscriber)
+	return report.Compatible
+}
+
+// ShouldRetainForLateJoiner reports whether offered history must be kept
+// for late joiners.
+//
+// It returns true only when the pair is compatible and the offered
+// durability is transient local. Volatile offered keeps no history.
+// Incompatible pairs keep no servable history even when offered is
+// transient local because they stay silent. History kind and depth size
+// retention through RetentionCapacity but never change this decision.
+func ShouldRetainForLateJoiner(offered, requested QoSProfile) bool {
+	if !PairShouldDeliver(offered, requested) {
+		return false
+	}
+	return offered.Durability == DurabilityTransientLocal
+}
+
+// EndpointsRetainForLateJoiner reports whether publisher history must be
+// kept for subscriber as late joiner.
+//
+// It applies ShouldRetainForLateJoiner to ActualQoS. Nil endpoints never
+// retain. Compatible transient local pairs keep history so Snapshot serves
+// late joiners. Incompatible pairs stay silent with no servable history.
+func EndpointsRetainForLateJoiner(publisher, subscriber *Endpoint) bool {
+	if publisher == nil || subscriber == nil {
+		return false
+	}
+	return ShouldRetainForLateJoiner(publisher.ActualQoS(), subscriber.ActualQoS())
+}

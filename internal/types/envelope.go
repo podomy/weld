@@ -22,7 +22,12 @@ import (
 const (
 	// HeaderSize is the base 4 byte XCDR1 encapsulation header.
 	HeaderSize = 4
-	// ServiceGUIDSize is the service request GUID prefix.
+	// ServiceGUIDSize is the service request GUID width.
+	//
+	// The service GUID is the 8 byte rmw request id (cdds_request_header_t
+	// guid) echoed verbatim in the reply. Wire layout is a 4 byte CDR
+	// header plus 8 byte GUID plus 8 byte sequence plus XCDR1 user fields,
+	// 20 bytes before payload with no dummy byte for empty structs.
 	ServiceGUIDSize = 8
 	// ServiceSequenceSize is the service sequence number width.
 	ServiceSequenceSize = 8
@@ -186,20 +191,14 @@ func UnmarshalMessage(data []byte, m *Metrics) ([]byte, bool, error) {
 // between GUID and sequence even though the GUID ends at offset 12.
 // User payload is therefore rebased at offset 20. This matches
 // Encoder.WriteServiceHeader and Decoder.ReadServiceHeader and is pinned
-// by golden byte tests. Interop example LE with guid 01..08 and seq
-// 0x0102030405060708 is 00 01 00 00 01 02 03 04 05 06 07 08
-// 08 07 06 05 04 03 02 01. BE replaces the last 8 with 01 02 03 04
-// 05 06 07 08. Empty payload encodes as one dummy byte.
+// by golden byte tests plus live ROS captures. Empty payload stays empty:
+// ROS sends no dummy byte for empty service structs.
 //
-// The GUID is opaque service identity bytes copied verbatim and never
-// byte swapped. This 8 byte service GUID is distinct from the 16 byte DDS
-// participant GUID used on discovery; do not mix them.
+// The GUID is the opaque 8 byte rmw request id echoed verbatim in the
+// reply. It is copied verbatim and never byte swapped.
 func MarshalServiceMessage(payload []byte, guid [8]byte, seq uint64, littleEndian bool) []byte {
 	h := EncodeHeader(littleEndian)
 	body := payload
-	if needsDummyByte(len(body)) {
-		body = []byte{0x00}
-	}
 	out := make([]byte, 0, ServiceEnvelopeSize+len(body)+4)
 	out = append(out, h[:]...)
 	out = append(out, guid[:]...)

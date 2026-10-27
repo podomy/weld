@@ -6,8 +6,9 @@ package types
 //
 // This file implements plain XCDR1 data encoding per introspection.
 // XCDR1 is the only representation used on DDS paths. XCDR2 is never
-// emitted. Alignment is relative to the start of the encapsulation
-// header so the payload is rebased 4 bytes forward. No transport code,
+// emitted. Alignment is relative to the user payload start, outside the
+// encapsulation header and service prefix, matching the de facto ROS 2
+// wire layout. No transport code,
 // no cgo, and no shared global state live here.
 
 import (
@@ -34,6 +35,18 @@ const (
 	maxWStringUnits = maxStringBytes / 2
 )
 
+// ErrTruncated reports short input that needs more bytes.
+//
+// Over cap lengths return ErrInvalid instead, so callers can tell a
+// truncated sample from a malformed one. Both count a drop and never panic.
+var ErrTruncated = errors.New("cdr: truncated")
+
+// ErrInvalid reports malformed input that fails validation.
+//
+// Over cap prefixes, missing NUL, bad bool, and trailing bytes map here.
+// Both sentinels count a drop and let TakeFrom continue with the next sample.
+var ErrInvalid = errors.New("cdr: invalid")
+
 // Wire value constants avoid magic literals at encode and decode sites.
 const (
 	// boolFalseByte is the IDL bool false encoding.
@@ -57,6 +70,9 @@ type Encoder struct {
 	order        binary.ByteOrder
 	le           bool
 	payloadStart int
+	// noDummy skips the empty dummy byte in Bytes. WriteServiceHeader
+	// sets it because ROS sends no dummy for empty service structs.
+	noDummy bool
 }
 
 // NewEncoder returns an Encoder with the 4 byte header already written.
@@ -94,11 +110,12 @@ func (e *Encoder) Len() int {
 // Bytes is a pure finalize step. It does not mutate the encoder, so it
 // may be called multiple times and Len stays unchanged. An empty user
 // payload, meaning no bytes after the header or after the service prefix,
-// encodes as one dummy zero byte via needsDummyByte before padding.
-// Padding bytes are zero.
+// encodes as one dummy zero byte via needsDummyByte before padding,
+// except for service encoders where WriteServiceHeader disables the dummy
+// to match ROS. Padding bytes are zero.
 func (e *Encoder) Bytes() []byte {
 	userLen := max(len(e.buf)-e.payloadStart, 0)
-	needDummy := needsDummyByte(userLen)
+	needDummy := needsDummyByte(userLen) && !e.noDummy
 	total := len(e.buf)
 	if needDummy {
 		total++
@@ -121,11 +138,16 @@ func (e *Encoder) Bytes() []byte {
 // leaves the buffer unchanged without reporting an error. This differs
 // from Decoder.Align which returns an error for invalid n without
 // counting a drop.
+//
+// Alignment is relative to the user payload start, not the buffer
+// start: the encapsulation header (and service prefix when present) is
+// outside the CDR alignment domain, matching the de facto ROS 2 wire
+// layout where a leading double needs no pad.
 func (e *Encoder) Align(n int) {
 	if n != 1 && n != 2 && n != 4 && n != 8 {
 		return
 	}
-	pad := alignPad(len(e.buf), n)
+	pad := alignPad(len(e.buf)-e.payloadStart, n)
 	for range pad {
 		e.buf = append(e.buf, nulByte)
 	}
@@ -247,11 +269,13 @@ func truncateRunes(s string, bound int) string {
 	return string(runes[:bound])
 }
 
-// encodeString appends length plus NUL plus pad for s.
+// encodeString appends length plus NUL for s.
 //
-// Pad ownership: the encoder owns pad insertion. It writes the NUL,
-// then zero bytes to the next 4 byte boundary. The decoder owns pad
-// skipping and checks the NUL but does not require pad bytes to be zero.
+// Pad ownership: the encoder inserts pad only per next-member alignment.
+// It writes the length prefix with Align(4), then the bytes plus NUL with
+// no trailing pad. The next member's Align absorbs any gap, and Bytes
+// pads a terminal string to 4. The decoder never skips string pad and
+// checks the NUL only.
 func (e *Encoder) encodeString(s string) {
 	e.Align(4)
 	total := len(s) + 1
@@ -260,17 +284,13 @@ func (e *Encoder) encodeString(s string) {
 	e.buf = append(e.buf, lenBytes[:]...)
 	e.buf = append(e.buf, s...)
 	e.buf = append(e.buf, nulByte)
-	pad := padTo4(len(e.buf))
-	for range pad {
-		e.buf = append(e.buf, nulByte)
-	}
 }
 
-// WriteString writes an IDL string as length plus NUL plus pad.
+// WriteString writes an IDL string as length plus NUL.
 //
 // The length prefix counts the trailing NUL. Payload bytes are the UTF-8
-// bytes plus one NUL, followed by zero pad to a 4 byte boundary.
-// See encodeString for pad ownership.
+// bytes plus one NUL with no trailing pad. See encodeString for pad
+// ownership.
 //
 // This is the unbounded write: it does not enforce maxStringBytes. A
 // string longer than the cap encodes without error but the decoder will
@@ -341,11 +361,11 @@ func (e *Encoder) WriteBoundedString(s string, bound int) (bool, error) {
 	return false, nil
 }
 
-// encodeWString appends length plus UTF-16 units plus pad for s.
+// encodeWString appends length plus UTF-16 units plus NUL for s.
 //
 // The length prefix counts UTF-16 code units including the trailing NUL.
-// Pad ownership matches encodeString: encoder inserts zero pad, decoder
-// skips it after checking the NUL.
+// No trailing pad is written. Pad ownership matches encodeString: the
+// next member's Align absorbs any gap and Bytes pads a terminal wstring.
 func (e *Encoder) encodeWString(s string) {
 	units := utf16.Encode([]rune(s))
 	e.Align(4)
@@ -359,16 +379,13 @@ func (e *Encoder) encodeWString(s string) {
 		e.buf = append(e.buf, tmp[:]...)
 	}
 	e.buf = append(e.buf, nulByte, nulByte)
-	pad := padTo4(len(e.buf))
-	for range pad {
-		e.buf = append(e.buf, nulByte)
-	}
 }
 
-// WriteWString writes an IDL wstring as length plus units plus pad.
+// WriteWString writes an IDL wstring as length plus units plus NUL.
 //
 // The input Go string is encoded to UTF-16. The length prefix counts
-// UTF-16 code units including the trailing NUL.
+// UTF-16 code units including the trailing NUL. No trailing pad is
+// written.
 //
 // This is the unbounded write: it does not enforce maxWStringUnits. An
 // over cap value encodes without error but the decoder rejects it with a
@@ -555,14 +572,13 @@ func (e *Encoder) WriteOctetSequenceChecked(v []byte) error {
 // when the buffer holds only the 4 byte header. The 8+8 service header
 // is packed outside the CDR alignment domain on purpose: only Align(4)
 // is applied so GUID at 4..12 and sequence at 12..20 stay contiguous with
-// no Align(8) pad. User payload is rebased at offset 20. Interop LE bytes
-// for guid 01..08 and seq 0x0102030405060708 are 00 01 00 00 01 02 03 04
-// 05 06 07 08 08 07 06 05 04 03 02 01. BE uses 01 02 03 04 05 06 07 08
-// for seq.
+// no Align(8) pad. User payload is rebased at offset 20. The GUID is the
+// opaque 8 byte rmw request id echoed verbatim in the reply and never
+// byte swapped.
 //
-// The GUID is opaque service identity bytes. They are copied verbatim
-// and never byte swapped. This 8 byte service GUID is distinct from the
-// 16 byte DDS participant GUID used on discovery; do not mix them.
+// A service encoder never emits the empty dummy byte: ROS sends no dummy
+// for empty service structs, so Bytes skips the dummy once the service
+// header is present.
 //
 // Misuse: calling twice or after user fields returns an error and leaves
 // the buffer unchanged. The guard checks payloadStart against HeaderSize
@@ -579,6 +595,7 @@ func (e *Encoder) WriteServiceHeader(guid [8]byte, seq uint64) error {
 	tmp := encodeServiceSequence(seq, e.le)
 	e.buf = append(e.buf, tmp[:]...)
 	e.payloadStart = ServiceEnvelopeSize
+	e.noDummy = true
 	return nil
 }
 
@@ -593,6 +610,10 @@ type Decoder struct {
 	off   int
 	order binary.ByteOrder
 	le    bool
+	// payloadStart is the user payload offset that alignment is relative
+	// to. It is HeaderSize normally and ServiceEnvelopeSize after a
+	// service header, mirroring Encoder so both sides share one origin.
+	payloadStart int
 	// drops counts truncated, empty, and malformed inputs seen by this decoder.
 	drops uint64
 }
@@ -607,11 +628,14 @@ type Decoder struct {
 func NewDecoder(data []byte) (*Decoder, error) {
 	le, err := ParseHeader(data)
 	if err != nil {
-		d := &Decoder{drops: 1}
+		d := &Decoder{drops: 1, payloadStart: HeaderSize}
 		msg := strings.TrimPrefix(err.Error(), "envelope: ")
-		return d, fmt.Errorf("cdr: %s", msg)
+		if len(data) < HeaderSize {
+			return d, fmt.Errorf("cdr: %s: %w", msg, ErrTruncated)
+		}
+		return d, fmt.Errorf("cdr: %s: %w", msg, ErrInvalid)
 	}
-	d := &Decoder{data: data, off: HeaderSize, le: le}
+	d := &Decoder{data: data, off: HeaderSize, le: le, payloadStart: HeaderSize}
 	if le {
 		d.order = binary.LittleEndian
 	} else {
@@ -644,15 +668,16 @@ func (d *Decoder) Dropped() uint64 {
 //
 // It returns an error and counts a drop when the padding runs past the
 // end of the buffer. An invalid n is a caller bug and returns an error
-// without counting a drop.
+// without counting a drop. Alignment is relative to the user payload
+// start, matching Encoder.Align.
 func (d *Decoder) Align(n int) error {
 	if n != 1 && n != 2 && n != 4 && n != 8 {
-		return fmt.Errorf("cdr: invalid alignment %d", n)
+		return fmt.Errorf("cdr: invalid alignment %d: %w", n, ErrInvalid)
 	}
-	pad := alignPad(d.off, n)
+	pad := alignPad(d.off-d.payloadStart, n)
 	if d.off+pad > len(d.data) {
 		d.drops++
-		return fmt.Errorf("cdr: truncated align pad need %d have %d", pad, len(d.data)-d.off)
+		return fmt.Errorf("cdr: truncated align pad need %d have %d: %w", pad, len(d.data)-d.off, ErrTruncated)
 	}
 	d.off += pad
 	return nil
@@ -667,11 +692,11 @@ func (d *Decoder) Align(n int) error {
 func (d *Decoder) need(n int) error {
 	if n < 0 {
 		d.drops++
-		return fmt.Errorf("cdr: negative read size %d", n)
+		return fmt.Errorf("cdr: negative read size %d: %w", n, ErrInvalid)
 	}
 	if d.off+n > len(d.data) {
 		d.drops++
-		return fmt.Errorf("cdr: truncated need %d have %d", n, len(d.data)-d.off)
+		return fmt.Errorf("cdr: truncated need %d have %d: %w", n, len(d.data)-d.off, ErrTruncated)
 	}
 	return nil
 }
@@ -772,7 +797,7 @@ func (d *Decoder) ReadBool() (bool, error) {
 		return true, nil
 	}
 	d.drops++
-	return false, fmt.Errorf("cdr: invalid bool byte 0x%02x", v)
+	return false, fmt.Errorf("cdr: invalid bool byte 0x%02x: %w", v, ErrInvalid)
 }
 
 // ReadWchar reads an IDL wchar as 2 bytes.
@@ -856,16 +881,15 @@ func (d *Decoder) ReadFloat64() (float64, error) {
 	return math.Float64frombits(v), nil
 }
 
-// ReadString reads an IDL string with length plus NUL plus pad.
+// ReadString reads an IDL string with length plus NUL.
 //
 // The length prefix includes the NUL. The trailing NUL is checked and
-// stripped. Padding to the next 4 byte boundary is skipped. See
-// encodeString for pad ownership.
+// stripped. No string pad is skipped: the next member's Align absorbs any
+// gap. See encodeString for pad ownership.
 //
 // Tolerant policy: interior NUL bytes are preserved as payload and do
 // not terminate the string. Invalid UTF-8 bytes are preserved as is in
-// the returned Go string. Pad bytes are skipped without requiring them
-// to be zero.
+// the returned Go string.
 func (d *Decoder) ReadString() (string, error) {
 	return d.readStringWithBound(0)
 }
@@ -883,7 +907,7 @@ func (d *Decoder) ReadBoundedString(bound int) (string, error) {
 func (d *Decoder) readStringWithBound(bound int) (string, error) {
 	if bound < 0 {
 		d.drops++
-		return "", fmt.Errorf("cdr: negative string bound %d", bound)
+		return "", fmt.Errorf("cdr: negative string bound %d: %w", bound, ErrInvalid)
 	}
 	length, err := d.readUint32()
 	if err != nil {
@@ -891,11 +915,11 @@ func (d *Decoder) readStringWithBound(bound int) (string, error) {
 	}
 	if length == 0 {
 		d.drops++
-		return "", errors.New("cdr: string length zero misses NUL") //nolint:wrapcheck // new error, nothing to wrap
+		return "", fmt.Errorf("cdr: string length zero misses NUL: %w", ErrInvalid)
 	}
-	if length > maxStringBytes {
+	if uint64(length) > uint64(maxStringBytes) {
 		d.drops++
-		return "", fmt.Errorf("cdr: string length %d exceeds cap", length)
+		return "", fmt.Errorf("cdr: string length %d exceeds cap %d: %w", length, maxStringBytes, ErrInvalid)
 	}
 	n := int(length)
 	err = d.need(n)
@@ -906,19 +930,13 @@ func (d *Decoder) readStringWithBound(bound int) (string, error) {
 	d.off += n
 	if raw[n-1] != nulByte {
 		d.drops++
-		return "", errors.New("cdr: string misses NUL terminator") //nolint:wrapcheck // new error, nothing to wrap
+		return "", fmt.Errorf("cdr: string misses NUL terminator: %w", ErrInvalid)
 	}
 	s := string(raw[:n-1])
 	if bound > 0 && countRunes(s) > bound {
 		d.drops++
-		return "", fmt.Errorf("cdr: string length %d exceeds bound %d", countRunes(s), bound)
+		return "", fmt.Errorf("cdr: string length %d exceeds bound %d: %w", countRunes(s), bound, ErrInvalid)
 	}
-	pad := alignPad(d.off, 4)
-	if d.off+pad > len(d.data) {
-		d.drops++
-		return "", errors.New("cdr: truncated string pad") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	d.off += pad
 	return s, nil
 }
 
@@ -943,7 +961,7 @@ func (d *Decoder) ReadBoundedWString(bound int) (string, error) {
 func (d *Decoder) readWStringWithBound(bound int) (string, error) {
 	if bound < 0 {
 		d.drops++
-		return "", fmt.Errorf("cdr: negative wstring bound %d", bound)
+		return "", fmt.Errorf("cdr: negative wstring bound %d: %w", bound, ErrInvalid)
 	}
 	length, err := d.readUint32()
 	if err != nil {
@@ -951,11 +969,11 @@ func (d *Decoder) readWStringWithBound(bound int) (string, error) {
 	}
 	if length == 0 {
 		d.drops++
-		return "", errors.New("cdr: wstring length zero misses NUL") //nolint:wrapcheck // new error, nothing to wrap
+		return "", fmt.Errorf("cdr: wstring length zero misses NUL: %w", ErrInvalid)
 	}
-	if length > maxWStringUnits {
+	if uint64(length) > uint64(maxWStringUnits) {
 		d.drops++
-		return "", fmt.Errorf("cdr: wstring length %d exceeds cap", length)
+		return "", fmt.Errorf("cdr: wstring length %d exceeds cap %d: %w", length, maxWStringUnits, ErrInvalid)
 	}
 	n := int(length) * 2
 	err = d.need(n)
@@ -969,19 +987,13 @@ func (d *Decoder) readWStringWithBound(bound int) (string, error) {
 	d.off += n
 	if units[len(units)-1] != 0 {
 		d.drops++
-		return "", errors.New("cdr: wstring misses NUL terminator") //nolint:wrapcheck // new error, nothing to wrap
+		return "", fmt.Errorf("cdr: wstring misses NUL terminator: %w", ErrInvalid)
 	}
 	s := string(utf16.Decode(units[:len(units)-1]))
 	if bound > 0 && countRunes(s) > bound {
 		d.drops++
-		return "", fmt.Errorf("cdr: wstring length %d exceeds bound %d", countRunes(s), bound)
+		return "", fmt.Errorf("cdr: wstring length %d exceeds bound %d: %w", countRunes(s), bound, ErrInvalid)
 	}
-	pad := alignPad(d.off, 4)
-	if d.off+pad > len(d.data) {
-		d.drops++
-		return "", errors.New("cdr: truncated wstring pad") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	d.off += pad
 	return s, nil
 }
 
@@ -994,9 +1006,9 @@ func (d *Decoder) ReadSequenceLength() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if length > maxSequenceElements {
+	if uint64(length) > uint64(maxSequenceElements) {
 		d.drops++
-		return 0, fmt.Errorf("cdr: sequence length %d exceeds cap", length)
+		return 0, fmt.Errorf("cdr: sequence length %d exceeds cap %d: %w", length, maxSequenceElements, ErrInvalid)
 	}
 	return int(length), nil
 }
@@ -1010,7 +1022,7 @@ func (d *Decoder) ReadSequenceLength() (int, error) {
 func (d *Decoder) ReadBoundedSequenceLength(bound int) (int, error) {
 	if bound < 0 {
 		d.drops++
-		return 0, fmt.Errorf("cdr: negative sequence bound %d", bound)
+		return 0, fmt.Errorf("cdr: negative sequence bound %d: %w", bound, ErrInvalid)
 	}
 	n, err := d.ReadSequenceLength()
 	if err != nil {
@@ -1018,7 +1030,7 @@ func (d *Decoder) ReadBoundedSequenceLength(bound int) (int, error) {
 	}
 	if bound > 0 && n > bound {
 		d.drops++
-		return 0, fmt.Errorf("cdr: sequence length %d exceeds bound %d", n, bound)
+		return 0, fmt.Errorf("cdr: sequence length %d exceeds bound %d: %w", n, bound, ErrInvalid)
 	}
 	return n, nil
 }
@@ -1046,11 +1058,8 @@ func (d *Decoder) ReadOctetSequence() ([]byte, error) {
 // the CDR alignment domain: GUID at 4..12 and sequence at 12..20 stay
 // contiguous with no Align(8) pad, so user payload is rebased at offset
 // 20. The sequence uses the negotiated byte order via
-// decodeServiceSequence.
-//
-// The GUID is opaque service identity bytes copied verbatim without byte
-// swapping. This 8 byte service GUID is distinct from the 16 byte DDS
-// participant GUID; do not mix them.
+// decodeServiceSequence. The GUID is the opaque 8 byte rmw request id
+// echoed verbatim in the reply.
 //
 // Calling when Offset is not HeaderSize counts a drop and returns an
 // error without advancing.
@@ -1058,7 +1067,7 @@ func (d *Decoder) ReadServiceHeader() ([8]byte, uint64, error) {
 	var guid [8]byte
 	if d.off != HeaderSize {
 		d.drops++
-		return guid, 0, fmt.Errorf("cdr: service header requires offset %d, have %d", HeaderSize, d.off)
+		return guid, 0, fmt.Errorf("cdr: service header requires offset %d, have %d: %w", HeaderSize, d.off, ErrInvalid)
 	}
 	err := d.need(ServiceHeaderSize)
 	if err != nil {
@@ -1069,24 +1078,45 @@ func (d *Decoder) ReadServiceHeader() ([8]byte, uint64, error) {
 	pad := alignPad(d.off, 4)
 	if d.off+pad+ServiceSequenceSize > len(d.data) {
 		d.drops++
-		return guid, 0, errors.New("cdr: truncated service sequence") //nolint:wrapcheck // new error, nothing to wrap
+		return guid, 0, fmt.Errorf("cdr: truncated service sequence: %w", ErrTruncated)
 	}
 	d.off += pad
 	seq := decodeServiceSequence(d.data[d.off:d.off+ServiceSequenceSize], d.le)
 	d.off += ServiceSequenceSize
+	d.payloadStart = ServiceEnvelopeSize
 	return guid, seq, nil
 }
 
 // Finish reports trailing bytes as an extra field drop.
 //
-// Call after the expected fields are read. A non empty remainder counts
-// a drop and returns an error. Exact consumption returns nil. Opaque
-// UnmarshalMessage views require this step for strict validation because
-// they do not check trailing garbage on their own.
+// Call after the expected fields are read. Exact consumption returns nil.
+// XCDR1 final zero pad to a 4 byte boundary is accepted: Encoder.Bytes
+// pads the wire, so a message ending with a 1 byte bool like PointCloud2
+// is_dense leaves up to 3 zero bytes that are not trailing garbage.
+// Those bytes must be all zero and must equal the pad needed from the
+// consumed offset relative to the user payload start. Any other
+// remainder counts a drop and returns an error. Opaque UnmarshalMessage
+// views require this step for strict validation because they do not check
+// trailing garbage on their own.
 func (d *Decoder) Finish() error {
-	if d.off != len(d.data) {
-		d.drops++
-		return fmt.Errorf("cdr: %d trailing bytes", len(d.data)-d.off)
+	remaining := len(d.data) - d.off
+	if remaining == 0 {
+		return nil
 	}
-	return nil
+	expected := alignPad(d.off-d.payloadStart, 4)
+	if remaining == expected {
+		ok := true
+		for _, b := range d.data[d.off:] {
+			if b != nulByte {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			d.off = len(d.data)
+			return nil
+		}
+	}
+	d.drops++
+	return fmt.Errorf("cdr: %d trailing bytes: %w", remaining, ErrInvalid)
 }

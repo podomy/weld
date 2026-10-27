@@ -232,7 +232,7 @@ func TestCdrServiceGuidSequence(t *testing.T) {
 	}
 }
 
-// TestCdrServiceEmptyPayload checks empty service encodes dummy byte.
+// TestCdrServiceEmptyPayload checks empty service stays empty for ROS.
 func TestCdrServiceEmptyPayload(t *testing.T) {
 	var guid [8]byte
 	wire := MarshalServiceMessage(nil, guid, 9, true)
@@ -247,8 +247,8 @@ func TestCdrServiceEmptyPayload(t *testing.T) {
 	if seq != 9 {
 		t.Fatalf("seq %d want 9", seq)
 	}
-	if len(got) == 0 || got[0] != 0x00 {
-		t.Fatalf("expected dummy byte, got %v", got)
+	if len(got) != 0 {
+		t.Fatalf("expected empty payload, got %v", got)
 	}
 }
 
@@ -313,17 +313,17 @@ func checkServiceEmptyDecode(t *testing.T, guid [8]byte, le bool) {
 	if gotSeq != 42 {
 		t.Fatalf("seq %d want 42", gotSeq)
 	}
-	v, err := dec.ReadUint8()
-	if err != nil {
-		t.Fatalf("empty dummy read failed: %v", err)
+	if dec.Remaining() != 0 {
+		t.Fatalf("empty service has %d trailing bytes, want 0", dec.Remaining())
 	}
-	if v != 0x00 {
-		t.Fatalf("empty decode expects one 0x00 dummy, got 0x%02x", v)
+	if err := dec.Finish(); err != nil {
+		t.Fatalf("empty service Finish failed: %v", err)
 	}
-	checkServiceEmptyPad(t, dec)
 }
 
 // checkServiceEmptyPad verifies remaining pad bytes are zero.
+//
+//nolint:unused // helper kept to document empty service pad invariant alongside decode checks
 func checkServiceEmptyPad(t *testing.T, dec *Decoder) {
 	t.Helper()
 	for dec.Remaining() > 0 {

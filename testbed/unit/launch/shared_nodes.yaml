@@ -1,0 +1,13 @@
+# Fixture 2: one shared file with per node FQN sections plus wildcard.
+# Node /r1/nav overrides speed on the CLI, /r1/mapper uses file values.
+r1.nav:
+  ros__parameters:
+    speed: 1.0
+    label: from-file-nav
+r1.mapper:
+  ros__parameters:
+    speed: 5.0
+    label: from-file-mapper
+/**:
+  ros__parameters:
+    use_sim_time: true

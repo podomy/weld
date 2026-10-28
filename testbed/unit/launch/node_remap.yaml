@@ -1,0 +1,10 @@
+# Fixture 1: params for node talker in namespace /ns.
+# File top keys use dotted FQN form plus wildcard fallback.
+ns.talker:
+  ros__parameters:
+    speed: 1.0
+    label: base
+/**:
+  ros__parameters:
+    speed: 9.0
+    use_sim_time: true

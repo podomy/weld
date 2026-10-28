@@ -1,0 +1,9 @@
+<?xml version="1.0" ?>
+<!-- Fixture 3: minimal SDF world, opaque to launch, carried as a node arg. -->
+<sdf version="1.6">
+  <world name="default">
+    <physics name="default_physics" type="ode">
+      <max_step_size>0.001</max_step_size>
+    </physics>
+  </world>
+</sdf>

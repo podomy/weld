@@ -1,0 +1,5 @@
+/r1/nav:
+  ros__parameters:
+    label: from-file-nav
+    speed: 2.0
+    use_sim_time: true

@@ -1,0 +1,5 @@
+/ns/talker:
+  ros__parameters:
+    label: base
+    speed: 2.0
+    use_sim_time: true

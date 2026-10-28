@@ -1,0 +1,5 @@
+/r1/mapper:
+  ros__parameters:
+    label: from-file-mapper
+    speed: 5.0
+    use_sim_time: true

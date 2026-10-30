@@ -40,6 +40,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
 
@@ -330,6 +331,23 @@ type SEDPEndpoint struct {
 	Provisional bool
 	// FirstSeen is when the provisional placeholder was installed, zero for confirmed.
 	FirstSeen time.Time
+	// Security carries the parsed DDS-Security attributes for the
+	// endpoint, zero when the peer announced none. Secured endpoints are
+	// detected, never decrypted.
+	Security SecurityInfo
+	// Partitions lists the DDS partitions the endpoint joins, empty for
+	// the default partition. Matching requires a common partition.
+	Partitions []string
+	// DurabilityService carries the parsed durability-service caps, zero
+	// when the peer announced none. It bounds late-joiner replay.
+	DurabilityService DurabilityServiceQoS
+	// HasDurabilityService reports whether durability-service was present.
+	HasDurabilityService bool
+	// WireOffer carries the per-profile translated wire QoS for locally
+	// declared endpoints, nil for the facade default. SerializeSEDPDATA
+	// announces WireOffer params when set and facade params otherwise,
+	// so existing paths keep byte-identical wire output.
+	WireOffer *WireQoS
 }
 
 // SEDPSender sends SEDP DATA bytes toward the discovery bus.
@@ -415,6 +433,59 @@ func (idx *SEDPIndex) DeclareReader(rosTopic, idlName, typeHash string, qos []by
 	ep, err := idx.declareEndpoint(true, rosTopic, idlName, typeHash, qos, true)
 	if err != nil {
 		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare reader: %w", err)
+	}
+
+	return ep, nil
+}
+
+// DeclareWriterWithQoS declares a local writer announcing the translated
+// per-profile wire QoS instead of the facade default.
+//
+// ForwardQoS refusal propagates as a loud declare error naming the topic,
+// endpoint pair, and policy kind; nothing downgrades quietly. A nil
+// profile keeps the facade path.
+func (idx *SEDPIndex) DeclareWriterWithQoS(rosTopic, idlName, typeHash string, qos []byte, profile *core.QoSProfile) (SEDPEndpoint, error) {
+	ep, err := idx.declareEndpointFull(false, false, rosTopic, idlName, typeHash, qos, false, profile, "publisher", "subscriber")
+	if err != nil {
+		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare writer with qos: %w", err)
+	}
+
+	return ep, nil
+}
+
+// DeclareReaderWithQoS declares a local reader announcing the translated
+// per-profile wire QoS instead of the facade default.
+//
+// The volatile flag keeps echo semantics for readers; the profile drives
+// reliability, history, deadline, lifespan, and liveliness. Refusal is
+// loud. A nil profile keeps the facade path.
+func (idx *SEDPIndex) DeclareReaderWithQoS(rosTopic, idlName, typeHash string, qos []byte, volatile bool, profile *core.QoSProfile) (SEDPEndpoint, error) {
+	ep, err := idx.declareEndpointFull(true, false, rosTopic, idlName, typeHash, qos, volatile, profile, "publisher", "subscriber")
+	if err != nil {
+		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare reader with qos: %w", err)
+	}
+
+	return ep, nil
+}
+
+// DeclareKeyedWriter declares a local with-key writer with kind 0x02.
+//
+// Keyed writers match only keyed readers; keyed-vs-unkeyed mismatch is a
+// loud incompatible at match time, never a silent filter drop.
+func (idx *SEDPIndex) DeclareKeyedWriter(rosTopic, idlName, typeHash string, qos []byte) (SEDPEndpoint, error) {
+	ep, err := idx.declareEndpointFull(false, true, rosTopic, idlName, typeHash, qos, false, nil, "publisher", "subscriber")
+	if err != nil {
+		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare keyed writer: %w", err)
+	}
+
+	return ep, nil
+}
+
+// DeclareKeyedReader declares a local with-key reader with kind 0x07.
+func (idx *SEDPIndex) DeclareKeyedReader(rosTopic, idlName, typeHash string, qos []byte, volatile bool) (SEDPEndpoint, error) {
+	ep, err := idx.declareEndpointFull(true, true, rosTopic, idlName, typeHash, qos, volatile, nil, "publisher", "subscriber")
+	if err != nil {
+		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare keyed reader: %w", err)
 	}
 
 	return ep, nil
@@ -535,6 +606,89 @@ func sedpValidateDeclare(rosTopic, idlName string) (sedpDeclareInputs, error) {
 
 // declareEndpoint validates mapping, allocates a user entity, and stores it.
 func (idx *SEDPIndex) declareEndpoint(isReader bool, rosTopic, idlName, typeHash string, qos []byte, readerVolatile bool) (SEDPEndpoint, error) {
+	return idx.declareEndpointFull(isReader, false, rosTopic, idlName, typeHash, qos, readerVolatile, nil, "publisher", "subscriber")
+}
+
+// sedpTranslateDeclareOffer translates an optional profile to a wire offer.
+func sedpTranslateDeclareOffer(rosTopic, publisherName, subscriberName string, profile *core.QoSProfile) (*WireQoS, error) {
+	if profile == nil {
+		return nil, nil
+	}
+
+	translated, err := ForwardQoS(rosTopic, publisherName, subscriberName, *profile)
+	if err != nil {
+		return nil, fmt.Errorf("dds: sedp declare wire qos: %w", err)
+	}
+
+	return &translated, nil
+}
+
+// sedpDeclarePartitions extracts validated partition names from raw QoS.
+func sedpDeclarePartitions(qos []byte) ([]string, error) {
+	if len(qos) == 0 {
+		return nil, nil
+	}
+
+	params, perr := rtps.DecodeParams(qos)
+	if perr == nil {
+		return sedpValidatedPartitionNames(params)
+	}
+
+	return nil, nil
+}
+
+// sedpValidatedPartitionNames validates partition names from decoded params.
+func sedpValidatedPartitionNames(params []rtps.Param) ([]string, error) {
+	names, ferr := FindPartitionParam(params)
+	if ferr == nil && len(names) != 0 {
+		if verr := ValidatePartitionList(names); verr != nil {
+			return nil, fmt.Errorf("dds: sedp declare partitions: %w", verr)
+		}
+
+		return append([]string(nil), names...), nil
+	}
+
+	return nil, nil
+}
+
+// sedpBuildDeclareEndpoint assembles the endpoint record before storing.
+func sedpBuildDeclareEndpoint(id SEDPGUID, inputs sedpDeclareInputs, typeHash string, qos []byte, isReader bool, domain uint32, readerVolatile bool, wireOffer *WireQoS) SEDPEndpoint {
+	return SEDPEndpoint{
+		ID:       id,
+		ROSTopic: inputs.rosTopic,
+		DDSTopic: inputs.ddsTopic,
+		Kind:     inputs.kind,
+		TypeDDS:  inputs.ddsType,
+		TypeIDL:  inputs.idlName,
+		TypeHash: typeHash,
+		QoS:      sedpCloneBytes(qos),
+		IsReader: isReader,
+		DomainID: domain,
+		// Readers default to volatile durability, matching ros2 topic
+		// echo semantics: a volatile request flows against both
+		// volatile and transient offers including the transient
+		// backlog, while a transient request is incompatible with the
+		// volatile talkers that ros2 topic pub creates by default and
+		// would receive nothing. The echo --qos-durability flag
+		// selects transient local when a gate must prove an
+		// incompatible pair stays silent. Writers keep offering
+		// transient local per the facade.
+		VolatileDurability: isReader && readerVolatile,
+		WireOffer:          wireOffer,
+	}
+}
+
+// declareEndpointFull validates mapping, allocates a user entity with an
+// optional with-key kind and an optional translated wire offer, and
+// stores the record.
+//
+// The keyed flag mints kind 0x02/0x07 entities via KeyedUserEntity so
+// keyed endpoints match only keyed peers. The profile translates through
+// ForwardQoS into WireOffer; refusal is loud and aborts the declare. A
+// nil profile keeps the facade announcement path byte-identical.
+//
+//nolint:unparam // publisher and subscriber name the refusing endpoint pair for all current callers
+func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlName, typeHash string, qos []byte, readerVolatile bool, profile *core.QoSProfile, publisherName, subscriberName string) (SEDPEndpoint, error) {
 	inputs, err := sedpValidateDeclare(rosTopic, idlName)
 	if err != nil {
 		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare validate: %w", err)
@@ -548,6 +702,9 @@ func (idx *SEDPIndex) declareEndpoint(isReader bool, rosTopic, idlName, typeHash
 	}
 
 	entity := sedpEntityFor(idx.next, isReader)
+	if keyed {
+		entity = KeyedUserEntity(idx.next, isReader)
+	}
 	idx.next++
 
 	id := SEDPGUID{Prefix: idx.prefix, Entity: entity}
@@ -557,36 +714,56 @@ func (idx *SEDPIndex) declareEndpoint(isReader bool, rosTopic, idlName, typeHash
 		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare duplicate entity: %w", ErrSEDPInvalidEndpoint)
 	}
 
-	ep := SEDPEndpoint{
-		ID:       id,
-		ROSTopic: inputs.rosTopic,
-		DDSTopic: inputs.ddsTopic,
-		Kind:     inputs.kind,
-		TypeDDS:  inputs.ddsType,
-		TypeIDL:  inputs.idlName,
-		TypeHash: typeHash,
-		QoS:      sedpCloneBytes(qos),
-		IsReader: isReader,
-		DomainID: idx.domain,
-		// Readers default to volatile durability, matching ros2 topic echo
-		// semantics: a volatile request flows against both volatile and
-		// transient offers including the transient backlog, while a
-		// transient request is incompatible with the volatile talkers
-		// that ros2 topic pub creates by default and would receive
-		// nothing. The echo --qos-durability flag selects transient
-		// local when a gate must prove an incompatible pair stays
-		// silent. Writers keep offering transient local per the facade.
-		VolatileDurability: isReader && readerVolatile,
+	wireOffer, err := sedpTranslateDeclareOffer(rosTopic, publisherName, subscriberName, profile)
+	if err != nil {
+		return SEDPEndpoint{}, err
 	}
+
+	ep := sedpBuildDeclareEndpoint(id, inputs, typeHash, qos, isReader, idx.domain, readerVolatile, wireOffer)
 
 	err = sedpCheckWireValues(ep.DDSTopic, ep.TypeHash)
 	if err != nil {
 		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare wire values: %w", err)
 	}
 
+	partitions, err := sedpDeclarePartitions(qos)
+	if err != nil {
+		return SEDPEndpoint{}, err
+	}
+
+	ep.Partitions = partitions
+
 	idx.locals[id] = sedpCloneEndpoint(ep)
 
 	return sedpCloneEndpoint(ep), nil
+}
+
+// StampLocalPartitions records partitions on matching local readers.
+//
+// It validates the names loudly, updates every local reader for the ROS
+// topic, and bumps generation once when any record changes so the next
+// announce carries the set. Unknown topics change nothing and report nil.
+func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions []string) {
+	if err := ValidatePartitionList(partitions); err != nil {
+		return
+	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	for id, ep := range idx.locals {
+		if !ep.IsReader {
+			continue
+		}
+
+		if ep.ROSTopic != rosTopic || ep.TypeIDL != typeName {
+			continue
+		}
+
+		ep.Partitions = append([]string(nil), partitions...)
+		idx.locals[id] = ep
+		idx.generation++
+	}
 }
 
 // sedpSnapshotEndpoints returns a sorted copy of one endpoint map.
@@ -1094,8 +1271,8 @@ func sedpFilterRemoteWriters(local SEDPEndpoint, remotes []SEDPEndpoint) []SEDPE
 	return out
 }
 
-// SEDPEndpointsMatch reports whether a local reader matches a remote writer.
-func SEDPEndpointsMatch(reader, writer SEDPEndpoint) bool {
+// sedpMatchIdentity compares routing identity fields for a reader and writer.
+func sedpMatchIdentity(reader, writer SEDPEndpoint) bool {
 	if !reader.IsReader {
 		return false
 	}
@@ -1120,17 +1297,61 @@ func SEDPEndpointsMatch(reader, writer SEDPEndpoint) bool {
 		return false
 	}
 
-	if reader.TypeDDS != writer.TypeDDS {
+	return reader.TypeDDS == writer.TypeDDS
+}
+
+// sedpMatchTypeHash compares type hashes with empty wildcarding.
+func sedpMatchTypeHash(reader, writer SEDPEndpoint) bool {
+	// Empty hash wildcards for Humble pre-hash peers without user-data hash.
+	// When both hashes are set they must be equal.
+	if reader.TypeHash != "" && writer.TypeHash != "" && reader.TypeHash != writer.TypeHash {
 		return false
 	}
 
-	// Empty hash wildcards for Humble pre-hash peers without user-data hash.
-	// When both hashes are set they must be equal.
-	if reader.TypeHash == "" || writer.TypeHash == "" {
-		return true
+	return true
+}
+
+// sedpMatchPartitions compares partitions with a trace on mismatch.
+func sedpMatchPartitions(reader, writer SEDPEndpoint) bool {
+	// Partition failure is a quiet non-match, not an RxO error, per the
+	// DDS rule that a missing common partition is not incompatible QoS.
+	// An empty list means the default partition on both sides.
+	if !PartitionsMatch(reader.Partitions, writer.Partitions) {
+		sedpTracef("match reject partition reader=%s writer=%s", reader.ID.String(), writer.ID.String())
+		return false
 	}
 
-	return reader.TypeHash == writer.TypeHash
+	return true
+}
+
+// sedpMatchKeyed compares keyed kinds with a trace on mismatch.
+func sedpMatchKeyed(reader, writer SEDPEndpoint) bool {
+	// Keyed-vs-unkeyed mismatch is a loud incompatible, never a silent
+	// filter drop. CheckKeyedMatch names the mismatch; here it gates
+	// matching while the caller surfaces the reason.
+	if ok, err := CheckKeyedMatch(reader, writer); err != nil || !ok {
+		sedpTracef("match reject keyed reader=%s writer=%s err=%v", reader.ID.String(), writer.ID.String(), err)
+		return false
+	}
+
+	return true
+}
+
+// SEDPEndpointsMatch reports whether a local reader matches a remote writer.
+func SEDPEndpointsMatch(reader, writer SEDPEndpoint) bool {
+	if !sedpMatchIdentity(reader, writer) {
+		return false
+	}
+
+	if !sedpMatchTypeHash(reader, writer) {
+		return false
+	}
+
+	if !sedpMatchPartitions(reader, writer) {
+		return false
+	}
+
+	return sedpMatchKeyed(reader, writer)
 }
 
 // sedpUserdataFields holds the parsed USER_DATA key value pairs.
@@ -1292,6 +1513,76 @@ func sedpEncodeParamListPayload(params []rtps.Param) []byte {
 // XTypes TypeObject rides as opaque passthrough; full lookup is out of scope for v1.
 // Sequence numbers increase process wide and each HEARTBEAT announces
 // first 1 to last DATA sequence with a fresh count.
+// sedpSerializeUserdata encodes endpoint or service userdata for announce.
+func sedpSerializeUserdata(ep SEDPEndpoint) (string, error) {
+	userdata, err := sedpEncodeEndpointUserdata(ep.TypeHash, ep.DDSTopic, ep.DomainID)
+	if err != nil {
+		return "", fmt.Errorf("dds: sedp serialize userdata: %w", err)
+	}
+
+	if ep.ServiceID != "" {
+		userdata, err = EncodeServiceUserdata(ep.ServiceID, ep.TypeHash, ep.DDSTopic, ep.DomainID)
+		if err != nil {
+			return "", fmt.Errorf("dds: sedp serialize service userdata: %w", err)
+		}
+	}
+
+	return userdata, nil
+}
+
+// sedpSerializeBaseParams builds identity plus QoS params for announce.
+func sedpSerializeBaseParams(ep SEDPEndpoint, userdata string) []rtps.Param {
+	params := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(ep.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(ep.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(ep.ID)},
+	}
+
+	if ep.WireOffer != nil {
+		params = append(params, ep.WireOffer.Params()...)
+	} else {
+		params = append(params,
+			rtps.Param{ID: rtps.PIDReliability, Value: sedpEncodeReliability()},
+			rtps.Param{ID: rtps.PIDHistory, Value: sedpEncodeHistory()},
+			rtps.Param{ID: rtps.PIDDurability, Value: sedpEncodeDurabilityFor(ep)},
+		)
+	}
+
+	return append(params, []rtps.Param{
+		{ID: rtps.PIDProtocolVersion, Value: sedpEncodeProtocolVersion()},
+		{ID: rtps.PIDVendorID, Value: sedpEncodeVendorID()},
+		{ID: rtps.PIDUserData, Value: sedpEncodeOctetSequence([]byte(userdata))},
+	}...)
+}
+
+// sedpSerializeOptionalParams appends durability, partitions, and extensions.
+func sedpSerializeOptionalParams(ep SEDPEndpoint, params []rtps.Param) ([]rtps.Param, error) {
+	if durabilityParam, err := DurabilityServiceParam(WeldDurabilityServiceQoS()); err != nil {
+		return nil, fmt.Errorf("dds: sedp serialize durability service: %w", err)
+	} else {
+		params = append(params, durabilityParam)
+	}
+
+	if len(ep.Partitions) != 0 {
+		partitionParam, err := PartitionParam(ep.Partitions)
+		if err != nil {
+			return nil, fmt.Errorf("dds: sedp serialize partitions: %w", err)
+		}
+
+		params = append(params, partitionParam)
+	}
+
+	if ep.BuiltinEndpointQos != 0 {
+		params = append(params, rtps.Param{ID: rtps.PIDBuiltinEndpointQos, Value: sedpEncodeBuiltinQos(ep.BuiltinEndpointQos)})
+	}
+
+	if len(ep.TypeObject) != 0 {
+		params = append(params, rtps.Param{ID: rtps.PIDTypeObject, Value: append([]byte(nil), ep.TypeObject...)})
+	}
+
+	return params, nil
+}
+
 func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 	err := sedpValidateMarshalEndpoint(ep)
 	if err != nil {
@@ -1303,36 +1594,16 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 		writer = sedpSubscriptionsWriter
 	}
 
-	userdata, err := sedpEncodeEndpointUserdata(ep.TypeHash, ep.DDSTopic, ep.DomainID)
+	userdata, err := sedpSerializeUserdata(ep)
 	if err != nil {
-		return nil, fmt.Errorf("dds: sedp serialize userdata: %w", err)
+		return nil, err
 	}
 
-	if ep.ServiceID != "" {
-		userdata, err = EncodeServiceUserdata(ep.ServiceID, ep.TypeHash, ep.DDSTopic, ep.DomainID)
-		if err != nil {
-			return nil, fmt.Errorf("dds: sedp serialize service userdata: %w", err)
-		}
-	}
+	params := sedpSerializeBaseParams(ep, userdata)
 
-	params := []rtps.Param{
-		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(ep.DDSTopic)},
-		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(ep.TypeDDS)},
-		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(ep.ID)},
-		{ID: rtps.PIDReliability, Value: sedpEncodeReliability()},
-		{ID: rtps.PIDHistory, Value: sedpEncodeHistory()},
-		{ID: rtps.PIDDurability, Value: sedpEncodeDurabilityFor(ep)},
-		{ID: rtps.PIDProtocolVersion, Value: sedpEncodeProtocolVersion()},
-		{ID: rtps.PIDVendorID, Value: sedpEncodeVendorID()},
-		{ID: rtps.PIDUserData, Value: sedpEncodeOctetSequence([]byte(userdata))},
-	}
-
-	if ep.BuiltinEndpointQos != 0 {
-		params = append(params, rtps.Param{ID: rtps.PIDBuiltinEndpointQos, Value: sedpEncodeBuiltinQos(ep.BuiltinEndpointQos)})
-	}
-
-	if len(ep.TypeObject) != 0 {
-		params = append(params, rtps.Param{ID: rtps.PIDTypeObject, Value: append([]byte(nil), ep.TypeObject...)})
+	params, err = sedpSerializeOptionalParams(ep, params)
+	if err != nil {
+		return nil, err
 	}
 
 	inline := rtps.EncodeParams(params)
@@ -1685,20 +1956,24 @@ func sedpAssembleEndpoint(identity sedpDecodedIdentity) (SEDPEndpoint, error) {
 	}
 
 	ep := SEDPEndpoint{
-		ID:                 identity.fields.id,
-		ROSTopic:           decodedROS,
-		DDSTopic:           identity.fields.ddsTopic,
-		Kind:               kind,
-		TypeDDS:            identity.fields.typeDDS,
-		TypeIDL:            decodedIDL,
-		TypeHash:           userdata.hash,
-		QoS:                identity.payload,
-		IsReader:           identity.isReader,
-		ServiceID:          userdata.serviceID,
-		ClientID:           userdata.clientID,
-		DomainID:           domain,
-		BuiltinEndpointQos: identity.fields.builtinQos,
-		TypeObject:         sedpCloneBytes(identity.fields.typeObject),
+		ID:                   identity.fields.id,
+		ROSTopic:             decodedROS,
+		DDSTopic:             identity.fields.ddsTopic,
+		Kind:                 kind,
+		TypeDDS:              identity.fields.typeDDS,
+		TypeIDL:              decodedIDL,
+		TypeHash:             userdata.hash,
+		QoS:                  identity.payload,
+		IsReader:             identity.isReader,
+		ServiceID:            userdata.serviceID,
+		ClientID:             userdata.clientID,
+		DomainID:             domain,
+		BuiltinEndpointQos:   identity.fields.builtinQos,
+		TypeObject:           sedpCloneBytes(identity.fields.typeObject),
+		Security:             identity.fields.security,
+		Partitions:           append([]string(nil), identity.fields.partitions...),
+		DurabilityService:    identity.fields.durabilityService,
+		HasDurabilityService: identity.fields.hasDurabilityService,
 	}
 	sedpTracef("assemble accept guid=%s ros=%q dds=%q typeDDS=%q typeIDL=%q hash=%q domain=%d reader=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.TypeIDL, ep.TypeHash, ep.DomainID, ep.IsReader)
 
@@ -1721,6 +1996,14 @@ type sedpEndpointWireFields struct {
 	hasBuiltinQos bool
 	// typeObject holds the raw XTypes TypeObject bytes when present.
 	typeObject []byte
+	// security carries the parsed DDS-Security attributes, zero when absent.
+	security SecurityInfo
+	// partitions lists the DDS partitions, empty for the default partition.
+	partitions []string
+	// durabilityService carries the parsed durability-service caps.
+	durabilityService DurabilityServiceQoS
+	// hasDurabilityService reports whether durability-service was present.
+	hasDurabilityService bool
 }
 
 // sedpCollectParams gathers inline QoS params and the payload bytes.
@@ -1845,6 +2128,103 @@ func sedpIsParamListEncap(raw []byte) bool {
 	return kind == sedpEncapPLCDRBE || kind == sedpEncapPLCDRLE
 }
 
+// sedpFieldsIdentity extracts topic, type, and GUID identity fields.
+func sedpFieldsIdentity(byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) error {
+	topic, err := sedpRequiredString(byID, rtps.PIDTopicName, littleEndian)
+	if err != nil {
+		return fmt.Errorf("dds: sedp parse fields topic: %w", err)
+	}
+
+	fields.ddsTopic = topic
+
+	dtype, err := sedpRequiredString(byID, rtps.PIDTypeName, littleEndian)
+	if err != nil {
+		return fmt.Errorf("dds: sedp parse fields type: %w", err)
+	}
+
+	fields.typeDDS = dtype
+
+	rawGUID, seen := byID[rtps.PIDEndpointGUIDWire]
+	if !seen {
+		rawGUID, seen = byID[rtps.PIDEndpointGUID]
+	}
+	if !seen {
+		return fmt.Errorf("dds: sedp parse data misses endpoint GUID: %w", ErrSEDPInvalidDATA)
+	}
+
+	id, err := sedpDecodeEndpointGUID(rawGUID)
+	if err != nil {
+		return fmt.Errorf("dds: sedp parse fields guid: %w", err)
+	}
+
+	fields.id = id
+
+	if fields.id.Entity == sedpEntityUnknown {
+		return fmt.Errorf("dds: sedp parse data zero entity: %w", ErrSEDPInvalidDATA)
+	}
+
+	return nil
+}
+
+// sedpFieldsOptionals extracts userdata, builtin QoS, and type object.
+func sedpFieldsOptionals(byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) error {
+	if rawUserdata, seen := byID[rtps.PIDUserData]; seen {
+		userdata, err := sedpDecodeOctetSequence(rawUserdata, littleEndian)
+		if err != nil {
+			return fmt.Errorf("dds: sedp parse fields userdata: %w", err)
+		}
+
+		fields.userdata = userdata
+	}
+
+	if rawQos, seen := byID[rtps.PIDBuiltinEndpointQos]; seen {
+		qos, err := sedpDecodeBuiltinQos(rawQos, littleEndian)
+		if err != nil {
+			return fmt.Errorf("dds: sedp parse fields builtin qos: %w", err)
+		}
+
+		fields.builtinQos = qos
+		fields.hasBuiltinQos = true
+	}
+
+	if rawObject, seen := byID[rtps.PIDTypeObject]; seen {
+		fields.typeObject = append([]byte(nil), rawObject...)
+	}
+
+	return nil
+}
+
+// sedpFieldsExtensions extracts security, partitions, and durability service.
+func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) {
+	secInfo, secErrs := ExtractSecurityInfo(params)
+	for _, secErr := range secErrs {
+		sedpTracef("parse security skip err=%v", secErr)
+	}
+
+	fields.security = secInfo
+
+	if err := CheckProtectedDiscovery(secInfo); err != nil {
+		sedpTracef("parse secured peer crypto unavailable err=%v", err)
+	}
+
+	partitionNames, err := FindPartitionParam(params)
+	if err != nil {
+		sedpTracef("parse partition skip err=%v", err)
+	} else {
+		fields.partitions = partitionNames
+	}
+
+	if rawDurabilityService, seen := byID[PIDDurabilityService]; seen {
+		durabilityService, err := DecodeDurabilityService(rawDurabilityService, littleEndian)
+		if err != nil {
+			sedpTracef("parse durability-service skip err=%v", err)
+		} else {
+			fields.durabilityService = durabilityService
+			fields.hasDurabilityService = true
+		}
+	}
+}
+
 // sedpEndpointFields extracts the endpoint identity from params.
 //
 // The first TOPIC_NAME, TYPE_NAME, ENDPOINT_GUID, and USER_DATA params
@@ -1859,61 +2239,15 @@ func sedpEndpointFields(params []rtps.Param, littleEndian bool) (sedpEndpointWir
 
 	byID := sedpFirstParams(params)
 
-	topic, err := sedpRequiredString(byID, rtps.PIDTopicName, littleEndian)
-	if err != nil {
-		return fields, fmt.Errorf("dds: sedp parse fields topic: %w", err)
+	if err := sedpFieldsIdentity(byID, littleEndian, &fields); err != nil {
+		return fields, err
 	}
 
-	fields.ddsTopic = topic
-
-	dtype, err := sedpRequiredString(byID, rtps.PIDTypeName, littleEndian)
-	if err != nil {
-		return fields, fmt.Errorf("dds: sedp parse fields type: %w", err)
+	if err := sedpFieldsOptionals(byID, littleEndian, &fields); err != nil {
+		return fields, err
 	}
 
-	fields.typeDDS = dtype
-
-	rawGUID, seen := byID[rtps.PIDEndpointGUIDWire]
-	if !seen {
-		rawGUID, seen = byID[rtps.PIDEndpointGUID]
-	}
-	if !seen {
-		return fields, fmt.Errorf("dds: sedp parse data misses endpoint GUID: %w", ErrSEDPInvalidDATA)
-	}
-
-	id, err := sedpDecodeEndpointGUID(rawGUID)
-	if err != nil {
-		return fields, fmt.Errorf("dds: sedp parse fields guid: %w", err)
-	}
-
-	fields.id = id
-
-	if fields.id.Entity == sedpEntityUnknown {
-		return fields, fmt.Errorf("dds: sedp parse data zero entity: %w", ErrSEDPInvalidDATA)
-	}
-
-	if rawUserdata, seen := byID[rtps.PIDUserData]; seen {
-		userdata, err := sedpDecodeOctetSequence(rawUserdata, littleEndian)
-		if err != nil {
-			return fields, fmt.Errorf("dds: sedp parse fields userdata: %w", err)
-		}
-
-		fields.userdata = userdata
-	}
-
-	if rawQos, seen := byID[rtps.PIDBuiltinEndpointQos]; seen {
-		qos, err := sedpDecodeBuiltinQos(rawQos, littleEndian)
-		if err != nil {
-			return fields, fmt.Errorf("dds: sedp parse fields builtin qos: %w", err)
-		}
-
-		fields.builtinQos = qos
-		fields.hasBuiltinQos = true
-	}
-
-	if rawObject, seen := byID[rtps.PIDTypeObject]; seen {
-		fields.typeObject = append([]byte(nil), rawObject...)
-	}
+	sedpFieldsExtensions(params, byID, littleEndian, &fields)
 
 	return fields, nil
 }
@@ -2365,6 +2699,10 @@ func sedpValidateMarshalEndpoint(ep SEDPEndpoint) error {
 		return fmt.Errorf("dds: sedp serialize idl %q vs %q: %w", ep.TypeIDL, decodedIDL, ErrSEDPInvalidType)
 	}
 
+	if err := ValidatePartitionList(ep.Partitions); err != nil {
+		return fmt.Errorf("dds: sedp serialize partitions: %w", err)
+	}
+
 	return nil
 }
 
@@ -2420,18 +2758,48 @@ func sedpEndpointsIdentityEqual(a, b SEDPEndpoint) bool {
 	return true
 }
 
-// sedpEndpointsAttrsEqual compares type and QoS attributes.
-func sedpEndpointsAttrsEqual(a, b SEDPEndpoint) bool {
+// sedpEndpointsTypeEqual compares type identity fields.
+func sedpEndpointsTypeEqual(a, b SEDPEndpoint) bool {
 	if a.TypeIDL != b.TypeIDL {
 		return false
 	}
+
 	if a.TypeHash != b.TypeHash {
 		return false
 	}
+
 	if a.IsReader != b.IsReader {
 		return false
 	}
-	if a.DomainID != b.DomainID {
+
+	return a.DomainID == b.DomainID
+}
+
+// sedpEndpointsQoSBytesEqual compares opaque QoS payloads and offers.
+func sedpEndpointsQoSBytesEqual(a, b SEDPEndpoint) bool {
+	if (a.WireOffer == nil) != (b.WireOffer == nil) {
+		return false
+	}
+
+	if a.WireOffer != nil && *a.WireOffer != *b.WireOffer {
+		return false
+	}
+
+	return bytes.Equal(a.QoS, b.QoS)
+}
+
+// sedpEndpointsDurabilityEqual compares durability service records.
+func sedpEndpointsDurabilityEqual(a, b SEDPEndpoint) bool {
+	if a.HasDurabilityService != b.HasDurabilityService {
+		return false
+	}
+
+	return !a.HasDurabilityService || a.DurabilityService == b.DurabilityService
+}
+
+// sedpEndpointsAttrsEqual compares type and QoS attributes.
+func sedpEndpointsAttrsEqual(a, b SEDPEndpoint) bool {
+	if !sedpEndpointsTypeEqual(a, b) {
 		return false
 	}
 	if a.BuiltinEndpointQos != b.BuiltinEndpointQos {
@@ -2440,13 +2808,69 @@ func sedpEndpointsAttrsEqual(a, b SEDPEndpoint) bool {
 	if !bytes.Equal(a.TypeObject, b.TypeObject) {
 		return false
 	}
-	return bytes.Equal(a.QoS, b.QoS)
+	if !slices.Equal(a.Partitions, b.Partitions) {
+		return false
+	}
+	if !securityInfoEqual(a.Security, b.Security) {
+		return false
+	}
+	if !sedpEndpointsDurabilityEqual(a, b) {
+		return false
+	}
+	return sedpEndpointsQoSBytesEqual(a, b)
+}
+
+// securityInfoFlagsEqual compares scalar security flags and classification.
+func securityInfoFlagsEqual(a, b SecurityInfo) bool {
+	return a.Present == b.Present &&
+		a.HasParticipantSecurityInfo == b.HasParticipantSecurityInfo &&
+		a.ParticipantSecurityAttributes == b.ParticipantSecurityAttributes &&
+		a.HasEndpointSecurityInfo == b.HasEndpointSecurityInfo &&
+		a.EndpointSecurityAttributes == b.EndpointSecurityAttributes &&
+		a.IdentityTokenPresent == b.IdentityTokenPresent &&
+		a.PermissionsTokenPresent == b.PermissionsTokenPresent &&
+		a.DataTagsPresent == b.DataTagsPresent &&
+		a.IdentityStatusPresent == b.IdentityStatusPresent &&
+		a.Classification == b.Classification
+}
+
+// securityInfoPropertiesEqual compares decoded property maps by content.
+func securityInfoPropertiesEqual(a, b SecurityInfo) bool {
+	if len(a.Properties) != len(b.Properties) {
+		return false
+	}
+
+	for k, v := range a.Properties {
+		if bv, ok := b.Properties[k]; !ok || bv != v {
+			return false
+		}
+	}
+
+	return true
+}
+
+// securityInfoEqual compares security records including properties.
+//
+// Maps compare by content; nil and empty maps compare equal since both
+// mean no decoded properties. A classification change bumps generation
+// so the graph reflects a newly secured peer.
+func securityInfoEqual(a, b SecurityInfo) bool {
+	if !securityInfoFlagsEqual(a, b) {
+		return false
+	}
+
+	return securityInfoPropertiesEqual(a, b)
 }
 
 // sedpCloneEndpoint copies an endpoint including its QoS bytes.
 func sedpCloneEndpoint(ep SEDPEndpoint) SEDPEndpoint {
 	ep.QoS = sedpCloneBytes(ep.QoS)
 	ep.TypeObject = sedpCloneBytes(ep.TypeObject)
+	ep.Partitions = append([]string(nil), ep.Partitions...)
+	if ep.WireOffer != nil {
+		offer := *ep.WireOffer
+		ep.WireOffer = &offer
+	}
 
 	return ep
 }

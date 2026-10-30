@@ -310,6 +310,6 @@ func (b *Backend) handleDataFrag(ctx context.Context, header rtps.Header, sub rt
 	}
 	b.noteRemoteData(guid, frag.SequenceNumber)
 	cp := append([]byte(nil), complete...)
-	enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, payload: cp})
+	enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: frag.SequenceNumber, payload: cp})
 	return true
 }

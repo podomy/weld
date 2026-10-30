@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
 )
@@ -161,6 +162,9 @@ type FragSink interface {
 //
 // The returned payload must be one DATA v1 frame ready for
 // ParseRTPSPayload, with guid matching the GUID stored inside the frame.
+// The sequence is the RTPS DATA submessage number, zero when the queue
+// predates sequence tracking; plain vendor takes need it for gap NACKs
+// while framed takes ignore it in favor of the frame header.
 // The returned payload is newly owned by the caller; the source must not
 // retain or mutate it after return, and the caller must not mutate it
 // after TakeFrom returns without copying. Implementations must be safe
@@ -169,7 +173,7 @@ type FrameSource interface {
 	// ReadFrame returns the next RTPS payload for its writer GUID.
 	// It blocks until a frame arrives or ctx ends and returns ctx.Err
 	// on cancellation.
-	ReadFrame(ctx context.Context) (guid WriterGUID, payload []byte, err error)
+	ReadFrame(ctx context.Context) (guid WriterGUID, seq uint64, payload []byte, err error)
 }
 
 // Publisher emits one DATA frame per Publish with a per GUID sequence.
@@ -450,8 +454,36 @@ type DataReceiver struct {
 	// owned by the sedp agent via SEDP upsert clearing Provisional; this map
 	// only marks provisional and re-checks SEDP on each sample.
 	provisional map[WriterGUID]ProvisionalEndpoint
+	// plainNack tracks per-writer plain-path repair state for vendor
+	// samples that bypass framed sequencing. Late joins NACK base 1 on
+	// first sight past seq 1; later gaps NACK once per advance.
+	plainNack map[WriterGUID]*plainNackState
+	// nackSender transmits ACKNACKs for plain-path gaps, wired by the
+	// backend at join. Nil disables gap NACKs; delivery flows unchanged.
+	nackSender func(ctx context.Context, guid WriterGUID, base uint64) error
 	// reasonCounts tallies drops by machine readable cause for dashboards.
 	reasonCounts map[DropReason]uint64
+	// contentFilters holds compiled content filters by ROS topic, set via
+	// SetContentFilter and consulted on every take. Absent means unfiltered.
+	contentFilters map[string]*contentFilterEntry
+	// lively tracks per-writer liveliness plus per-topic deadlines, set via
+	// SetLivelinessTracker and SetDeadlineTracker. Absent means untracked:
+	// delivery flows exactly as before.
+	lively map[WriterGUID]*core.LivelinessTracker
+	// livelyCfg holds per-topic liveliness configs for lazy tracker
+	// creation. Writers discovered after subscribe still get tracked on
+	// their first take, so enforcement needs no re-subscribe.
+	livelyCfg map[string]livelyConfig
+	// deadlines holds per-topic deadline trackers by ROS topic.
+	deadlines map[string]*core.DeadlineTracker
+}
+
+// livelyConfig names the liveliness contract for one subscribed topic.
+type livelyConfig struct {
+	// kind selects manual versus automatic assertion.
+	kind core.LivelinessPolicy
+	// lease bounds the assert interval.
+	lease core.Duration
 }
 
 // DropReason names one counted drop cause for dashboards.
@@ -463,6 +495,12 @@ const (
 	DropReasonUnknownWriter DropReason = "unknown-writer"
 	// DropReasonProvisionalDecodeFail counts undecodable provisional samples.
 	DropReasonProvisionalDecodeFail DropReason = "provisional-decode-fail"
+	// DropReasonDeadlineMissed counts samples dropped past the topic deadline.
+	DropReasonDeadlineMissed DropReason = "deadline-missed"
+	// DropReasonLivelinessExpired counts samples dropped from expired writers.
+	DropReasonLivelinessExpired DropReason = "liveliness-expired"
+	// DropReasonNackSendFailed counts gap NACKs that failed to send.
+	DropReasonNackSendFailed DropReason = "nack-send-failed"
 )
 
 var (
@@ -470,6 +508,10 @@ var (
 	ErrUnknownWriter = errors.New("dds: unknown writer")
 	// ErrProvisionalDecodeFail reports an undecodable provisional sample.
 	ErrProvisionalDecodeFail = errors.New("dds: provisional decode fail")
+	// ErrDeadlineMissed reports a sample dropped past the topic deadline.
+	ErrDeadlineMissed = errors.New("dds: deadline missed")
+	// ErrLivelinessExpired reports a sample dropped from an expired writer.
+	ErrLivelinessExpired = errors.New("dds: liveliness expired")
 )
 
 // ProvisionalQoS carries DATA inline QoS for one unknown writer sample.
@@ -521,7 +563,7 @@ type ProvisionalEndpoint struct {
 // live sources report hasQoS false and provisional installs hash-unset.
 type qoSFrameSource interface {
 	// ReadFrameWithQoS returns the next payload plus its inline QoS.
-	ReadFrameWithQoS(ctx context.Context) (WriterGUID, []byte, ProvisionalQoS, bool, error)
+	ReadFrameWithQoS(ctx context.Context) (WriterGUID, uint64, []byte, ProvisionalQoS, bool, error)
 }
 
 // NewDataReceiver returns an empty DataReceiver with no observed writers.
@@ -1126,11 +1168,13 @@ func (r *DataReceiver) takeDecoded(
 ) (transports.IncomingMessage, error) {
 	var empty transports.IncomingMessage
 
+	snap := r.snapshotTakeHooks(rosTopic, decoded.guid)
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	err := r.trackSequenceLocked(decoded.guid, decoded.seq)
 	if err != nil {
+		r.mu.Unlock()
 		return empty, fmt.Errorf("dds: take sequence: %w", err)
 	}
 
@@ -1139,6 +1183,12 @@ func (r *DataReceiver) takeDecoded(
 	if decoded.userLen > 0 {
 		outPayload = make([]byte, decoded.userLen)
 		copy(outPayload, payloadView[:decoded.userLen])
+	}
+
+	r.mu.Unlock()
+
+	if rej := evalTakeHooks(snap, rosTopic, decoded.typeName, payloadView[:decoded.userLen], decoded.guid, writerGUIDKeyed(decoded.guid)); rej != nil {
+		return empty, r.countTakeHookReject(rej)
 	}
 
 	msg := transports.IncomingMessage{
@@ -1205,14 +1255,32 @@ func (r *DataReceiver) Take(frame []byte) (transports.IncomingMessage, error) {
 }
 
 // tryPlainFallbacks decodes foreign plain samples before counting a drop.
-func (r *DataReceiver) tryPlainFallbacks(guid WriterGUID, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, bool) {
+//
+// It returns the hook rejection when a decoded sample is filtered, keyed
+// invalid, or liveliness gated, so TakeFrom counts exactly once under the
+// right reason instead of falling through to the unknown-writer path.
+func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, seq uint64, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, *takeHookReject, bool) {
+	var empty transports.IncomingMessage
+
 	if msg, ok := r.decodePlainCDRWithQoS(guid, payload, qos, hasQoS); ok {
-		return msg, true
+		r.notePlainSample(ctx, guid, seq)
+		snap := r.snapshotTakeHooks(msg.TopicName, guid)
+		if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
+			return empty, rej, false
+		}
+
+		return msg, nil, true
 	}
 	if msg, ok := r.decodeCycloneChatter(guid, payload); ok {
-		return msg, true
+		r.notePlainSample(ctx, guid, seq)
+		snap := r.snapshotTakeHooks(msg.TopicName, guid)
+		if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
+			return empty, rej, false
+		}
+
+		return msg, nil, true
 	}
-	return transports.IncomingMessage{}, false
+	return empty, nil, false
 }
 
 // takeValidatedFrame finishes TakeFrom for one validated Weld frame.
@@ -1262,7 +1330,7 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 		return empty, err //nolint:wrapcheck // ctx error passes through unchanged
 	}
 
-	guid, payload, qos, hasQoS, err := readFrameWithQoS(ctx, s)
+	guid, seq, payload, qos, hasQoS, err := readFrameWithQoS(ctx, s)
 	if err != nil {
 		return empty, fmt.Errorf("dds: take from read: %w", err)
 	}
@@ -1274,8 +1342,10 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 
 	frame, err := ParseRTPSPayload(payload)
 	if err != nil {
-		if msg, ok := r.tryPlainFallbacks(guid, payload, qos, hasQoS); ok {
+		if msg, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
 			return msg, nil
+		} else if rej != nil {
+			return empty, r.countTakeHookReject(rej)
 		}
 		return empty, r.countPlainDrop(guid, err, "payload")
 	}
@@ -1287,8 +1357,10 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 	}
 
 	if decoded.guid != guid {
-		if msg, ok := r.tryPlainFallbacks(guid, payload, qos, hasQoS); ok {
+		if msg, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
 			return msg, nil
+		} else if rej != nil {
+			return empty, r.countTakeHookReject(rej)
 		}
 		return empty, r.countPlainDrop(guid, ErrInvalidFrame, "guid mismatch")
 	}
@@ -1301,24 +1373,24 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 // When the source implements ReadFrameWithQoS the inline QoS supplies the
 // provisional topic, type, and hash where present. Otherwise it falls back
 // to ReadFrame with hasQoS false so the provisional marks hash-unset.
-func readFrameWithQoS(ctx context.Context, s FrameSource) (WriterGUID, []byte, ProvisionalQoS, bool, error) {
+func readFrameWithQoS(ctx context.Context, s FrameSource) (WriterGUID, uint64, []byte, ProvisionalQoS, bool, error) {
 	var empty WriterGUID
 
 	if qs, ok := s.(qoSFrameSource); ok {
-		guid, payload, qos, hasQoS, err := qs.ReadFrameWithQoS(ctx)
+		guid, seq, payload, qos, hasQoS, err := qs.ReadFrameWithQoS(ctx)
 		if err != nil {
-			return empty, nil, ProvisionalQoS{}, false, fmt.Errorf("dds: read frame with qos: %w", err)
+			return empty, 0, nil, ProvisionalQoS{}, false, fmt.Errorf("dds: read frame with qos: %w", err)
 		}
 
-		return guid, payload, qos, hasQoS, nil
+		return guid, seq, payload, qos, hasQoS, nil
 	}
 
-	guid, payload, err := s.ReadFrame(ctx)
+	guid, seq, payload, err := s.ReadFrame(ctx)
 	if err != nil {
-		return empty, nil, ProvisionalQoS{}, false, fmt.Errorf("dds: read frame: %w", err)
+		return empty, 0, nil, ProvisionalQoS{}, false, fmt.Errorf("dds: read frame: %w", err)
 	}
 
-	return guid, payload, ProvisionalQoS{}, false, nil
+	return guid, seq, payload, ProvisionalQoS{}, false, nil
 }
 
 // countPlainDrop counts one plain CDR drop with a distinct reason code.

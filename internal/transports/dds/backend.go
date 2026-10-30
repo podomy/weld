@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
@@ -191,6 +192,7 @@ func (discardWriter) WriteFrame(_ []byte) error {
 // dataItem carries one RTPS DATA payload with its writer GUID.
 type dataItem struct {
 	guid    WriterGUID
+	seq     uint64
 	payload []byte
 }
 
@@ -293,8 +295,11 @@ type Backend struct {
 	dataCh chan dataItem
 	// repairHistory keeps sent user payloads for ACKNACK repair.
 	repairHistory *userHistory
-	// remoteHighSeq tracks the highest outer RTPS seq per remote writer for ACK base.
-	remoteHighSeq map[WriterGUID]uint64
+	// remoteTrack holds per-writer contiguity state for NACK base.
+	// The base must be the first missing sequence, not highest seen
+	// plus one: a cumulative ACK advances the peer past everything
+	// below it, so an overshooting base abandons the gap forever.
+	remoteTrack map[WriterGUID]*remoteTracker
 	// sedpHighSeq tracks the highest SEDP DATA seq per remote builtin writer.
 	sedpHighSeq map[WriterGUID]uint64
 	// fragReasm reassembles DATA_FRAG samples.
@@ -536,6 +541,131 @@ func (b *Backend) startLiveLoopsLocked(runCtx context.Context) {
 	go b.sedpListenLoop(runCtx)
 	b.runWG.Add(1)
 	go b.demuxLoop(runCtx)
+	b.runWG.Add(1)
+	go b.userHeartbeatLoop(runCtx)
+}
+
+// userHeartbeatInterval spaces silent-writer availability heartbeats.
+//
+// A writer that published and went silent emits no DATA, so late joiners
+// never learn its retained history without a heartbeat trigger. The loop
+// advertises every local writer's [first-kept, last] range once per
+// interval; matched readers NACK the gap and repair serves from history.
+// The interval matches the SEDP resend cadence: prompt enough for tests,
+// quiet enough for the fleet.
+const userHeartbeatInterval = 1 * time.Second
+
+// userHeartbeatLoop advertises retained writer history until context ends.
+//
+// It shares the run WaitGroup with the other live loops so Close waits
+// for it. Each tick is best effort: a send failure logs and the next tick
+// retries, so a transient send error never kills availability.
+func (b *Backend) userHeartbeatLoop(ctx context.Context) {
+	defer b.runWG.Done()
+
+	ticker := time.NewTicker(userHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.advertiseWriterHistory(ctx)
+		}
+	}
+}
+
+// advertiseWriterHistory heartbeats every local writer's retained range.
+//
+// Writers with no retained samples are skipped: First 1 Last 0 is an
+// invalid range and there is nothing to repair. Failures log loudly and
+// skip the writer; the next tick retries.
+func (b *Backend) advertiseWriterHistory(ctx context.Context) {
+	err := ctx.Err()
+	if err != nil {
+		return
+	}
+
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	joined := b.joined
+	closed := b.closed
+	b.mu.RUnlock()
+
+	if sedpIdx == nil || !joined || closed {
+		return
+	}
+
+	for _, ep := range sedpIdx.LocalEndpoints() {
+		if ep.IsReader {
+			continue
+		}
+
+		guid := writerGUIDFromEndpoint(ep.ID)
+		first := b.repairHistoryFirst(guid)
+		last := b.repairHistoryLast(guid)
+
+		if last == 0 {
+			continue
+		}
+
+		msg, err := b.buildHistoryHeartbeatMessage(guid, first, last)
+		if err != nil {
+			log.Printf("dds: user heartbeat build %x: %v", guid[:], err)
+			continue
+		}
+
+		if err := b.sendUserControl(ctx, msg); err != nil {
+			log.Printf("dds: user heartbeat send %x: %v", guid[:], err)
+		}
+	}
+}
+
+// buildHistoryHeartbeatMessage wraps one HEARTBEAT naming a retained range.
+//
+// First names the earliest kept seq so a late reader NACKing from 1 gets
+// GAP for the evicted prefix plus repair for retained samples. Last names
+// the newest seq so the reader learns everything available without
+// waiting for the next DATA sample.
+func (b *Backend) buildHistoryHeartbeatMessage(guid WriterGUID, first, last uint64) ([]byte, error) {
+	b.mu.RLock()
+	local := b.local
+	b.mu.RUnlock()
+
+	if local == nil {
+		return nil, fmt.Errorf("dds: history heartbeat without transport: %w", ErrDataPathNotWired)
+	}
+
+	var prefix [12]byte
+	lg := local.GUID()
+	copy(prefix[:], lg.Prefix[:])
+
+	header := rtps.DefaultHeader(prefix)
+
+	var writerID rtps.EntityID
+	copy(writerID[:], guid[12:16])
+
+	heartbeat := rtps.Heartbeat{
+		ReaderID:      rtps.EntityUnknown,
+		WriterID:      writerID,
+		FirstSequence: first,
+		LastSequence:  last,
+		Count:         nextHeartbeatCount(),
+	}
+
+	hbRaw := rtps.RawSubmessage{
+		ID:    rtps.SubmessageHeartbeat,
+		Flags: rtps.FlagLittleEndian,
+		Body:  heartbeat.Encode(true),
+	}
+
+	msg, err := rtps.EncodeMessage(header, []rtps.RawSubmessage{hbRaw})
+	if err != nil {
+		return nil, fmt.Errorf("dds: history heartbeat encode: %w", err)
+	}
+
+	return msg, nil
 }
 
 // closePeerBestEffort closes a dialed peer and logs failures.
@@ -738,13 +868,14 @@ func (b *Backend) installLiveLocked(
 	b.sedp = sedpIdx
 	b.receiver = NewDataReceiver()
 	b.receiver.SetSEDPIndex(sedpIdx)
+	b.receiver.SetNackSender(b.sendPlainNack)
 	b.publisher = publisher
 	b.pubGUID = pubGUID
 	b.spdpCh = make(chan []byte, demuxQueueDepth)
 	b.sedpCh = make(chan []byte, demuxQueueDepth)
 	b.dataCh = make(chan dataItem, demuxQueueDepth)
 	b.repairHistory = newUserHistory()
-	b.remoteHighSeq = make(map[WriterGUID]uint64)
+	b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	if b.rtpsSeqByWriter == nil {
 		b.rtpsSeqByWriter = make(map[WriterGUID]uint64)
 	}
@@ -1302,12 +1433,16 @@ type frameSource struct {
 }
 
 // ReadFrame returns the next RTPS payload for its writer GUID.
-func (s *frameSource) ReadFrame(ctx context.Context) (WriterGUID, []byte, error) {
+//
+// The sequence is the RTPS DATA submessage number, zero when the queue
+// predates sequence tracking. Plain vendor samples need it for gap
+// NACKs; framed takes ignore it in favor of the frame header.
+func (s *frameSource) ReadFrame(ctx context.Context) (WriterGUID, uint64, []byte, error) {
 	var empty WriterGUID
 
 	err := ctx.Err()
 	if err != nil {
-		return empty, nil, fmt.Errorf("dds: frame source context: %w", err)
+		return empty, 0, nil, fmt.Errorf("dds: frame source context: %w", err)
 	}
 
 	s.backend.mu.RLock()
@@ -1316,27 +1451,27 @@ func (s *frameSource) ReadFrame(ctx context.Context) (WriterGUID, []byte, error)
 	s.backend.mu.RUnlock()
 
 	if ch == nil {
-		return empty, nil, fmt.Errorf("dds: frame source without transport: %w", ErrDataPathNotWired)
+		return empty, 0, nil, fmt.Errorf("dds: frame source without transport: %w", ErrDataPathNotWired)
 	}
 
 	if done == nil {
 		select {
 		case <-ctx.Done():
 			err := ctx.Err()
-			return empty, nil, fmt.Errorf("dds: frame source context: %w", err)
+			return empty, 0, nil, fmt.Errorf("dds: frame source context: %w", err)
 		case item := <-ch:
-			return item.guid, item.payload, nil
+			return item.guid, item.seq, item.payload, nil
 		}
 	}
 
 	select {
 	case <-ctx.Done():
 		err := ctx.Err()
-		return empty, nil, fmt.Errorf("dds: frame source context: %w", err)
+		return empty, 0, nil, fmt.Errorf("dds: frame source context: %w", err)
 	case <-done:
-		return empty, nil, fmt.Errorf("dds: frame source stopped: %w", transports.ErrBackendClosed)
+		return empty, 0, nil, fmt.Errorf("dds: frame source stopped: %w", transports.ErrBackendClosed)
 	case item := <-ch:
-		return item.guid, item.payload, nil
+		return item.guid, item.seq, item.payload, nil
 	}
 }
 
@@ -2190,6 +2325,24 @@ func (b *Backend) dispatchRTPS(
 		return
 	}
 
+	b.mu.RLock()
+	recv := b.receiver
+	b.mu.RUnlock()
+
+	kept := subs[:0]
+	for _, sub := range subs {
+		handled, herr := HandleProtectedSubmessage(recv, sub)
+		if herr != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux secured submessage dropped: %v", herr)
+		}
+		if handled {
+			continue
+		}
+		kept = append(kept, sub)
+	}
+	subs = kept
+
 	if b.routeBuiltinDiscovery(ctx, header, data, subs, spdpCh, sedpCh) {
 		return
 	}
@@ -2237,6 +2390,23 @@ func (b *Backend) routeBuiltinDiscovery(
 	}
 
 	return false
+}
+
+// sendPlainNack transmits one ACKNACK for a plain-path sequence gap.
+//
+// It answers late-join and loss gaps on vendor samples that bypass framed
+// sequencing. Failures return loudly so the receiver counts them under a
+// distinct reason instead of failing silently.
+func (b *Backend) sendPlainNack(ctx context.Context, guid WriterGUID, base uint64) error {
+	if base == 0 {
+		return nil
+	}
+
+	if err := b.sendUserAckNack(ctx, guid, b.readerEntityForWriter(guid), base, 0, nil); err != nil {
+		return fmt.Errorf("dds: plain nack send: %w", err)
+	}
+
+	return nil
 }
 
 // routeBuiltinSub routes one discovery control submessage.
@@ -2394,7 +2564,7 @@ func (b *Backend) ackSedpHeartbeat(ctx context.Context, header rtps.Header, sub 
 	copy(remote[12:16], beat.WriterID[:])
 	base := b.sedpBase(remote, beat.FirstSequence)
 	bitmap, numBits, _ := planSedpNack(base, beat.LastSequence)
-	ack, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap)
+	ack, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap, numBits == 0)
 	if err != nil {
 		b.bumpDemuxError()
 		log.Printf("dds: demux sedp ack build: %v", err)
@@ -2589,7 +2759,7 @@ func (b *Backend) enqueueData(
 
 	payload := append([]byte(nil), decoded.Data.Payload...)
 
-	enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, payload: payload})
+	enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: decoded.Data.SequenceNumber, payload: payload})
 }
 
 // ReportLiveliness reports local endpoint liveliness on the SEDP path.
@@ -3019,6 +3189,114 @@ func (b *Backend) Subscribe(ctx context.Context, topic, typeName, typeHash strin
 // A transient local reader refuses volatile writers through peer side RxO
 // matching, which is how QoS gates prove silence for incompatible pairs.
 func (b *Backend) SubscribeWithDurability(ctx context.Context, topic, typeName, typeHash string, volatile bool) error {
+	return b.subscribeReader(ctx, topic, typeName, typeHash, volatile, nil)
+}
+
+// SubscribeWithQoS declares a local SEDP reader announcing the translated
+// per-profile wire QoS instead of the facade default.
+//
+// System defaults resolve exactly like the core matcher, so a zero
+// profile behaves like Subscribe. Refusal to translate is loud and aborts
+// the subscribe. The reader also records liveliness and deadline
+// trackers so the take path enforces the requested lease and deadline.
+func (b *Backend) SubscribeWithQoS(ctx context.Context, topic, typeName, typeHash string, profile core.QoSProfile) error {
+	return b.subscribeReader(ctx, topic, typeName, typeHash, false, &profile)
+}
+
+// SubscribeWithPartitions declares a local SEDP reader joining explicit
+// DDS partitions, empty for the default partition.
+//
+// Partition names validate loudly at declare. Matching requires a common
+// partition with writers, otherwise the pair stays silent without an RxO
+// error per the DDS rule.
+func (b *Backend) SubscribeWithPartitions(ctx context.Context, topic, typeName, typeHash string, partitions []string) error {
+	if err := ValidatePartitionList(partitions); err != nil {
+		return fmt.Errorf("dds: subscribe partitions: %w", err)
+	}
+
+	err := b.Subscribe(ctx, topic, typeName, typeHash)
+	if err != nil {
+		return err
+	}
+
+	return b.stampLocalPartitions(topic, typeName, partitions)
+}
+
+// stampLocalPartitions records partitions on matching local readers.
+//
+// SEDP declare stores no partitions by default; this backfills the field
+// on locals for one topic and type so matching and announce carry the
+// requested set. It bumps generation once when any record changes.
+func (b *Backend) stampLocalPartitions(topic, typeName string, partitions []string) error {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return fmt.Errorf("dds: stamp partitions data path not wired yet: %w", ErrDataPathNotWired)
+	}
+
+	sedpIdx.StampLocalPartitions(topic, typeName, partitions)
+
+	return nil
+}
+
+// SubscribeWithContentFilter declares a local SEDP reader and attaches a
+// compiled content filter evaluated on every take.
+//
+// The expression compiles now and parses loudly on error; nothing
+// subscribes when compilation fails. Matching samples flow; misses and
+// eval errors drop under distinct reasons countable via DropReasonCount.
+func (b *Backend) SubscribeWithContentFilter(ctx context.Context, topic, typeName, typeHash, filterExpr string) error {
+	filter, err := CompileContentFilter(filterExpr)
+	if err != nil {
+		return fmt.Errorf("dds: subscribe content filter: %w", err)
+	}
+
+	desc, err := lookupDescriptorForIDL(typeName)
+	if err != nil {
+		return fmt.Errorf("dds: subscribe content filter descriptor: %w", err)
+	}
+
+	err = b.Subscribe(ctx, topic, typeName, typeHash)
+	if err != nil {
+		return err
+	}
+
+	b.mu.RLock()
+	receiver := b.receiver
+	b.mu.RUnlock()
+
+	if receiver == nil {
+		return fmt.Errorf("dds: subscribe content filter data path not wired yet: %w", ErrDataPathNotWired)
+	}
+
+	receiver.SetContentFilter(topic, filter, desc)
+
+	return nil
+}
+
+// DropReasonCount forwards the per-reason drop tally for dashboards.
+func (b *Backend) DropReasonCount(reason DropReason) uint64 {
+	b.mu.RLock()
+	receiver := b.receiver
+	b.mu.RUnlock()
+
+	if receiver == nil {
+		return 0
+	}
+
+	return receiver.DropReasonCount(reason)
+}
+
+// subscribeReader declares a local SEDP reader, optionally with a profile.
+//
+// A nil profile keeps the facade path with the volatile default. A
+// non-nil profile resolves system defaults, derives the volatile flag
+// from requested durability, and announces translated wire QoS loudly
+// refusing untranslatable settings. Liveliness and deadline trackers
+// record from the resolved profile so takes enforce them.
+func (b *Backend) subscribeReader(ctx context.Context, topic, typeName, typeHash string, volatile bool, profile *core.QoSProfile) error {
 	err := ctx.Err()
 	if err != nil {
 		return fmt.Errorf("dds: subscribe: %w", err)
@@ -3028,6 +3306,7 @@ func (b *Backend) SubscribeWithDurability(ctx context.Context, topic, typeName, 
 	closed := b.closed
 	joined := b.joined
 	sedpIdx := b.sedp
+	receiver := b.receiver
 	b.mu.RUnlock()
 
 	if closed {
@@ -3044,9 +3323,32 @@ func (b *Backend) SubscribeWithDurability(ctx context.Context, topic, typeName, 
 
 	hash := sedpTypeHashForIDL(typeName, typeHash)
 
-	_, err = sedpIdx.DeclareReaderWithDurability(topic, typeName, hash, nil, volatile)
+	if profile == nil {
+		_, err = sedpIdx.DeclareReaderWithDurability(topic, typeName, hash, nil, volatile)
+		if err != nil {
+			return fmt.Errorf("dds: subscribe declare reader: %w", err)
+		}
+
+		return nil
+	}
+
+	resolved := core.ResolveSystemDefaults(*profile)
+	readerVolatile := resolved.Durability == core.DurabilityVolatile
+	local, err := sedpIdx.DeclareReaderWithQoS(topic, typeName, hash, nil, readerVolatile, &resolved)
 	if err != nil {
-		return fmt.Errorf("dds: subscribe declare reader: %w", err)
+		return fmt.Errorf("dds: subscribe declare reader with qos: %w", err)
+	}
+
+	if receiver != nil {
+		var writers []WriterGUID
+		if matched, merr := sedpIdx.MatchingWriters(local.ID); merr == nil {
+			for _, writer := range matched {
+				writers = append(writers, writerGUIDFromEndpoint(writer.ID))
+			}
+		}
+
+		receiver.SetLivelinessTrackerForTopic(topic, resolved.Liveliness, resolved.LeaseDuration, writers)
+		receiver.SetDeadlineTrackerForTopic(topic, resolved.Deadline)
 	}
 
 	return nil

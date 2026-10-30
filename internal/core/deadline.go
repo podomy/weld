@@ -110,6 +110,64 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 	return DeadlineAlert{Topic: t.topic, Endpoint: t.endpoint, Deadline: t.deadline, ElapsedNanos: elapsed}, true
 }
 
+// DeadlineExceeded reports whether elapsedNanos reaches deadline without state.
+//
+// Unspecified, infinite, best available sentinel, and negative malformed
+// deadlines never exceed, matching Check quiet rules. It is pure for the
+// gating path: it never fires, never latches, and never rebases.
+func DeadlineExceeded(deadline Duration, elapsedNanos int64) bool {
+	if deadline.IsUnspecified() {
+		return false
+	}
+	if deadline.Seconds < 0 {
+		return false
+	}
+	if IsBestAvailableDuration(deadline) {
+		return false
+	}
+	if deadline.IsInfinite() {
+		return false
+	}
+	return elapsedNanos >= deadline.TotalNanoseconds()
+}
+
+// ElapsedAt returns the silence observed at nowNanos without mutating state.
+//
+// Unlike Check it never fires, never latches, and never rebases: backward
+// time yields a negative elapsed so callers see the rewind. Tests prefer
+// this peek for gating assertions.
+func (t *DeadlineTracker) ElapsedAt(nowNanos int64) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return nowNanos - t.lastNanos
+}
+
+// MissedAt reports whether the deadline window elapsed at nowNanos.
+//
+// It never fires, never latches, and never rebases, so repeated calls are
+// stable and gating stays pure. Unspecified, infinite, sentinel, and
+// negative deadlines never miss. Backward time never misses.
+func (t *DeadlineTracker) MissedAt(nowNanos int64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.deadline.IsUnspecified() {
+		return false
+	}
+	if t.deadline.Seconds < 0 {
+		return false
+	}
+	if IsBestAvailableDuration(t.deadline) {
+		return false
+	}
+	if t.deadline.IsInfinite() {
+		return false
+	}
+	if nowNanos < t.lastNanos {
+		return false
+	}
+	return nowNanos-t.lastNanos >= t.deadline.TotalNanoseconds()
+}
+
 // DeadlineAlert is one fired freshness alarm with topic plus endpoint names.
 //
 // This is a single endpoint freshness signal, not an RxO pair mismatch, so

@@ -232,18 +232,18 @@ type negFrameSourceStub struct {
 }
 
 // ReadFrame returns the next queued payload.
-func (s *negFrameSourceStub) ReadFrame(ctx context.Context) (dds.WriterGUID, []byte, error) {
+func (s *negFrameSourceStub) ReadFrame(ctx context.Context) (dds.WriterGUID, uint64, []byte, error) {
 	err := negCtxErr(ctx, "neg frame source")
 	if err != nil {
-		return dds.WriterGUID{}, nil, err
+		return dds.WriterGUID{}, 0, nil, err
 	}
 	if s.idx >= len(s.payloads) {
-		return dds.WriterGUID{}, nil, context.DeadlineExceeded
+		return dds.WriterGUID{}, 0, nil, context.DeadlineExceeded
 	}
 	guid := s.guids[s.idx]
 	cp := append([]byte(nil), s.payloads[s.idx]...)
 	s.idx++
-	return guid, cp, nil
+	return guid, 0, cp, nil
 }
 
 // negBuildValidRTPSMessage builds one header plus INFO_TS plus DATA datagram.

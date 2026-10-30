@@ -621,28 +621,28 @@ type sliceFrameSource struct {
 }
 
 // ReadFrame returns the next queued payload or the injected failure.
-func (s *sliceFrameSource) ReadFrame(ctx context.Context) (WriterGUID, []byte, error) {
+func (s *sliceFrameSource) ReadFrame(ctx context.Context) (WriterGUID, uint64, []byte, error) {
 	err := ctx.Err()
 	if err != nil {
-		return WriterGUID{}, nil, err //nolint:wrapcheck // ctx error passes through unchanged
+		return WriterGUID{}, 0, nil, err //nolint:wrapcheck // ctx error passes through unchanged
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.fail != nil {
-		return WriterGUID{}, nil, s.fail
+		return WriterGUID{}, 0, nil, s.fail
 	}
 
 	if s.idx >= len(s.payloads) {
-		return WriterGUID{}, nil, context.DeadlineExceeded
+		return WriterGUID{}, 0, nil, context.DeadlineExceeded
 	}
 
 	guid := s.guids[s.idx]
 	cp := append([]byte(nil), s.payloads[s.idx]...)
 	s.idx++
 
-	return guid, cp, nil
+	return guid, 0, cp, nil
 }
 
 // setFail installs an injected failure under lock for race safety.
@@ -1485,24 +1485,24 @@ type provisionalQoSSource struct {
 }
 
 // ReadFrame returns the next queued payload without QoS metadata.
-func (s *provisionalQoSSource) ReadFrame(ctx context.Context) (WriterGUID, []byte, error) {
-	guid, payload, _, _, err := s.ReadFrameWithQoS(ctx)
+func (s *provisionalQoSSource) ReadFrame(ctx context.Context) (WriterGUID, uint64, []byte, error) {
+	guid, _, payload, _, _, err := s.ReadFrameWithQoS(ctx)
 
-	return guid, payload, err
+	return guid, 0, payload, err
 }
 
 // ReadFrameWithQoS returns the next queued payload plus its inline QoS.
-func (s *provisionalQoSSource) ReadFrameWithQoS(ctx context.Context) (WriterGUID, []byte, ProvisionalQoS, bool, error) {
+func (s *provisionalQoSSource) ReadFrameWithQoS(ctx context.Context) (WriterGUID, uint64, []byte, ProvisionalQoS, bool, error) {
 	err := ctx.Err()
 	if err != nil {
-		return WriterGUID{}, nil, ProvisionalQoS{}, false, err //nolint:wrapcheck // ctx error passes through unchanged
+		return WriterGUID{}, 0, nil, ProvisionalQoS{}, false, err //nolint:wrapcheck // ctx error passes through unchanged
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.idx >= len(s.payloads) {
-		return WriterGUID{}, nil, ProvisionalQoS{}, false, context.DeadlineExceeded
+		return WriterGUID{}, 0, nil, ProvisionalQoS{}, false, context.DeadlineExceeded
 	}
 
 	guid := s.guids[s.idx]
@@ -1510,7 +1510,7 @@ func (s *provisionalQoSSource) ReadFrameWithQoS(ctx context.Context) (WriterGUID
 	qos := s.qos[s.idx]
 	s.idx++
 
-	return guid, cp, qos, true, nil
+	return guid, 0, cp, qos, true, nil
 }
 
 // queueProvisional appends one guid plus payload plus inline QoS for later reads.

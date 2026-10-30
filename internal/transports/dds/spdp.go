@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"slices"
@@ -94,6 +95,9 @@ type ParticipantInfo struct {
 	LeaseExpiry time.Time
 	// LastSeq is the last accepted SPDP sequence.
 	LastSeq uint64
+	// Security carries the parsed DDS-Security attributes for the
+	// participant, zero when the peer announced none.
+	Security SecurityInfo
 }
 
 // Announcement is a parsed SPDP packet.
@@ -114,6 +118,9 @@ type Announcement struct {
 	ManualLivelinessCount uint32
 	// BuiltinEndpointQos is the builtin endpoint QoS mask, zero when absent.
 	BuiltinEndpointQos uint32
+	// Security carries the parsed DDS-Security attributes, zero when the
+	// peer announced none. Secured peers are detected, never decrypted.
+	Security SecurityInfo
 }
 
 // Sender transmits SPDP payloads to the transport.
@@ -674,6 +681,69 @@ func ParseAnnouncement(data []byte) (Announcement, error) {
 	return out, fmt.Errorf("dds: no SPDP DATA: %w", ErrInvalidSPDP)
 }
 
+// announcementAliveFields fills lease, ports, manual count, and QoS.
+func announcementAliveFields(params []rtps.Param, out *Announcement) error {
+	lease, err := findLeaseParam(params)
+	if err != nil {
+		return err
+	}
+
+	ports, err := findUnicastPortsParam(params)
+	if err != nil {
+		return err
+	}
+
+	manual, err := findManualCountParam(params)
+	if err != nil {
+		return err
+	}
+
+	qos, err := findBuiltinQosParam(params)
+	if err != nil {
+		return err
+	}
+
+	out.Lease = lease
+	out.Ports = ports
+	out.ManualLivelinessCount = manual
+	out.BuiltinEndpointQos = qos
+
+	return nil
+}
+
+// announcementSecurityFields fills security info with skip logging.
+func announcementSecurityFields(params []rtps.Param, out *Announcement) {
+	secInfo, secErrs := ExtractSecurityInfo(params)
+	for _, secErr := range secErrs {
+		log.Printf("dds: spdp security param skipped: %v", secErr)
+	}
+
+	out.Security = secInfo
+
+	if err := CheckProtectedDiscovery(secInfo); err != nil {
+		log.Printf("dds: spdp secured peer detected, crypto unavailable: %v", err)
+	}
+}
+
+// announcementIdentity extracts GUID and domain from params.
+func announcementIdentity(params []rtps.Param) (GUID, uint32, error) {
+	guid, err := findGUIDParam(params)
+	if err != nil {
+		return GUID{}, 0, err
+	}
+
+	domain, err := findDomainParam(params)
+	if err != nil {
+		return GUID{}, 0, err
+	}
+
+	if domain > transports.MaxDomainID {
+		return GUID{}, 0, fmt.Errorf("dds: domain %d above maximum %d: %w", domain, transports.MaxDomainID, ErrInvalidSPDP)
+	}
+
+	return guid, domain, nil
+}
+
 // announcementFromData extracts fields from one SPDP DATA submessage.
 //
 // Key flagged DATA is a dispose carrying GUID plus domain. Other DATA
@@ -695,18 +765,9 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 		return out, err
 	}
 
-	guid, err := findGUIDParam(params)
+	guid, domain, err := announcementIdentity(params)
 	if err != nil {
 		return out, err
-	}
-
-	domain, err := findDomainParam(params)
-	if err != nil {
-		return out, err
-	}
-
-	if domain > transports.MaxDomainID {
-		return out, fmt.Errorf("dds: domain %d above maximum %d: %w", domain, transports.MaxDomainID, ErrInvalidSPDP)
 	}
 
 	out.GUID = guid
@@ -719,30 +780,11 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 
 	out.Alive = true
 
-	lease, err := findLeaseParam(params)
-	if err != nil {
+	if err := announcementAliveFields(params, &out); err != nil {
 		return out, err
 	}
 
-	ports, err := findUnicastPortsParam(params)
-	if err != nil {
-		return out, err
-	}
-
-	manual, err := findManualCountParam(params)
-	if err != nil {
-		return out, err
-	}
-
-	qos, err := findBuiltinQosParam(params)
-	if err != nil {
-		return out, err
-	}
-
-	out.Lease = lease
-	out.Ports = ports
-	out.ManualLivelinessCount = manual
-	out.BuiltinEndpointQos = qos
+	announcementSecurityFields(params, &out)
 
 	return out, nil
 }
@@ -1302,6 +1344,7 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 			GUID:        ann.GUID,
 			LeaseExpiry: expiry,
 			LastSeq:     ann.Sequence,
+			Security:    ann.Security,
 		}
 		t.generation++
 
@@ -1315,6 +1358,7 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 	existing.GUID = ann.GUID
 	existing.LeaseExpiry = expiry
 	existing.LastSeq = ann.Sequence
+	existing.Security = ann.Security
 	t.entries[ann.GUID.Prefix] = existing
 	t.generation++
 

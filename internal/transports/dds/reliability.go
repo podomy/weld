@@ -11,6 +11,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
@@ -419,10 +420,96 @@ func (b *Backend) repairHistoryLast(
 	return b.repairHistory.last(guid)
 }
 
-// noteRemoteData records one outer seq.
+// remoteSeenCap bounds one writer's out-of-order set.
 //
-// It tracks the highest RTPS seq per remote writer for ACKNACK base. A nil map is allocated on first
-// use under mu.
+// Gaps beyond the cap reset tracking to highest seen instead of growing
+// without limit; the base then re-derives from the next heartbeat and
+// repair converges over later NACKs, the same as a fresh join.
+const remoteSeenCap = 4096
+
+// remoteTracker holds per-writer contiguity state for NACK base.
+//
+// base is the first missing sequence: contig plus one, where contig is
+// the highest contiguous received seq. Out-of-order samples above a gap
+// sit in seen until the gap fills. A cumulative ACK advances the peer
+// past everything below it, so the base must never overshoot a gap the
+// way highest-seen plus one does.
+type remoteTracker struct {
+	// contig is the highest contiguous received seq, zero when none.
+	contig uint64
+	// seen holds received seqs above a gap, bounded by remoteSeenCap.
+	seen map[uint64]struct{}
+}
+
+// observe records one received seq.
+//
+// It returns false for zero, duplicates, and already contiguous seqs.
+// Otherwise it records the sample, advances contiguity through filled
+// gaps, and returns true.
+func (t *remoteTracker) observe(seq uint64) bool {
+	if seq == 0 || seq <= t.contig {
+		return false
+	}
+
+	if _, ok := t.seen[seq]; ok {
+		return false
+	}
+
+	if t.seen == nil {
+		t.seen = make(map[uint64]struct{})
+	}
+
+	if len(t.seen) >= remoteSeenCap {
+		t.seen = make(map[uint64]struct{})
+	}
+
+	t.seen[seq] = struct{}{}
+
+	for {
+		next := t.contig + 1
+		if next == 0 {
+			break
+		}
+		if _, ok := t.seen[next]; !ok {
+			break
+		}
+
+		delete(t.seen, next)
+		t.contig = next
+	}
+
+	return true
+}
+
+// base returns the first missing sequence, at least 1.
+func (t *remoteTracker) base() uint64 {
+	next := t.contig + 1
+	if next == 0 {
+		return FirstSequenceNumber
+	}
+
+	return next
+}
+
+// skipTo advances contiguity past a GAP range the writer will never send.
+func (t *remoteTracker) skipTo(seq uint64) {
+	if seq <= t.contig {
+		return
+	}
+
+	t.contig = seq
+
+	for s := range t.seen {
+		if s <= t.contig {
+			delete(t.seen, s)
+		}
+	}
+}
+
+// noteRemoteData records one outer seq per remote writer for NACK base.
+//
+// It tracks contiguity, not highest seen, so the ACK base names the
+// first missing sample instead of skipping silent gaps.
 func (b *Backend) noteRemoteData(
 	guid WriterGUID,
 	seq uint64,
@@ -434,17 +521,21 @@ func (b *Backend) noteRemoteData(
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.remoteHighSeq == nil {
-		b.remoteHighSeq = make(map[WriterGUID]uint64)
+	if b.remoteTrack == nil {
+		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
-	if seq > b.remoteHighSeq[guid] {
-		b.remoteHighSeq[guid] = seq
+	tracker, ok := b.remoteTrack[guid]
+	if !ok {
+		tracker = &remoteTracker{}
+		b.remoteTrack[guid] = tracker
 	}
+
+	tracker.observe(seq)
 }
 
-// remoteBase returns next wanted seq for a remote writer: highest plus one, or first from heartbeat
-// when never seen.
+// remoteBase returns next wanted seq for a remote writer: first missing,
+// or first from heartbeat when never seen.
 func (b *Backend) remoteBase(
 	guid WriterGUID,
 	first uint64,
@@ -452,7 +543,7 @@ func (b *Backend) remoteBase(
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	last, seen := b.remoteHighSeq[guid]
+	tracker, seen := b.remoteTrack[guid]
 	if !seen {
 		if first == 0 {
 			return FirstSequenceNumber
@@ -461,12 +552,7 @@ func (b *Backend) remoteBase(
 		return first
 	}
 
-	next := last + 1
-	if next == 0 {
-		return FirstSequenceNumber
-	}
-
-	return next
+	return tracker.base()
 }
 
 // noteSedpSeq records one SEDP DATA seq per remote builtin writer.
@@ -586,13 +672,17 @@ func (b *Backend) applyRemoteGap(
 	}
 
 	b.mu.Lock()
-	if b.remoteHighSeq == nil {
-		b.remoteHighSeq = make(map[WriterGUID]uint64)
+	if b.remoteTrack == nil {
+		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
-	if gapStart > b.remoteHighSeq[guid] {
-		b.remoteHighSeq[guid] = gapStart
+	tracker, ok := b.remoteTrack[guid]
+	if !ok {
+		tracker = &remoteTracker{}
+		b.remoteTrack[guid] = tracker
 	}
+
+	tracker.skipTo(gapStart)
 
 	receiver := b.receiver
 	b.mu.Unlock()
@@ -760,6 +850,7 @@ func (b *Backend) buildAckSubmessage(
 	base uint64,
 	numBits uint32,
 	bitmap []uint32,
+	final bool,
 ) (rtps.RawSubmessage, error) {
 	var empty rtps.RawSubmessage
 
@@ -802,7 +893,7 @@ func (b *Backend) buildAckSubmessage(
 	}
 
 	flags := uint8(rtps.FlagLittleEndian)
-	if numBits == 0 {
+	if final {
 		flags |= rtps.AckNackFlagFinal
 	}
 
@@ -820,6 +911,8 @@ func (b *Backend) buildAckMessage(
 	remote WriterGUID,
 	reader rtps.EntityID,
 	base uint64,
+	numBits uint32,
+	bitmap []uint32,
 ) ([]byte, error) {
 	b.mu.RLock()
 	local := b.local
@@ -846,14 +939,22 @@ func (b *Backend) buildAckMessage(
 
 	header := rtps.DefaultHeader(prefix)
 
-	raw, err := b.buildAckSubmessage(remote, reader, base, 0, nil)
+	raw, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap, false)
 	if err != nil {
 		return nil, err
 	}
 
+	var dstPrefix GUIDPrefix
+	copy(dstPrefix[:], remote[:12])
+	dst := rtps.RawSubmessage{
+		ID:    rtps.SubmessageInfoDst,
+		Flags: rtps.FlagLittleEndian,
+		Body:  append([]byte(nil), dstPrefix[:]...),
+	}
+
 	msg, err := rtps.EncodeMessage(
 		header,
-		[]rtps.RawSubmessage{raw},
+		[]rtps.RawSubmessage{dst, raw},
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -863,6 +964,62 @@ func (b *Backend) buildAckMessage(
 	}
 
 	return msg, nil
+}
+
+// sendUserAckNack targets one INFO_DST plus ACKNACK at the NACKed writer.
+//
+// INFO_DST names the writer participant so CycloneDDS resolves the target
+// writer; without it Cyclone logs not a connection and drops the NACK
+// silently. Final is never set on the user path: every user ACKNACK
+// either requests repair or stays open for the next heartbeat, so a
+// response must always stay possible. The send fans out to the writer
+// participant's route ports and falls back to all routes when the
+// participant has none yet, since NACKs during discovery must still go
+// out. Failures return loudly so callers count them.
+func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader rtps.EntityID, base uint64, numBits uint32, bitmap []uint32) error {
+	if base == 0 {
+		return fmt.Errorf("dds: user nack base 0: %w", ErrInvalidFrame)
+	}
+
+	if ctx.Err() != nil {
+		return fmt.Errorf("dds: user nack context: %w", ctx.Err())
+	}
+
+	var prefix GUIDPrefix
+	copy(prefix[:], remote[:12])
+
+	ports := b.snapshotRoutePorts(prefix)
+	b.mu.RLock()
+	uni := b.uni
+	b.mu.RUnlock()
+
+	if len(ports) == 0 {
+		ports = b.snapshotRoutes()
+	}
+
+	if len(ports) == 0 {
+		return nil
+	}
+
+	if uni == nil {
+		return fmt.Errorf("dds: user nack without transport: %w", ErrDataPathNotWired)
+	}
+
+	msg, err := b.buildAckMessage(remote, reader, base, numBits, bitmap)
+	if err != nil {
+		return err
+	}
+
+	sent, last := sendToPorts(ctx, uni, ports, msg)
+	if sent > 0 {
+		return nil
+	}
+
+	if last != nil {
+		return fmt.Errorf("dds: user nack send: %w", last)
+	}
+
+	return fmt.Errorf("dds: user nack no route to writer: %w", ErrNoRoute)
 }
 
 // sendUserControl fanouts one control datagram to all routes best effort.
@@ -933,6 +1090,19 @@ func (b *Backend) repairWindow(
 		end = last
 	}
 
+	// Cap the served range by the announced durability-service bounds so
+	// a late joiner receives at most ReplayBound samples. With facade
+	// caps (keep-last 100) this matches retention exactly and changes
+	// nothing; smaller announced caps narrow the window instead of
+	// over-serving evicted history.
+	bound := ReplayBound(last, uint64(userHistoryDepth), sedpDurabilityTransientLocal, WeldDurabilityServiceQoS())
+	if bound == 0 {
+		return 0, 0, 0, 0, false
+	}
+	if end-start+1 > bound {
+		end = start + bound - 1
+	}
+
 	return start, first, last, end, true
 }
 
@@ -982,6 +1152,15 @@ func (b *Backend) repairOneSeq(
 
 	return nil
 }
+
+// repairPace spaces repair datagrams so a burst does not overflow the
+// peer socket buffer. A late joiner NACKs the full backlog at once;
+// sending every repair back to back drops random packets on localhost
+// UDP (observed live: 13-packet bursts losing 7), and a dropped repair
+// is never retried once the peer advances its base. Two milliseconds
+// per packet keeps a full window under a second while making bursts
+// receivable.
+const repairPace = 2 * time.Millisecond
 
 // repairFromAck resends history from base plus GAP for missing in window. It bounds work to
 // userRepairWindow seq. Base 0 and unknown writers are ignored without repair.
@@ -1039,9 +1218,57 @@ func (b *Backend) repairFromAck(
 		if err != nil {
 			return err
 		}
+
+		if seq != end {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf(
+					"dds: repair context: %w",
+					ctx.Err(),
+				)
+			case <-time.After(repairPace):
+			}
+		}
 	}
 
 	return nil
+}
+
+// readerEntityForWriter resolves our local reader entity for NACKs.
+//
+// User ACKNACKs must name a real reader: Cyclone disregards reader-unknown
+// NACKs, so the unknown fallback from v1 only ever repaired against Weld
+// peers. The reader is the local reader on the remote writer's DDS topic;
+// unknown writers or topics without a local reader keep EntityUnknown.
+func (b *Backend) readerEntityForWriter(guid WriterGUID) rtps.EntityID {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	receiver := b.receiver
+	b.mu.RUnlock()
+
+	if sedpIdx == nil || receiver == nil {
+		return rtps.EntityUnknown
+	}
+
+	remote, ok := receiver.remoteForGUID(guid)
+	if !ok {
+		return rtps.EntityUnknown
+	}
+
+	for _, ep := range sedpIdx.LocalEndpoints() {
+		if !ep.IsReader {
+			continue
+		}
+
+		if ep.DDSTopic == remote.DDSTopic {
+			var entity rtps.EntityID
+			copy(entity[:], ep.ID.Entity[:])
+
+			return entity
+		}
+	}
+
+	return rtps.EntityUnknown
 }
 
 // ackUserHeartbeat answers one user HEARTBEAT with ACKNACK. Base is next wanted from remote tracking.
@@ -1075,15 +1302,16 @@ func (b *Backend) ackUserHeartbeat(
 		return
 	}
 
-	msg, err := b.buildAckMessage(remote, rtps.EntityUnknown, base)
-	if err != nil {
-		b.bumpDemuxError()
-		log.Printf("dds: demux ack build: %v", err)
-
-		return
+	// Bitmap the full heartbeat range: base-only NACKs draw heartbeats
+	// while explicit missing bits queue retransmit on Cyclone peers.
+	// A caught-up heartbeat (Last below base) stays base-only.
+	var bitmap []uint32
+	var numBits uint32
+	if beat.LastSequence >= base {
+		bitmap, numBits = sedpNackBitmap(beat.LastSequence - base + 1)
 	}
 
-	err = b.sendUserControl(ctx, msg)
+	err := b.sendUserAckNack(ctx, remote, b.readerEntityForWriter(remote), base, numBits, bitmap)
 	if err != nil {
 		b.bumpDemuxError()
 		log.Printf("dds: demux ack send: %v", err)
@@ -1144,15 +1372,7 @@ func (b *Backend) sendPromptNack(
 		return
 	}
 
-	msg, err := b.buildAckMessage(remote, rtps.EntityUnknown, base)
-	if err != nil {
-		b.bumpDemuxError()
-		log.Printf("dds: demux prompt ack build: %v", err)
-
-		return
-	}
-
-	err = b.sendUserControl(ctx, msg)
+	err := b.sendUserAckNack(ctx, remote, b.readerEntityForWriter(remote), base, 0, nil)
 	if err != nil {
 		b.bumpDemuxError()
 		log.Printf("dds: demux prompt ack send: %v", err)
@@ -1181,7 +1401,7 @@ func (b *Backend) maybePromptNackOnData(
 	}
 
 	b.mu.RLock()
-	_, seen := b.remoteHighSeq[remote]
+	_, seen := b.remoteTrack[remote]
 	b.mu.RUnlock()
 
 	if seen {

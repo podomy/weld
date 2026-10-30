@@ -201,7 +201,7 @@ func TestPlanSedpNackFinalDiscipline(t *testing.T) {
 		t.Fatalf("need = true for caught up, want pure")
 	}
 
-	pure, err := backend.buildAckSubmessage(remote, reader, 6, 0, nil)
+	pure, err := backend.buildAckSubmessage(remote, reader, 6, 0, nil, true)
 	if err != nil {
 		t.Fatalf("build pure ack: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestPlanSedpNackFinalDiscipline(t *testing.T) {
 		t.Fatalf("need = false for missing range, want NACK")
 	}
 
-	nack, err := backend.buildAckSubmessage(remote, reader, 1, numBits, bitmap)
+	nack, err := backend.buildAckSubmessage(remote, reader, 1, numBits, bitmap, false)
 	if err != nil {
 		t.Fatalf("build nack: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 		local:         local,
 		repairHistory: newUserHistory(),
 		routes:        make(map[GUIDPrefix][]int),
-		remoteHighSeq: make(map[WriterGUID]uint64),
+		remoteTrack:   make(map[WriterGUID]*remoteTracker),
 		dataCh:        make(chan dataItem, demuxQueueDepth),
 	}
 

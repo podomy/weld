@@ -1550,7 +1550,7 @@ func TestBackendCancelPaths(t *testing.T) {
 	}
 
 	source := &frameSource{backend: backend}
-	_, _, err = source.ReadFrame(canceled)
+	_, _, _, err = source.ReadFrame(canceled)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("frame source canceled = %v, want context.Canceled", err)
 	}
@@ -1774,7 +1774,7 @@ func TestBackendBuildAckFinalFlag(t *testing.T) {
 
 	reader := rtps.EntityID{0x00, 0x00, 0x00, 0x01}
 
-	pure, err := backend.buildAckSubmessage(remote, reader, 10, 0, nil)
+	pure, err := backend.buildAckSubmessage(remote, reader, 10, 0, nil, true)
 	if err != nil {
 		t.Fatalf("build pure ack: %v", err)
 	}
@@ -1783,7 +1783,7 @@ func TestBackendBuildAckFinalFlag(t *testing.T) {
 		t.Fatalf("pure ack flags %#02x missing Final", pure.Flags)
 	}
 
-	nack, err := backend.buildAckSubmessage(remote, reader, 10, 32, []uint32{0xFFFFFFFF})
+	nack, err := backend.buildAckSubmessage(remote, reader, 10, 32, []uint32{0xFFFFFFFF}, false)
 	if err != nil {
 		t.Fatalf("build nack: %v", err)
 	}

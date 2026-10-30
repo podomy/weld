@@ -1,10 +1,10 @@
-# Overview
+Overview
 
 Weld is robotics middleware written in Go. It speaks ROS 2 on the wire so Go programs join ROS 2 systems as first-class nodes.
 
 The relation is CockroachDB to Postgres: same wire protocol and observable surface, different system behind it. Compatibility lives on the wire. Quality lives inside Weld.
 
-## Wire vs system
+Wire vs system
 
 Unchanged on the wire:
 
@@ -12,12 +12,12 @@ Unchanged on the wire:
 - Topic and type naming, type hashes
 - Discovery and liveliness
 - Standard messages, services, actions, parameters
-- TF topics, `/clock`, bags on disk, launch arguments
-- Every `ros2cli` verb
+- TF topics, /clock, bags on disk, launch arguments
+- Every ros2cli verb
 
 Replaced inside Weld:
 
-- No `rmw` handles, no `rcl` wait sets
+- No rmw handles, no rcl wait sets
 - No executor plus callback group split
 - No Node versus LifecycleNode duality
 - No global error state, no allocator plumbing
@@ -25,26 +25,26 @@ Replaced inside Weld:
 
 Operator view stays fixed. Implementation is free to differ.
 
-## Goals
+Goals
 
 - A Go native system an operator would choose even with no ROS present
 - Bit level wire compatibility with CycloneDDS peers in v1, verified by interop gates
 - Nav2 and MoveIt 2 run unmodified on Weld
 - Every recurring ROS 2 failure class is structurally impossible, not merely handled
 
-## Non-goals for v1
+Non-goals for v1
 
-- No source compatibility with `rclcpp`
+- No source compatibility with rclcpp
 - No intra process transport
 - No zero copy loans or shared memory
 - No bag storage engine, only exchange formats
 - No FastDDS, Zenoh, or MQTT transports; CycloneDDS via sidecar is the reference peer
 
-## One binary
+One binary
 
 Weld ships no C ABI. One Go binary talks to Humble, Jazzy, and Rolling by negotiating per peer: type hash presence, introspection topics, message hashes. Parsing is tolerant. Sending is strict. The version patchwork lives in transport backends. Core and the Go API stay single.
 
-## Build order
+Build order
 
 1. Foundations: types plus CDR plus hash plus fuzz
 2. First contact: DDS unreliable round trip plus CLI echo
@@ -56,4 +56,4 @@ Weld ships no C ABI. One Go binary talks to Humble, Jazzy, and Rolling by negoti
 8. Second transport (post v1): Zenoh, then FastDDS and MQTT
 9. Supervision, fidelity, soak
 
-Each feature ships with three gates: unit tables with fake clocks, interop runs against `rclcpp` on CycloneDDS with `ros2cli`, chaos runs under race detection.
+Each feature ships with three gates: unit tables with fake clocks, interop runs against rclcpp on CycloneDDS with ros2cli, chaos runs under race detection.

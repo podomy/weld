@@ -5,7 +5,7 @@
 //
 // Tests run pure Go against the public chaos harness API with virtual
 // time only. They pin the two state bursty link matrix from
-// docs/wireless.md sections 3 and 8, partition split plus heal with local
+// docs/wireless sections 3 and 8, partition split plus heal with local
 // queries, debounced 200 ms discovery flap, teardown mid run, clock jumps
 // across link states, the large message matrix, and late joiner retention.
 package unit_chaos

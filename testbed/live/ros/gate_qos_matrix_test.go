@@ -64,7 +64,7 @@ type qosCase struct {
 // qosCompatibleCases lists pairs that must deliver.
 //
 // Forward entries offer reliable plus transient local so they satisfy the
-// facade request under docs/qos.md. Reverse entries request volatile so
+// facade request under docs/qos. Reverse entries request volatile so
 // they satisfy both the facade offer of transient local and the wire offer
 // of volatile. History and depth vary to prove they never affect matching.
 func qosCompatibleCases() []qosCase {

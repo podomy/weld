@@ -1,0 +1,33 @@
+FAQ
+
+Why do IDL constants exist if they never travel?
+
+Names like BOX=1 are compile-time labels. Only the field value travels (one uint8 with value 1). Both sides already know the label from IDL. The fixture consts in internal/types/bounds.go pin the L, UL, F, and bool mappings with distinct values (-123, 456, 1.5, true, false) and the test proves they never appear in introspection tables.
+
+What is the identity quaternion?
+
+No rotation: x=0, y=0, z=0, w=1. ROS uses it as the default orientation in poses. It is the single IDL default in the corpus that Weld must apply.
+
+Why one binary for Humble, Jazzy, and Rolling?
+
+Weld ships no C ABI. It negotiates per peer by type hash, introspection topics, and message hashes, keyed by name plus hash. Parsing stays tolerant and sending stays strict. The matrix runs in CI with CycloneDDS as reference.
+
+Why a CycloneDDS sidecar?
+
+No license mixing and no C toolchain in Weld builds. Weld speaks to the sidecar over localhost. Core stays pure Go with no C linkage.
+
+Why do FastDDS, Zenoh, and MQTT come later?
+
+v1 must prove bytes, matching, tools, and one green interop test first. The backend interface already reserves their place (type hash, QoS offer, GID, sequence as v2 extensions). They land as pull requests with interop tests, never as plugins.
+
+Why is mismatch loud?
+
+Silent mismatch was the largest ROS interop cost: pubs and subs that never connect with no message. Weld surfaces topic, endpoint pair, and policy kind in logs, metrics, and CLI, with counters. Silence is a defect.
+
+Why drop oldest with a lost counter?
+
+Bounded topics must choose an overflow rule at creation. Drop oldest keeps the freshest sample for control loops and makes loss visible. Keep-all is bounded by retention entries; transports bound bytes.
+
+Where do I start reading code?
+
+internal/types/registry.go for lookup, internal/types/cdr.go plus envelope.go for bytes, internal/core/matcher.go for the truth table, internal/core/endpoint.go plus facade.go for best-available and retention, internal/transports/transport.go for the backend contract.

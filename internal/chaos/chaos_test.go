@@ -735,7 +735,7 @@ func countMissedSamples(outageNanos, periodNanos int64) int64 {
 
 // TestDeadlineOutageRatios checks Tbad over P across fake clock spells.
 //
-// Ratios 0.2, 1, 5, and 20 come from docs/wireless.md section 3: deadline
+// Ratios 0.2, 1, 5, and 20 come from docs/wireless section 3: deadline
 // period P read against bad state dwell Tbad with a 100 ms period. A short
 // outage below one period still raises exactly one alert per spell, and
 // long outages scale missed samples as 0, 1, 5, and 20. The harness clock

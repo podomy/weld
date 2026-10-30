@@ -1,0 +1,35 @@
+Config
+
+Plain words first: robot settings with history. The term is config store, a versioned store with schema, types, validation, atomic updates, watches, and history.
+
+Contract
+
+There is one store, not two parameter paths. Startup applies files plus CLI plus code in a fixed precedence with one batched event, not N events (docs/design:122, docs/invariants:174). Schemas validate generated YAML before launch, catching missing wrappers, wrong units, and unknown joints before the robot moves (docs/design:122).
+
+Split validation from apply: on_set validation runs first, post-set apply runs only when validation accepts (docs/design:122). There are no fixed size parse buffers (docs/invariants:175).
+
+Precedence and remap
+
+Precedence order is files, then CLI, then code, collapsed into one batched event. Wildcard versus fully qualified name precedence is tested and documented (docs/invariants:230).
+
+Remap is a pure first-class rewrite table applied at creation: first match across global plus local arrays wins, with node scoped expansion and full name validation (docs/invariants:231).
+
+OPEN ITEM: whether batched startup is atomic and whether remap can update after creation is decided before launch parity (docs/invariants:232).
+
+Watches and history
+
+Watches are versioned with history, so a late subscriber reads what changed and when instead of guessing current values (docs/invariants:231). A practical case is controller_server loading planner.yaml where max_vel_x must be a double in meters per second: a string fast fails schema validation before motion (docs/design:122).
+
+Wire
+
+The standard parameter services stay on the wire for ros2cli and Nav2, served from the store: declare, get, set, describe, list, events, and overrides (docs/design:124). CLI parity covers list with types, get, atomic set, describe, and dump to load round trip (docs/invariants:262).
+
+Proof
+
+Three gates before merge (docs/design:196, docs/invariants:318):
+
+1. Unit tables: schema reject, precedence collapse, watch versions, remap first match.
+2. Interop: ros2 param verbs against a Weld node on CycloneDDS.
+3. Chaos under race detection: concurrent sets, teardown mid watch, event flood sizing.
+
+Current state: the store lands after services in build order, before action workflows (docs/overview:49-56).

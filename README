@@ -14,25 +14,25 @@ first-class nodes, verified by mixed fleet behavior.
 
 Documentation
 
-  Weld design - /docs/design.md: architecture, invariants, and build order.
-  Weld invariants - /docs/invariants.md: 250+ testable promises the system
+  Weld design - /docs/design: architecture, invariants, and build order.
+  Weld invariants - /docs/invariants: 250+ testable promises the system
     holds, drawn from 6000+ upstream ROS issues.
-  Overview - /docs/overview.md: what Weld is and what v1 ships.
-  Types - /docs/types.md: IDL mapping, registry, constants.
-  Type hashes - /docs/hash.md: RIHS01 computation and negotiation.
-  CDR - /docs/cdr.md: XCDR1 wire encoding.
-  Introspection and bounds - /docs/introspection.md: reflection tables
+  Overview - /docs/overview: what Weld is and what v1 ships.
+  Types - /docs/types: IDL mapping, registry, constants.
+  Type hashes - /docs/hash: RIHS01 computation and negotiation.
+  CDR - /docs/cdr: XCDR1 wire encoding.
+  Introspection and bounds - /docs/introspection: reflection tables
     and limits.
-  Corpus - /docs/corpus.md: message families and fixtures.
-  QoS - /docs/qos.md: matching, best-available, facade, retention.
-  Transports - /docs/transports.md: backend interface and DDS sidecar.
-  Interop - /docs/interop.md: field notes from CycloneDDS interop.
-  Testbed - /docs/testbed.md: Docker peers and first interop.
-  Conformance - /docs/conformance.md: wire end state and gate record.
-  Wireless - /docs/wireless.md: Rappaport distilled for WiFi fleets.
-  CLI - /docs/cli.md: the weld echo/pub commands plus weld action send.
-  Glossary - /docs/glossary.md: terms in plain words.
-  FAQ - /docs/faq.md: constants, identity quaternion, one binary, sidecar.
+  Corpus - /docs/corpus: message families and fixtures.
+  QoS - /docs/qos: matching, best-available, facade, retention.
+  Transports - /docs/transports: backend interface and DDS sidecar.
+  Interop - /docs/interop: field notes from CycloneDDS interop.
+  Testbed - /docs/testbed: Docker peers and first interop.
+  Conformance - /docs/conformance: wire end state and gate record.
+  Wireless - /docs/wireless: Rappaport distilled for WiFi fleets.
+  CLI - /docs/cli: the weld echo/pub commands plus weld action send.
+  Glossary - /docs/glossary: terms in plain words.
+  FAQ - /docs/faq: constants, identity quaternion, one binary, sidecar.
 
 Contributing
 

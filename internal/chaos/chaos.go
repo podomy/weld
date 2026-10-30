@@ -8,7 +8,7 @@
 // flap, teardown mid run, clock jumps, a large message matrix, and late
 // joiners. Time is virtual through FakeClock so every timing and partition
 // behavior runs deterministically in tests with no real sleeps on the data
-// path. Loss follows a two state bursty link per docs/wireless.md sections
+// path. Loss follows a two state bursty link per docs/wireless sections
 // 3 and 8: a good state with loss near zero for seconds and a bad state
 // with heavy loss for a dwell such as 300 ms, repeated. Uniform random
 // drops alone are not offered because they understate correlated outage.
@@ -29,7 +29,7 @@ import (
 //
 // A flap of 200 ms models a sub second WiFi fade with no attachment change.
 // It suspends liveliness watermark updates without ticking the discovery
-// generation, per docs/wireless.md section 7. Genuine roams use Split plus
+// generation, per docs/wireless section 7. Genuine roams use Split plus
 // Heal, which do tick the generation as remove plus add.
 const DiscoveryFlapNanos int64 = 200_000_000
 
@@ -806,7 +806,7 @@ func copyIncoming(msg transports.IncomingMessage) transports.IncomingMessage {
 // LargePayloadSizes returns the message size matrix in bytes.
 //
 // The axis runs from empty control samples through MTU scale frames near
-// 1500 bytes to large bulk frames, per docs/wireless.md section 4: small
+// 1500 bytes to large bulk frames, per docs/wireless section 4: small
 // and often stays fresh on lossy links while bulk sheds first.
 func LargePayloadSizes() []int {
 	return []int{0, 64, 512, 1500, 8000, 32768, 65536}

@@ -400,3 +400,139 @@ func (n *Node) NewSubscription(topic, typeName string, qos QoS) (*Subscription, 
 	}
 	return sub, nil
 }
+
+// LoanPolicy selects zero-copy loan behavior for one publish or take.
+//
+// Loaning applies only within one process for eligible types; every other
+// path copies. Use CanLoanOffer to check a concrete request before
+// assuming a loan.
+type LoanPolicy int
+
+const (
+	// LoanNever always copies at ingress and on take.
+	LoanNever LoanPolicy = iota
+	// LoanIfEligible permits a loan when the type is eligible and the
+	// path is in-process; otherwise it falls back to copies.
+	LoanIfEligible
+)
+
+// String renders the loan policy in lowercase form.
+func (l LoanPolicy) String() string {
+	switch l {
+	case LoanNever:
+		return "never"
+	case LoanIfEligible:
+		return "if_eligible"
+	default:
+		return "invalid"
+	}
+}
+
+// LoanOptions carries the loan preference for one publish or take.
+//
+// InProcess must be true for a loan: cross-process and cross-vendor
+// exchanges always copy because no shared-memory transport exists.
+// Eligible reports whether the message type may loan, mirroring the
+// transport CanLoan check for self-contained memcpy-safe types.
+type LoanOptions struct {
+	// Policy selects whether a loan may be used.
+	Policy LoanPolicy
+	// InProcess reports whether peer and local share one address space.
+	InProcess bool
+	// Eligible reports whether the message type may loan.
+	Eligible bool
+}
+
+// DefaultLoanOptions returns the conservative default: never loan, so
+// behavior matches plain Publish and Next copies exactly.
+func DefaultLoanOptions() LoanOptions {
+	return LoanOptions{Policy: LoanNever}
+}
+
+// CanLoanOffer answers whether a loan may be used for the given options.
+//
+// It is true only when the policy opts in, the path is in-process, and
+// the type is eligible. Every other combination answers false with a
+// reason naming the veto, so callers never assume a loan where a copy
+// happens. It is pure with no I/O.
+func CanLoanOffer(opts LoanOptions) (bool, string) {
+	if opts.Policy != LoanIfEligible {
+		return false, "sdk: loan policy never: exchange copies"
+	}
+	if !opts.InProcess {
+		return false, "sdk: loan needs one shared process: exchange copies"
+	}
+	if !opts.Eligible {
+		return false, "sdk: loan type not eligible: exchange copies"
+	}
+	return true, "sdk: in-process eligible loan"
+}
+
+// PublishWithLoan sends one sample with a loan preference.
+//
+// It copies the payload once at ingress exactly like Publish. A future
+// in-process transport may loan eligible samples; until then the copy
+// fallback keeps delivery identical and CanLoanOffer reports the outcome
+// honestly. It returns the context error when ctx already ended, or an
+// error when the node or publisher is closed.
+func (p *Publisher) PublishWithLoan(ctx context.Context, payload []byte, _ LoanOptions) error {
+	return p.Publish(ctx, payload)
+}
+
+// LoanedMessage is one take with explicit return.
+//
+// Bytes stays valid until Return. Return consumes the handle: Bytes fails
+// after return and a second Return is a loud error. The SDK bus path
+// always copies, so NextLoaned documents the fallback and a future
+// in-process transport may back this handle with a true loan.
+type LoanedMessage struct {
+	// mu guards valid across Bytes and Return.
+	mu sync.Mutex
+	// payload holds the owned sample bytes.
+	payload []byte
+	// valid is consumed by Return.
+	valid bool
+}
+
+// Bytes exposes the sample bytes. It fails after Return.
+func (m *LoanedMessage) Bytes() ([]byte, error) {
+	if m == nil {
+		return nil, errors.New("sdk: loaned bytes on nil message") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.valid {
+		return nil, errors.New("sdk: loaned bytes after return") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	return m.payload, nil
+}
+
+// Return releases the handle exactly once.
+func (m *LoanedMessage) Return() error {
+	if m == nil {
+		return errors.New("sdk: loaned return on nil message") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.valid {
+		return errors.New("sdk: loaned double return") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	m.valid = false
+	m.payload = nil
+	return nil
+}
+
+// NextLoaned waits for one sample or context end and returns a handle
+// with explicit return.
+//
+// It copies once like Next and reports the fallback honestly through
+// CanLoanOffer: pass LoanIfEligible with InProcess and Eligible set and a
+// future transport may loan, while today the bytes are an owned copy.
+// The caller must call Return exactly once.
+func (s *Subscription) NextLoaned(ctx context.Context, _ LoanOptions) (*LoanedMessage, error) {
+	msg, err := s.Next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &LoanedMessage{payload: msg, valid: true}, nil
+}

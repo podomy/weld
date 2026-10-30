@@ -410,7 +410,15 @@ testbed/live/cyclone/gate1_spdp_test.go:20.
   reverse plus deadline PASS; params declare plus atomic set plus validation
   reject PASS single-backend; TF lookup static plus dynamic plus unknown
   PASS; actions accept plus cancel plus timeout PASS; large payload all 4
-  PASS on domain 55 with no skips. Unit plus vet plus cmd/weld PASS.
+  PASS on domain 55 with no skips. Extended wire gates PASS: keyed
+  forward plus reverse (gate_keyed_live_test); durability backlog both
+  directions (gate_durability_live_test); partitions default, reverse,
+  and isolation (gate_partition_live_test); per-profile writer QoS
+  (gate_writerqos_live_test); content-filtered mixed plus always-false
+  (gate_contentfilter_live_test); loan honesty plus in-process zero-copy
+  (gate_loan_live_test); liveliness stale-expiry plus deadline-miss
+  (gate_liveliness_live_test); secured-payload loud drop
+  (gate_security_live_test). Unit plus vet plus cmd/weld PASS.
 
 Full run detail is in Testbed - /docs/testbed. Live harness detail is in
 Testbed Go - /docs/testbed-go.

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/weld-logo.png" alt="Weld" width="20%">
+  <img src="./assets/weld-logo.png" alt="Weld" width="40%">
 </p>
 
 <p align="center">

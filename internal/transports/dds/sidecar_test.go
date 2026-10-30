@@ -673,9 +673,8 @@ func TestSidecarBadEnvChainsToNumError(t *testing.T) {
 		t.Fatalf("new sidecar succeeded, want error")
 	}
 
-	var numErr *strconv.NumError
-	if !errors.As(err, &numErr) {
-		t.Fatalf("error %v does not chain to NumError", err)
+	if numErr, ok := errors.AsType[*strconv.NumError](err); !ok {
+		t.Fatalf("error %v does not chain to NumError (got %v)", err, numErr)
 	}
 }
 
@@ -765,9 +764,8 @@ func TestSidecarStubErrorsAsChain(t *testing.T) {
 		t.Fatalf("connect succeeded, want error")
 	}
 
-	var numErr *strconv.NumError
-	if errors.As(err, &numErr) {
-		t.Fatalf("stub error chains to NumError, want only NotImplemented")
+	if numErr, ok := errors.AsType[*strconv.NumError](err); ok {
+		t.Fatalf("stub error chains to NumError %v, want only NotImplemented", numErr)
 	}
 
 	if !errors.Is(err, dds.ErrSidecarNotImplemented) {

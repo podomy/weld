@@ -783,9 +783,8 @@ func TestDomainConfigResolveErrorChain(t *testing.T) {
 		t.Fatalf("resolve succeeded, want error")
 	}
 
-	var numErr *strconv.NumError
-	if !errors.As(err, &numErr) {
-		t.Fatalf("error %v does not chain to NumError", err)
+	if numErr, ok := errors.AsType[*strconv.NumError](err); !ok {
+		t.Fatalf("error %v does not chain to NumError (got %v)", err, numErr)
 	}
 }
 

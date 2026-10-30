@@ -82,8 +82,8 @@ func runWeldLaunch(t *testing.T, ctx context.Context, args []string) string {
 	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
+		exit, ok := errors.AsType[*exec.ExitError](err)
+		if ok {
 			t.Fatalf("weld launch %v: %v stderr %q", args, err, string(exit.Stderr))
 		}
 		t.Fatalf("weld launch %v: %v", args, err)

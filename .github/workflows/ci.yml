@@ -75,15 +75,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
       - name: Build binary
+        working-directory: cmd/weld
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
           GOARM: ${{ matrix.arm_version }}
           CGO_ENABLED: "1"
           CC: ${{ matrix.cc }}
+          GOWORK: "off"
         run: |
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.output }}" .
+          mkdir -p "${{ github.workspace }}/dist"
+          go build -trimpath -ldflags="-s -w" -o "${{ github.workspace }}/dist/${{ matrix.output }}" .
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

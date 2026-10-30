@@ -2,8 +2,6 @@
   <img src="./assets/logo.png" alt="Weld" width="20%">
 </p>
 
-<h1 align="center">Weld</h1>
-
 <p align="center">
   <a href="https://github.com/podomy/weld/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/podomy/weld/ci.yml?label=linux" alt="Linux"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/podomy/weld" alt="License"></a>

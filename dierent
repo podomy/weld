@@ -1,0 +1,793 @@
+=== RUN   TestROSTypeBuiltinTimeZero
+    gate_type_builtin_extra_test.go:237: matrix forward builtin-time-zero topic /chatter_ros_fwd_builtin_time_zero_4012239_1793296006909028692 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:46:52 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_extra_test.go:237: matrix reverse builtin-time-zero topic /chatter_ros_rev_builtin_time_zero_4012239_1793296012797926133 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:46:59 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinTimeZero (13.51s)
+=== RUN   TestROSTypeBuiltinTimeMax
+    gate_type_builtin_extra_test.go:248: matrix forward builtin-time-max topic /chatter_ros_fwd_builtin_time_max_4012239_1793296020520285794 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:47:06 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_extra_test.go:248: matrix reverse builtin-time-max topic /chatter_ros_rev_builtin_time_max_4012239_1793296026486615043 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:47:13 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinTimeMax (13.72s)
+=== RUN   TestROSTypeBuiltinDurationZero
+    gate_type_builtin_extra_test.go:261: matrix forward builtin-duration-zero topic /chatter_ros_fwd_builtin_duration_zero_4012239_1793296034197621014 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:47:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_extra_test.go:261: matrix reverse builtin-duration-zero topic /chatter_ros_rev_builtin_duration_zero_4012239_1793296040133819043 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:47:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinDurationZero (13.63s)
+=== RUN   TestROSTypeBuiltinDurationNeg
+    gate_type_builtin_extra_test.go:273: matrix forward builtin-duration-neg topic /chatter_ros_fwd_builtin_duration_neg_4012239_1793296047822687654 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:47:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_extra_test.go:273: matrix reverse builtin-duration-neg topic /chatter_ros_rev_builtin_duration_neg_4012239_1793296055248450944 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:47:41 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinDurationNeg (15.12s)
+=== RUN   TestROSTypeBuiltinTime
+    gate_type_builtin_test.go:431: matrix forward builtin-time topic /chatter_ros_fwd_builtin_time_4012239_1793296062915365451 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:47:48 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_test.go:431: matrix reverse builtin-time topic /chatter_ros_rev_builtin_time_4012239_1793296068835634073 hash RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197
+2026/10/29 22:47:55 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinTime (13.57s)
+=== RUN   TestROSTypeBuiltinDuration
+    gate_type_builtin_test.go:442: matrix forward builtin-duration topic /chatter_ros_fwd_builtin_duration_4012239_1793296076535590202 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:48:02 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_builtin_test.go:442: matrix reverse builtin-duration topic /chatter_ros_rev_builtin_duration_4012239_1793296082492552342 hash RIHS01_e8d009f659816f758b75334ee1a9ca5b5c0b859843261f14c7f937349599d93b
+2026/10/29 22:48:09 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeBuiltinDuration (13.69s)
+=== RUN   TestROSTypeDiagArray
+    gate_type_diagnostic_extra_test.go:206: matrix forward diag-array topic /chatter_ros_fwd_diag_array_4012239_1793296090206530829 hash RIHS01_5a8a36efb05fb25070fa0fb3810290c0e6cd4862b54a8fb975a1ee8dc55a333e
+2026/10/29 22:48:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_diagnostic_extra_test.go:206: matrix reverse diag-array topic /chatter_ros_rev_diag_array_4012239_1793296096138542963 hash RIHS01_5a8a36efb05fb25070fa0fb3810290c0e6cd4862b54a8fb975a1ee8dc55a333e
+2026/10/29 22:48:22 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeDiagArray (13.64s)
+=== RUN   TestROSTypeDiagKeyValue
+    gate_type_diagnostic_test.go:527: matrix forward diag-keyvalue topic /chatter_ros_fwd_diag_keyvalue_4012239_1793296103869070328 hash RIHS01_d68081eaa540288c5440753baecef0c4e16e81a5f78ad68902ded5100413bb42
+2026/10/29 22:48:29 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_diagnostic_test.go:527: matrix reverse diag-keyvalue topic /chatter_ros_rev_diag_keyvalue_4012239_1793296109803380668 hash RIHS01_d68081eaa540288c5440753baecef0c4e16e81a5f78ad68902ded5100413bb42
+2026/10/29 22:48:36 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+2026/10/29 22:48:36 dds: demux ack send: dds: user control send: dds: send ports context: context canceled
+--- PASS: TestROSTypeDiagKeyValue (13.65s)
+=== RUN   TestROSTypeDiagStatus
+    gate_type_diagnostic_test.go:541: matrix forward diag-status topic /chatter_ros_fwd_diag_status_4012239_1793296117526719390 hash RIHS01_b0e3e692ea2d54a8af2f4ef1930e81556a2db55216b771f8a7d2724ed47bf0e4
+2026/10/29 22:48:43 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_diagnostic_test.go:541: matrix reverse diag-status topic /chatter_ros_rev_diag_status_4012239_1793296123453541184 hash RIHS01_b0e3e692ea2d54a8af2f4ef1930e81556a2db55216b771f8a7d2724ed47bf0e4
+2026/10/29 22:48:49 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeDiagStatus (13.63s)
+=== RUN   TestROSTypeGeometryPose
+    gate_type_geometry_extra_test.go:296: matrix forward geometry-pose topic /chatter_ros_fwd_geometry_pose_4012239_1793296131111173562 hash RIHS01_d501954e9476cea2996984e812054b68026ae0bfae789d9a10b23daf35cc90fa
+2026/10/29 22:48:56 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_extra_test.go:296: matrix reverse geometry-pose topic /chatter_ros_rev_geometry_pose_4012239_1793296137018557883 hash RIHS01_d501954e9476cea2996984e812054b68026ae0bfae789d9a10b23daf35cc90fa
+2026/10/29 22:49:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPose (13.58s)
+=== RUN   TestROSTypeGeometryQuaternion
+    gate_type_geometry_extra_test.go:307: matrix forward geometry-quaternion topic /chatter_ros_fwd_geometry_quaternion_4012239_1793296144696873491 hash RIHS01_8a765f66778c8ff7c8ab94afcc590a2ed5325a1d9a076ffff38fbce36f458684
+2026/10/29 22:49:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_extra_test.go:307: matrix reverse geometry-quaternion topic /chatter_ros_rev_geometry_quaternion_4012239_1793296150634823548 hash RIHS01_8a765f66778c8ff7c8ab94afcc590a2ed5325a1d9a076ffff38fbce36f458684
+2026/10/29 22:49:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryQuaternion (13.60s)
+=== RUN   TestROSTypeGeometryTwist
+    gate_type_geometry_extra_test.go:318: matrix forward geometry-twist topic /chatter_ros_fwd_geometry_twist_4012239_1793296158302280716 hash RIHS01_9c45bf16fe0983d80e3cfe750d6835843d265a9a6c46bd2e609fcddde6fb8d2a
+2026/10/29 22:49:23 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_extra_test.go:318: matrix reverse geometry-twist topic /chatter_ros_rev_geometry_twist_4012239_1793296164220635289 hash RIHS01_9c45bf16fe0983d80e3cfe750d6835843d265a9a6c46bd2e609fcddde6fb8d2a
+2026/10/29 22:49:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTwist (13.61s)
+=== RUN   TestROSTypeGeometryRest2Coverage
+    gate_type_geometry_rest2_test.go:99: rest2 fwd live ros-rest2-fwd-4012239-1793296171530819764 topic /chatter_ros_rest2_fwd_4012239_1793296171530819764 rev live ros-rest2-rev-4012239-1793296171530829762 topic /chatter_ros_rest2_rev_4012239_1793296171530829762
+--- PASS: TestROSTypeGeometryRest2Coverage (0.10s)
+=== RUN   TestROSTypeGeometryPoint
+    gate_type_geometry_rest_test.go:1604: matrix forward geometry-point topic /chatter_ros_fwd_geometry_point_4012239_1793296172021740138 hash RIHS01_6963084842a9b04494d6b2941d11444708d892da2f4b09843b9c43f42a7f6881
+2026/10/29 22:49:37 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1604: matrix reverse geometry-point topic /chatter_ros_rev_geometry_point_4012239_1793296177954912244 hash RIHS01_6963084842a9b04494d6b2941d11444708d892da2f4b09843b9c43f42a7f6881
+2026/10/29 22:49:44 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoint (13.60s)
+=== RUN   TestROSTypeGeometryPoint32
+    gate_type_geometry_rest_test.go:1615: matrix forward geometry-point32 topic /chatter_ros_fwd_geometry_point32_4012239_1793296185589718343 hash RIHS01_2fc4db7cae16a4582c79a56b66173a8d48d52c7dc520ddc55a0d4bcf2a4bfdbc
+2026/10/29 22:49:51 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1615: matrix reverse geometry-point32 topic /chatter_ros_rev_geometry_point32_4012239_1793296191544323829 hash RIHS01_2fc4db7cae16a4582c79a56b66173a8d48d52c7dc520ddc55a0d4bcf2a4bfdbc
+2026/10/29 22:49:58 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoint32 (13.58s)
+=== RUN   TestROSTypeGeometryAccel
+    gate_type_geometry_rest_test.go:1626: matrix forward geometry-accel topic /chatter_ros_fwd_geometry_accel_4012239_1793296199218236194 hash RIHS01_dc448243ded9b1fcbcca24aba0c22f013dae06c354ba2d849571c0a2a3f57ca0
+2026/10/29 22:50:04 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1626: matrix reverse geometry-accel topic /chatter_ros_rev_geometry_accel_4012239_1793296206676145330 hash RIHS01_dc448243ded9b1fcbcca24aba0c22f013dae06c354ba2d849571c0a2a3f57ca0
+2026/10/29 22:50:13 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryAccel (15.18s)
+=== RUN   TestROSTypeGeometryInertia
+    gate_type_geometry_rest_test.go:1637: matrix forward geometry-inertia topic /chatter_ros_fwd_geometry_inertia_4012239_1793296214390205561 hash RIHS01_2ddd5dab5c347825ba2e56c895ddccfd0b8efe53ae931bf67f905529930b4bd7
+2026/10/29 22:50:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1637: matrix reverse geometry-inertia topic /chatter_ros_rev_geometry_inertia_4012239_1793296220329713916 hash RIHS01_2ddd5dab5c347825ba2e56c895ddccfd0b8efe53ae931bf67f905529930b4bd7
+2026/10/29 22:50:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryInertia (13.62s)
+=== RUN   TestROSTypeGeometryPolygon
+    gate_type_geometry_rest_test.go:1648: matrix forward geometry-polygon topic /chatter_ros_fwd_geometry_polygon_4012239_1793296228009218574 hash RIHS01_3782f9f0bf044964d692d6c017d705e37611afb1f0bf6a9dee248a7dda0f784a
+2026/10/29 22:50:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1648: matrix reverse geometry-polygon topic /chatter_ros_rev_geometry_polygon_4012239_1793296233986095098 hash RIHS01_3782f9f0bf044964d692d6c017d705e37611afb1f0bf6a9dee248a7dda0f784a
+2026/10/29 22:50:40 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPolygon (13.66s)
+=== RUN   TestROSTypeGeometryTransform
+    gate_type_geometry_rest_test.go:1659: matrix forward geometry-transform topic /chatter_ros_fwd_geometry_transform_4012239_1793296241632884471 hash RIHS01_beb83fbe698636351461f6f35d1abb20010c43d55374d81bd041f1ba2581fddc
+2026/10/29 22:50:47 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1659: matrix reverse geometry-transform topic /chatter_ros_rev_geometry_transform_4012239_1793296247559061750 hash RIHS01_beb83fbe698636351461f6f35d1abb20010c43d55374d81bd041f1ba2581fddc
+2026/10/29 22:50:54 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTransform (13.61s)
+=== RUN   TestROSTypeGeometryWrench
+    gate_type_geometry_rest_test.go:1670: matrix forward geometry-wrench topic /chatter_ros_fwd_geometry_wrench_4012239_1793296255263148809 hash RIHS01_018e8519d57c16adbe97c9fe1460ef21fec7e31bc541de3d653a35895677ce52
+2026/10/29 22:51:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1670: matrix reverse geometry-wrench topic /chatter_ros_rev_geometry_wrench_4012239_1793296261215364759 hash RIHS01_018e8519d57c16adbe97c9fe1460ef21fec7e31bc541de3d653a35895677ce52
+2026/10/29 22:51:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryWrench (13.58s)
+=== RUN   TestROSTypeGeometryAccelWithCovariance
+    gate_type_geometry_rest_test.go:1681: matrix forward geometry-accelcov topic /chatter_ros_fwd_geometry_accelcov_4012239_1793296268880501623 hash RIHS01_230d51bd53bc36f260574e73b42941cefe44684753480b6fc330c032c5db5997
+2026/10/29 22:51:14 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1681: matrix reverse geometry-accelcov topic /chatter_ros_rev_geometry_accelcov_4012239_1793296274845624347 hash RIHS01_230d51bd53bc36f260574e73b42941cefe44684753480b6fc330c032c5db5997
+2026/10/29 22:51:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryAccelWithCovariance (13.67s)
+=== RUN   TestROSTypeGeometryPoseWithCovariance
+    gate_type_geometry_rest_test.go:1692: matrix forward geometry-posecov topic /chatter_ros_fwd_geometry_posecov_4012239_1793296282529226368 hash RIHS01_9a7c0fd234b7f45c6098745ecccd773ca1085670e64107135397aee31c02e1bb
+2026/10/29 22:51:28 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1692: matrix reverse geometry-posecov topic /chatter_ros_rev_geometry_posecov_4012239_1793296288475894693 hash RIHS01_9a7c0fd234b7f45c6098745ecccd773ca1085670e64107135397aee31c02e1bb
+2026/10/29 22:51:34 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoseWithCovariance (13.59s)
+=== RUN   TestROSTypeGeometryTwistWithCovariance
+    gate_type_geometry_rest_test.go:1703: matrix forward geometry-twistcov topic /chatter_ros_fwd_geometry_twistcov_4012239_1793296296110485609 hash RIHS01_49f574f033f095d8b6cd1beaca5ca7925e296e84af1716d16c89d38b059c8c18
+2026/10/29 22:51:41 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1703: matrix reverse geometry-twistcov topic /chatter_ros_rev_geometry_twistcov_4012239_1793296302082548087 hash RIHS01_49f574f033f095d8b6cd1beaca5ca7925e296e84af1716d16c89d38b059c8c18
+2026/10/29 22:51:48 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTwistWithCovariance (13.68s)
+=== RUN   TestROSTypeGeometryAccelStamped
+    gate_type_geometry_rest_test.go:1713: matrix forward geometry-accelstamped topic /chatter_ros_fwd_geometry_accelstamped_4012239_1793296309796865558 hash RIHS01_ef1df9eabae0a708cc049a061ebcddc4e2a5f745730100ba680e086a9698b165
+2026/10/29 22:51:55 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1713: matrix reverse geometry-accelstamped topic /chatter_ros_rev_geometry_accelstamped_4012239_1793296315782604051 hash RIHS01_ef1df9eabae0a708cc049a061ebcddc4e2a5f745730100ba680e086a9698b165
+2026/10/29 22:52:02 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryAccelStamped (13.66s)
+=== RUN   TestROSTypeGeometryAccelWithCovarianceStamped
+    gate_type_geometry_rest_test.go:1723: matrix forward geometry-accelcovstamped topic /chatter_ros_fwd_geometry_accelcovstamped_4012239_1793296323474810704 hash RIHS01_61c9ad8928e71dd95ce791b2f02809ee2a0bbcc42cd0e4047fd00a822a08e444
+2026/10/29 22:52:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1723: matrix reverse geometry-accelcovstamped topic /chatter_ros_rev_geometry_accelcovstamped_4012239_1793296329442974925 hash RIHS01_61c9ad8928e71dd95ce791b2f02809ee2a0bbcc42cd0e4047fd00a822a08e444
+2026/10/29 22:52:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryAccelWithCovarianceStamped (13.67s)
+=== RUN   TestROSTypeGeometryInertiaStamped
+    gate_type_geometry_rest_test.go:1733: matrix forward geometry-inertiastamped topic /chatter_ros_fwd_geometry_inertiastamped_4012239_1793296337154554576 hash RIHS01_766be45976252babf7f9d8ac4ae7c912a7ceccf71035622529f27518b695aa09
+2026/10/29 22:52:22 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1733: matrix reverse geometry-inertiastamped topic /chatter_ros_rev_geometry_inertiastamped_4012239_1793296343134868017 hash RIHS01_766be45976252babf7f9d8ac4ae7c912a7ceccf71035622529f27518b695aa09
+2026/10/29 22:52:29 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryInertiaStamped (13.69s)
+=== RUN   TestROSTypeGeometryPolygonStamped
+    gate_type_geometry_rest_test.go:1743: matrix forward geometry-polygonstamped topic /chatter_ros_fwd_geometry_polygonstamped_4012239_1793296350824024066 hash RIHS01_b7cf07932f1523d4b4088075945c1a0141f7cd21da87cc940fc61652e9138b46
+2026/10/29 22:52:36 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1743: matrix reverse geometry-polygonstamped topic /chatter_ros_rev_geometry_polygonstamped_4012239_1793296356812314920 hash RIHS01_b7cf07932f1523d4b4088075945c1a0141f7cd21da87cc940fc61652e9138b46
+2026/10/29 22:52:43 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPolygonStamped (13.65s)
+=== RUN   TestROSTypeGeometryPoseArray
+    gate_type_geometry_rest_test.go:1754: matrix forward geometry-posearray topic /chatter_ros_fwd_geometry_posearray_4012239_1793296364481700044 hash RIHS01_af0cc36d190e104d546d168d6b39df04fa4b4ccecf59cb4c9ed328d3d5004aa0
+2026/10/29 22:52:49 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1754: matrix reverse geometry-posearray topic /chatter_ros_rev_geometry_posearray_4012239_1793296370453082556 hash RIHS01_af0cc36d190e104d546d168d6b39df04fa4b4ccecf59cb4c9ed328d3d5004aa0
+2026/10/29 22:52:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoseArray (13.70s)
+=== RUN   TestROSTypeGeometryPoseStamped
+    gate_type_geometry_rest_test.go:1764: matrix forward geometry-posestamped topic /chatter_ros_fwd_geometry_posestamped_4012239_1793296378174428031 hash RIHS01_10f3786d7d40fd2b54367835614bff85d4ad3b5dab62bf8bca0cc232d73b4cd8
+2026/10/29 22:53:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1764: matrix reverse geometry-posestamped topic /chatter_ros_rev_geometry_posestamped_4012239_1793296384145362645 hash RIHS01_10f3786d7d40fd2b54367835614bff85d4ad3b5dab62bf8bca0cc232d73b4cd8
+2026/10/29 22:53:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoseStamped (13.63s)
+=== RUN   TestROSTypeGeometryPoseWithCovarianceStamped
+    gate_type_geometry_rest_test.go:1774: matrix forward geometry-posecovstamped topic /chatter_ros_fwd_geometry_posecovstamped_4012239_1793296391801709565 hash RIHS01_26432f9803e43727d3c8f668d1fdb3c630f548af631e2f4e31382371bfea3b6e
+2026/10/29 22:53:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1774: matrix reverse geometry-posecovstamped topic /chatter_ros_rev_geometry_posecovstamped_4012239_1793296397796306579 hash RIHS01_26432f9803e43727d3c8f668d1fdb3c630f548af631e2f4e31382371bfea3b6e
+2026/10/29 22:53:24 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPoseWithCovarianceStamped (13.66s)
+=== RUN   TestROSTypeGeometryQuaternionStamped
+    gate_type_geometry_rest_test.go:1785: matrix forward geometry-quatstamped topic /chatter_ros_fwd_geometry_quatstamped_4012239_1793296405450285031 hash RIHS01_381add86c6c3160644d228ca342182c7fd6c7fab11c7a85ad817a9cc22dbac6e
+2026/10/29 22:53:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1785: matrix reverse geometry-quatstamped topic /chatter_ros_rev_geometry_quatstamped_4012239_1793296411393872705 hash RIHS01_381add86c6c3160644d228ca342182c7fd6c7fab11c7a85ad817a9cc22dbac6e
+2026/10/29 22:53:37 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryQuaternionStamped (13.61s)
+=== RUN   TestROSTypeGeometryTransformStamped
+    gate_type_geometry_rest_test.go:1796: matrix forward geometry-tfstamped topic /chatter_ros_fwd_geometry_tfstamped_4012239_1793296419082928208 hash RIHS01_0a241f87d04668d94099cbb5ba11691d5ad32c2f29682e4eb5653424bd275206
+2026/10/29 22:53:44 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1796: matrix reverse geometry-tfstamped topic /chatter_ros_rev_geometry_tfstamped_4012239_1793296425075683034 hash RIHS01_0a241f87d04668d94099cbb5ba11691d5ad32c2f29682e4eb5653424bd275206
+2026/10/29 22:53:51 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTransformStamped (13.69s)
+=== RUN   TestROSTypeGeometryTwistStamped
+    gate_type_geometry_rest_test.go:1806: matrix forward geometry-twiststamped topic /chatter_ros_fwd_geometry_twiststamped_4012239_1793296432777327769 hash RIHS01_5f0fcd4f81d5d06ad9b4c4c63e3ea51b82d6ae4d0558f1d475229b1121db6f64
+2026/10/29 22:53:58 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1806: matrix reverse geometry-twiststamped topic /chatter_ros_rev_geometry_twiststamped_4012239_1793296440239281734 hash RIHS01_5f0fcd4f81d5d06ad9b4c4c63e3ea51b82d6ae4d0558f1d475229b1121db6f64
+2026/10/29 22:54:06 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTwistStamped (15.16s)
+=== RUN   TestROSTypeGeometryTwistWithCovarianceStamped
+    gate_type_geometry_rest_test.go:1816: matrix forward geometry-twistcovstamped topic /chatter_ros_fwd_geometry_twistcovstamped_4012239_1793296447925550092 hash RIHS01_77b67434531e6529b7a0091357b186b6ebdb17fd9ffd3e0c7ce9d3fb11a44563
+2026/10/29 22:54:13 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1816: matrix reverse geometry-twistcovstamped topic /chatter_ros_rev_geometry_twistcovstamped_4012239_1793296453897389502 hash RIHS01_77b67434531e6529b7a0091357b186b6ebdb17fd9ffd3e0c7ce9d3fb11a44563
+2026/10/29 22:54:20 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryTwistWithCovarianceStamped (13.64s)
+=== RUN   TestROSTypeGeometryVector3Stamped
+    gate_type_geometry_rest_test.go:1826: matrix forward geometry-vecstamped topic /chatter_ros_fwd_geometry_vecstamped_4012239_1793296461587536424 hash RIHS01_d4829622288cbb443886e7ea94ea5671a3b1be6bab4ad04224432a65f7d7887a
+2026/10/29 22:54:27 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1826: matrix reverse geometry-vecstamped topic /chatter_ros_rev_geometry_vecstamped_4012239_1793296467560345587 hash RIHS01_d4829622288cbb443886e7ea94ea5671a3b1be6bab4ad04224432a65f7d7887a
+2026/10/29 22:54:34 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryVector3Stamped (13.66s)
+=== RUN   TestROSTypeGeometryWrenchStamped
+    gate_type_geometry_rest_test.go:1836: matrix forward geometry-wrenchstamped topic /chatter_ros_fwd_geometry_wrenchstamped_4012239_1793296475223793680 hash RIHS01_8dc3deaf06b2ab281f9f9a742a8961c328ca7cec16e3fd6586d3a5c83fa78f77
+2026/10/29 22:54:40 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_geometry_rest_test.go:1836: matrix reverse geometry-wrenchstamped topic /chatter_ros_rev_geometry_wrenchstamped_4012239_1793296481189579495 hash RIHS01_8dc3deaf06b2ab281f9f9a742a8961c328ca7cec16e3fd6586d3a5c83fa78f77
+2026/10/29 22:54:47 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryWrenchStamped (13.63s)
+=== RUN   TestROSTypeStdInt32
+    gate_type_matrix_test.go:774: matrix forward std-int32 topic /chatter_ros_fwd_std_int32_4012239_1793296488850325210 hash RIHS01_b6578ded3c58c626cfe8d1a6fb6e04f706f97e9f03d2727c9ff4e74b1cef0deb
+2026/10/29 22:54:54 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:774: matrix reverse std-int32 topic /chatter_ros_rev_std_int32_4012239_1793296494825098180 hash RIHS01_b6578ded3c58c626cfe8d1a6fb6e04f706f97e9f03d2727c9ff4e74b1cef0deb
+2026/10/29 22:55:01 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt32 (13.67s)
+=== RUN   TestROSTypeStdFloat64
+    gate_type_matrix_test.go:785: matrix forward std-float64 topic /chatter_ros_fwd_std_float64_4012239_1793296502527046071 hash RIHS01_705ba9c3d1a09df43737eb67095534de36fd426c0587779bda2bc51fe790182a
+2026/10/29 22:55:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:785: matrix reverse std-float64 topic /chatter_ros_rev_std_float64_4012239_1793296508469015596 hash RIHS01_705ba9c3d1a09df43737eb67095534de36fd426c0587779bda2bc51fe790182a
+2026/10/29 22:55:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdFloat64 (13.65s)
+=== RUN   TestROSTypeStdBool
+    gate_type_matrix_test.go:796: matrix forward std-bool topic /chatter_ros_fwd_std_bool_4012239_1793296516171794036 hash RIHS01_feb91e995ff9ebd09c0cb3d2aed18b11077585839fb5db80193b62d74528f6c9
+2026/10/29 22:55:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:796: matrix reverse std-bool topic /chatter_ros_rev_std_bool_4012239_1793296522141795729 hash RIHS01_feb91e995ff9ebd09c0cb3d2aed18b11077585839fb5db80193b62d74528f6c9
+2026/10/29 22:55:28 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdBool (13.64s)
+=== RUN   TestROSTypeGeometryVector3
+    gate_type_matrix_test.go:807: matrix forward geometry-vector3 topic /chatter_ros_fwd_geometry_vector3_4012239_1793296529837239090 hash RIHS01_cc12fe83e4c02719f1ce8070bfd14aecd40f75a96696a67a2a1f37f7dbb0765d
+2026/10/29 22:55:35 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:807: matrix reverse geometry-vector3 topic /chatter_ros_rev_geometry_vector3_4012239_1793296535777511921 hash RIHS01_cc12fe83e4c02719f1ce8070bfd14aecd40f75a96696a67a2a1f37f7dbb0765d
+2026/10/29 22:55:42 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryVector3 (13.65s)
+=== RUN   TestROSTypeGeometryPointStamped
+    gate_type_matrix_test.go:818: matrix forward geometry-pointstamped topic /chatter_ros_fwd_geometry_pointstamped_4012239_1793296543472713869 hash RIHS01_4c0296af86e01e562e9e0405d138a01537247580076c58ea38d7923ac1045897
+2026/10/29 22:55:48 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:818: matrix reverse geometry-pointstamped topic /chatter_ros_rev_geometry_pointstamped_4012239_1793296550909214695 hash RIHS01_4c0296af86e01e562e9e0405d138a01537247580076c58ea38d7923ac1045897
+2026/10/29 22:55:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeGeometryPointStamped (15.12s)
+=== RUN   TestROSTypeSensorTemperature
+    gate_type_matrix_test.go:829: matrix forward sensor-temperature topic /chatter_ros_fwd_sensor_temperature_4012239_1793296558560906643 hash RIHS01_72514a14126ab9f8a9abec974c78e5610a367b59db5da355ff1fb982d5bad4b8
+2026/10/29 22:56:04 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:829: matrix reverse sensor-temperature topic /chatter_ros_rev_sensor_temperature_4012239_1793296564483071044 hash RIHS01_72514a14126ab9f8a9abec974c78e5610a367b59db5da355ff1fb982d5bad4b8
+2026/10/29 22:56:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorTemperature (13.56s)
+=== RUN   TestROSTypeSensorFluidPressure
+    gate_type_matrix_test.go:840: matrix forward sensor-fluidpressure topic /chatter_ros_fwd_sensor_fluidpressure_4012239_1793296572162822531 hash RIHS01_22dfb2b145a0bd5a31a1ac3882a1b32148b51d9b2f3bab250290d66f3595bc32
+2026/10/29 22:56:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_matrix_test.go:840: matrix reverse sensor-fluidpressure topic /chatter_ros_rev_sensor_fluidpressure_4012239_1793296578120035689 hash RIHS01_22dfb2b145a0bd5a31a1ac3882a1b32148b51d9b2f3bab250290d66f3595bc32
+2026/10/29 22:56:24 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorFluidPressure (13.60s)
+=== RUN   TestROSTypeMiscRest2Completeness
+    gate_type_misc_rest2_test.go:97: misc rest2 live ros-misc-rest2-4012239-1793296585361932654 topic /chatter_ros_misc_rest2_4012239_1793296585361932654 domain 42
+--- PASS: TestROSTypeMiscRest2Completeness (2.17s)
+=== RUN   TestROSTypeNavOccupancyGrid
+    gate_type_nav_extra_test.go:416: matrix forward nav-occupancygrid topic /chatter_ros_fwd_nav_occupancygrid_4012239_1793296587769417267 hash RIHS01_8d348150c12913a31ee0ec170fbf25089e4745d17035792a1ba94d6f0bc0cfc7
+2026/10/29 22:56:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_nav_extra_test.go:416: matrix reverse nav-occupancygrid topic /chatter_ros_rev_nav_occupancygrid_4012239_1793296593670927449 hash RIHS01_8d348150c12913a31ee0ec170fbf25089e4745d17035792a1ba94d6f0bc0cfc7
+2026/10/29 22:56:40 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeNavOccupancyGrid (13.39s)
+=== RUN   TestROSTypeNavMapMetaData
+    gate_type_nav_extra_test.go:430: matrix forward nav-mapmetadata topic /chatter_ros_fwd_nav_mapmetadata_4012239_1793296601341512871 hash RIHS01_2772d4b2000ef2b35dbaeb80fd3946c1369f817fb4f75677d916d27c17d763c8
+2026/10/29 22:56:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_nav_extra_test.go:430: matrix reverse nav-mapmetadata topic /chatter_ros_rev_nav_mapmetadata_4012239_1793296608805903166 hash RIHS01_2772d4b2000ef2b35dbaeb80fd3946c1369f817fb4f75677d916d27c17d763c8
+2026/10/29 22:56:55 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeNavMapMetaData (15.18s)
+=== RUN   TestROSTypeNavGridCells
+    gate_type_nav_extra_test.go:443: matrix forward nav-gridcells topic /chatter_ros_fwd_nav_gridcells_4012239_1793296616496552914 hash RIHS01_bb99c2f5d0a04750745a81ec6a8147aa373cce5bd17c8cd6507f2413354a6933
+2026/10/29 22:57:01 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_nav_extra_test.go:443: matrix reverse nav-gridcells topic /chatter_ros_rev_nav_gridcells_4012239_1793296622436723934 hash RIHS01_bb99c2f5d0a04750745a81ec6a8147aa373cce5bd17c8cd6507f2413354a6933
+2026/10/29 22:57:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeNavGridCells (13.63s)
+=== RUN   TestROSTypeNavOdometry
+    gate_type_nav_test.go:402: matrix forward nav-odometry topic /chatter_ros_fwd_nav_odometry_4012239_1793296630135367550 hash RIHS01_3cc97dc7fb7502f8714462c526d369e35b603cfc34d946e3f2eda2766dfec6e0
+2026/10/29 22:57:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_nav_test.go:402: matrix reverse nav-odometry topic /chatter_ros_rev_nav_odometry_4012239_1793296636131463212 hash RIHS01_3cc97dc7fb7502f8714462c526d369e35b603cfc34d946e3f2eda2766dfec6e0
+2026/10/29 22:57:22 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeNavOdometry (13.70s)
+=== RUN   TestROSTypeNavPath
+    gate_type_nav_test.go:415: matrix forward nav-path topic /chatter_ros_fwd_nav_path_4012239_1793296643816873382 hash RIHS01_1957a5bb3cee5da65c4e52e52b65a93df227efce4c20f8458b36e73066ca334b
+2026/10/29 22:57:29 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_nav_test.go:415: matrix reverse nav-path topic /chatter_ros_rev_nav_path_4012239_1793296649776357211 hash RIHS01_1957a5bb3cee5da65c4e52e52b65a93df227efce4c20f8458b36e73066ca334b
+2026/10/29 22:57:36 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeNavPath (13.67s)
+=== RUN   TestROSTypeSensorImu
+    gate_type_sensor_extra_test.go:572: matrix forward sensor-imu topic /chatter_ros_fwd_sensor_imu_4012239_1793296657461593965 hash RIHS01_7d9a00ff131080897a5ec7e26e315954b8eae3353c3f995c55faf71574000b5b
+2026/10/29 22:57:42 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_extra_test.go:572: matrix reverse sensor-imu topic /chatter_ros_rev_sensor_imu_4012239_1793296663430703710 hash RIHS01_7d9a00ff131080897a5ec7e26e315954b8eae3353c3f995c55faf71574000b5b
+2026/10/29 22:57:49 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorImu (13.65s)
+=== RUN   TestROSTypeSensorLaserScan
+    gate_type_sensor_extra_test.go:584: matrix forward sensor-laserscan topic /chatter_ros_fwd_sensor_laserscan_4012239_1793296671126069350 hash RIHS01_64c191398013af96509d518dac71d5164f9382553fce5c1f8cca5be7924bd828
+2026/10/29 22:57:56 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_extra_test.go:584: matrix reverse sensor-laserscan topic /chatter_ros_rev_sensor_laserscan_4012239_1793296677084592629 hash RIHS01_64c191398013af96509d518dac71d5164f9382553fce5c1f8cca5be7924bd828
+2026/10/29 22:58:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorLaserScan (13.64s)
+=== RUN   TestROSTypeSensorNavSatFix
+    gate_type_sensor_extra_test.go:596: matrix forward sensor-navsatfix topic /chatter_ros_fwd_sensor_navsatfix_4012239_1793296684787040582 hash RIHS01_62223ab3fe210a15976021da7afddc9e200dc9ec75231c1b6a557fc598a65404
+2026/10/29 22:58:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_extra_test.go:596: matrix reverse sensor-navsatfix topic /chatter_ros_rev_sensor_navsatfix_4012239_1793296690769305325 hash RIHS01_62223ab3fe210a15976021da7afddc9e200dc9ec75231c1b6a557fc598a65404
+2026/10/29 22:58:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorNavSatFix (13.65s)
+=== RUN   TestROSTypeSensorImage
+    gate_type_sensor_rest2_test.go:196: matrix forward sensor-image topic /chatter_ros_fwd_sensor_image_4012239_1793296698379036761 hash RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47
+2026/10/29 22:58:23 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest2_test.go:196: matrix reverse sensor-image topic /chatter_ros_rev_sensor_image_4012239_1793296704314593323 hash RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47
+2026/10/29 22:58:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorImage (13.58s)
+=== RUN   TestROSTypeSensorPointCloud2Large
+    gate_type_sensor_rest2_test.go:585: local rest2 large pc2 codec ok len 102556 id ros-rest2-pc2-large-4012239-1793296712028892751
+2026/10/29 22:58:32 dds: multicast receive joined on domain 55 group port 21150 user port 21151 unicast port 21161
+    gate_type_sensor_rest2_test.go:611: rest2 large pc2 fragmented ok len 102556 id ros-rest2-pc2-large-4012239-1793296712028892751
+--- PASS: TestROSTypeSensorPointCloud2Large (8.99s)
+=== RUN   TestROSTypeSensorCameraInfo
+    gate_type_sensor_rest_test.go:2339: matrix forward sensor-camerainfo topic /chatter_ros_fwd_sensor_camerainfo_4012239_1793296721016405030 hash RIHS01_b3dfd68ff46c9d56c80fd3bd4ed22c7a4ddce8c8348f2f59c299e73118e7e275
+2026/10/29 22:58:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2339: matrix reverse sensor-camerainfo topic /chatter_ros_rev_sensor_camerainfo_4012239_1793296727034545347 hash RIHS01_b3dfd68ff46c9d56c80fd3bd4ed22c7a4ddce8c8348f2f59c299e73118e7e275
+2026/10/29 22:58:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorCameraInfo (13.76s)
+=== RUN   TestROSTypeSensorCompressedImage
+    gate_type_sensor_rest_test.go:2347: matrix forward sensor-compressedimage topic /chatter_ros_fwd_sensor_compressedimage_4012239_1793296734766938546 hash RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a
+2026/10/29 22:59:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2347: matrix reverse sensor-compressedimage topic /chatter_ros_rev_sensor_compressedimage_4012239_1793296740739898783 hash RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a
+2026/10/29 22:59:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorCompressedImage (13.70s)
+=== RUN   TestROSTypeSensorPointCloud
+    gate_type_sensor_rest_test.go:2355: matrix forward sensor-pointcloud topic /chatter_ros_fwd_sensor_pointcloud_4012239_1793296748410983746 hash RIHS01_614593df71d3c2b9bd4604a71b750fd218f0d65c045ea988b713719455a65b3b
+2026/10/29 22:59:13 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2355: matrix reverse sensor-pointcloud topic /chatter_ros_rev_sensor_pointcloud_4012239_1793296754366543580 hash RIHS01_614593df71d3c2b9bd4604a71b750fd218f0d65c045ea988b713719455a65b3b
+2026/10/29 22:59:20 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorPointCloud (13.64s)
+=== RUN   TestROSTypeSensorPointField
+    gate_type_sensor_rest_test.go:2363: matrix forward sensor-pointfield topic /chatter_ros_fwd_sensor_pointfield_4012239_1793296762059382408 hash RIHS01_5c6a4750728c2bcfbbf7037225b20b02d4429634732146b742dee1726637ef01
+2026/10/29 22:59:27 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2363: matrix reverse sensor-pointfield topic /chatter_ros_rev_sensor_pointfield_4012239_1793296767973218712 hash RIHS01_5c6a4750728c2bcfbbf7037225b20b02d4429634732146b742dee1726637ef01
+2026/10/29 22:59:34 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorPointField (13.54s)
+=== RUN   TestROSTypeSensorRange
+    gate_type_sensor_rest_test.go:2371: matrix forward sensor-range topic /chatter_ros_fwd_sensor_range_4012239_1793296775660455236 hash RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a
+2026/10/29 22:59:41 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2371: matrix reverse sensor-range topic /chatter_ros_rev_sensor_range_4012239_1793296781598149711 hash RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a
+2026/10/29 22:59:48 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorRange (13.61s)
+=== RUN   TestROSTypeSensorROI
+    gate_type_sensor_rest_test.go:2379: matrix forward sensor-roi topic /chatter_ros_fwd_sensor_roi_4012239_1793296789260768300 hash RIHS01_ad16bcba5f9131dcdba6fbded19f726f5440e3c513b4fb586dd3027eeed8abb1
+2026/10/29 22:59:54 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2379: matrix reverse sensor-roi topic /chatter_ros_rev_sensor_roi_4012239_1793296795183527768 hash RIHS01_ad16bcba5f9131dcdba6fbded19f726f5440e3c513b4fb586dd3027eeed8abb1
+2026/10/29 23:00:01 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorROI (13.58s)
+=== RUN   TestROSTypeSensorHumidity
+    gate_type_sensor_rest_test.go:2387: matrix forward sensor-humidity topic /chatter_ros_fwd_sensor_humidity_4012239_1793296802817412262 hash RIHS01_8687c99b4fb393cb2e545e407b5ea7fd0b5d8960bcd849a0f86c544740138839
+2026/10/29 23:00:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2387: matrix reverse sensor-humidity topic /chatter_ros_rev_sensor_humidity_4012239_1793296808757085207 hash RIHS01_8687c99b4fb393cb2e545e407b5ea7fd0b5d8960bcd849a0f86c544740138839
+2026/10/29 23:00:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorHumidity (13.63s)
+=== RUN   TestROSTypeSensorTimeRef
+    gate_type_sensor_rest_test.go:2395: matrix forward sensor-timeref topic /chatter_ros_fwd_sensor_timeref_4012239_1793296816479803062 hash RIHS01_dd66e84cf40bbb5d5a40472e6ecf2675a031334d4c426abdb2ad41801a8efc99
+2026/10/29 23:00:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2395: matrix reverse sensor-timeref topic /chatter_ros_rev_sensor_timeref_4012239_1793296822450267913 hash RIHS01_dd66e84cf40bbb5d5a40472e6ecf2675a031334d4c426abdb2ad41801a8efc99
+2026/10/29 23:00:28 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorTimeRef (13.67s)
+=== RUN   TestROSTypeSensorMagField
+    gate_type_sensor_rest_test.go:2403: matrix forward sensor-magfield topic /chatter_ros_fwd_sensor_magfield_4012239_1793296830134718668 hash RIHS01_e80f32f56a20486c9923008fc1a1db07bbb273cbbf6a5b3bfa00835ee00e4dff
+2026/10/29 23:00:35 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2403: matrix reverse sensor-magfield topic /chatter_ros_rev_sensor_magfield_4012239_1793296836107931156 hash RIHS01_e80f32f56a20486c9923008fc1a1db07bbb273cbbf6a5b3bfa00835ee00e4dff
+2026/10/29 23:00:42 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorMagField (13.68s)
+=== RUN   TestROSTypeSensorJoy
+    gate_type_sensor_rest_test.go:2411: matrix forward sensor-joy topic /chatter_ros_fwd_sensor_joy_4012239_1793296843812209777 hash RIHS01_0d356c79cad3401e35ffeb75a96a96e08be3ef896b8b83841d73e890989372c5
+2026/10/29 23:00:49 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2411: matrix reverse sensor-joy topic /chatter_ros_rev_sensor_joy_4012239_1793296849803261502 hash RIHS01_0d356c79cad3401e35ffeb75a96a96e08be3ef896b8b83841d73e890989372c5
+2026/10/29 23:00:56 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorJoy (13.66s)
+=== RUN   TestROSTypeSensorJointState
+    gate_type_sensor_rest_test.go:2419: matrix forward sensor-jointstate topic /chatter_ros_fwd_sensor_jointstate_4012239_1793296857517264267 hash RIHS01_a13ee3a330e346c9d87b5aa18d24e11690752bd33a0350f11c5882bc9179260e
+2026/10/29 23:01:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2419: matrix reverse sensor-jointstate topic /chatter_ros_rev_sensor_jointstate_4012239_1793296863498571363 hash RIHS01_a13ee3a330e346c9d87b5aa18d24e11690752bd33a0350f11c5882bc9179260e
+2026/10/29 23:01:09 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorJointState (13.68s)
+=== RUN   TestROSTypeSensorBatteryState
+    gate_type_sensor_rest_test.go:2427: matrix forward sensor-batterystate topic /chatter_ros_fwd_sensor_batterystate_4012239_1793296871135367325 hash RIHS01_4bee5dfce981c98faa6828b868307a0a73f992ed0789f374ee96c8f840e69741
+2026/10/29 23:01:16 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2427: matrix reverse sensor-batterystate topic /chatter_ros_rev_sensor_batterystate_4012239_1793296877088100073 hash RIHS01_4bee5dfce981c98faa6828b868307a0a73f992ed0789f374ee96c8f840e69741
+2026/10/29 23:01:23 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorBatteryState (13.62s)
+=== RUN   TestROSTypeSensorIlluminance
+    gate_type_sensor_rest_test.go:2435: matrix forward sensor-illuminance topic /chatter_ros_fwd_sensor_illuminance_4012239_1793296884805287862 hash RIHS01_b954b25f452fcf81a91c9c2a7e3b3fd85c4c873d452aecb3cfd8fd1da732a22d
+2026/10/29 23:01:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2435: matrix reverse sensor-illuminance topic /chatter_ros_rev_sensor_illuminance_4012239_1793296890788063682 hash RIHS01_b954b25f452fcf81a91c9c2a7e3b3fd85c4c873d452aecb3cfd8fd1da732a22d
+2026/10/29 23:01:37 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorIlluminance (13.70s)
+=== RUN   TestROSTypeSensorMultiEcho
+    gate_type_sensor_rest_test.go:2443: matrix forward sensor-multiecho topic /chatter_ros_fwd_sensor_multiecho_4012239_1793296898512793704 hash RIHS01_ba5eac341cd5bbb2701527aa4568e8baec172b69cadb9a1945d6f149d087ee48
+2026/10/29 23:01:44 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2443: matrix reverse sensor-multiecho topic /chatter_ros_rev_sensor_multiecho_4012239_1793296904486167426 hash RIHS01_ba5eac341cd5bbb2701527aa4568e8baec172b69cadb9a1945d6f149d087ee48
+2026/10/29 23:01:51 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorMultiEcho (13.71s)
+=== RUN   TestROSTypeSensorMultiDOF
+    gate_type_sensor_rest_test.go:2451: matrix forward sensor-multidof topic /chatter_ros_fwd_sensor_multidof_4012239_1793296912173161923 hash RIHS01_4d4ded702cfba7ff3ec783835c1a1425f75e53939a430ff355d1fee4b3bbc40b
+2026/10/29 23:01:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2451: matrix reverse sensor-multidof topic /chatter_ros_rev_sensor_multidof_4012239_1793296919615043004 hash RIHS01_4d4ded702cfba7ff3ec783835c1a1425f75e53939a430ff355d1fee4b3bbc40b
+2026/10/29 23:02:06 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+2026/10/29 23:02:06 dds: publish type "sensor_msgs__msg__MultiDOFJointState" topic "/chatter_ros_rev_sensor_multidof_4012239_1793296919615043004" has no known type hash, announcing with empty hash
+2026/10/29 23:02:06 dds: publish type "sensor_msgs__msg__MultiDOFJointState" topic "/chatter_ros_rev_sensor_multidof_4012239_1793296919615043004" has no known type hash, announcing with empty hash
+--- PASS: TestROSTypeSensorMultiDOF (15.12s)
+=== RUN   TestROSTypeSensorLaserEcho
+    gate_type_sensor_rest_test.go:2459: matrix forward sensor-laserecho topic /chatter_ros_fwd_sensor_laserecho_4012239_1793296927328814700 hash RIHS01_0fbc05a0db7d37fe52c0f0375356db55da0046f7ef5bd27ca6b34bd0582bc952
+2026/10/29 23:02:12 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2459: matrix reverse sensor-laserecho topic /chatter_ros_rev_sensor_laserecho_4012239_1793296933321996200 hash RIHS01_0fbc05a0db7d37fe52c0f0375356db55da0046f7ef5bd27ca6b34bd0582bc952
+2026/10/29 23:02:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorLaserEcho (13.72s)
+=== RUN   TestROSTypeSensorNavSatStatus
+    gate_type_sensor_rest_test.go:2467: matrix forward sensor-navsatstatus topic /chatter_ros_fwd_sensor_navsatstatus_4012239_1793296941049436950 hash RIHS01_d1ed3befa628e09571bd273b888ba1c1fd187c9a5e0006b385d7e5e9095a3204
+2026/10/29 23:02:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2467: matrix reverse sensor-navsatstatus topic /chatter_ros_rev_sensor_navsatstatus_4012239_1793296947017874493 hash RIHS01_d1ed3befa628e09571bd273b888ba1c1fd187c9a5e0006b385d7e5e9095a3204
+2026/10/29 23:02:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorNavSatStatus (13.66s)
+=== RUN   TestROSTypeSensorJoyFeedback
+    gate_type_sensor_rest_test.go:2475: matrix forward sensor-joyfeedback topic /chatter_ros_fwd_sensor_joyfeedback_4012239_1793296954702355817 hash RIHS01_231dd362f71d6fc08272770d07120ad5fe5874ce2dbac70109b28986834290cd
+2026/10/29 23:02:40 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2475: matrix reverse sensor-joyfeedback topic /chatter_ros_rev_sensor_joyfeedback_4012239_1793296960690624025 hash RIHS01_231dd362f71d6fc08272770d07120ad5fe5874ce2dbac70109b28986834290cd
+2026/10/29 23:02:47 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorJoyFeedback (13.69s)
+=== RUN   TestROSTypeSensorJoyFeedbackArray
+    gate_type_sensor_rest_test.go:2483: matrix forward sensor-joyfeedbackarray topic /chatter_ros_fwd_sensor_joyfeedbackarray_4012239_1793296968404535734 hash RIHS01_3287c32e1b688cae04555e465443df3cca7dae76ee4ebf85c4658d585037bcaa
+2026/10/29 23:02:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2483: matrix reverse sensor-joyfeedbackarray topic /chatter_ros_rev_sensor_joyfeedbackarray_4012239_1793296974422804275 hash RIHS01_3287c32e1b688cae04555e465443df3cca7dae76ee4ebf85c4658d585037bcaa
+2026/10/29 23:03:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+2026/10/29 23:03:00 dds: publish type "sensor_msgs__msg__JoyFeedbackArray" topic "/chatter_ros_rev_sensor_joyfeedbackarray_4012239_1793296974422804275" has no known type hash, announcing with empty hash
+2026/10/29 23:03:00 dds: publish type "sensor_msgs__msg__JoyFeedbackArray" topic "/chatter_ros_rev_sensor_joyfeedbackarray_4012239_1793296974422804275" has no known type hash, announcing with empty hash
+--- PASS: TestROSTypeSensorJoyFeedbackArray (13.66s)
+=== RUN   TestROSTypeSensorChannelFloat
+    gate_type_sensor_rest_test.go:2491: matrix forward sensor-channelfloat topic /chatter_ros_fwd_sensor_channelfloat_4012239_1793296982059170299 hash RIHS01_92665437ddf39346f4ba39ee32e648390605b633cc077d40f4bd4d7b58af6cd4
+2026/10/29 23:03:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2491: matrix reverse sensor-channelfloat topic /chatter_ros_rev_sensor_channelfloat_4012239_1793296988040728201 hash RIHS01_92665437ddf39346f4ba39ee32e648390605b633cc077d40f4bd4d7b58af6cd4
+2026/10/29 23:03:14 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+2026/10/29 23:03:14 dds: publish type "sensor_msgs__msg__ChannelFloat32" topic "/chatter_ros_rev_sensor_channelfloat_4012239_1793296988040728201" has no known type hash, announcing with empty hash
+2026/10/29 23:03:14 dds: publish type "sensor_msgs__msg__ChannelFloat32" topic "/chatter_ros_rev_sensor_channelfloat_4012239_1793296988040728201" has no known type hash, announcing with empty hash
+--- PASS: TestROSTypeSensorChannelFloat (13.71s)
+=== RUN   TestROSTypeSensorPointCloud2
+    gate_type_sensor_rest_test.go:2499: matrix forward sensor-pointcloud2 topic /chatter_ros_fwd_sensor_pointcloud2_4012239_1793296995745661135 hash RIHS01_9198cabf7da3796ae6fe19c4cb3bdd3525492988c70522628af5daa124bae2b5
+2026/10/29 23:03:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_sensor_rest_test.go:2499: matrix reverse sensor-pointcloud2 topic /chatter_ros_rev_sensor_pointcloud2_4012239_1793297001714485517 hash RIHS01_9198cabf7da3796ae6fe19c4cb3bdd3525492988c70522628af5daa124bae2b5
+2026/10/29 23:03:28 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeSensorPointCloud2 (13.69s)
+=== RUN   TestROSTypeSensorImageLarge
+    gate_type_sensor_rest_test.go:2579: local rest large image codec ok len 102496 id ros-rest-image-large-4012239-1793297009411192705
+2026/10/29 23:03:29 dds: multicast receive joined on domain 55 group port 21150 user port 21151 unicast port 21161
+    gate_type_sensor_rest_test.go:2605: rest large image fragmented ok len 102496 id ros-rest-image-large-4012239-1793297009411192705
+--- PASS: TestROSTypeSensorImageLarge (8.95s)
+=== RUN   TestROSTypeShapePlane
+    gate_type_shape_extra_test.go:338: matrix forward shape-plane topic /chatter_ros_fwd_shape_plane_4012239_1793297018386317511 hash RIHS01_dfbfe8314689c850615d4a727af017e9aa86c10e369a606c8c851ef8f16c58c8
+2026/10/29 23:03:43 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_shape_extra_test.go:338: matrix reverse shape-plane topic /chatter_ros_rev_shape_plane_4012239_1793297024364436476 hash RIHS01_dfbfe8314689c850615d4a727af017e9aa86c10e369a606c8c851ef8f16c58c8
+2026/10/29 23:03:50 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeShapePlane (13.71s)
+=== RUN   TestROSTypeShapeMeshTriangle
+    gate_type_shape_extra_test.go:349: matrix forward shape-meshtriangle topic /chatter_ros_fwd_shape_meshtriangle_4012239_1793297032115625928 hash RIHS01_618e5c073eeb729e433ef6226e72c01d995c459fb7d76348c9700409a5020bd0
+2026/10/29 23:03:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_shape_extra_test.go:349: matrix reverse shape-meshtriangle topic /chatter_ros_rev_shape_meshtriangle_4012239_1793297038077594315 hash RIHS01_618e5c073eeb729e433ef6226e72c01d995c459fb7d76348c9700409a5020bd0
+2026/10/29 23:04:04 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeShapeMeshTriangle (13.68s)
+=== RUN   TestROSTypeShapeMesh
+    gate_type_shape_extra_test.go:360: matrix forward shape-mesh topic /chatter_ros_fwd_shape_mesh_4012239_1793297045796471520 hash RIHS01_f2150b82d8ee7e8bc3f396a2b158aefb4b9a5510a474be271ba1268aebb55289
+2026/10/29 23:04:11 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_shape_extra_test.go:360: matrix reverse shape-mesh topic /chatter_ros_rev_shape_mesh_4012239_1793297052783039991 hash RIHS01_f2150b82d8ee7e8bc3f396a2b158aefb4b9a5510a474be271ba1268aebb55289
+2026/10/29 23:04:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeShapeMesh (14.71s)
+=== RUN   TestROSTypeShapeSolidPrimitive
+    gate_type_shape_test.go:392: shape forward topic /chatter_ros_fwd_shape_4012239_1793297060519797442 hash RIHS01_2802a15190aadc3f496584df4b0b4c5824d8a0b31aaef839faa75bc34dda38ac
+2026/10/29 23:04:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_shape_test.go:395: shape reverse topic /chatter_ros_rev_shape_4012239_1793297066466473669 hash RIHS01_2802a15190aadc3f496584df4b0b4c5824d8a0b31aaef839faa75bc34dda38ac
+2026/10/29 23:04:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeShapeSolidPrimitive (13.71s)
+=== RUN   TestROSTypeStdUInt8
+    gate_type_std_extra_test.go:551: matrix forward std-uint8 topic /chatter_ros_fwd_std_uint8_4012239_1793297074216026471 hash RIHS01_6138bd83d8c3569cb80a667db03cfc1629f529fee79d944c39c34e352e72f010
+2026/10/29 23:04:39 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:551: matrix reverse std-uint8 topic /chatter_ros_rev_std_uint8_4012239_1793297080180879811 hash RIHS01_6138bd83d8c3569cb80a667db03cfc1629f529fee79d944c39c34e352e72f010
+2026/10/29 23:04:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt8 (13.66s)
+=== RUN   TestROSTypeStdInt8
+    gate_type_std_extra_test.go:562: matrix forward std-int8 topic /chatter_ros_fwd_std_int8_4012239_1793297087895217677 hash RIHS01_26525065a403d972cb672f0777e333f0c799ad444ae5fcd79e43d1e73bd0f440
+2026/10/29 23:04:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:562: matrix reverse std-int8 topic /chatter_ros_rev_std_int8_4012239_1793297093825964256 hash RIHS01_26525065a403d972cb672f0777e333f0c799ad444ae5fcd79e43d1e73bd0f440
+2026/10/29 23:05:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt8 (13.68s)
+=== RUN   TestROSTypeStdUInt16
+    gate_type_std_extra_test.go:573: matrix forward std-uint16 topic /chatter_ros_fwd_std_uint16_4012239_1793297101524579341 hash RIHS01_08a406e4b022bc22e907f985d6a9e9dd1d4fbecae573549cf49350113e7757b1
+2026/10/29 23:05:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:573: matrix reverse std-uint16 topic /chatter_ros_rev_std_uint16_4012239_1793297107495213900 hash RIHS01_08a406e4b022bc22e907f985d6a9e9dd1d4fbecae573549cf49350113e7757b1
+2026/10/29 23:05:14 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt16 (13.65s)
+=== RUN   TestROSTypeStdUInt32
+    gate_type_std_extra_test.go:584: matrix forward std-uint32 topic /chatter_ros_fwd_std_uint32_4012239_1793297115145047219 hash RIHS01_a5c874829b752bc5fa190024b0ad76f578cc278271e855c7d02a818b3516fb4a
+2026/10/29 23:05:20 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:584: matrix reverse std-uint32 topic /chatter_ros_rev_std_uint32_4012239_1793297121075814240 hash RIHS01_a5c874829b752bc5fa190024b0ad76f578cc278271e855c7d02a818b3516fb4a
+2026/10/29 23:05:27 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt32 (13.57s)
+=== RUN   TestROSTypeStdFloat32
+    gate_type_std_extra_test.go:595: matrix forward std-float32 topic /chatter_ros_fwd_std_float32_4012239_1793297128780160291 hash RIHS01_7170d3d8f841f7be3172ce5f4f59f3a4d7f63b0447e8b33327601ad64d83d6e2
+2026/10/29 23:05:34 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:595: matrix reverse std-float32 topic /chatter_ros_rev_std_float32_4012239_1793297134738892852 hash RIHS01_7170d3d8f841f7be3172ce5f4f59f3a4d7f63b0447e8b33327601ad64d83d6e2
+2026/10/29 23:05:41 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdFloat32 (13.64s)
+=== RUN   TestROSTypeStdChar
+    gate_type_std_extra_test.go:607: matrix forward std-char topic /chatter_ros_fwd_std_char_4012239_1793297142419789692 hash RIHS01_3ad2d04dd29ba19d04b16659afa3ccaedd691914b02a64e82e252f2fa6a586a9
+2026/10/29 23:05:47 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:607: matrix reverse std-char topic /chatter_ros_rev_std_char_4012239_1793297148387313762 hash RIHS01_3ad2d04dd29ba19d04b16659afa3ccaedd691914b02a64e82e252f2fa6a586a9
+2026/10/29 23:05:54 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdChar (13.72s)
+=== RUN   TestROSTypeStdByte
+    gate_type_std_extra_test.go:619: matrix forward std-byte topic /chatter_ros_fwd_std_byte_4012239_1793297156137791131 hash RIHS01_41e1a3345f73fe93ede006da826a6ee274af23dd4653976ff249b0f44e3e798f
+2026/10/29 23:06:01 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:619: matrix reverse std-byte topic /chatter_ros_rev_std_byte_4012239_1793297162109190449 hash RIHS01_41e1a3345f73fe93ede006da826a6ee274af23dd4653976ff249b0f44e3e798f
+2026/10/29 23:06:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdByte (13.70s)
+=== RUN   TestROSTypeStdEmpty
+    gate_type_std_extra_test.go:630: matrix forward std-empty topic /chatter_ros_fwd_std_empty_4012239_1793297169811288621 hash RIHS01_20b625256f32d5dbc0d04fee44f43c41e51c70d3502f84b4a08e7a9c26a96312
+2026/10/29 23:06:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:630: matrix reverse std-empty topic /chatter_ros_rev_std_empty_4012239_1793297175762649103 hash RIHS01_20b625256f32d5dbc0d04fee44f43c41e51c70d3502f84b4a08e7a9c26a96312
+2026/10/29 23:06:22 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdEmpty (13.65s)
+=== RUN   TestROSTypeStdHeader
+    gate_type_std_extra_test.go:641: matrix forward std-header topic /chatter_ros_fwd_std_header_4012239_1793297183487928557 hash RIHS01_f49fb3ae2cf070f793645ff749683ac6b06203e41c891e17701b1cb597ce6a01
+2026/10/29 23:06:28 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_extra_test.go:641: matrix reverse std-header topic /chatter_ros_rev_std_header_4012239_1793297189436429339 hash RIHS01_f49fb3ae2cf070f793645ff749683ac6b06203e41c891e17701b1cb597ce6a01
+2026/10/29 23:06:35 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdHeader (13.67s)
+=== RUN   TestROSTypeStdInt16
+    gate_type_std_multi_test.go:977: matrix forward std-int16 topic /chatter_ros_fwd_std_int16_4012239_1793297197156744031 hash RIHS01_1dcc3464e47c288a55f943a389d337cdb06804de3f5cd7a266b0de718eee17e5
+2026/10/29 23:06:42 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:977: matrix reverse std-int16 topic /chatter_ros_rev_std_int16_4012239_1793297204616318819 hash RIHS01_1dcc3464e47c288a55f943a389d337cdb06804de3f5cd7a266b0de718eee17e5
+2026/10/29 23:06:51 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt16 (15.19s)
+=== RUN   TestROSTypeStdInt64
+    gate_type_std_multi_test.go:985: matrix forward std-int64 topic /chatter_ros_fwd_std_int64_4012239_1793297212347493324 hash RIHS01_8cd1048c2f186b6bd9a92472dc1ce51723c0833a221e2b7aecfff111774f4b49
+2026/10/29 23:06:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:985: matrix reverse std-int64 topic /chatter_ros_rev_std_int64_4012239_1793297218298493690 hash RIHS01_8cd1048c2f186b6bd9a92472dc1ce51723c0833a221e2b7aecfff111774f4b49
+2026/10/29 23:07:04 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt64 (13.68s)
+=== RUN   TestROSTypeStdUInt64
+    gate_type_std_multi_test.go:993: matrix forward std-uint64 topic /chatter_ros_fwd_std_uint64_4012239_1793297226050532707 hash RIHS01_fbdc52018fc13755dce18024d1a671c856aa8b4aaf63adfb095b608f98e8c943
+2026/10/29 23:07:11 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:993: matrix reverse std-uint64 topic /chatter_ros_rev_std_uint64_4012239_1793297232027619563 hash RIHS01_fbdc52018fc13755dce18024d1a671c856aa8b4aaf63adfb095b608f98e8c943
+2026/10/29 23:07:18 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt64 (13.70s)
+=== RUN   TestROSTypeStdFloat32MultiArray
+    gate_type_std_multi_test.go:1001: matrix forward std-float32multiarray topic /chatter_ros_fwd_std_float32multiarray_4012239_1793297239732367663 hash RIHS01_0599f6f85b4bfca379873a0b4375a0aca022156bd2d7021275d116ed1fa8bfe0
+2026/10/29 23:07:25 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1001: matrix reverse std-float32multiarray topic /chatter_ros_rev_std_float32multiarray_4012239_1793297245700424367 hash RIHS01_0599f6f85b4bfca379873a0b4375a0aca022156bd2d7021275d116ed1fa8bfe0
+2026/10/29 23:07:32 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdFloat32MultiArray (13.65s)
+=== RUN   TestROSTypeStdFloat64MultiArray
+    gate_type_std_multi_test.go:1009: matrix forward std-float64multiarray topic /chatter_ros_fwd_std_float64multiarray_4012239_1793297253378552428 hash RIHS01_1025ddc6b9552d191f89ef1a8d2f60f3d373e28b283d8891ddcc974e8c55397f
+2026/10/29 23:07:38 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1009: matrix reverse std-float64multiarray topic /chatter_ros_rev_std_float64multiarray_4012239_1793297259307815613 hash RIHS01_1025ddc6b9552d191f89ef1a8d2f60f3d373e28b283d8891ddcc974e8c55397f
+2026/10/29 23:07:45 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdFloat64MultiArray (13.59s)
+=== RUN   TestROSTypeStdInt16MultiArray
+    gate_type_std_multi_test.go:1017: matrix forward std-int16multiarray topic /chatter_ros_fwd_std_int16multiarray_4012239_1793297266942930375 hash RIHS01_b58810e8e5b90fb19a5062469eb8409f5ab11a446d60de7157a1457e52a076ce
+2026/10/29 23:07:52 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1017: matrix reverse std-int16multiarray topic /chatter_ros_rev_std_int16multiarray_4012239_1793297272879967482 hash RIHS01_b58810e8e5b90fb19a5062469eb8409f5ab11a446d60de7157a1457e52a076ce
+2026/10/29 23:07:59 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt16MultiArray (13.60s)
+=== RUN   TestROSTypeStdInt32MultiArray
+    gate_type_std_multi_test.go:1025: matrix forward std-int32multiarray topic /chatter_ros_fwd_std_int32multiarray_4012239_1793297280512134970 hash RIHS01_84a7346323525d1b4dfca899df3820f245e54009dac5a6b69217d14fdefd1701
+2026/10/29 23:08:06 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1025: matrix reverse std-int32multiarray topic /chatter_ros_rev_std_int32multiarray_4012239_1793297286422590191 hash RIHS01_84a7346323525d1b4dfca899df3820f245e54009dac5a6b69217d14fdefd1701
+2026/10/29 23:08:12 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt32MultiArray (13.47s)
+=== RUN   TestROSTypeStdInt64MultiArray
+    gate_type_std_multi_test.go:1033: matrix forward std-int64multiarray topic /chatter_ros_fwd_std_int64multiarray_4012239_1793297294030019627 hash RIHS01_e60f9fe34d697f0939ad49d33158693c1277fbac0e2f04b7c2995dc21c89b422
+2026/10/29 23:08:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1033: matrix reverse std-int64multiarray topic /chatter_ros_rev_std_int64multiarray_4012239_1793297299954028388 hash RIHS01_e60f9fe34d697f0939ad49d33158693c1277fbac0e2f04b7c2995dc21c89b422
+2026/10/29 23:08:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt64MultiArray (13.64s)
+=== RUN   TestROSTypeStdInt8MultiArray
+    gate_type_std_multi_test.go:1041: matrix forward std-int8multiarray topic /chatter_ros_fwd_std_int8multiarray_4012239_1793297307646812705 hash RIHS01_f21998d4b492abd63330765d75d5831238d400740386f651f13a872a4d2188db
+2026/10/29 23:08:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1041: matrix reverse std-int8multiarray topic /chatter_ros_rev_std_int8multiarray_4012239_1793297313583496908 hash RIHS01_f21998d4b492abd63330765d75d5831238d400740386f651f13a872a4d2188db
+2026/10/29 23:08:40 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdInt8MultiArray (13.63s)
+=== RUN   TestROSTypeStdUInt16MultiArray
+    gate_type_std_multi_test.go:1049: matrix forward std-uint16multiarray topic /chatter_ros_fwd_std_uint16multiarray_4012239_1793297321279600229 hash RIHS01_94fe73428ec63baecc774f8fb82406123e9291cf728f1b7c91caf5335129492b
+2026/10/29 23:08:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1049: matrix reverse std-uint16multiarray topic /chatter_ros_rev_std_uint16multiarray_4012239_1793297327197370424 hash RIHS01_94fe73428ec63baecc774f8fb82406123e9291cf728f1b7c91caf5335129492b
+2026/10/29 23:08:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt16MultiArray (13.55s)
+=== RUN   TestROSTypeStdUInt32MultiArray
+    gate_type_std_multi_test.go:1057: matrix forward std-uint32multiarray topic /chatter_ros_fwd_std_uint32multiarray_4012239_1793297334869233556 hash RIHS01_6c2577c7ad3cbdcc2164a41c12f1d5ad314ea320f3fb1ee47e78019fe16bb5b0
+2026/10/29 23:09:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1057: matrix reverse std-uint32multiarray topic /chatter_ros_rev_std_uint32multiarray_4012239_1793297340821557848 hash RIHS01_6c2577c7ad3cbdcc2164a41c12f1d5ad314ea320f3fb1ee47e78019fe16bb5b0
+2026/10/29 23:09:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt32MultiArray (13.70s)
+=== RUN   TestROSTypeStdUInt64MultiArray
+    gate_type_std_multi_test.go:1065: matrix forward std-uint64multiarray topic /chatter_ros_fwd_std_uint64multiarray_4012239_1793297348570863231 hash RIHS01_fc1c685c2f76bdc6983da025cb25d2db5fb5157b059e300f6d957d86f981b366
+2026/10/29 23:09:14 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1065: matrix reverse std-uint64multiarray topic /chatter_ros_rev_std_uint64multiarray_4012239_1793297354522998739 hash RIHS01_fc1c685c2f76bdc6983da025cb25d2db5fb5157b059e300f6d957d86f981b366
+2026/10/29 23:09:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt64MultiArray (13.67s)
+=== RUN   TestROSTypeStdUInt8MultiArray
+    gate_type_std_multi_test.go:1073: matrix forward std-uint8multiarray topic /chatter_ros_fwd_std_uint8multiarray_4012239_1793297362235083037 hash RIHS01_5687e861b8d307a5e48b7515467ae7a5fc2daf805bd0ce6d8e9e604bade9f385
+2026/10/29 23:09:27 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_multi_test.go:1073: matrix reverse std-uint8multiarray topic /chatter_ros_rev_std_uint8multiarray_4012239_1793297369676773633 hash RIHS01_5687e861b8d307a5e48b7515467ae7a5fc2daf805bd0ce6d8e9e604bade9f385
+2026/10/29 23:09:36 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdUInt8MultiArray (15.10s)
+=== RUN   TestROSTypeStdString
+    gate_type_std_rest2_test.go:104: matrix forward std-string topic /chatter_ros_fwd_std_string_4012239_1793297377343591365 hash RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18
+2026/10/29 23:09:42 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_rest2_test.go:104: matrix reverse std-string topic /chatter_ros_rev_std_string_4012239_1793297383282259801 hash RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18
+2026/10/29 23:09:49 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdString (13.64s)
+=== RUN   TestROSTypeStdMultiArrayDimension
+    gate_type_std_rest_test.go:411: matrix forward std-multiarraydimension topic /chatter_ros_fwd_std_multiarraydimension_4012239_1793297390958498656 hash RIHS01_5e773a60a4c7fc8a54985f307c7837aa2994252a126c301957a24e31282c9cbe
+2026/10/29 23:09:56 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_rest_test.go:411: matrix reverse std-multiarraydimension topic /chatter_ros_rev_std_multiarraydimension_4012239_1793297396885210935 hash RIHS01_5e773a60a4c7fc8a54985f307c7837aa2994252a126c301957a24e31282c9cbe
+2026/10/29 23:10:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdMultiArrayDimension (13.60s)
+=== RUN   TestROSTypeStdMultiArrayLayout
+    gate_type_std_rest_test.go:422: matrix forward std-multiarraylayout topic /chatter_ros_fwd_std_multiarraylayout_4012239_1793297404598627854 hash RIHS01_4c66e6f78e740ac103a94cf63259f968e48c617e7699e829b63c21a5cb50dac6
+2026/10/29 23:10:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_rest_test.go:422: matrix reverse std-multiarraylayout topic /chatter_ros_rev_std_multiarraylayout_4012239_1793297410562459293 hash RIHS01_4c66e6f78e740ac103a94cf63259f968e48c617e7699e829b63c21a5cb50dac6
+2026/10/29 23:10:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdMultiArrayLayout (13.67s)
+=== RUN   TestROSTypeStdColorRGBA
+    gate_type_std_rest_test.go:435: matrix forward std-colorrgba topic /chatter_ros_fwd_std_colorrgba_4012239_1793297418266702524 hash RIHS01_77a7a5b9ae477306097665106e0413ba74440245b1f3d0c6d6405fe5c7813fe8
+2026/10/29 23:10:23 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_rest_test.go:435: matrix reverse std-colorrgba topic /chatter_ros_rev_std_colorrgba_4012239_1793297424232211210 hash RIHS01_77a7a5b9ae477306097665106e0413ba74440245b1f3d0c6d6405fe5c7813fe8
+2026/10/29 23:10:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdColorRGBA (13.67s)
+=== RUN   TestROSTypeStdByteMultiArray
+    gate_type_std_rest_test.go:448: matrix forward std-bytemultiarray topic /chatter_ros_fwd_std_bytemultiarray_4012239_1793297431905416656 hash RIHS01_972fec7f50ab3c1d06783c228e79e8a9a509021708c511c059926261ada901d4
+2026/10/29 23:10:37 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_std_rest_test.go:448: matrix reverse std-bytemultiarray topic /chatter_ros_rev_std_bytemultiarray_4012239_1793297437846576555 hash RIHS01_972fec7f50ab3c1d06783c228e79e8a9a509021708c511c059926261ada901d4
+2026/10/29 23:10:44 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStdByteMultiArray (13.63s)
+=== RUN   TestROSTypeStdByteMultiArrayReverse
+    gate_type_std_rest_test.go:522: local byte array codec ok len 88 id ros-rev-std-bytemultiarray-4012239-1793297445552212639
+    gate_type_std_rest_test.go:527: matrix reverse std-bytemultiarray-reverse topic /chatter_ros_rev_std_bytemultiarray_4012239_1793297445552212639 hash RIHS01_972fec7f50ab3c1d06783c228e79e8a9a509021708c511c059926261ada901d4
+2026/10/29 23:10:45 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+    gate_type_std_rest_test.go:550: byte array reverse ok id ros-rev-std-bytemultiarray-4012239-1793297445552212639
+--- PASS: TestROSTypeStdByteMultiArrayReverse (7.33s)
+=== RUN   TestROSTypeStereoDisparity
+    gate_type_stereo_test.go:572: stereo disparity forward topic /chatter_ros_fwd_stereo_disparity_4012239_1793297452899014406 hash RIHS01_1ec1ff6b5bace919e4544a37f2d96ead9f81783701b7b7a4d97a09325ecf2711
+2026/10/29 23:10:58 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_stereo_test.go:575: stereo disparity reverse topic /chatter_ros_rev_stereo_disparity_4012239_1793297458906461756 hash RIHS01_1ec1ff6b5bace919e4544a37f2d96ead9f81783701b7b7a4d97a09325ecf2711
+2026/10/29 23:11:05 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeStereoDisparity (13.70s)
+=== RUN   TestROSTypeTrajectoryJointTrajectory
+    gate_type_trajectory_extra_test.go:585: matrix forward trajectory-jointtrajectory topic /chatter_ros_fwd_trajectory_jointtrajectory_4012239_1793297466635971268 hash RIHS01_179b33eba59d676f6d967ac71fe35e7ca2f64b2f3928f4a018cec115e213796e
+2026/10/29 23:11:12 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_trajectory_extra_test.go:585: matrix reverse trajectory-jointtrajectory topic /chatter_ros_rev_trajectory_jointtrajectory_4012239_1793297472619760405 hash RIHS01_179b33eba59d676f6d967ac71fe35e7ca2f64b2f3928f4a018cec115e213796e
+2026/10/29 23:11:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeTrajectoryJointTrajectory (13.71s)
+=== RUN   TestROSTypeTrajectoryMultiDOFJointTrajectory
+    gate_type_trajectory_extra_test.go:598: matrix forward trajectory-multidofjointtrajectory topic /chatter_ros_fwd_trajectory_multidofjointtrajectory_4012239_1793297480311350972 hash RIHS01_3a18fd095292a65cfde8833c72985a30af981f3ec44494655c6267262b443a4a
+2026/10/29 23:11:25 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_trajectory_extra_test.go:598: matrix reverse trajectory-multidofjointtrajectory topic /chatter_ros_rev_trajectory_multidofjointtrajectory_4012239_1793297486318493312 hash RIHS01_3a18fd095292a65cfde8833c72985a30af981f3ec44494655c6267262b443a4a
+2026/10/29 23:11:32 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeTrajectoryMultiDOFJointTrajectory (13.73s)
+=== RUN   TestROSTypeTrajectoryMultiDOFJointTrajectoryPoint
+    gate_type_trajectory_extra_test.go:612: matrix forward trajectory-multidofjointtrajectorypoint topic /chatter_ros_fwd_trajectory_multidofjointtrajectorypoint_4012239_1793297494032588451 hash RIHS01_6ada1085b5ee64eaa069b074968e69f0e27c8c5e6f5bb0586dd1c834ef0e32b8
+2026/10/29 23:11:39 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_trajectory_extra_test.go:612: matrix reverse trajectory-multidofjointtrajectorypoint topic /chatter_ros_rev_trajectory_multidofjointtrajectorypoint_4012239_1793297499963347580 hash RIHS01_6ada1085b5ee64eaa069b074968e69f0e27c8c5e6f5bb0586dd1c834ef0e32b8
+2026/10/29 23:11:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeTrajectoryMultiDOFJointTrajectoryPoint (13.63s)
+=== RUN   TestROSTypeTrajectoryJointTrajectoryPoint
+    gate_type_trajectory_test.go:192: matrix forward trajectory-jointtrajectorypoint topic /chatter_ros_fwd_trajectory_jointtrajectorypoint_4012239_1793297507663335533 hash RIHS01_de8907036d8bd45aac6f30cc9044a3d4a329c42cbf719aff7d95a584cfa532d7
+2026/10/29 23:11:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_trajectory_test.go:195: matrix reverse trajectory-jointtrajectorypoint topic /chatter_ros_rev_trajectory_jointtrajectorypoint_4012239_1793297513602411520 hash RIHS01_de8907036d8bd45aac6f30cc9044a3d4a329c42cbf719aff7d95a584cfa532d7
+2026/10/29 23:12:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeTrajectoryJointTrajectoryPoint (13.65s)
+=== RUN   TestROSTypeVisualizationMarker
+    gate_type_visualization_test.go:546: matrix forward viz-marker topic /chatter_ros_fwd_viz_marker_4012239_1793297521317099309 hash RIHS01_45b13ccf791f225962bf74e746f9644518855d783a6f42ba0cc14fde2b4f3ce0
+2026/10/29 23:12:06 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_visualization_test.go:549: matrix reverse viz-marker topic /chatter_ros_rev_viz_marker_4012239_1793297528837883990 hash RIHS01_45b13ccf791f225962bf74e746f9644518855d783a6f42ba0cc14fde2b4f3ce0
+2026/10/29 23:12:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVisualizationMarker (15.21s)
+=== RUN   TestROSTypeVizMarkerArray
+    gate_type_viz_extra_test.go:1492: matrix forward viz-markerarray topic /chatter_ros_fwd_viz_markerarray_4012239_1793297536504781172 hash RIHS01_86cb8800b6fb05b5eff1abd7a56f62a5641d3ae9a1c29e78e67e704f1d067dcf
+2026/10/29 23:12:21 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1492: matrix reverse viz-markerarray topic /chatter_ros_rev_viz_markerarray_4012239_1793297543516335114 hash RIHS01_86cb8800b6fb05b5eff1abd7a56f62a5641d3ae9a1c29e78e67e704f1d067dcf
+2026/10/29 23:12:30 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizMarkerArray (14.70s)
+=== RUN   TestROSTypeVizMenuEntry
+    gate_type_viz_extra_test.go:1503: matrix forward viz-menuentry topic /chatter_ros_fwd_viz_menuentry_4012239_1793297551212483640 hash RIHS01_22170c387c70fd4236232ec902de8604e72ff027342c7c0f28ad9f68c64c51d6
+2026/10/29 23:12:36 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1503: matrix reverse viz-menuentry topic /chatter_ros_rev_viz_menuentry_4012239_1793297557162204388 hash RIHS01_22170c387c70fd4236232ec902de8604e72ff027342c7c0f28ad9f68c64c51d6
+2026/10/29 23:12:43 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizMenuEntry (13.53s)
+=== RUN   TestROSTypeVizImageMarker
+    gate_type_viz_extra_test.go:1515: matrix forward viz-imagemarker topic /chatter_ros_fwd_viz_imagemarker_4012239_1793297564750185111 hash RIHS01_603152491ef2331c200a5305230d31f6e8704875944b388da0f547c415d11836
+2026/10/29 23:12:50 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1515: matrix reverse viz-imagemarker topic /chatter_ros_rev_viz_imagemarker_4012239_1793297570747230312 hash RIHS01_603152491ef2331c200a5305230d31f6e8704875944b388da0f547c415d11836
+2026/10/29 23:12:57 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizImageMarker (13.67s)
+=== RUN   TestROSTypeVizInteractiveMarkerControl
+    gate_type_viz_extra_test.go:1527: matrix forward viz-imcontrol topic /chatter_ros_fwd_viz_imcontrol_4012239_1793297578344471949 hash RIHS01_60e2fa36344f5f4791b24a809542a18bffd555f563550d4b22b3bbfc31ec0ed5
+2026/10/29 23:13:03 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1527: matrix reverse viz-imcontrol topic /chatter_ros_rev_viz_imcontrol_4012239_1793297584311886600 hash RIHS01_60e2fa36344f5f4791b24a809542a18bffd555f563550d4b22b3bbfc31ec0ed5
+2026/10/29 23:13:10 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarkerControl (13.58s)
+=== RUN   TestROSTypeVizInteractiveMarker
+    gate_type_viz_extra_test.go:1539: matrix forward viz-imarker topic /chatter_ros_fwd_viz_imarker_4012239_1793297592012943166 hash RIHS01_3d5b51448b51d73b0f395b94d259edd3a5d269ae9f7d9fd5cceb9ae4b72be346
+2026/10/29 23:13:17 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1539: matrix reverse viz-imarker topic /chatter_ros_rev_viz_imarker_4012239_1793297598008599210 hash RIHS01_3d5b51448b51d73b0f395b94d259edd3a5d269ae9f7d9fd5cceb9ae4b72be346
+2026/10/29 23:13:24 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarker (13.71s)
+=== RUN   TestROSTypeVizInteractiveMarkerPose
+    gate_type_viz_extra_test.go:1549: matrix forward viz-ipose topic /chatter_ros_fwd_viz_ipose_4012239_1793297605698150765 hash RIHS01_c60e9a4407d5f709a63e0fe9caea324aee08fe717cd090209ebe35012ce7cb66
+2026/10/29 23:13:31 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1549: matrix reverse viz-ipose topic /chatter_ros_rev_viz_ipose_4012239_1793297611647081794 hash RIHS01_c60e9a4407d5f709a63e0fe9caea324aee08fe717cd090209ebe35012ce7cb66
+2026/10/29 23:13:38 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarkerPose (13.64s)
+=== RUN   TestROSTypeVizInteractiveMarkerFeedback
+    gate_type_viz_extra_test.go:1561: matrix forward viz-ifeedback topic /chatter_ros_fwd_viz_ifeedback_4012239_1793297619348016825 hash RIHS01_6cc48741df9f05d19ba7d9ea3101e9fcd1309c9d6bda3c55668ba607492f725e
+2026/10/29 23:13:44 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1561: matrix reverse viz-ifeedback topic /chatter_ros_rev_viz_ifeedback_4012239_1793297625318696606 hash RIHS01_6cc48741df9f05d19ba7d9ea3101e9fcd1309c9d6bda3c55668ba607492f725e
+2026/10/29 23:13:51 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarkerFeedback (13.68s)
+=== RUN   TestROSTypeVizInteractiveMarkerInit
+    gate_type_viz_extra_test.go:1573: matrix forward viz-iinit topic /chatter_ros_fwd_viz_iinit_4012239_1793297633053296322 hash RIHS01_23fda1b3373b154d9d6408dd7b9f8129b2a2b76b905ee421e8c4109d8bf71f78
+2026/10/29 23:13:58 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1573: matrix reverse viz-iinit topic /chatter_ros_rev_viz_iinit_4012239_1793297639067750362 hash RIHS01_23fda1b3373b154d9d6408dd7b9f8129b2a2b76b905ee421e8c4109d8bf71f78
+2026/10/29 23:14:05 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarkerInit (13.75s)
+=== RUN   TestROSTypeVizInteractiveMarkerUpdate
+    gate_type_viz_extra_test.go:1585: matrix forward viz-iupdate topic /chatter_ros_fwd_viz_iupdate_4012239_1793297646794982720 hash RIHS01_0a8b000c4fd4d50876ac716a7de018911599a2f015795388e956a2ca8b0c54f0
+2026/10/29 23:14:12 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_extra_test.go:1585: matrix reverse viz-iupdate topic /chatter_ros_rev_viz_iupdate_4012239_1793297652764239182 hash RIHS01_0a8b000c4fd4d50876ac716a7de018911599a2f015795388e956a2ca8b0c54f0
+2026/10/29 23:14:19 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizInteractiveMarkerUpdate (13.69s)
+=== RUN   TestROSTypeVizRest2MarkerArray
+    gate_type_viz_rest2_test.go:37: matrix forward viz-markerarray topic /chatter_ros_fwd_viz_markerarray_4012239_1793297660514420492 hash RIHS01_86cb8800b6fb05b5eff1abd7a56f62a5641d3ae9a1c29e78e67e704f1d067dcf
+2026/10/29 23:14:26 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:37: matrix reverse viz-markerarray topic /chatter_ros_rev_viz_markerarray_4012239_1793297666487105633 hash RIHS01_86cb8800b6fb05b5eff1abd7a56f62a5641d3ae9a1c29e78e67e704f1d067dcf
+2026/10/29 23:14:33 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2MarkerArray (13.75s)
+=== RUN   TestROSTypeVizRest2MenuEntry
+    gate_type_viz_rest2_test.go:45: matrix forward viz-menuentry topic /chatter_ros_fwd_viz_menuentry_4012239_1793297674216730900 hash RIHS01_22170c387c70fd4236232ec902de8604e72ff027342c7c0f28ad9f68c64c51d6
+2026/10/29 23:14:39 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:45: matrix reverse viz-menuentry topic /chatter_ros_rev_viz_menuentry_4012239_1793297680133957180 hash RIHS01_22170c387c70fd4236232ec902de8604e72ff027342c7c0f28ad9f68c64c51d6
+2026/10/29 23:14:46 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2MenuEntry (13.64s)
+=== RUN   TestROSTypeVizRest2ImageMarker
+    gate_type_viz_rest2_test.go:53: matrix forward viz-imagemarker topic /chatter_ros_fwd_viz_imagemarker_4012239_1793297687861382271 hash RIHS01_603152491ef2331c200a5305230d31f6e8704875944b388da0f547c415d11836
+2026/10/29 23:14:53 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:53: matrix reverse viz-imagemarker topic /chatter_ros_rev_viz_imagemarker_4012239_1793297693855045975 hash RIHS01_603152491ef2331c200a5305230d31f6e8704875944b388da0f547c415d11836
+2026/10/29 23:15:00 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2ImageMarker (13.70s)
+=== RUN   TestROSTypeVizRest2InteractiveMarkerControl
+    gate_type_viz_rest2_test.go:61: matrix forward viz-imcontrol topic /chatter_ros_fwd_viz_imcontrol_4012239_1793297701562302885 hash RIHS01_60e2fa36344f5f4791b24a809542a18bffd555f563550d4b22b3bbfc31ec0ed5
+2026/10/29 23:15:07 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:61: matrix reverse viz-imcontrol topic /chatter_ros_rev_viz_imcontrol_4012239_1793297707564326656 hash RIHS01_60e2fa36344f5f4791b24a809542a18bffd555f563550d4b22b3bbfc31ec0ed5
+2026/10/29 23:15:14 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarkerControl (13.71s)
+=== RUN   TestROSTypeVizRest2InteractiveMarker
+    gate_type_viz_rest2_test.go:69: matrix forward viz-imarker topic /chatter_ros_fwd_viz_imarker_4012239_1793297715264897744 hash RIHS01_3d5b51448b51d73b0f395b94d259edd3a5d269ae9f7d9fd5cceb9ae4b72be346
+2026/10/29 23:15:20 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:69: matrix reverse viz-imarker topic /chatter_ros_rev_viz_imarker_4012239_1793297721244760429 hash RIHS01_3d5b51448b51d73b0f395b94d259edd3a5d269ae9f7d9fd5cceb9ae4b72be346
+2026/10/29 23:15:27 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarker (13.65s)
+=== RUN   TestROSTypeVizRest2InteractiveMarkerPose
+    gate_type_viz_rest2_test.go:77: matrix forward viz-ipose topic /chatter_ros_fwd_viz_ipose_4012239_1793297728845599520 hash RIHS01_c60e9a4407d5f709a63e0fe9caea324aee08fe717cd090209ebe35012ce7cb66
+2026/10/29 23:15:34 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:77: matrix reverse viz-ipose topic /chatter_ros_rev_viz_ipose_4012239_1793297734780288916 hash RIHS01_c60e9a4407d5f709a63e0fe9caea324aee08fe717cd090209ebe35012ce7cb66
+2026/10/29 23:15:41 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarkerPose (13.59s)
+=== RUN   TestROSTypeVizRest2InteractiveMarkerFeedback
+    gate_type_viz_rest2_test.go:85: matrix forward viz-ifeedback topic /chatter_ros_fwd_viz_ifeedback_4012239_1793297742521234128 hash RIHS01_6cc48741df9f05d19ba7d9ea3101e9fcd1309c9d6bda3c55668ba607492f725e
+2026/10/29 23:15:48 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:85: matrix reverse viz-ifeedback topic /chatter_ros_rev_viz_ifeedback_4012239_1793297748500189362 hash RIHS01_6cc48741df9f05d19ba7d9ea3101e9fcd1309c9d6bda3c55668ba607492f725e
+2026/10/29 23:15:55 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarkerFeedback (13.73s)
+=== RUN   TestROSTypeVizRest2InteractiveMarkerInit
+    gate_type_viz_rest2_test.go:93: matrix forward viz-iinit topic /chatter_ros_fwd_viz_iinit_4012239_1793297756279605800 hash RIHS01_23fda1b3373b154d9d6408dd7b9f8129b2a2b76b905ee421e8c4109d8bf71f78
+2026/10/29 23:16:01 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:93: matrix reverse viz-iinit topic /chatter_ros_rev_viz_iinit_4012239_1793297762253418115 hash RIHS01_23fda1b3373b154d9d6408dd7b9f8129b2a2b76b905ee421e8c4109d8bf71f78
+2026/10/29 23:16:08 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarkerInit (13.75s)
+=== RUN   TestROSTypeVizRest2InteractiveMarkerUpdate
+    gate_type_viz_rest2_test.go:101: matrix forward viz-iupdate topic /chatter_ros_fwd_viz_iupdate_4012239_1793297769998230967 hash RIHS01_0a8b000c4fd4d50876ac716a7de018911599a2f015795388e956a2ca8b0c54f0
+2026/10/29 23:16:15 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17917
+    gate_type_viz_rest2_test.go:101: matrix reverse viz-iupdate topic /chatter_ros_rev_viz_iupdate_4012239_1793297776021255366 hash RIHS01_0a8b000c4fd4d50876ac716a7de018911599a2f015795388e956a2ca8b0c54f0
+2026/10/29 23:16:22 dds: multicast receive joined on domain 42 group port 17900 user port 17901 unicast port 17911
+--- PASS: TestROSTypeVizRest2InteractiveMarkerUpdate (13.77s)
+PASS
+ok  	github.com/podomy/weld/testbed/live/ros	1776.790s

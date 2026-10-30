@@ -15,8 +15,8 @@ coverage.out
 # Temp files folder
 .temp
 
-# Binary
-weld
+# Binary (repo root only, not cmd/ subdirectories)
+/weld
 
 # History folder
 .history/

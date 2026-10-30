@@ -22,7 +22,7 @@ One message encodes as one CDR byte stream. The encoder walks struct fields in I
 
 - Nested message: encoded inline in place
 - Sequence field: length prefix plus elements, embedded in the same stream
-- String field: length plus bytes plus NUL plus pad, embedded in the same stream
+- String field: length plus bytes plus NUL with no trailing pad, embedded in the same stream
 
 A message can therefore contain sequences while itself becoming a CDR stream. There is no separate CDR message per inner array. The outer stream contains the inner length prefixes and elements.
 
@@ -31,7 +31,7 @@ A message can therefore contain sequences while itself becoming a CDR stream. Th
 Plain XCDR1 per introspection:
 
 - Aligned primitives, `bool` as one byte, `wchar` as 2 bytes
-- Strings: 4 byte length plus bytes plus NUL plus zero pad to 4
+- Strings: 4 byte length plus bytes plus NUL with no trailing pad; the next member's `Align` absorbs the gap and `Bytes` pads a terminal string to 4. Example: `sensor_msgs/Image` with encoding `mono8` places `is_bigendian` immediately after the NUL, and the following `step` aligns from there.
 - Bounded strings truncate on rune boundary and report truncation; negative bounds error without mutation
 - Fixed arrays inline with 8 byte alignment and no length prefix; `float64[36]` covariance is the reference case
 - Unbounded sequences carry a `uint32` length prefix; bounded sequences have checked helpers
@@ -45,7 +45,7 @@ Reject on:
 
 - nonzero first byte or second byte above `1`
 - length prefix beyond caps
-- missing NUL, length beyond cap, truncated pad
+- missing NUL or truncated content
 - service header at wrong offset
 
 Drops never panic. Truncated, empty, and extra-field inputs increment drops with a metric. `UnmarshalMessage` returns an unvalidated prefix view; strict validation requires `Decoder` plus `Finish`, which detects trailing garbage that the prefix view accepts. Interior NUL, invalid UTF-8, and unpaired surrogates (to `U+FFFD`) are preserved by tolerant receive and documented as such.
@@ -53,7 +53,7 @@ Drops never panic. Truncated, empty, and extra-field inputs increment drops with
 ## Tests that pin it
 
 - LE and BE primitive round trips with golden bytes
-- String padding, empty string, bounded ASCII and astral (`U+1F600`) edges
+- String lazy pad, Image-shaped string plus `uint8` golden, empty string, bounded ASCII and astral (`U+1F600`) edges
 - Fixed array 8 byte alignment, sequence prefixes
 - Service GUID plus sequence LE and BE goldens, empty service `0x00`
 - `Align(8)` after the 20 byte service prefix (`20` to `24`)

@@ -1,0 +1,328 @@
+# Wireless for Weld
+
+Weld is robotics middleware in Go. It speaks ROS 2 on the wire (DDS RTPS with XCDR1 CDR) so Go programs join ROS 2 systems as first-class nodes. One Go core owns matching, routing, and supervision. Transports sit at the border behind one backend interface: DDS in v1 via a CycloneDDS sidecar, Zenoh and MQTT after v1. See `docs/design.md`, `docs/transports.md`, `docs/qos.md`.
+
+This file answers one question: what does the radio do to a fleet, and what must Weld do about it.
+
+Scope promise: sizing of topics, timers, and chaos tests for WiFi fleets. Deferred to other files: wire encoding (`docs/cdr.md`), matching rules (`docs/qos.md`), backend interface (`docs/transports.md`).
+
+Invariants for this file:
+
+- Every wireless claim must map to a Weld observable (log, metric, CLI output, or test) or it is removed.
+- Weld never tunes the radio. Weld tunes topic choice, message size, publish rate, reliability setting, and producer slowdown.
+- Partition is expected state, not error state.
+
+## 1. Why the air breaks fleets
+
+Wire is private. Air is shared. A wire carries one conversation in isolation. Radio sprays energy that every nearby receiver hears, so capacity is set by interference management, not by raw bandwidth.
+
+Three consequences shape everything below:
+
+- Same distance does not mean same link. Shadowing and multipath move the link while robots stand still.
+- Loss has memory. Errors arrive in bursts during fades and contention tails, not as independent coin flips.
+- Control traffic is load-bearing. Discovery, liveliness, and beacons are the control plane. Keep them small, periodic, and partition scoped.
+
+Weld mapping:
+
+- Discovery and liveliness are the control channel. Reconnect after flaky WiFi is a normal re-scan and re-register, not a failure path.
+- Graph index is partition local (`docs/design.md`). Two sides of a split each report only what they see. Merge on contact is deterministic, no vote.
+- QoS facade: advertise reliable plus transient-local on the wire for ROS 2 compatibility, implement behavior in core with backpressure, bounded retention, drop-oldest with lost counters, and deadline monitoring (`docs/qos.md`).
+
+## 2. Loss with distance
+
+### 2.1 Free space is the best case
+
+Power falls with distance squared in empty space with clear line of sight:
+
+```
+Pr(d) = Pt + Gt + Gr - 20*log10(4*pi*d / wavelength)
+```
+
+Legend: `Pr` received power in dBm, `Pt` transmit power in dBm, `Gt` and `Gr` antenna gains in dBi, `d` separation in meters, `wavelength = c / f` with `c = 3e8 m/s`. Valid only in far field with clear line of sight.
+
+Use this once to compute a 1 m reference, then stop. Everything real is worse.
+
+### 2.2 Log-distance sets the mean
+
+Average loss grows with log of distance, with slope set by environment:
+
+```
+PL(d) = PL(d0) + 10*n*log10(d / d0)
+```
+
+Legend: `PL` path loss in dB, `d0` close-in reference (1 m indoors, 100 m or 1 km outdoors), `PL(d0)` loss at `d0` from the free-space formula or a measurement, `n` loss exponent. Typical `n`: 2 in free space, 2.7 to 3.5 in cities, 1.6 to 1.8 in hallways that guide waves, 4 to 6 in badly blocked buildings.
+
+A range claim without `n` is meaningless. Going from `n = 2` to `n = 3.5` changes 10x-distance cost from 20 dB to 35 dB.
+
+### 2.3 Shadowing sets the surprise
+
+Real loss is the mean plus a random spread, Gaussian in dB:
+
+```
+PL_real(d) = PL(d) + X,  X ~ Normal(0, sigma)
+```
+
+Legend: `sigma` spread in dB. About 4 to 6 in suburbs, 8 to 12 in cities and obstructed indoors. Same `d`, different `X` per spot.
+
+This is why a stationary pair can partition when a door closes or a forklift passes. Weld must expire, rejoin quietly, and resync from bounded retention.
+
+Coverage at distance `d` against a threshold:
+
+```
+P_ok(d) = Q((threshold - Pr_mean(d)) / sigma)
+```
+
+Legend: `Pr_mean(d)` average received power in dBm, `threshold` minimum usable power such as radio sensitivity, `Q` tail of standard normal with `Q(0) = 0.5`. Design for a probability such as 75 percent of spots, never for the mean alone.
+
+### 2.4 Indoor keeper: add walls, not just meters
+
+```
+PL(d) = PL(d0) + 10*n*log10(d/d0) + sum(wall losses) + sum(floor losses)
+```
+
+Planning shape only: a light partition a few dB, a concrete wall order 10 dB, one floor order 15 to 30 dB. Measure per building. Indoors, relay placement relative to walls beats raw transmit power.
+
+### 2.5 Worked examples
+
+Example A, outdoor at 2.4 GHz, `Pt = 20 dBm`, `Gt = Gr = 0 dBi`, `d0 = 1 m`, `n = 3.5`, `d = 100 m`:
+
+```
+wavelength = 3e8 / 2.4e9 = 0.125 m
+PL(d0) = 20*log10(4*pi*1 / 0.125) = 40.05 dB
+PL(100) = 40.05 + 35*log10(100) = 40.05 + 70 = 110.05 dB
+Pr_mean = 20 - 110.05 = -90.05 dBm
+```
+
+With threshold `-95 dBm` and `sigma = 8 dB`:
+
+```
+P_ok = Q((-95 + 90.05) / 8) = Q(-0.62) = about 0.73
+```
+
+Read: mean 5 dB above sensitivity still leaves about 1 spot in 4 dead. That is normal shadowing.
+
+Example B, indoor office, same radio, `n = 3.0`, `d = 20 m`, one concrete wall 10 dB:
+
+```
+PL(20) = 40.05 + 30*log10(20) + 10 = 40.05 + 39.03 + 10 = 89.08 dB
+Pr_mean = 20 - 89.08 = -69.08 dBm
+```
+
+Read: 20 m indoors through one heavy wall costs nearly as much as 100 m outdoors above. One more floor and the link is gone while distance barely changed.
+
+### 2.6 Noise floor
+
+Warm circuits hiss. Wider bandwidth lets in proportionally more hiss:
+
+```
+Pn = k * T * B
+```
+
+Legend: `k = 1.38e-23 J/K`, `T` about 290 K, `B` bandwidth in Hz. A 20 MHz channel at 290 K gives `Pn = 8.0e-14 W = -101 dBm`. Treat about -95 to -100 dBm as the practical basement before fade margin. A link budget that needs signals near or below this is fiction.
+
+Front-end loss lands almost 1:1 on the budget. A 3 dB cable ahead of a 6 dB receiver gives system noise factor 8, about 9.0 dB. Keep antennas and pigtails on fleet robots short and documented.
+
+Weld rules from this section:
+
+- Never gate publishing, discovery, or liveness on an RSSI threshold. Gate on deadlines and discovery timeouts.
+- Retention and late-joiner catch-up exist because shadowing guarantees gaps. Signal strength is a log field for placement debugging, not a control input.
+- The container testbed uses host networking, so it hides partitions, walls, and roaming. Behavior proven only there is unproven for real robots until run over lossy partitioned links.
+
+## 3. Fading and motion
+
+Signal strength jumps over a few wavelengths or a fraction of a second while large-scale loss stays frozen. Cause: many copies arrive by different paths with different phases and add or cancel. A parked receiver can fade if nearby objects move.
+
+### 3.1 Doppler in one line
+
+```
+f_d = v / lambda * cos(theta)
+```
+
+Legend: `f_d` apparent frequency shift, `v` mobile speed, `lambda` carrier wavelength, `theta` angle between motion and incoming wave. Different paths have different `theta`, so one tone arrives as a spread band. That spread is why packets fail in runs.
+
+### 3.2 Echo spread numbers
+
+Power delay profile `P(tau)` is echo power versus extra delay. From it:
+
+```
+bar tau = sum P(tau_k) * tau_k / sum P(tau_k)
+sigma_tau = sqrt(mean square - bar tau^2)
+```
+
+Legend: `bar tau` mean excess delay, `sigma_tau` rms spread or width of echo cloud, `tau_k` bin delay with first arrival at 0. Typical `sigma_tau`: urban 1 to 10 microseconds, suburban 0.2 to 2 microseconds, indoor offices 10 to 100 nanoseconds.
+
+Weld intuition: `sigma_tau` is like queue plus retry tail width. Size history from tail width, not from mean latency.
+
+Coherence bandwidth is the frequency width over which the channel looks flat. Inverse to spread:
+
+```
+B_c approx 1 / (50 * sigma_tau) for correlation above 0.9
+B_c approx 1 / (5 * sigma_tau) for correlation above 0.5
+```
+
+A 30 kHz stream inside a 146 kHz flat width stays flat. A 200 kHz stream spills outside and distorts.
+
+Coherence time is the time the channel stays similar. Dual of Doppler spread:
+
+```
+T_c approx 1 / f_m, strict 9 / (16*pi*f_m), practical 0.423 / f_m
+```
+
+Legend: `f_m = v / lambda` maximum Doppler shift. A 900 MHz vehicle at highway speed gives `T_c` of a few milliseconds. Faster motion means shorter calm time.
+
+Four boxes, two independent questions: does the signal fit in the flat width (delay question), and does it finish before the channel changes (motion question). Flat means signal much narrower than `B_c` and symbol period much longer than `sigma_tau`. Frequency selective means echoes overlap symbols. Slow means channel frozen over several symbols, the normal case for Weld rates. Fast means channel changes inside one symbol, rare except very low rates or very fast motion.
+
+### 3.3 Rayleigh and Ricean in plain words
+
+Scattered-only reception with no direct ray has deep nulls. A steady direct ray fills them in.
+
+- Rayleigh: no line of sight, many similar scattered copies. Deep fades are normal. Median and mean differ by only about 0.55 dB, so field data often use median.
+- Ricean: one strong steady path plus scatter. Ratio of steady power to scattered variance is `K = A^2 / (2*sigma^2)`. `K` near zero means back to Rayleigh. Large `K` means near steady plus weak ripple.
+
+Level crossing rate `N_R` counts how often fades cross a threshold per second. Average fade duration is outage probability divided by `N_R`. Faster motion gives shorter but more frequent fades. The chapter example at `f_m = 200 Hz` gives about 200 microseconds at deep threshold and about 3.4 ms near rms; at `f_m = 20 Hz` about 18 ms at mid threshold.
+
+### 3.4 Why errors come in bursts
+
+A fade below usable level wipes several symbols or packets in a row, then many succeed. Short-term error rate during a fade can be orders of magnitude worse than the average. Average bit error rate misleads.
+
+Weld consequences:
+
+- Uniform random drop tests understate correlated outage. Use a two-state link in chaos tests: good state with loss near zero for seconds, bad state with loss 30 to 100 percent for a dwell time such as 300 ms, repeated. That dwell is the analog of coherence time or fade duration.
+- On repair, many NACKs and repairs can arrive together. Cap outstanding repair bytes, coalesce ranges, jitter responses. A run of `N` missing samples must increment the lost counter by `N` as one gap event, not double count on partial repair.
+- History depth must cover the tail. With publish rate `R` and target survivable outage `T_out`, need `D >= R * T_out + repair slack`. At 100 Hz with 200 ms outage, at least 20 depth before slack. A depth of 5 converts every 200 ms outage into permanent loss even if the network recovers.
+- Deadline policy: if deadline period `P` is much shorter than bad-state dwell, one spell causes many consecutive misses. Alert once per outage and clear once, not flap per sample. Program `T_bad / P` ratios such as 0.2, 1, 5, and 20 in fake-clock tests.
+
+## 4. From signal quality to packet loss
+
+Radio packs bits into a wave. Middleware decides which bytes deserve the unreliable capacity.
+
+Families in plain words: change height (ASK), change pitch (FSK), change starting angle (PSK), change height plus angle together (QAM). BPSK carries 1 bit per symbol with best energy efficiency in its group. QPSK carries 2 bits per symbol at about the same energy per bit in about half the bandwidth. Higher QAM packs more bits per Hz but needs cleaner signal. More tones in FSK need more bandwidth but less energy per bit. Constant-envelope forms such as GMSK survive cheap amplifiers and fading better with lower far-out spillover.
+
+Two efficiencies that fight each other:
+
+```
+eta = Rb / B
+Rs = Rb / log2(M)
+C = B * log2(1 + SNR)
+```
+
+Legend: `eta` bits per second per Hz, `Rb` information bit rate, `B` occupied bandwidth, `Rs` symbols per second on air, `M` alphabet size, `C` Shannon ceiling no scheme beats, `SNR` linear signal-to-noise ratio. BPSK and QPSK share the same noise waterfall shape. Higher QAM sits to the right: same error rate needs clearly more energy per bit.
+
+Fading average, concept only:
+
+```
+Pe_fading = average of Pe_awgn(X) over fading distribution of X
+```
+
+Legend: `X` instantaneous SNR, random because gain is random. Deep fades dominate the average. The curve stops being a waterfall and becomes a slow slope. Extra power helps little because errors come from rare deep nulls, not average noise.
+
+Spread spectrum in one paragraph each: multiply fast (direct sequence) turns other users and narrow interferers into extra background noise, with code gain `G = Wss / B`, but a close loud talker can drown a far quiet one unless power is controlled. Dodge fast (frequency hop) collides only when two users land in the same slot, with hit chance about `(K-1)/M` for `K` users and `M` channels, and leaves a floor set by hits no matter how strong the signal. Later systems split one fast fragile stream into many slow sturdy subcarriers side by side so delay spread becomes a smaller fraction of each symbol.
+
+Worked ceiling check: 30 dB SNR is ratio 1000. In 200 kHz, `C = 200000 * log2(1001)` is about 2.0 Mbit/s. A real system of that era lands near 270 kbit/s after guard bands, pilots, coding, margins, and sharing. Middleware must never budget Shannon. Budget measured goodput with margin.
+
+Weld rules:
+
+- Bound message sizes. One symbol error can kill a whole large frame and trigger a slow retry. Small packets decode more often at a given SNR and cost less airtime to retry.
+- Prefer small control topics at higher rate over large frames on lossy links. Small and often keeps deadline and liveliness fresh; bulk goes best-effort and droppable, shed first under backpressure.
+- No PHY knob in the Weld API. No option names a modulation, constellation size, hop channel, or target SNR. Adaptation is expressed as topic choice, message size, publish rate, reliability setting, and slow-the-producer behavior.
+
+## 5. Sharing one channel
+
+Ways to share in plain words: split by frequency (simple but rigid, idle lanes waste), take turns in time (efficient for steady streams, needs a shared clock), all talk at once with different codes (flexible for bursty users, needs power discipline), split by space with beams or sectors (multiplies capacity, needs antennas or separation). Real systems mix them.
+
+Aloha intuition: send whenever ready, retry after random wait on collision. A packet is vulnerable to any other packet that starts during its own length plus the length before it, so the danger window is about twice the packet length and useful output collapses at high load. Slotted Aloha halves the window by allowing starts only at slot edges. Even tuned perfectly, only about one third of the channel carries fresh data:
+
+```
+S_max = 1/e = about 0.37 for slotted Aloha
+```
+
+Legend: `S` useful packets per slot time, `e` natural-log base. Pure Aloha is roughly half that. Retries add load exactly like overload.
+
+WiFi uses listen-first with avoidance: wait for quiet, wait a little extra, pick a random backoff, count down only while quiet, then send. On collision double the random range and try again. Average delay grows with load, worst-case tail grows much faster. A radio usually cannot listen while it transmits, so collision detection while sending is impractical. Short request plus clear handshake reserves the channel around the receiver and pays off for long packets because a collision wastes only the short request.
+
+Hidden terminal: A and C both reach B but cannot hear each other. Both sense quiet, both send, they collide at B. Robot version: two robots at opposite hall ends publish to one access point and collide while each thinks the air is clear. Exposed terminal: C holds off needlessly when its send would not have harmed anyone. Near-far: a close loud streamer starves a far quiet telemetry source at the same receiver.
+
+Weld mapping:
+
+- DDS multicast discovery plus high-rate sensor topics stack three penalties on WiFi: multicast goes out at a low base rate to every station, every publisher contends independently, and hidden terminals defeat carrier sense at the access point. Adding one raw topic can push the whole cell past the useful peak, so discovery slows, endpoints flap, and retries add still more traffic.
+- Narrow the audience on wireless: unicast discovery with explicit peers, gossip or directory instead of fixed shouts to all, membership traffic small and infrequent and off the bulk burst. This lowers background load so sensor bursts stay left of collapse.
+- Backoff tails look like bursty deadline misses, not a slow link. Set sensor deadlines from 99th percentile delay, not the mean. Enable request handshake only for large frames (start near 500 to 1000 bytes and tune). Stagger periodic publishers so robots do not all fire in the same slot.
+
+Trunking for capacity planning: pooling channels is efficient; splitting pools wastes capacity. Offered load is `A = lambda * H` in Erlangs, arrival rate times mean holding time. Blocked-cleared systems follow Erlang B:
+
+```
+P(block) = (A^C / C!) / sum(A^k / k!, k = 0..C)
+```
+
+Legend: `C` channels, `A` offered Erlangs. Example: 2 relay slots carrying 1 Erlang block 20 percent; a third slot drops this to about 6 percent. Blocked-waiting systems follow Erlang C with mean delay `D = P(delayed) * H / (C - A)`, valid only when `C > A`. Weld use: back-of-envelope for bounded queues and relay slots before simulating. Keep one shared transport pool per failure domain, split into separate domains or radios only when measured interference justifies the pooling loss.
+
+## 6. Diversity, coding, and retransmit
+
+Channel has three stackable fixes: undo smearing, add independent looks, add redundancy.
+
+Equalizers undo time smearing when signal is wider than coherence bandwidth. Linear form is a tapped delay line with adjustable weights, simple but boosts noise in deep dips. Decision feedback adds a second filter fed by past decisions, cancels trailing smear without as much noise boost, risks error spread. Sequence search keeps a channel model and asks which whole transmitted sequence was most likely, best on severe smear at high compute cost. Weld analog is bounded: a shallow reorder buffer plus sequence-hole repair is the message-layer transversal filter. Keep it shallow and time bounded.
+
+Diversity gets independent looks with no extra power or spectrum. Space (separate antennas), polarization (scrambled components fade independently), frequency (carriers spaced wider than coherence bandwidth), time (repeat after a gap wider than coherence time). Combining: selection connects the strongest branch; maximal-ratio aligns and weights each branch by its own quality then adds, so output quality is the sum; scanning settles for first good-enough branch with one receiver. With `M` independent Rayleigh branches, chance all sit below threshold is single-branch outage raised to `M`. The chapter 4-branch example at mean 20 dB and threshold 10 dB falls from about 0.095 to about 0.00008. That is three orders of magnitude from adding looks, not power.
+
+Weld diversity above the radio: two radios, two access points, or parallel DDS plus Zenoh paths are independent branches. Treat backup as a live diversity branch with decorrelated failure (different NIC, AP, or path). Selection maps to deliver-first-wins with dedupe by origin GID plus sequence plus epoch. Combining maps to path confidence scores such as recent loss, latency, and gap count, used for path choice or prefetch, not bit combining.
+
+Coding plus interleaving: detection-only codes ask for a repeat on error. Correction codes add parity up front so the receiver fixes limited errors with no round trip, at always-on overhead. Retransmit wins when loss is rare and round trip fits budget. Proactive redundancy wins when feedback is slow, loss is bursty, or fanout makes NACK storms likely. Interleaving spreads neighbors apart so a burst hits scattered positions the code can fix, at pure delay cost: the receiver cannot decode until the full block arrives. The voice bound of about 40 ms has a Weld analog: every transform tail or scan sweep has a deadline. Size redundancy backward from that deadline.
+
+Weld rule: history cache plus explicit repair is Weld retransmit. Proactive duplicate or parity fragment is Weld correction. Sweep loss 0.1 percent to 10 percent and record the crossover where pure repair loses on tail latency; switch modes per topic priority at that measured threshold.
+
+## 7. Timers and QoS defaults from the radio facts
+
+Heartbeat says still here. Timeout says gone long enough to act. One missed heartbeat on a noisy channel is not death. Separate fast probe from slow verdict.
+
+Concrete Weld numbers already in `docs/design.md` and `docs/invariants.md`: bond-style liveliness with heartbeat period about 0.25 s, check timers about 0.2 s, manager bond timeout about 4.0 s, service timeout about 5.0 s, sub-second admission and deactivation bounds, action goal default 60 s when the client sets none.
+
+Derivation from sections above:
+
+- Liveliness lease must span several fades. Coherence and fade-duration math sets the dwell; lease covers multiples of it.
+- Deadline period `P` must be read against bad-state dwell `T_bad`. If `P` is much shorter, expect clustered misses: one alert per outage, then clear within one good period.
+- History depth follows `D >= R * T_out + repair slack`. Record `R`, `T_out`, and the chosen `D` together; a depth without its outage target is unreviewable.
+- Backward clock jumps rebase deadline tracking rather than unmatching. A wall-clock stamp against sim time must surface as an explicit clock-mismatch error with goal stamp and active domain, never freeze silently.
+
+Discovery on WiFi: do not trust multicast. Many access points turn broadcast into slow repeated unicasts or drop it. Discover over explicit unicast peers with domain isolation, version the graph with a generation counter, and treat a flap as a normal event. A genuine roam resolves as remove plus add with a counter step and no duplicates; a sub-second fade with no attachment change must not tick the generation. Debounce short fades the way handoff averages signal before moving, or operator tooling flickers on every fade.
+
+Cellular handoff pattern ports directly: threshold plus patience, measure neighbors, average before moving, reserve a few channels for transfers, queue transfers briefly. Dwell and hysteresis belong in Weld roam and lease design.
+
+## 8. Chaos test matrix and cheat sheet
+
+Axes: signal level, fade rate, load, partition. Replay profiles, not single numbers.
+
+- Signal: sweep SNR finely near threshold, where 1 to 2 dB swings loss by an order of magnitude. Anchor the axis at the noise floor near -101 dBm for 20 MHz and practical sensitivity near -95 dBm.
+- Fade rate: two-state link with programmed dwell (good seconds, bad hundreds of milliseconds). Ratios `T_bad / P` at 0.2, 1, 5, and 20.
+- Load: shared-pool offered load `A = lambda * H`. Compare shared pool against split pools at same load. Bulk sensor airtime capped near one third of measured goodput on the deployment cell; control kept small near 10 Hz on a separate profile.
+- Partition: split, query each side, publish each side, rejoin. Each side reports only its visible segment, no query blocks across the cut, no election runs, rejoin converges to the same sorted order with generation showing the flap and no duplicates.
+
+Pass and fail examples:
+
+- Burst loss accounting: good 0 percent for 5 s, bad 100 percent for 300 ms, 10 repeats, 50 Hz publish, depth 10. Expect about 15 lost per spell, 150 total, one contiguous gap per spell, no duplicate gap reports.
+- Depth covers outage: 100 Hz, depth 20, deadline 100 ms. A 150 ms outage delays but loses nothing if repairs succeed. A 500 ms outage loses about 30 per spell after drop-oldest with exact counter. At most one active deadline alert per spell.
+- Repair edge bounded: 200 Hz, 400 ms blackout, then perfect link, depth 100. Expect one coalesced gap request per missing range, duplicate factor under about 1.2, live samples not starved into a second outage.
+- Loss versus congestion: 10 percent random loss with empty queues shows drops plus counters without throughput collapse; filled bounded history asserting the full hint shows the caller slowing or shedding with bounded growth and late joiners still getting bounded retention.
+
+Cheat sheet:
+
+- dB: `gain_dB = 10*log10(P_out/P_in)`, `P_dBm = 10*log10(P_mW)`. 3 dB about doubles power, 10 dB times ten, 20 dB times one hundred. Never mix dB with dBm in one sum.
+- Poisson and exponential: count `P(k in t) = (lambda*t)^k * e^(-lambda*t) / k!`, tail `P(T > s) = e^(-s/H)`, load `A = lambda * H`. At 5 arrivals per second, chance of zero in 0.2 s is `e^-1 = 0.368`.
+- Erlang B and C as above. Needs `C > A` or the queue never drains.
+- Friis cascade in linear ratios: `F_sys = F1 + (F2-1)/G1 + ...`. Convert to dB at the end.
+- Q and error functions: `Q(z)` tail past `z` on unit bell, `Q(0) = 0.5`, `Q(3) = 0.00135`, `Q(z) = 0.5*erfc(z/sqrt(2))`, `Q(-z) = 1 - Q(z)`. At energy ratio 7 dB, coherent binary error is `Q(sqrt(2*5.01)) = Q(3.17) = 7.7e-4`.
+- Distributions: Gaussian for summed gusts (mean, variance); Rayleigh envelope with no direct path (mean `sigma*sqrt(pi/2)`); Ricean centered on direct ray once it dominates; uniform-jitter timer variance `(b-a)^2/12`.
+- Small-x: `e^x` about `1+x`, `ln(1+x)` about `x`, `sin x` and `tan x` about `x`, `cos x` about `1-x^2/2`.
+- Shannon is a ceiling: `C = B*log2(1+SNR)`. Budget measured goodput with margin.
+
+## 9. What was cut and why
+
+Cut because it fixes a dead voice-radio parameter that never crosses the Weld core boundary:
+
+- AMPS channel counts and splits, 30 kHz voice slots, 45 MHz duplex gaps, US duopoly tables, 7-channel spacing subsets.
+- Paging rates and FSK variants, cordless tables by country, IMT-2000 band predictions, LEO-as-pager speculation, 1990s penetration curves.
+- Full Bessel derivations for fading spectra, tap-update proofs, Galois-field tables, Viterbi traceback steps, PN polynomials. Keep results and gain intuition; look up proofs only when building a real PHY, which Weld does not.
+- Speech vocoder internals: LPC and codebook search, quantizer distribution fits, tandem test tables. Keep only the policy shape: rate buys quality at the cost of compute, delay, and fragility; protect important bits more; fill gaps at the edge.
+- Spec parameter dumps for obsolete air interfaces: deviations, chip rates, slot counts, message layouts, SID handling, carrier deployment history.
+- Generic calculus tables and bibliography. A CAS or libc replaces them.
+
+Kept because it changes a Weld decision: distance plus shadow law with worked budgets, fade duration versus lease, SNR-to-loss bridge with cliff warning, contention collapse with one-third rule, Erlang sizing for bounded queues, diversity as dual-path argument, repair versus redundancy crossover, explicit-peer discovery on WiFi, and the two-state chaos profiles above.

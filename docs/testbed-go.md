@@ -1,0 +1,101 @@
+# Go-only live testbed
+
+Go tests are the only live harness. No Python helpers exist in testbed. No new clones are needed.
+
+## Why Go only
+
+Containers already provide CycloneDDS plus ROS Jazzy. Go already encodes and decodes the wire:
+
+- XCDR1 String codec in `internal/types/cdr.go:68` (`NewEncoder`), `internal/types/cdr.go:290` (`WriteString`), `internal/types/cdr.go:880` (`ReadString`).
+- XCDR1 primitives for the ROS type matrix in `internal/types/cdr.go:209` (`WriteInt32`), `internal/types/cdr.go:234` (`WriteFloat64`), `internal/types/cdr.go:185` (`WriteBool`), plus `internal/types/cdr.go:617` (`NewDecoder`) for all takes.
+- SPDP marshal and parse in `internal/transports/dds/spdp.go:440` (`MarshalAlivePacket`) and `internal/transports/dds/spdp.go:572` (`ParseAnnouncement`).
+- SEDP marshal and parse in `internal/transports/dds/sedp.go:1030` (`SerializeSEDPDATA`) and `internal/transports/dds/sedp.go:1119` (`ParseSEDPDATA`).
+- In memory publish and receive path in `internal/transports/dds/datapath.go:175` (`NewPublisher`) and `internal/transports/dds/datapath.go:375` (`NewDataReceiver`).
+
+Adding Python would duplicate that codec and add a second failure surface. Adding clones would duplicate images that `testbed/docker-compose.yml:8-12` already defines.
+
+## Run without exec hell
+
+Rules:
+
+- Use `os/exec` with docker argv plus structured Env. See `testbed/live/helpers/helpers.go:191` (`DockerArgs`) and `testbed/live/helpers/helpers.go:327` (`ExecRun`).
+- No shell inside the container for ros2 calls. `testbed/live/helpers/helpers.go:109-122` (`ImageEnv`) replicates the Jazzy setup as `-e` flags, so `ros2` runs directly as argv. Same pattern in `testbed/live/helpers/distro.go:76` (`DistroEnv`) via `testbed/live/helpers/distro.go:109` (`DistroDockerArgs`).
+- Never run `compose up` per test. `weld-jazzy` already runs with host networking and `sleep infinity` per `testbed/docker-compose.yml:8-12`. Tests fail fast or skip when it is absent. See `testbed/live/helpers/helpers.go:412` (`SkipIfNoPeer`) and `testbed/live/helpers/distro.go:160` (`SkipIfNoDistroPeer`).
+- Bring the fleet up once: `cd testbed && docker compose up -d`. Then run Go tests only.
+
+Commands:
+
+```bash
+go test ./testbed/unit/... -count=1
+go test -tags live -timeout 60m ./testbed/live/... -count=1
+```
+
+Live runs need `-timeout 60m`: the default 10m package timeout fires mid-suite with the peer present. The ros package holds 187 top-level tests and QoS cases budget 30m each (see `testbed/live/ros/gate_qos_full_test.go:38`); raise the timeout further if the ros matrix still exceeds it.
+
+Per-package matrix (unit first, then live by package):
+
+```bash
+go test ./testbed/unit/cli/... -count=1
+go test ./testbed/unit/datapath/... -count=1
+go test ./testbed/unit/negative/... -count=1
+go test ./testbed/unit/ports/... -count=1
+go test ./testbed/unit/sedp/... -count=1
+go test ./testbed/unit/spdp/... -count=1
+```
+
+```bash
+go test -tags live ./testbed/live/gates/... -count=1
+go test -tags live ./testbed/live/cyclone/... -count=1
+go test -tags live -timeout 60m ./testbed/live/ros/... -count=1
+go test -tags live ./testbed/live/cli/... -count=1
+```
+
+Skip-when-absent rule: every live test calls `SkipIfNoPeer` first and type
+matrix tests also call `SkipIfNoTypeInterface`. A missing docker daemon, a
+stopped peer, or a missing `ros2 interface show` type skips cleanly. Failed
+wire, payload, or route asserts still fail. See
+`testbed/live/helpers/helpers.go:412`, `testbed/live/helpers/live.go:271`,
+and `testbed/live/helpers/distro.go:160`.
+
+Sentinel versus live-ID rule: header types carry the per-run live ID in
+`frame_id`; types without a string field use a fixed sentinel and rely on
+per-run topic plus domain isolation. See
+`testbed/live/ros/gate_type_matrix_test.go:43` plus live `frame_id` at
+`testbed/live/ros/gate_type_matrix_test.go:382`, ID creation at
+`testbed/live/helpers/helpers.go:130`, and topic derivation at
+`testbed/live/helpers/helpers.go:143`. A missing type skips, a known
+no-route pub skips after the local codec passes
+(`testbed/live/helpers/live.go:351`), and backend errors fail
+(`testbed/live/helpers/live.go:324`).
+
+## Domain split
+
+- Domain 42 is the ROS type matrix on per-run topics. String round trip on `/chatter` is pinned in `testbed/live/ros/roundtrip_test.go:24` (`rosDomain`). The extended matrix for Int32 plus Float64 plus Bool plus geometry plus sensor is pinned in `testbed/live/ros/gate_type_matrix_test.go:105` (cases) with tests at `testbed/live/ros/gate_type_matrix_test.go:770` and reuses the same domain with per-run topic isolation.
+- Domain 48 is SPDP acceptance. Pinned in `testbed/live/cyclone/gate1_spdp_test.go:20` (`gateDomain`).
+- Domain 47 is the single entrypoint live gate in `testbed/live/helpers/helpers.go:40` (`LiveDomain`), kept off 42 and 48 so runs never hear each other.
+- Domains 43 and 44 are the distro matrix: Humble on 43 (`testbed/live/helpers/distro.go:46-50`), Rolling on 44 (`testbed/live/helpers/distro.go:54-58`).
+- Domains 60 through 69 are ephemeral isolation for liveliness and CLI checks, so they never hear 42, 47, or 48 (`testbed/live/helpers/helpers.go:49-52`).
+- Only one run per domain plus topic at a time. Multicast groups overlap otherwise.
+- Every live run uses a per run live ID for payload isolation. See `testbed/live/helpers/helpers.go:130` (`LiveID`) and `testbed/live/helpers/helpers.go:143` (`LiveTopic`). Start and assert must reuse the same ID.
+
+## File split
+
+Cyclone SPDP and ROS String checks live in different packages:
+
+- `testbed/live/cyclone/gate1_spdp_test.go:370` (`TestCycloneGate1SPDPST0NonLocalPureGo`) and `testbed/live/cyclone/gate1_spdp_test.go:411` (`TestCycloneGate1SPDPST0NonLocalLive`) prove SPDP acceptance on domain 48 with direct UDP only. No ROS topics. No trace files.
+- `testbed/live/ros/roundtrip_test.go:45` (`TestROSForwardWeldEchoSeesROSTalker`) and `testbed/live/ros/roundtrip_test.go:94` (`TestROSReverseROSEchoSeesWeldPub`) prove String payloads on domain 42 and `/chatter`. No SPDP asserts. Scope is pinned in `testbed/live/ros/doc.go:4-13`.
+- `testbed/live/ros/gate_type_matrix_test.go:105` (cases) with tests at `testbed/live/ros/gate_type_matrix_test.go:770` proves one live case per type on domain 42 with per-run topics. Each case runs forward (`ros2 topic pub` to Weld take decoded via `NewDecoder`) plus reverse (Weld pub to `ros2 topic echo`). Header types carry the live ID in `frame_id` (`testbed/live/ros/gate_type_matrix_test.go:382`), other types use a fixed sentinel (`testbed/live/ros/gate_type_matrix_test.go:43`) with topic plus domain isolation. Missing `ros2 interface show` skips cleanly (`testbed/live/helpers/live.go:271`). Known no-route pub skips after the local codec passes (`testbed/live/helpers/live.go:351`), backend errors fail (`testbed/live/helpers/live.go:324`).
+- `testbed/live/gates/gate1_test.go:31` (`TestGate1SPDPAcceptance`) and `testbed/live/gates/gate2_test.go:27` plus `testbed/live/gates/gate2_test.go:81` (forward plus reverse) are the single entrypoint equivalents on domain 47. Shared helpers live in `testbed/live/helpers/helpers.go:191`.
+
+Do not mix SPDP wire asserts into ROS payload tests. Do not mix String payload asserts into SPDP tests.
+
+## Bulletproof checks
+
+- Prove non local by GUID prefix inequality, not by grepping trace. See `testbed/live/cyclone/gate1_spdp_test.go:101` (`checkGateAnnouncement`) and `testbed/live/gates/gate1_test.go:31`.
+- Decode with `ParseAnnouncement` and `ParseSEDPDATA`, not by grepping trace text. See `testbed/live/cyclone/gate1_spdp_test.go:291` plus `internal/transports/dds/spdp.go:572`. Failures count as deserialization failures with zero tolerance in `testbed/live/cyclone/gate1_spdp_test.go:392-394`.
+- Bound every docker and weld call with `context.WithTimeout`, not with the `timeout` binary. See `testbed/live/helpers/helpers.go:327`, and `testbed/live/ros/roundtrip_test.go:45`.
+- Skip when no daemon or no peer is present. Never fail the suite for a missing container. See `testbed/live/helpers/helpers.go:412`, `testbed/live/helpers/distro.go:160`.
+
+## Status note
+
+Go tests are the canonical live harness. No shell harnesses remain under testbed. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (`internal/transports/dds/datapath.go:746`) plus SEDP fixes; reverse is green after writer `03c2` (`internal/transports/dds/sedp.go:149-157`) plus announce loop (`internal/transports/dds/sedp.go:633`) plus Heartbeat (`internal/transports/dds/backend.go:1347`). The gap skip remains only when the peer echo misses the live ID. Backend errors and missing `sent:` still fail. The type matrix in `testbed/live/ros/gate_type_matrix_test.go:105` follows the same rule: local XCDR1 codec proof must pass, live interop may skip on the no-route gap (`testbed/live/helpers/live.go:351`), and `ros2 interface show` absence skips cleanly (`testbed/live/helpers/live.go:271`). Full wire record is in [Conformance](./conformance.md).

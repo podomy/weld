@@ -1,0 +1,417 @@
+# Conformance
+
+End state after the locator, port, and pad fixes. Two checks stay separate:
+a Cyclone SPDP acceptance probe and the ROS `std_msgs/String` round trip.
+
+## Scope
+
+v1 gates cover CycloneDDS only. Design pins bit level compatibility
+with CycloneDDS peers in v1 (`docs/design.md:31`, `docs/overview.md:31`)
+and lists FastDDS, Zenoh, and MQTT as post v1
+(`docs/design.md:41`, `docs/transports.md:38`). CycloneDDS runs as a sidecar process
+(`docs/transports.md:30`).
+
+Cyclone checks and ROS checks stay separate. SPDP checks assert wire
+fields and never assert String payloads. ROS checks assert String
+payloads and never parse SPDP trace. The split is pinned in
+`testbed/live/ros/doc.go:4-14`.
+
+## Wire identity
+
+- Domain ports use `B = 7400 + 250 * domain`: multicast `B/B+1`,
+  unicast `B+10/B+11` for participant 0
+  (`internal/transports/dds/rtps/udp.go:25`,
+  `internal/transports/dds/rtps/udp.go:95-114`).
+  Domain 48 is multicast `19400/19401` and unicast `19410/19411`.
+- LAN IP is advertised via `rtps.AdvertiseIPv4`
+  (`internal/transports/dds/rtps/udp.go:1275`): first up
+  multicast-capable non-loopback IPv4, loopback fallback.
+  SPDP locators carry it (`internal/transports/dds/spdp.go:471`).
+- Unicast bind is wildcard `AnyIPv4 = "0.0.0.0"`
+  (`internal/transports/dds/rtps/udp.go:44-46`,
+  `internal/transports/dds/rtps/udp.go:550`)
+  so LAN-directed packets arrive alongside loopback traffic.
+  `DialUnicast` binds the first free user unicast slot from participant 0
+  (`internal/transports/dds/rtps/udp.go:682`,
+  `internal/transports/dds/rtps/udp.go:708`).
+  The live unicast port is patched into SPDP locators before each send
+  (`internal/transports/dds/backend.go:985`,
+  `internal/transports/dds/spdp.go:913`).
+
+## SPDP
+
+- Alive packet is 264 bytes (`internal/transports/dds/spdp_test.go:561`).
+- `UserData` value is pad-in-length: length prefix includes the zero pad
+  to 4 bytes, matching CycloneDDS. Cyclone sends length 16 for the
+  14 byte `enclave=/;` value plus 2 pad, and rejects the
+  length-excludes-pad form
+  (`internal/transports/dds/spdp.go:494-505`,
+  `testbed/unit/spdp/conformance_test.go:381`).
+- Builtin endpoint mask `0x0000003F`
+  (`internal/transports/dds/spdp.go:354-358`).
+- Multi-port routes: receivers collect all unicast locator ports in wire order;
+  multicast locators never count (`internal/transports/dds/spdp.go:843`).
+  Bootstrap probes both meta and user unicast for 16 participants
+  (`internal/transports/dds/backend.go:950`).
+  Per-peer port lists flatten deduped
+  (`internal/transports/dds/backend.go:1283`)
+  and fan out unicast (`internal/transports/dds/backend.go:1316`).
+
+## SEDP
+
+- CDR strings are pad-in-length: the 4 byte length includes NUL plus zero
+  pad to 4 bytes (`internal/transports/dds/sedp.go:1654`).
+  Octet sequences use the same rule (`internal/transports/dds/sedp.go:1719`).
+  Pinned by `testbed/unit/sedp/conformance_test.go:392` and
+  `testbed/unit/sedp/conformance_test.go:429`.
+- Flags are always `LE | InlineQoS | Data` (`0x07`).
+  Endpoint DATA always carries a PL_CDR payload copy of the params
+  (`internal/transports/dds/sedp.go:1092`).
+  Pinned by `testbed/unit/sedp/conformance_test.go:481`.
+- Sequence numbers use per-writer streams keyed on participant prefix plus writer entity (`sedpWriterSeqLast`);
+  encoding is high word then low word per RTPS, pinned by
+  `testbed/unit/sedp/conformance_test.go:530`.
+- Every DATA carries HEARTBEATs: publications announce from `0x000002c2`
+  plus the CycloneDDS variant `0x000003c2`, subscriptions from `0x000004c2`
+  (`internal/transports/dds/sedp.go:149-157`,
+  append at `internal/transports/dds/sedp.go:954-964`,
+  writers at `internal/transports/dds/sedp.go:962`).
+  Heartbeat body is 28 bytes (`internal/transports/dds/sedp.go:131-132`).
+  Pinned by `testbed/unit/sedp/conformance_test.go:604`.
+  Announce repeats every 1 s with fresh sequences
+  (`internal/transports/dds/sedp.go:633`).
+- Inline QoS carries reliability kind 2 with infinite blocking,
+  history KEEP_LAST depth 100, protocol version 2.1, vendor id 01 10
+  (`internal/transports/dds/sedp.go:163-174`,
+  encode at `internal/transports/dds/sedp.go:1774`).
+  Writers offer transient-local durability; readers request volatile like
+  `ros2 topic echo`, which flows against both volatile talkers (the
+  `ros2 topic pub` default) and transient talkers including their
+  backlog. Pinned by `testbed/unit/sedp/conformance_test.go:653`
+  (writer offer) and `TestSEDPReaderRequestsVolatile` (reader request).
+- SPDP announces the actually bound unicast ports, not participant-zero
+  ports, so a second participant on one host does not divert its
+  metatraffic and user DATA to the first participant's socket.
+  Pinned by `TestMarshalAliveWithPortsAnnouncesBoundPorts`.
+- User-traffic multicast is joined alongside SPDP multicast, so every
+  local participant receives user DATA and heartbeats by fanout instead
+  of depending on per-reader unicast. Pinned by
+  `TestBackendUserMulticastDeliversData`.
+- Writer set is `0x000002c2` plus `0x000003c2` plus `0x000004c2`
+  (`internal/transports/dds/sedp.go:149-157`).
+  Pinned by `testbed/unit/sedp/conformance_test.go:804`.
+
+## Type hashes
+
+All 8 IDLs have pinned RIHS01 hashes. Dispatcher is
+`internal/transports/dds/backend.go:2249`. Pins are in
+`testbed/unit/sedp/conformance_matrix_hash_test.go:88`.
+
+- `std_msgs__msg__String`:
+  `RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18`
+  (`internal/transports/dds/sedp.go:199-200`)
+- `std_msgs__msg__Int32`:
+  `RIHS01_b6578ded3c58c626cfe8d1a6fb6e04f706f97e9f03d2727c9ff4e74b1cef0deb`
+- `std_msgs__msg__Float64`:
+  `RIHS01_705ba9c3d1a09df43737eb67095534de36fd426c0587779bda2bc51fe790182a`
+- `std_msgs__msg__Bool`:
+  `RIHS01_feb91e995ff9ebd09c0cb3d2aed18b11077585839fb5db80193b62d74528f6c9`
+- `geometry_msgs__msg__Vector3`:
+  `RIHS01_cc12fe83e4c02719f1ce8070bfd14aecd40f75a96696a67a2a1f37f7dbb0765d`
+- `geometry_msgs__msg__PointStamped`:
+  `RIHS01_4c0296af86e01e562e9e0405d138a01537247580076c58ea38d7923ac1045897`
+- `sensor_msgs__msg__Temperature`:
+  `RIHS01_72514a14126ab9f8a9abec974c78e5610a367b59db5da355ff1fb982d5bad4b8`
+- `sensor_msgs__msg__FluidPressure`:
+  `RIHS01_22dfb2b145a0bd5a31a1ac3882a1b32148b51d9b2f3bab250290d66f3595bc32`
+
+## Type coverage
+
+124 corpus rows in topological order (`internal/types/corpus.go:108`,
+manifest pin in `internal/types/corpus_test.go:450`, shape pin in
+`internal/types/corpus_test.go:13`). Status values: `live` is forward plus
+reverse pub and echo on domain 42 (`testbed/live/ros/roundtrip_test.go:24`,
+large payloads on domain 55 at `testbed/live/ros/gate_large_payload_test.go`,
+46 abandoned for host-container traffic) with
+per-run topics. Every live gate calls `SkipIfNoPeer` first and skips when
+the peer or the ROS type is absent (`testbed/live/helpers/helpers.go:412`,
+`testbed/live/ros/gate_type_matrix_test.go:177`). `pure-Go-only` is XCDR
+envelope round trip with no topic path. `service` is KindService on rq
+and rr with no rt topic gate, so the Live gate column is N/A and the
+Pure-Go pin cites the service XCDR test, except `std_srvs/Trigger`
+which is live-gated forward plus reverse plus deadline
+(`testbed/live/ros/gate_service_call_test.go:471,508,560`).
+`missing` is corpus structural
+pin only with no wire codec or live gate. Counts: live 115,
+pure-Go-only 2, service 7, missing 0.
+All 124 rows have gates or pure-Go pins. The 13 former `std_msgs` missing
+rows (`Int16`, `Int64`, `UInt64` plus the 10 multi-array types other than
+`ByteMultiArray`) now have live gates in
+`testbed/live/ros/gate_type_std_multi_test.go` with pure-Go XCDR pins in
+`testbed/unit/std_multis_extra_test.go`. Rest2 alias gates in
+`testbed/live/ros/gate_type_std_rest2_test.go:100`,
+`testbed/live/ros/gate_type_geometry_rest2_test.go:71`,
+`testbed/live/ros/gate_type_viz_rest2_test.go:33`,
+`testbed/live/ros/gate_type_diag_rest2_test.go:398`, and
+`testbed/live/ros/gate_type_misc_rest2_test.go:86` reuse existing corpus rows.
+`std_msgs/ByteMultiArray` forward uses per-element `!!binary` YAML
+(`testbed/live/ros/gate_type_std_rest_test.go:300`) because the integer list
+form crashes the ROS CLI talker with SIGABRT (see `docs/interop.md:124`).
+
+| Type | Kind | Corpus | Live gate | Pure-Go pin | Status |
+| ---- | ---- | ------ | --------- | ----------- | ------ |
+| builtin_interfaces/Duration | message | `internal/types/corpus.go:110` | `testbed/live/ros/gate_type_builtin_test.go:172`, `testbed/live/ros/gate_type_builtin_test.go:128` | `testbed/unit/datapath/conformance_builtin_extra_test.go:147` | live |
+| builtin_interfaces/Time | message | `internal/types/corpus.go:111` | `testbed/live/ros/gate_type_builtin_test.go:161`, `testbed/live/ros/gate_type_builtin_test.go:114` | `testbed/unit/datapath/conformance_builtin_extra_test.go:147` | live |
+| std_msgs/Bool | message | `internal/types/corpus.go:114` | `testbed/live/ros/gate_type_matrix_test.go:792`, `testbed/live/ros/gate_type_matrix_test.go:125` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:31` | live |
+| std_msgs/Byte | message | `internal/types/corpus.go:115` | `testbed/live/ros/gate_type_std_extra_test.go:615`, `testbed/live/ros/gate_type_std_extra_test.go:118` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Char | message | `internal/types/corpus.go:116` | `testbed/live/ros/gate_type_std_extra_test.go:603`, `testbed/live/ros/gate_type_std_extra_test.go:108` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/ColorRGBA | message | `internal/types/corpus.go:117` | `testbed/live/ros/gate_type_std_rest_test.go:425`, `testbed/live/ros/gate_type_std_rest_test.go:84` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Empty | message | `internal/types/corpus.go:118` | `testbed/live/ros/gate_type_std_extra_test.go:626`, `testbed/live/ros/gate_type_std_extra_test.go:128` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Float32 | message | `internal/types/corpus.go:119` | `testbed/live/ros/gate_type_std_extra_test.go:591`, `testbed/live/ros/gate_type_std_extra_test.go:98` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Float64 | message | `internal/types/corpus.go:120` | `testbed/live/ros/gate_type_matrix_test.go:781`, `testbed/live/ros/gate_type_matrix_test.go:115` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:30` | live |
+| std_msgs/Header | message | `internal/types/corpus.go:121` | `testbed/live/ros/gate_type_std_extra_test.go:637`, `testbed/live/ros/gate_type_std_extra_test.go:138` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Int16 | message | `internal/types/corpus.go:122` | `testbed/live/ros/gate_type_std_multi_test.go:973`, `testbed/live/ros/gate_type_std_multi_test.go:86` | `testbed/unit/std_multis_extra_test.go:194` | live |
+| std_msgs/Int32 | message | `internal/types/corpus.go:123` | `testbed/live/ros/gate_type_matrix_test.go:770`, `testbed/live/ros/gate_type_matrix_test.go:105` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:29` | live |
+| std_msgs/Int64 | message | `internal/types/corpus.go:124` | `testbed/live/ros/gate_type_std_multi_test.go:981`, `testbed/live/ros/gate_type_std_multi_test.go:96` | `testbed/unit/std_multis_extra_test.go:194` | live |
+| std_msgs/Int8 | message | `internal/types/corpus.go:125` | `testbed/live/ros/gate_type_std_extra_test.go:547`, `testbed/live/ros/gate_type_std_extra_test.go:68` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/String | message | `internal/types/corpus.go:126` | `testbed/live/ros/roundtrip_test.go:45`, `testbed/live/ros/roundtrip_test.go:94` | `testbed/unit/datapath/conformance_test.go:491` | live |
+| std_msgs/UInt16 | message | `internal/types/corpus.go:127` | `testbed/live/ros/gate_type_std_extra_test.go:569`, `testbed/live/ros/gate_type_std_extra_test.go:78` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/UInt32 | message | `internal/types/corpus.go:128` | `testbed/live/ros/gate_type_std_extra_test.go:580`, `testbed/live/ros/gate_type_std_extra_test.go:88` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/UInt64 | message | `internal/types/corpus.go:129` | `testbed/live/ros/gate_type_std_multi_test.go:989`, `testbed/live/ros/gate_type_std_multi_test.go:106` | `testbed/unit/std_multis_extra_test.go:194` | live |
+| std_msgs/UInt8 | message | `internal/types/corpus.go:130` | `testbed/live/ros/gate_type_std_extra_test.go:547`, `testbed/live/ros/gate_type_std_extra_test.go:58` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/MultiArrayDimension | message | `internal/types/corpus.go:131` | `testbed/live/ros/gate_type_std_rest_test.go:401`, `testbed/live/ros/gate_type_std_rest_test.go:64` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/MultiArrayLayout | message | `internal/types/corpus.go:132` | `testbed/live/ros/gate_type_std_rest_test.go:412`, `testbed/live/ros/gate_type_std_rest_test.go:74` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/ByteMultiArray | message | `internal/types/corpus.go:133` | `testbed/live/ros/gate_type_std_rest_test.go:438`, `testbed/live/ros/gate_type_std_rest_test.go:300` | `internal/types/corpus_test.go:13` | live |
+| std_msgs/Float32MultiArray | message | `internal/types/corpus.go:134` | `testbed/live/ros/gate_type_std_multi_test.go:997`, `testbed/live/ros/gate_type_std_multi_test.go:116` | `testbed/unit/std_multis_extra_test.go:252` | live |
+| std_msgs/Float64MultiArray | message | `internal/types/corpus.go:135` | `testbed/live/ros/gate_type_std_multi_test.go:1005`, `testbed/live/ros/gate_type_std_multi_test.go:126` | `testbed/unit/std_multis_extra_test.go:263` | live |
+| std_msgs/Int16MultiArray | message | `internal/types/corpus.go:136` | `testbed/live/ros/gate_type_std_multi_test.go:1013`, `testbed/live/ros/gate_type_std_multi_test.go:136` | `testbed/unit/std_multis_extra_test.go:274` | live |
+| std_msgs/Int32MultiArray | message | `internal/types/corpus.go:137` | `testbed/live/ros/gate_type_std_multi_test.go:1021`, `testbed/live/ros/gate_type_std_multi_test.go:146` | `testbed/unit/std_multis_extra_test.go:285` | live |
+| std_msgs/Int64MultiArray | message | `internal/types/corpus.go:138` | `testbed/live/ros/gate_type_std_multi_test.go:1029`, `testbed/live/ros/gate_type_std_multi_test.go:156` | `testbed/unit/std_multis_extra_test.go:296` | live |
+| std_msgs/Int8MultiArray | message | `internal/types/corpus.go:139` | `testbed/live/ros/gate_type_std_multi_test.go:1037`, `testbed/live/ros/gate_type_std_multi_test.go:166` | `testbed/unit/std_multis_extra_test.go:307` | live |
+| std_msgs/UInt16MultiArray | message | `internal/types/corpus.go:140` | `testbed/live/ros/gate_type_std_multi_test.go:1045`, `testbed/live/ros/gate_type_std_multi_test.go:176` | `testbed/unit/std_multis_extra_test.go:314` | live |
+| std_msgs/UInt32MultiArray | message | `internal/types/corpus.go:141` | `testbed/live/ros/gate_type_std_multi_test.go:1053`, `testbed/live/ros/gate_type_std_multi_test.go:186` | `testbed/unit/std_multis_extra_test.go:325` | live |
+| std_msgs/UInt64MultiArray | message | `internal/types/corpus.go:142` | `testbed/live/ros/gate_type_std_multi_test.go:1061`, `testbed/live/ros/gate_type_std_multi_test.go:196` | `testbed/unit/std_multis_extra_test.go:336` | live |
+| std_msgs/UInt8MultiArray | message | `internal/types/corpus.go:143` | `testbed/live/ros/gate_type_std_multi_test.go:1069`, `testbed/live/ros/gate_type_std_multi_test.go:206` | `testbed/unit/std_multis_extra_test.go:347` | live |
+| geometry_msgs/Point | message | `internal/types/corpus.go:146` | `testbed/live/ros/gate_type_geometry_rest_test.go:1600`, `testbed/live/ros/gate_type_geometry_rest_test.go:1354` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Point32 | message | `internal/types/corpus.go:147` | `testbed/live/ros/gate_type_geometry_rest_test.go:1611`, `testbed/live/ros/gate_type_geometry_rest_test.go:1364` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Quaternion | message | `internal/types/corpus.go:148` | `testbed/live/ros/gate_type_geometry_extra_test.go:303`, `testbed/live/ros/gate_type_geometry_extra_test.go:256` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Vector3 | message | `internal/types/corpus.go:149` | `testbed/live/ros/gate_type_matrix_test.go:803`, `testbed/live/ros/gate_type_matrix_test.go:135` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:32` | live |
+| geometry_msgs/Accel | message | `internal/types/corpus.go:150` | `testbed/live/ros/gate_type_geometry_rest_test.go:1622`, `testbed/live/ros/gate_type_geometry_rest_test.go:1374` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Inertia | message | `internal/types/corpus.go:151` | `testbed/live/ros/gate_type_geometry_rest_test.go:1633`, `testbed/live/ros/gate_type_geometry_rest_test.go:1384` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Polygon | message | `internal/types/corpus.go:152` | `testbed/live/ros/gate_type_geometry_rest_test.go:1644`, `testbed/live/ros/gate_type_geometry_rest_test.go:1394` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Pose | message | `internal/types/corpus.go:153` | `testbed/live/ros/gate_type_geometry_extra_test.go:292`, `testbed/live/ros/gate_type_geometry_extra_test.go:246` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Transform | message | `internal/types/corpus.go:154` | `testbed/live/ros/gate_type_geometry_rest_test.go:1655`, `testbed/live/ros/gate_type_geometry_rest_test.go:1404` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Twist | message | `internal/types/corpus.go:155` | `testbed/live/ros/gate_type_geometry_extra_test.go:314`, `testbed/live/ros/gate_type_geometry_extra_test.go:266` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Wrench | message | `internal/types/corpus.go:156` | `testbed/live/ros/gate_type_geometry_rest_test.go:1666`, `testbed/live/ros/gate_type_geometry_rest_test.go:1414` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/AccelWithCovariance | message | `internal/types/corpus.go:157` | `testbed/live/ros/gate_type_geometry_rest_test.go:1677`, `testbed/live/ros/gate_type_geometry_rest_test.go:1424` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/PoseWithCovariance | message | `internal/types/corpus.go:158` | `testbed/live/ros/gate_type_geometry_rest_test.go:1688`, `testbed/live/ros/gate_type_geometry_rest_test.go:1434` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/TwistWithCovariance | message | `internal/types/corpus.go:159` | `testbed/live/ros/gate_type_geometry_rest_test.go:1699`, `testbed/live/ros/gate_type_geometry_rest_test.go:1444` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/AccelStamped | message | `internal/types/corpus.go:160` | `testbed/live/ros/gate_type_geometry_rest_test.go:1709`, `testbed/live/ros/gate_type_geometry_rest_test.go:1454` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/AccelWithCovarianceStamped | message | `internal/types/corpus.go:161` | `testbed/live/ros/gate_type_geometry_rest_test.go:1719`, `testbed/live/ros/gate_type_geometry_rest_test.go:1464` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/InertiaStamped | message | `internal/types/corpus.go:162` | `testbed/live/ros/gate_type_geometry_rest_test.go:1729`, `testbed/live/ros/gate_type_geometry_rest_test.go:1474` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/PointStamped | message | `internal/types/corpus.go:163` | `testbed/live/ros/gate_type_matrix_test.go:814`, `testbed/live/ros/gate_type_matrix_test.go:145` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:33` | live |
+| geometry_msgs/PolygonStamped | message | `internal/types/corpus.go:164` | `testbed/live/ros/gate_type_geometry_rest_test.go:1739`, `testbed/live/ros/gate_type_geometry_rest_test.go:1484` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/PoseArray | message | `internal/types/corpus.go:165` | `testbed/live/ros/gate_type_geometry_rest_test.go:1750`, `testbed/live/ros/gate_type_geometry_rest_test.go:1494` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/PoseStamped | message | `internal/types/corpus.go:166` | `testbed/live/ros/gate_type_geometry_rest_test.go:1760`, `testbed/live/ros/gate_type_geometry_rest_test.go:1504` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/PoseWithCovarianceStamped | message | `internal/types/corpus.go:167` | `testbed/live/ros/gate_type_geometry_rest_test.go:1770`, `testbed/live/ros/gate_type_geometry_rest_test.go:1514` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/QuaternionStamped | message | `internal/types/corpus.go:168` | `testbed/live/ros/gate_type_geometry_rest_test.go:1781`, `testbed/live/ros/gate_type_geometry_rest_test.go:1524` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/TransformStamped | message | `internal/types/corpus.go:169` | `testbed/live/ros/gate_type_geometry_rest_test.go:1792`, `testbed/live/ros/gate_type_geometry_rest_test.go:1534` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/TwistStamped | message | `internal/types/corpus.go:170` | `testbed/live/ros/gate_type_geometry_rest_test.go:1802`, `testbed/live/ros/gate_type_geometry_rest_test.go:1544` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/TwistWithCovarianceStamped | message | `internal/types/corpus.go:171` | `testbed/live/ros/gate_type_geometry_rest_test.go:1812`, `testbed/live/ros/gate_type_geometry_rest_test.go:1554` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/Vector3Stamped | message | `internal/types/corpus.go:172` | `testbed/live/ros/gate_type_geometry_rest_test.go:1822`, `testbed/live/ros/gate_type_geometry_rest_test.go:1564` | `internal/types/corpus_test.go:13` | live |
+| geometry_msgs/WrenchStamped | message | `internal/types/corpus.go:173` | `testbed/live/ros/gate_type_geometry_rest_test.go:1832`, `testbed/live/ros/gate_type_geometry_rest_test.go:1574` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/BatteryState | message | `internal/types/corpus.go:176` | `testbed/live/ros/gate_type_sensor_rest_test.go:2385`, `testbed/live/ros/gate_type_sensor_rest_test.go:2184` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/ChannelFloat32 | message | `internal/types/corpus.go:177` | `testbed/live/ros/gate_type_sensor_rest_test.go:2449`, `testbed/live/ros/gate_type_sensor_rest_test.go:2264` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/CompressedImage | message | `internal/types/corpus.go:178` | `testbed/live/ros/gate_type_sensor_rest_test.go:2305`, `testbed/live/ros/gate_type_sensor_rest_test.go:2084` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/FluidPressure | message | `internal/types/corpus.go:179` | `testbed/live/ros/gate_type_matrix_test.go:836`, `testbed/live/ros/gate_type_matrix_test.go:165` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:35` | live |
+| sensor_msgs/Illuminance | message | `internal/types/corpus.go:180` | `testbed/live/ros/gate_type_sensor_rest_test.go:2393`, `testbed/live/ros/gate_type_sensor_rest_test.go:2194` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/Image | message | `internal/types/corpus.go:181` | `testbed/live/ros/gate_large_payload_test.go:450`, `testbed/live/ros/gate_type_sensor_rest_test.go:2475` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/Imu | message | `internal/types/corpus.go:182` | `testbed/live/ros/gate_type_sensor_extra_test.go:568`, `testbed/live/ros/gate_type_sensor_extra_test.go:521` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/JointState | message | `internal/types/corpus.go:183` | `testbed/live/ros/gate_type_sensor_rest_test.go:2377`, `testbed/live/ros/gate_type_sensor_rest_test.go:2174` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/Joy | message | `internal/types/corpus.go:184` | `testbed/live/ros/gate_type_sensor_rest_test.go:2369`, `testbed/live/ros/gate_type_sensor_rest_test.go:2164` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/JoyFeedback | message | `internal/types/corpus.go:185` | `testbed/live/ros/gate_type_sensor_rest_test.go:2433`, `testbed/live/ros/gate_type_sensor_rest_test.go:2244` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/JoyFeedbackArray | message | `internal/types/corpus.go:186` | `testbed/live/ros/gate_type_sensor_rest_test.go:2441`, `testbed/live/ros/gate_type_sensor_rest_test.go:2254` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/LaserEcho | message | `internal/types/corpus.go:187` | `testbed/live/ros/gate_type_sensor_rest_test.go:2417`, `testbed/live/ros/gate_type_sensor_rest_test.go:2224` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/LaserScan | message | `internal/types/corpus.go:188` | `testbed/live/ros/gate_type_sensor_extra_test.go:580`, `testbed/live/ros/gate_type_sensor_extra_test.go:531` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/MagneticField | message | `internal/types/corpus.go:189` | `testbed/live/ros/gate_type_sensor_rest_test.go:2361`, `testbed/live/ros/gate_type_sensor_rest_test.go:2154` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/MultiDOFJointState | message | `internal/types/corpus.go:190` | `testbed/live/ros/gate_type_sensor_rest_test.go:2409`, `testbed/live/ros/gate_type_sensor_rest_test.go:2214` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/MultiEchoLaserScan | message | `internal/types/corpus.go:191` | `testbed/live/ros/gate_type_sensor_rest_test.go:2401`, `testbed/live/ros/gate_type_sensor_rest_test.go:2204` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/NavSatStatus | message | `internal/types/corpus.go:192` | `testbed/live/ros/gate_type_sensor_rest_test.go:2425`, `testbed/live/ros/gate_type_sensor_rest_test.go:2234` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/NavSatFix | message | `internal/types/corpus.go:193` | `testbed/live/ros/gate_type_sensor_extra_test.go:592`, `testbed/live/ros/gate_type_sensor_extra_test.go:541` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/PointCloud | message | `internal/types/corpus.go:194` | `testbed/live/ros/gate_type_sensor_rest_test.go:2313`, `testbed/live/ros/gate_type_sensor_rest_test.go:2094` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/PointField | message | `internal/types/corpus.go:195` | `testbed/live/ros/gate_type_sensor_rest_test.go:2321`, `testbed/live/ros/gate_type_sensor_rest_test.go:2104` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/PointCloud2 | message | `internal/types/corpus.go:196` | `testbed/live/ros/gate_type_sensor_rest_test.go:2457`, `testbed/live/ros/gate_type_sensor_rest_test.go:2274` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/Range | message | `internal/types/corpus.go:197` | `testbed/live/ros/gate_type_sensor_rest_test.go:2329`, `testbed/live/ros/gate_type_sensor_rest_test.go:2114` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/RegionOfInterest | message | `internal/types/corpus.go:198` | `testbed/live/ros/gate_type_sensor_rest_test.go:2337`, `testbed/live/ros/gate_type_sensor_rest_test.go:2124` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/CameraInfo | message | `internal/types/corpus.go:199` | `testbed/live/ros/gate_type_sensor_rest_test.go:2297`, `testbed/live/ros/gate_type_sensor_rest_test.go:2074` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/RelativeHumidity | message | `internal/types/corpus.go:200` | `testbed/live/ros/gate_type_sensor_rest_test.go:2345`, `testbed/live/ros/gate_type_sensor_rest_test.go:2134` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/Temperature | message | `internal/types/corpus.go:201` | `testbed/live/ros/gate_type_matrix_test.go:825`, `testbed/live/ros/gate_type_matrix_test.go:155` | `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:34` | live |
+| sensor_msgs/TimeReference | message | `internal/types/corpus.go:202` | `testbed/live/ros/gate_type_sensor_rest_test.go:2353`, `testbed/live/ros/gate_type_sensor_rest_test.go:2144` | `internal/types/corpus_test.go:13` | live |
+| sensor_msgs/SetCameraInfo | service | `internal/types/corpus.go:203` | N/A | `testbed/live/ros/gate_type_sensor_rest_test.go:2685` | service |
+| trajectory_msgs/JointTrajectoryPoint | message | `internal/types/corpus.go:206` | `testbed/live/ros/gate_type_trajectory_test.go:184`, `testbed/live/ros/gate_type_trajectory_test.go:38` | `internal/types/corpus_test.go:13` | live |
+| trajectory_msgs/JointTrajectory | message | `internal/types/corpus.go:207` | `testbed/live/ros/gate_type_trajectory_extra_test.go:581`, `testbed/live/ros/gate_type_trajectory_extra_test.go:533` | `internal/types/corpus_test.go:13` | live |
+| trajectory_msgs/MultiDOFJointTrajectoryPoint | message | `internal/types/corpus.go:208` | `testbed/live/ros/gate_type_trajectory_extra_test.go:608`, `testbed/live/ros/gate_type_trajectory_extra_test.go:553` | `internal/types/corpus_test.go:13` | live |
+| trajectory_msgs/MultiDOFJointTrajectory | message | `internal/types/corpus.go:209` | `testbed/live/ros/gate_type_trajectory_extra_test.go:594`, `testbed/live/ros/gate_type_trajectory_extra_test.go:543` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/GridCells | message | `internal/types/corpus.go:212` | `testbed/live/ros/gate_type_nav_extra_test.go:439`, `testbed/live/ros/gate_type_nav_extra_test.go:384` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/MapMetaData | message | `internal/types/corpus.go:213` | `testbed/live/ros/gate_type_nav_extra_test.go:426`, `testbed/live/ros/gate_type_nav_extra_test.go:374` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/OccupancyGrid | message | `internal/types/corpus.go:214` | `testbed/live/ros/gate_type_nav_extra_test.go:412`, `testbed/live/ros/gate_type_nav_extra_test.go:364` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/Odometry | message | `internal/types/corpus.go:215` | `testbed/live/ros/gate_type_nav_test.go:398`, `testbed/live/ros/gate_type_nav_test.go:357` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/Path | message | `internal/types/corpus.go:216` | `testbed/live/ros/gate_type_nav_test.go:411`, `testbed/live/ros/gate_type_nav_test.go:367` | `internal/types/corpus_test.go:13` | live |
+| nav_msgs/GetMap | service | `internal/types/corpus.go:217` | N/A | `testbed/live/ros/gate_type_nav_extra_test.go:982` | service |
+| nav_msgs/GetPlan | service | `internal/types/corpus.go:218` | N/A | `testbed/live/ros/gate_type_nav_extra_test.go:982` | service |
+| nav_msgs/LoadMap | service | `internal/types/corpus.go:219` | N/A | `testbed/live/ros/gate_type_nav_extra_test.go:982` | service |
+| nav_msgs/SetMap | service | `internal/types/corpus.go:220` | N/A | `testbed/live/ros/gate_type_nav_extra_test.go:982` | service |
+| stereo_msgs/DisparityImage | message | `internal/types/corpus.go:223` | `testbed/live/ros/gate_type_stereo_test.go:565`, `testbed/live/ros/gate_type_stereo_test.go:46` | `internal/types/corpus_test.go:13` | live |
+| shape_msgs/MeshTriangle | message | `internal/types/corpus.go:226` | `testbed/live/ros/gate_type_shape_extra_test.go:345`, `testbed/live/ros/gate_type_shape_extra_test.go:298` | `internal/types/corpus_test.go:13` | live |
+| shape_msgs/Mesh | message | `internal/types/corpus.go:227` | `testbed/live/ros/gate_type_shape_extra_test.go:356`, `testbed/live/ros/gate_type_shape_extra_test.go:308` | `internal/types/corpus_test.go:13` | live |
+| shape_msgs/Plane | message | `internal/types/corpus.go:228` | `testbed/live/ros/gate_type_shape_extra_test.go:334`, `testbed/live/ros/gate_type_shape_extra_test.go:288` | `internal/types/corpus_test.go:13` | live |
+| shape_msgs/SolidPrimitive | message | `internal/types/corpus.go:229` | `testbed/live/ros/gate_type_shape_test.go:385`, `testbed/live/ros/gate_type_shape_test.go:62` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/ImageMarker | message | `internal/types/corpus.go:232` | `testbed/live/ros/gate_type_viz_extra_test.go:1511`, `testbed/live/ros/gate_type_viz_extra_test.go:1401` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/Marker | message | `internal/types/corpus.go:233` | `testbed/live/ros/gate_type_visualization_test.go:529`, `testbed/live/ros/gate_type_visualization_test.go:533` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/MarkerArray | message | `internal/types/corpus.go:234` | `testbed/live/ros/gate_type_viz_extra_test.go:1488`, `testbed/live/ros/gate_type_viz_extra_test.go:1381` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/MenuEntry | message | `internal/types/corpus.go:235` | `testbed/live/ros/gate_type_viz_extra_test.go:1499`, `testbed/live/ros/gate_type_viz_extra_test.go:1391` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarkerControl | message | `internal/types/corpus.go:236` | `testbed/live/ros/gate_type_viz_extra_test.go:1523`, `testbed/live/ros/gate_type_viz_extra_test.go:1411` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarker | message | `internal/types/corpus.go:237` | `testbed/live/ros/gate_type_viz_extra_test.go:1535`, `testbed/live/ros/gate_type_viz_extra_test.go:1421` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarkerInit | message | `internal/types/corpus.go:238` | `testbed/live/ros/gate_type_viz_extra_test.go:1569`, `testbed/live/ros/gate_type_viz_extra_test.go:1451` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarkerPose | message | `internal/types/corpus.go:239` | `testbed/live/ros/gate_type_viz_extra_test.go:1545`, `testbed/live/ros/gate_type_viz_extra_test.go:1431` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarkerFeedback | message | `internal/types/corpus.go:240` | `testbed/live/ros/gate_type_viz_extra_test.go:1557`, `testbed/live/ros/gate_type_viz_extra_test.go:1441` | `internal/types/corpus_test.go:13` | live |
+| visualization_msgs/InteractiveMarkerUpdate | message | `internal/types/corpus.go:241` | `testbed/live/ros/gate_type_viz_extra_test.go:1581`, `testbed/live/ros/gate_type_viz_extra_test.go:1461` | `internal/types/corpus_test.go:13` | live |
+| diagnostic_msgs/KeyValue | message | `internal/types/corpus.go:244` | `testbed/live/ros/gate_type_diagnostic_test.go:245`, `testbed/live/ros/gate_type_diagnostic_test.go:208` | `internal/types/corpus_test.go:13` | live |
+| diagnostic_msgs/DiagnosticStatus | message | `internal/types/corpus.go:245` | `testbed/live/ros/gate_type_diagnostic_test.go:259`, `testbed/live/ros/gate_type_diagnostic_test.go:218` | `internal/types/corpus_test.go:13` | live |
+| diagnostic_msgs/DiagnosticArray | message | `internal/types/corpus.go:246` | `testbed/live/ros/gate_type_diagnostic_extra_test.go:202`, `testbed/live/ros/gate_type_diagnostic_extra_test.go:184` | `internal/types/corpus_test.go:13` | live |
+| diagnostic_msgs/AddDiagnostics | service | `internal/types/corpus.go:247` | N/A | `testbed/live/ros/gate_type_diagnostic_extra_test.go:465` | service |
+| diagnostic_msgs/SelfTest | service | `internal/types/corpus.go:248` | N/A | `testbed/live/ros/gate_type_diagnostic_extra_test.go:441` | service |
+| std_srvs/Empty | service | `internal/types/corpus.go:251` | N/A | `testbed/unit/datapath/conformance_std_srvs_test.go:287` | pure-Go-only |
+| std_srvs/SetBool | service | `internal/types/corpus.go:252` | N/A | `testbed/unit/datapath/conformance_std_srvs_test.go:289` | pure-Go-only |
+| std_srvs/Trigger | service | `internal/types/corpus.go:253` | `testbed/live/ros/gate_service_call_test.go:471,508,560` | `testbed/unit/datapath/conformance_std_srvs_test.go:285` | live |
+
+## DATA
+
+- Generic CDR: `decodePlainCDR` resolves writer through SEDP remotes,
+  maps DDS topic, demangles type, validates per IDL shape, returns owned copy,
+  skips sequence tracking (`internal/transports/dds/datapath.go:746`).
+  Strict per type checks cover all 8 IDLs via `validatePlainPayload`
+  (`internal/transports/dds/datapath.go:701`) plus validators from
+  `internal/transports/dds/datapath.go:534`.
+  Pinned by `testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:317`.
+- String fallback: `decodeCycloneChatter` is String only and requires
+  one valid XCDR1 String with no trailing bytes
+  (`internal/transports/dds/datapath.go:479`).
+  Generic path stays in `decodePlainCDR`.
+  Pinned by `testbed/unit/datapath/conformance_test.go:491`.
+- `TakeFrom` reads one frame, validates with `ParseRTPSPayload`, tries
+  generic CDR then String fallback, counts a drop only when both fail,
+  then checks GUID match and reuses `Take` ordering
+  (`internal/transports/dds/datapath.go:887`).
+  Framed path is `Take` (`internal/transports/dds/datapath.go:844`)
+  with 32 MiB cap (`internal/transports/dds/datapath.go:102`)
+  and seq 1 start (`internal/transports/dds/datapath.go:64`).
+- Frag: bounds by `fragMaxCount` (`internal/transports/dds/frag.go:32`),
+  check at `internal/transports/dds/frag.go:95`, reassemble and deliver
+  one complete payload at `internal/transports/dds/frag.go:188`.
+- Gap: `ApplyGap` skips one seq with no lost count, ignores 0 and duplicates
+  (`internal/transports/dds/reliability.go:350`).
+  Encode is at `internal/transports/dds/reliability.go:316`.
+  Demux routes GAP to skip, never to `dataCh`
+  (`internal/transports/dds/reliability.go:1047`).
+- AckNack: decode validates length and caps bits at 1024
+  (`internal/transports/dds/reliability.go:198`), `repairFromAck`
+  resends stored DATA in window plus GAP for evicted seq
+  (`internal/transports/dds/reliability.go:901`).
+  Repair message plus HEARTBEAT is at
+  `internal/transports/dds/reliability.go:533`.
+  Demux routes ACKNACK to repair and HEARTBEAT to ACK, never to `dataCh`
+  (`internal/transports/dds/reliability.go:1003`,
+  `internal/transports/dds/reliability.go:1023`).
+- DATA receipt assert: gates assert the live ID appears in echo output
+  on the per-run topic. Forward and reverse checks each use one per-run
+  live ID for start plus assert, so a pass proves one DATA sample arrived.
+
+## Sustained stress scope
+
+Proven: all 4 large-payload gates PASS on domain 55 with no skips:
+`TestROSLargePayloadImageFragmented` plus
+`TestROSLargePayloadPointCloud2Fragmented` in
+`testbed/live/ros/gate_large_payload_test.go`, plus
+`TestROSTypeSensorImageLarge` and `TestROSTypeSensorPointCloud2Large`.
+The 320 by 320 mono8 Image (102400 data bytes) fragments on the
+wire and reassembles to full bytes in `TestROSLargePayloadImageFragmented`
+(`testbed/live/ros/gate_large_payload_test.go:450`, size at
+`testbed/live/ros/gate_large_payload_test.go:44-53`). Reassembly is bounded
+by `maxPayloadLen` 32 MiB (`internal/transports/dds/datapath.go:102`) with
+sample cap check (`internal/transports/dds/frag.go:99-100`) and fragment
+count bound (`internal/transports/dds/frag.go:32`). Ordering is best effort:
+`trackSequenceLocked` accepts the first sample with no lost count, counts
+skipped seq as lost, and drops duplicates or old seq with
+`ErrStaleSequence` (`internal/transports/dds/datapath.go:960`). Explicit
+`ApplyGap` skips one seq with no lost count
+(`internal/transports/dds/reliability.go:350`). Unit pins are
+`TestDataPathGapDropCounter`
+(`internal/transports/dds/datapath_test.go:243`) and `TestBridgeGapMatches`
+(`internal/transports/dds/datapath_test.go:884`).
+
+Out of scope: sustained loss storms, N-participant stress, and multi-MB
+streams have no gate. Case-insensitive grep for `storm|flood|stress` in
+`testbed/` returns 0 matches. No sustained duplicate burst test, no
+multi-writer contention test, and no stream above the 32 MiB cap is claimed.
+
+## CLI
+
+- `echo` declares an SEDP reader via `Subscribe`
+  (`cmd/weld/main.go:242-255`).
+- `pub` waits for SPDP routes: retries `PublishBytes` on `ErrNoRoute` every
+  50 ms up to 5 s (`cmd/weld/main.go:47-50`,
+  `cmd/weld/main.go:370`), then prints `sent: <text>`.
+- `action send` sends one goal and waits for result
+  (`weld action send`, backend live-gated accept plus cancel plus timeout,
+  `testbed/live/ros/gate_action_workflow_test.go`).
+
+## Gates
+
+Run: unit with `go test ./testbed/unit/... -count=1`, live with
+`go test -tags live ./testbed/live/... -count=1` against the already running
+`weld-jazzy` peer (see `testbed/live/helpers/helpers.go:412`).
+Only one run per domain and topic at a time.
+Domain split is 42 for ROS String, 48 for SPDP, 47 for the single entrypoint
+live gate, 43 plus 44 for the Humble plus Rolling distro matrix, 55 for
+large payloads (46 abandoned, no host-container multicast), and 60
+through 69 for ephemeral isolation. See `testbed/live/helpers/helpers.go:40-44`,
+`testbed/live/ros/roundtrip_test.go:24`,
+`testbed/live/cyclone/gate1_spdp_test.go:20`.
+
+- Gate 0 green: `go build`, `go vet`, `gofumpt`, `golangci-lint`, `go test`
+  (`testbed/live/gates/gate0_test.go:37`). Launch corpus presence is pinned
+  at `testbed/live/gates/gate0_test.go:149` for `testbed/unit/launch/conformance_test.go:199`.
+- Gate 1 green: direct UDP SPDP acceptance on domain 48 by GUID prefix
+  inequality with zero deserialization failures
+  (`testbed/live/cyclone/gate1_spdp_test.go:370`,
+  `testbed/live/cyclone/gate1_spdp_test.go:411`,
+  `testbed/live/gates/gate1_test.go:31`). Observed: about 900 non-local
+  `SPDP ST0 NEW` rows, builtin endpoint set `bes 3f`, zero deserialization
+  failures.
+- Gate 2 forward green after plain CDR receive plus SEDP fixes; reverse green
+  after writer `03c2` plus announce now plus Heartbeat. Forward plain CDR is
+  in `internal/transports/dds/datapath.go:746` with String fallback at
+  `internal/transports/dds/datapath.go:479` and the `TakeFrom` fallback
+  at `internal/transports/dds/datapath.go:887`. Writer `03c2` is in
+  `internal/transports/dds/sedp.go:149-157`, announce loop is in
+  `internal/transports/dds/sedp.go:633`, DATA plus Heartbeat is in
+  `internal/transports/dds/backend.go:1347`. Checks are
+  `testbed/live/ros/roundtrip_test.go:45` plus
+  `testbed/live/ros/roundtrip_test.go:94` on domain 42 and the single
+  entrypoint equivalents on domain 47 at `testbed/live/gates/gate2_test.go:27`
+  plus `testbed/live/gates/gate2_test.go:81`.
+- The SPDP acceptance probe (gate 1, direct UDP) stays separate from the
+  ROS String round-trip test (gate 2).
+- Full verified matrix, all PASS live unless noted: full type matrix
+  (`TestROSType*`, ByteMultiArray forward PASS via per-element `!!binary`
+  YAML, not a skip); distro matrix forward plus reverse on humble, jazzy,
+  rolling (`TestROSDistroMatrix`); gates entrypoint PASS with no skips;
+  CLI PASS; cyclone user-data receipt PASS; Trigger forward plus
+  reverse plus deadline PASS; params declare plus atomic set plus validation
+  reject PASS single-backend; TF lookup static plus dynamic plus unknown
+  PASS; actions accept plus cancel plus timeout PASS; large payload all 4
+  PASS on domain 55 with no skips. Unit plus vet plus `cmd/weld` PASS.
+
+Full run detail is in [Testbed](./testbed.md). Live harness detail is in
+[Testbed Go](./testbed-go.md).

@@ -6,32 +6,34 @@
 // These tests prove a dead CycloneDDS writer turns stale then expired in
 // the Weld reader within the lease bound instead of serving ancient
 // samples silently, plus deadline misses count against a slow publisher.
-// They run on ephemeral domain 63 with per-run topics, skip without a
-// peer, and fail loudly on timeout. They never start the compose stack.
+// Stale uses ephemeral domain 63 and deadline uses one allocated exclusive
+// domain so the parallel tests never share SPDP state, both with per-run
+// topics, skip without a peer, and fail loudly on timeout. They never
+// start the compose stack.
 package ros_test
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports/dds"
-	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
 // Enforcement live gate constants.
 //
-// Domain 63 is ephemeral so this gate never hears canonical 42, 47, or
-// 48 and never hears the 65 through 69 ROS liveliness gates. Per-run
-// topics isolate concurrent runs on the same domain. The lease is 5
-// seconds against a 2 Hz talker: healthy gaps are 500 ms, stale fires at
-// one lease, expired at two leases, each with slack for loaded CI.
+// Stale pins ephemeral domain 63 so it never hears canonical 42, 47, or
+// 48 and never hears the 65 through 69 ROS liveliness gates. Deadline
+// uses one allocated exclusive domain so the two parallel enforcement
+// tests never share SPDP state. Per-run topics isolate concurrent runs on
+// the same domain. The lease is 5 seconds against a 2 Hz talker: healthy
+// gaps are 500 ms, stale fires at one lease, expired at two leases, each
+// with slack for loaded CI. Talker lifecycle plus XCDR String codec reuse
+// the single helpers in gate_liveliness_test.go.
 const (
 	enforceGateDomain      uint32        = 63
 	enforceGateOverall     time.Duration = 2 * time.Minute
@@ -45,68 +47,33 @@ const (
 	enforceGateType        string        = "std_msgs__msg__String"
 )
 
-// startEnforceTalker starts ros2 topic pub at the given rate.
-func startEnforceTalker(t *testing.T, ctx context.Context, domain uint32, topic, payload, rate string) *exec.Cmd {
-	t.Helper()
-	pubArg := fmt.Sprintf("{data: %s}", payload)
-	args := helpers.DockerArgs(helpers.Container, int(domain), helpers.RosBin, "topic", "pub", topic, helpers.RosType, pubArg, "--rate", rate)
-	talker := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness runs docker with fixed test args
-	err := talker.Start()
-	if err != nil {
-		t.Fatalf("start enforce talker: %v", err)
-	}
-	t.Cleanup(func() {
-		helpers.StopCmd(talker)
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), payload)
-	})
-	return talker
-}
-
-// stopEnforceTalker kills a talker started by startEnforceTalker.
-func stopEnforceTalker(t *testing.T, ctx context.Context, talker *exec.Cmd, domain uint32, payload string) {
-	t.Helper()
-	helpers.StopCmd(talker)
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cleanupCancel()
-	helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), payload)
-	helpers.Sleep(ctx, enforceGateSettle)
-}
-
-// enforceDecodeLiveString decodes XCDR1 String bytes or returns an error.
-func enforceDecodeLiveString(wire []byte) (string, error) {
-	dec, err := types.NewDecoder(wire)
-	if err != nil {
-		return "", fmt.Errorf("enforce decode header: %w", err)
-	}
-	got, err := dec.ReadString()
-	if err != nil {
-		return "", fmt.Errorf("enforce decode string: %w", err)
-	}
-	err = dec.Finish()
-	if err != nil {
-		return "", fmt.Errorf("enforce decode finish: %w", err)
-	}
-	return got, nil
-}
+// Talker lifecycle plus XCDR String codec reuse the single helpers in
+// gate_liveliness_test.go: startLiveTalker, stopLiveTalker, and
+// tryDecodeLiveString. Enforcement tests call those directly so parallel
+// runs share one lifecycle and one codec with no drift.
 
 // enforceTakeOneLiveSample takes until the per-run payload arrives.
 //
 // Samples on other topics, undecodable payloads, and gap drops count as
 // skips. Only the take timeout fails. Every accepted sample asserts the
 // tracker when automatic so the kill phase measures real liveliness.
+// A loud skip cap fails after 100 consecutive skips so systematic
+// wrong-topic delivery fails instead of spinning to timeout.
 //
-//nolint:gocognit // live helper sequences take skip and assert in one loop, splitting would obscure intent
+//nolint:gocognit,cyclop // live helper sequences take skip and assert in one loop, splitting would obscure intent
 func enforceTakeOneLiveSample(t *testing.T, ctx context.Context, backend *dds.Backend, topic, runID string, tracker *core.LivelinessTracker) {
 	t.Helper()
 	takeCtx, takeCancel := context.WithTimeout(ctx, enforceGateTakeTimeout)
 	defer takeCancel()
 	skips := 0
+	lastReason := ""
 	for {
 		cerr := ctx.Err()
 		if cerr != nil {
 			t.Fatalf("enforce context ended waiting for %q: %v", topic, cerr)
+		}
+		if skips >= 100 {
+			t.Fatalf("enforce take on %q saw 100 consecutive skips without run %q, last reason %q: systematic wrong-topic delivery", topic, runID, lastReason)
 		}
 		msg, err := backend.TakeBytes(takeCtx)
 		if err != nil {
@@ -115,23 +82,28 @@ func enforceTakeOneLiveSample(t *testing.T, ctx context.Context, backend *dds.Ba
 			}
 			if errors.Is(err, dds.ErrStaleSequence) || errors.Is(err, dds.ErrTruncated) || errors.Is(err, dds.ErrInvalidFrame) {
 				skips++
+				lastReason = err.Error()
 				continue
 			}
 			skips++
+			lastReason = err.Error()
 			t.Logf("enforce skip take error %d: %v", skips, err)
 			continue
 		}
 		if msg.TopicName != topic {
 			skips++
+			lastReason = "wrong topic " + msg.TopicName
 			continue
 		}
-		text, derr := enforceDecodeLiveString(msg.Payload)
+		text, derr := tryDecodeLiveString(msg.Payload)
 		if derr != nil {
 			skips++
+			lastReason = derr.Error()
 			continue
 		}
 		if !strings.Contains(text, runID) {
 			skips++
+			lastReason = "payload without run ID " + text
 			continue
 		}
 		tracker.RecordSampleAt(time.Now().UnixNano())
@@ -144,6 +116,8 @@ func enforceTakeOneLiveSample(t *testing.T, ctx context.Context, backend *dds.Ba
 // deliver an ancient buffered sample. Drops and gap errors count as
 // drained; only the timeout ends the drain. The tracker is untouched, so
 // stale and expired timing still anchors on the last live sample.
+// Empty queue is legitimate best effort, so drained count is logged with
+// topic and never asserted.
 func enforceDrainQueue(t *testing.T, ctx context.Context, backend *dds.Backend, topic string) {
 	t.Helper()
 
@@ -153,7 +127,7 @@ func enforceDrainQueue(t *testing.T, ctx context.Context, backend *dds.Backend, 
 		msg, err := backend.TakeBytes(drainCtx)
 		drainCancel()
 		if err != nil {
-			return
+			break
 		}
 		_ = msg
 		drained++
@@ -205,10 +179,10 @@ func TestROSLivelinessEnforcementStaleExpiry(t *testing.T) {
 	}
 	lease := core.NewDuration(int64(enforceGateLease/time.Second), 0)
 	tracker := core.NewLivelinessTracker(topic, "cyclone-talker", core.LivelinessAutomatic, lease, time.Now().UnixNano())
-	talker := startEnforceTalker(t, ctx, enforceGateDomain, topic, payload, "2")
+	talker := startLiveTalker(t, ctx, enforceGateDomain, topic, payload, "2")
 	helpers.WaitForTopicDiscovery(ctx, backend, topic)
 	enforceTakeOneLiveSample(t, ctx, backend, topic, runID, &tracker)
-	stopEnforceTalker(t, ctx, talker, enforceGateDomain, payload)
+	stopLiveTalker(t, ctx, talker, enforceGateDomain, payload)
 	// Drain after the kill so no buffered sample survives into the
 	// post-expiry take: the talker is dead, nothing new can arrive, and
 	// the tracker still anchors on the live sample for stale/expiry.
@@ -250,22 +224,23 @@ func TestROSLivelinessEnforcementDeadlineMiss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), enforceGateOverall)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
+	deadlineDomain := helpers.MustAllocateDomainU32(t)
 	runID := helpers.LiveID("ros-enforce-deadline")
 	topic := helpers.LiveTopic(runID + "-deadline")
 	payload := "hello enforce deadline " + runID
-	backend := helpers.MustOpenLiveBackend(t, ctx, enforceGateDomain, "ros-enforce-dl-"+runID, "live")
+	backend := helpers.MustOpenLiveBackend(t, ctx, deadlineDomain, "ros-enforce-dl-"+runID, "live")
 	err := backend.Subscribe(ctx, topic, enforceGateType, "")
 	if err != nil {
 		t.Fatalf("subscribe deadline %q: %v", topic, err)
 	}
 	deadline := core.NewDuration(0, 500000000)
 	deadlineTracker := core.NewDeadlineTracker(topic, "cyclone-talker", deadline, time.Now().UnixNano())
-	talker := startEnforceTalker(t, ctx, enforceGateDomain, topic, payload, "1")
+	talker := startLiveTalker(t, ctx, deadlineDomain, topic, payload, "1")
 	helpers.WaitForTopicDiscovery(ctx, backend, topic)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(enforceGateDomain), payload)
+		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(deadlineDomain), payload)
 	})
 	misses := 0
 	alerts := 0
@@ -291,7 +266,7 @@ func TestROSLivelinessEnforcementDeadlineMiss(t *testing.T) {
 		if msg.TopicName != topic {
 			continue
 		}
-		text, derr := enforceDecodeLiveString(msg.Payload)
+		text, derr := tryDecodeLiveString(msg.Payload)
 		if derr != nil {
 			continue
 		}
@@ -313,7 +288,7 @@ func TestROSLivelinessEnforcementDeadlineMiss(t *testing.T) {
 	if _, ok := deadlineTracker.Check(now); ok {
 		alerts++
 	}
-	stopEnforceTalker(t, ctx, talker, enforceGateDomain, payload)
+	stopLiveTalker(t, ctx, talker, deadlineDomain, payload)
 	if seen == 0 {
 		t.Fatalf("slow publisher on %q delivered nothing in %v", topic, enforceGateTakeTimeout)
 	}

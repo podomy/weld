@@ -392,9 +392,9 @@ func AssertNoBackendError(t *testing.T, name, combined string) {
 // early publish can leave before matching completes and never arrive. It
 // publishes with PublishLiveWithRetry, polls the echo file for one
 // republish interval, and repeats until the overall poll wait ends. It
-// reports true when the echo holds want. A publish without routes skips
-// with the interop gap note, while other publish failures still fail.
-// The label scopes skip and fatal messages so matrix, shape, and stereo
+// reports true when the echo holds want. A publish without routes fails
+// loudly as product news, while other publish failures still fail.
+// The label scopes fatal messages so matrix, shape, and stereo
 // callers keep distinct output while sharing one retry loop.
 func PublishUntilEcho(ctx context.Context, t *testing.T, backend *dds.Backend, msg transports.OutgoingMessage, echoPath, want, typeHash string, pollWait, repubWait, retryTimeout, retryInterval time.Duration, label string) bool {
 	t.Helper()
@@ -403,7 +403,7 @@ func PublishUntilEcho(ctx context.Context, t *testing.T, backend *dds.Backend, m
 		err := PublishLiveWithRetry(ctx, backend, msg, retryTimeout, retryInterval, label)
 		if err != nil {
 			if strings.Contains(err.Error(), "no route") {
-				t.Skipf("weld pub %s hash %s has no route (known interop gap), local codec ok: %v", label, typeHash, err)
+				t.Fatalf("weld pub %s hash %s has no route, want route: %v", label, typeHash, err)
 			}
 			t.Fatalf("weld pub %s: %v", label, err)
 		}

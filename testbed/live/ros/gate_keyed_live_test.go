@@ -307,7 +307,8 @@ func TestKeyedLiveReversePeerVisible(t *testing.T) {
 	}
 	t.Logf("keyed live reverse topic %s hash %s", topic, typeHash)
 	payload := keyedLiveEncodeString(t, live)
-	if err := keyedLiveDecodeString(payload, live); err != nil {
+	err = keyedLiveDecodeString(payload, live)
+	if err != nil {
 		t.Fatalf("keyed live local codec: %v", err)
 	}
 	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "keyed-live-reverse-"+live, "keyed-rev") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32

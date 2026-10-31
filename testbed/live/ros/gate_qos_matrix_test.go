@@ -193,7 +193,7 @@ func qosCheckCompatible(t *testing.T, c qosCase, report core.CompatibilityReport
 // qosCheckIncompatible asserts an incompatible report names the policy loudly.
 func qosCheckIncompatible(t *testing.T, c qosCase, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string) {
 	t.Helper()
-	helpers.CheckQoSIncompatible(t, c.name, report, offered, requested, publisher, subscriber, c.wantPolicy, "qos")
+	helpers.CheckQoSIncompatible(t, c.name, report, offered, requested, publisher, subscriber, c.wantPolicy, "qos", 0, "")
 }
 
 // qosCheckCore asserts core compatibility matches the case expectation.

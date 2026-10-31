@@ -45,8 +45,7 @@ func TestCycloneDiscoveryCollisionLive(t *testing.T) {
 	checkCollisionTake(t, ctx, secondBackend, payload, domain)
 }
 
-// checkCollisionPacket pins alive packet fields for collision domain.
-// checkCollisionPacket pins alive packet fields for one allocated domain.
+// checkCollisionPacket pins alive packet fields for fixed collision domain 58.
 func checkCollisionPacket(t *testing.T, announcer, observer *dds.LocalParticipant, domain uint32) {
 	t.Helper()
 	packet, err := dds.MarshalAlivePacket(announcer.GUID(), domain, 1, announcer.LeaseDuration())
@@ -71,8 +70,7 @@ func checkCollisionPacket(t *testing.T, announcer, observer *dds.LocalParticipan
 	}
 }
 
-// checkSuccessiveUnicast dials two unicasts and pins successive indices.
-// checkSuccessiveUnicast dials two unicasts and pins successive indices on one allocated domain.
+// checkSuccessiveUnicast dials two unicasts and pins successive indices on fixed domain 58.
 func checkSuccessiveUnicast(t *testing.T, ctx context.Context, domain uint32) (*rtps.UnicastConn, *rtps.UnicastConn) {
 	t.Helper()
 	dialCtx, dialCancel := context.WithTimeout(ctx, discoveryDialTimeout)
@@ -103,8 +101,7 @@ func checkSuccessiveUnicast(t *testing.T, ctx context.Context, domain uint32) (*
 	return first, second
 }
 
-// checkUnicastPorts pins expected user ports for both unicasts.
-// checkUnicastPorts pins expected user ports for both unicasts on one allocated domain.
+// checkUnicastPorts pins expected user ports for both unicasts on fixed domain 58.
 func checkUnicastPorts(t *testing.T, first, second *rtps.UnicastConn, domain uint32) {
 	t.Helper()
 	wantFirst, err := rtps.UsertrafficUnicastPort(domain, first.Participant())
@@ -147,8 +144,7 @@ func closeUnicastPair(t *testing.T, first, second *rtps.UnicastConn) {
 	}
 }
 
-// checkCollisionBackends joins two backends on collision domain.
-// checkCollisionBackends joins two backends on one allocated domain.
+// checkCollisionBackends joins two backends on fixed collision domain 58.
 func checkCollisionBackends(t *testing.T, ctx context.Context, runID string, domain uint32) (*dds.Backend, *dds.Backend) {
 	t.Helper()
 	firstBackend, err := dds.NewBackend(dds.SidecarConfig{
@@ -200,8 +196,7 @@ func checkCollisionBackends(t *testing.T, ctx context.Context, runID string, dom
 	return firstBackend, secondBackend
 }
 
-// checkCollisionPublish publishes until route appears.
-// checkCollisionPublish publishes until route appears on one allocated domain.
+// checkCollisionPublish publishes until route appears on fixed domain 58.
 func checkCollisionPublish(t *testing.T, ctx context.Context, firstBackend *dds.Backend, payload []byte, domain uint32) {
 	t.Helper()
 	published := false
@@ -230,8 +225,7 @@ func checkCollisionPublish(t *testing.T, ctx context.Context, firstBackend *dds.
 	}
 }
 
-// checkCollisionTake takes one sample and pins topic and payload.
-// checkCollisionTake takes one sample and pins topic and payload on one allocated domain.
+// checkCollisionTake takes one sample and pins topic and payload on fixed domain 58.
 func checkCollisionTake(t *testing.T, ctx context.Context, secondBackend *dds.Backend, payload []byte, domain uint32) {
 	t.Helper()
 	takeCtx, takeCancel := context.WithTimeout(ctx, 5*time.Second)

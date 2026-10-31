@@ -159,7 +159,7 @@ func relCheckCompatible(t *testing.T, name string, report core.CompatibilityRepo
 // relCheckIncompatible asserts an incompatible report names reliability loudly.
 func relCheckIncompatible(t *testing.T, name string, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string) {
 	t.Helper()
-	helpers.CheckQoSIncompatible(t, name, report, offered, requested, publisher, subscriber, core.PolicyReliability, "reliability")
+	helpers.CheckQoSIncompatible(t, name, report, offered, requested, publisher, subscriber, core.PolicyReliability, "reliability", 0, "")
 }
 
 // relCoreOfferedRequested maps a live case to offered and requested profiles.

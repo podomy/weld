@@ -91,13 +91,14 @@ func TestDurabilityLateJoinerSeesCycloneBacklog(t *testing.T) {
 	pubID := live + "-pub"
 	pubPid := helpers.HostPidPath(t, pubID)
 	pubArgs := durPythonTransientPub(topic, live)
-	if err := helpers.StartPeerProc(ctx, helpers.Container, domain, pubID, pubArgs...); err != nil {
+	err := helpers.StartPeerProc(ctx, helpers.Container, domain, pubID, pubArgs...)
+	if err != nil {
 		t.Fatalf("start bounded transient publisher: %v", err)
 	}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), durBacklogCleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, domain, pubPid, pubID)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pubPid, pubID)
 	})
 
 	published := make(chan struct{})
@@ -168,7 +169,8 @@ func durEncodeString(t *testing.T, text string) []byte {
 	t.Helper()
 
 	enc := types.NewEncoder(true)
-	if err := enc.WriteString(text); err != nil {
+	err := enc.WriteString(text)
+	if err != nil {
 		t.Fatalf("encode backlog sample: %v", err)
 	}
 
@@ -223,7 +225,8 @@ func TestDurabilityLateCycloneEchoSeesWeldBacklog(t *testing.T) {
 	// backend subscribed to the topic donates SPDP routes without
 	// affecting the late-echo backlog assertion below.
 	donor := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "dur-backlog-donor", "durability-donor") //nolint:gosec // G115: pooled domain fits uint32
-	if err := donor.Subscribe(ctx, topic, "std_msgs__msg__String", helpers.ForwardStringHash); err != nil {
+	err := donor.Subscribe(ctx, topic, "std_msgs__msg__String", helpers.ForwardStringHash)
+	if err != nil {
 		t.Fatalf("donor subscribe: %v", err)
 	}
 	helpers.WaitForTopicDiscovery(ctx, donor, topic)
@@ -242,7 +245,8 @@ func TestDurabilityLateCycloneEchoSeesWeldBacklog(t *testing.T) {
 	// served publishing; keeping it alive would NACK every heartbeat as
 	// it receives live backlog into an untaken queue, drowning the echo's
 	// own NACKs in noise and skewing drop accounting.
-	if err := donor.Close(); err != nil {
+	err = donor.Close()
+	if err != nil {
 		t.Fatalf("close donor backend: %v", err)
 	}
 

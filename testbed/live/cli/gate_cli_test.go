@@ -132,15 +132,17 @@ func TestGateCLITextVsPositional(t *testing.T) {
 	})
 	helpers.SettleAfterJoin(ctx)
 
-	// Flag text wins over positional.
+	// Flag plus positional is rejected: silently dropping the positional
+	// would lose user data, so pub matches service and action and fails
+	// loudly instead of letting text win.
 	winCtx, winCancel := context.WithTimeout(ctx, cliShortTimeout)
 	winRes := cliRunWeld(winCtx, bin, helpers.EnvWithDomain(domain), "pub", "--topic", topic, "--domain", domainStr, "--text", "flag-wins", "pos-ignored")
 	winCancel()
-	if winRes.code != 0 {
-		t.Fatalf("text wins: exit = %d, want 0\nstdout:\n%s\nstderr:\n%s", winRes.code, winRes.stdout, winRes.stderr)
+	if winRes.code != 2 {
+		t.Fatalf("flag plus positional: exit = %d, want 2\nstdout:\n%s\nstderr:\n%s", winRes.code, winRes.stdout, winRes.stderr)
 	}
-	if strings.TrimSpace(winRes.stdout) != "sent: flag-wins" {
-		t.Fatalf("text wins stdout = %q, want sent flag-wins", winRes.stdout)
+	if !strings.Contains(winRes.stderr, "flag plus positionals") {
+		t.Fatalf("flag plus positional stderr = %q, want flag plus positionals\nstdout:\n%s", winRes.stderr, winRes.stdout)
 	}
 
 	// Single positional without flag must succeed.
@@ -239,6 +241,9 @@ func TestGateCLIEchoPrintsPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start echo: %v", err)
 	}
+	t.Cleanup(func() {
+		helpers.StopCmd(echoCmd)
+	})
 	helpers.Sleep(ctx, 2*time.Second)
 
 	pubCtx, pubCancel := context.WithTimeout(ctx, cliPubTimeout)
@@ -387,6 +392,9 @@ func TestGateCLIWeldToWeldRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start echo: %v", err)
 	}
+	t.Cleanup(func() {
+		helpers.StopCmd(echoCmd)
+	})
 	helpers.Sleep(ctx, 2*time.Second)
 
 	pubCtx, pubCancel := context.WithTimeout(ctx, cliPubTimeout)

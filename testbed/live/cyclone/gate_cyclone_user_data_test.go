@@ -62,7 +62,7 @@ func TestCycloneUserDataReceiptToWeld(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cycloneDataClean)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
 	})
 	helpers.Sleep(ctx, cycloneDataSettle)
 	err = ctx.Err()

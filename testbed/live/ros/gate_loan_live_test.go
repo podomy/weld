@@ -56,7 +56,8 @@ func decodeLoanLiveString(t *testing.T, wire []byte) string {
 	if err != nil {
 		t.Fatalf("decode loan string: %v", err)
 	}
-	if err := dec.Finish(); err != nil {
+	err = dec.Finish()
+	if err != nil {
 		t.Fatalf("decode loan string finish: %v", err)
 	}
 	return got
@@ -107,7 +108,7 @@ func TestLoanCrossVendorHonesty(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), loanLiveSettle)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, domain, pidPath, topic)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pidPath, topic)
 	})
 	takeCtx, takeCancel := context.WithTimeout(ctx, loanLiveTakeTimeout)
 	defer takeCancel()
@@ -169,7 +170,8 @@ func TestLoanInProcessZeroCopy(t *testing.T) {
 		t.Fatalf("bytes: %v", err)
 	}
 	copy(view, want)
-	if err := ch.Send(loan); err != nil {
+	err = ch.Send(loan)
+	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	got, err := ch.Recv(ctx)
@@ -189,7 +191,8 @@ func TestLoanInProcessZeroCopy(t *testing.T) {
 	if ch.Copies() != 0 {
 		t.Fatalf("copies = %d, want 0 on zero-copy path", ch.Copies())
 	}
-	if err := got.Return(); err != nil {
+	err = got.Return()
+	if err != nil {
 		t.Fatalf("return: %v", err)
 	}
 	if pool.Returns() != 1 {

@@ -101,7 +101,7 @@ func startParamsNode(t *testing.T, ctx context.Context, domain int, live, node, 
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), paramsCleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, domain, pidPath, live)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pidPath, live)
 	})
 	helpers.Sleep(ctx, paramsSettle)
 	if err := ctx.Err(); err != nil {

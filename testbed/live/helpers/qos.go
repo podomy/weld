@@ -34,7 +34,7 @@ func CheckQoSCompatible(t *testing.T, name string, report core.CompatibilityRepo
 }
 
 // CheckQoSIncompatible asserts an incompatible report names the policy loudly.
-func CheckQoSIncompatible(t *testing.T, name string, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string, wantPolicy core.PolicyKind, logPrefix string) {
+func CheckQoSIncompatible(t *testing.T, name string, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string, wantPolicy core.PolicyKind, logPrefix string, domain int, runID string) {
 	t.Helper()
 	if report.Compatible {
 		t.Fatalf("case %s: want incompatible, got compatible", name)
@@ -57,6 +57,6 @@ func CheckQoSIncompatible(t *testing.T, name string, report core.CompatibilityRe
 		t.Fatalf("case %s: no loud events for incompatible pair", name)
 	}
 	for _, ev := range events {
-		t.Logf("%s mismatch topic=%s publisher=%s subscriber=%s policy=%s offered=%s requested=%s: %s", logPrefix, ev.Topic, ev.Publisher, ev.Subscriber, string(ev.Policy), ev.Offered, ev.Requested, ev.Detail)
+		t.Logf("%s mismatch domain=%d run=%s topic=%s publisher=%s subscriber=%s policy=%s offered=%s requested=%s: %s", logPrefix, domain, runID, ev.Topic, ev.Publisher, ev.Subscriber, string(ev.Policy), ev.Offered, ev.Requested, ev.Detail)
 	}
 }

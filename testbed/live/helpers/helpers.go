@@ -755,29 +755,30 @@ func ContainsSPDP(raw []byte) bool {
 //
 // It asserts the RTPS header major and minor, the Cyclone vendor ID, and
 // that every SPDP DATA submessage targets the unknown reader. Drops must
-// be zero for a clean live datagram.
-func CheckWire(t *testing.T, raw []byte) {
+// be zero for a clean live datagram. Domain and runID scope every failure
+// so parallel live runs triage to one domain and one per-run ID.
+func CheckWire(t *testing.T, raw []byte, domain int, runID string) {
 	t.Helper()
 	var drops rtps.Counter
 	hdr, raws, err := rtps.DecodeMessage(raw, &drops)
 	if err != nil {
-		t.Fatalf("decode live message: %v", err)
+		t.Fatalf("decode live message domain %d run %s: %v", domain, runID, err)
 	}
 	if hdr.Major != 2 {
-		t.Fatalf("live major = %d want 2", hdr.Major)
+		t.Fatalf("live major domain %d run %s = %d want 2", domain, runID, hdr.Major)
 	}
 	if hdr.Minor != 1 {
-		t.Fatalf("live minor = %d want 1", hdr.Minor)
+		t.Fatalf("live minor domain %d run %s = %d want 1", domain, runID, hdr.Minor)
 	}
 	wantVendor := [2]byte{0x01, 0x10}
 	if hdr.Vendor != wantVendor {
-		t.Fatalf("live vendor = %v want 01 10", hdr.Vendor)
+		t.Fatalf("live vendor domain %d run %s = %v want 01 10", domain, runID, hdr.Vendor)
 	}
 	found := false
 	for i := range raws {
 		sub, err := rtps.DecodeSubmessage(raws[i], &drops)
 		if err != nil {
-			t.Fatalf("decode live submessage %d: %v", i, err)
+			t.Fatalf("decode live submessage %d domain %d run %s: %v", i, domain, runID, err)
 		}
 		if sub.Data == nil {
 			continue
@@ -786,14 +787,14 @@ func CheckWire(t *testing.T, raw []byte) {
 			continue
 		}
 		if sub.Data.ReaderID != rtps.EntityUnknown {
-			t.Fatalf("live reader = %v want unknown", sub.Data.ReaderID)
+			t.Fatalf("live reader domain %d run %s = %v want unknown", domain, runID, sub.Data.ReaderID)
 		}
 		found = true
 	}
 	if !found {
-		t.Fatalf("live datagram misses SPDP DATA")
+		t.Fatalf("live datagram misses SPDP DATA domain %d run %s", domain, runID)
 	}
 	if drops.Count() != 0 {
-		t.Fatalf("live drops = %d want 0", drops.Count())
+		t.Fatalf("live drops domain %d run %s = %d want 0", domain, runID, drops.Count())
 	}
 }

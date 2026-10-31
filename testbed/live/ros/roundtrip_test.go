@@ -124,7 +124,7 @@ func TestROSForwardWeldEchoSeesROSTalker(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, domain, pidPath, live)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pidPath, live)
 	})
 	helpers.Sleep(ctx, forwardNap)
 	if ctx.Err() != nil {
@@ -177,7 +177,7 @@ func TestROSReverseROSEchoSeesWeldPub(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, domain, pidPath, topic)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pidPath, topic)
 	})
 	helpers.Sleep(ctx, reverseNap)
 	if ctx.Err() != nil {

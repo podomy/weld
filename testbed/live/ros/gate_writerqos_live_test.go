@@ -91,11 +91,13 @@ func wqDurability(name string, out *core.QoSProfile) error {
 func wqProfile(reliability, durability string) (core.QoSProfile, error) {
 	var out core.QoSProfile
 
-	if err := wqReliability(reliability, &out); err != nil {
+	err := wqReliability(reliability, &out)
+	if err != nil {
 		return core.QoSProfile{}, err
 	}
 
-	if err := wqDurability(durability, &out); err != nil {
+	err = wqDurability(durability, &out)
+	if err != nil {
 		return core.QoSProfile{}, err
 	}
 
@@ -129,10 +131,10 @@ func wqCheckWireCompatible(t *testing.T, name string, report core.CompatibilityR
 }
 
 // wqCheckWireIncompatible asserts a wire gate report names the policy loudly.
-func wqCheckWireIncompatible(t *testing.T, name string, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string, wantPolicy core.PolicyKind) {
+func wqCheckWireIncompatible(t *testing.T, name string, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string, wantPolicy core.PolicyKind, domain int, runID string) {
 	t.Helper()
 
-	helpers.CheckQoSIncompatible(t, name, report, offered, requested, publisher, subscriber, wantPolicy, "writerqos")
+	helpers.CheckQoSIncompatible(t, name, report, offered, requested, publisher, subscriber, wantPolicy, "writerqos", domain, runID)
 }
 
 // wqRequireQoSFlags skips the test when the peer lacks the ros2 QoS flags.
@@ -376,12 +378,13 @@ func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
 	}
 
 	requested := core.FacadeAdvertisedQoS()
-	topic := helpers.LiveTopic(helpers.LiveID("wq-mismatch"))
+	mismatchLive := helpers.LiveID("wq-mismatch")
+	topic := helpers.LiveTopic(mismatchLive)
 	report := dds.CheckWireCompatibility(
 		wqForwardOffered(t, topic, "ros-pub", "weld-echo", offered),
 		wqForwardOffered(t, topic, "ros-pub", "weld-echo", requested),
 	)
-	wqCheckWireIncompatible(t, "reliable-requester-vs-best-effort-offer", report, offered, requested, "ros-pub", "weld-echo", core.PolicyReliability)
+	wqCheckWireIncompatible(t, "reliable-requester-vs-best-effort-offer", report, offered, requested, "ros-pub", "weld-echo", core.PolicyReliability, domain, mismatchLive)
 
 	subCtx, subCancel := context.WithTimeout(ctx, wqMismatchWait+2*wqEchoWait)
 	defer subCancel()

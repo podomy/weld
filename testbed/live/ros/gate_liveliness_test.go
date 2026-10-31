@@ -62,11 +62,11 @@ func encodeLiveString(t *testing.T, text string) []byte {
 	return wire
 }
 
-// startLiveTalker starts ros2 topic pub in the peer with per-run payload.
-func startLiveTalker(t *testing.T, ctx context.Context, domain uint32, topic, payload string) *exec.Cmd {
+// startLiveTalker starts ros2 topic pub in the peer with per-run payload at the given rate.
+func startLiveTalker(t *testing.T, ctx context.Context, domain uint32, topic, payload, rate string) *exec.Cmd {
 	t.Helper()
 	pubArg := fmt.Sprintf("{data: %s}", payload)
-	args := helpers.DockerArgs(helpers.Container, int(domain), helpers.RosBin, "topic", "pub", topic, helpers.RosType, pubArg, "--rate", "2")
+	args := helpers.DockerArgs(helpers.Container, int(domain), helpers.RosBin, "topic", "pub", topic, helpers.RosType, pubArg, "--rate", rate)
 	talker := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness runs docker with fixed test args
 	err := talker.Start()
 	if err != nil {
@@ -167,13 +167,18 @@ func checkLateForward(t *testing.T, ctx context.Context, backend *dds.Backend, f
 	if cerr != nil {
 		t.Fatalf("context ended before talker: %v", cerr)
 	}
-	talker := startLiveTalker(t, ctx, rosLiveLateDomain, forwardTopic, forwardPayload)
+	talker := startLiveTalker(t, ctx, rosLiveLateDomain, forwardTopic, forwardPayload, "2")
 	skips := 0
+	lastReason := ""
 	for {
 		cerr = ctx.Err()
 		if cerr != nil {
 			stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
 			t.Fatalf("context ended waiting for late talker: %v", cerr)
+		}
+		if skips >= 100 {
+			stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
+			t.Fatalf("weld take on %q saw 100 consecutive skips without run %q, last reason %q: systematic wrong-topic delivery", forwardTopic, runID, lastReason)
 		}
 		msg, terr := backend.TakeBytes(takeCtx)
 		if terr != nil {
@@ -187,26 +192,31 @@ func checkLateForward(t *testing.T, ctx context.Context, backend *dds.Backend, f
 			}
 			if errors.Is(terr, dds.ErrStaleSequence) || errors.Is(terr, dds.ErrTruncated) || errors.Is(terr, dds.ErrInvalidFrame) {
 				skips++
+				lastReason = terr.Error()
 				t.Logf("skip late take drop %d: %v", skips, terr)
 				continue
 			}
 			skips++
+			lastReason = terr.Error()
 			t.Logf("skip late take error %d: %v", skips, terr)
 			continue
 		}
 		if msg.TopicName != forwardTopic {
 			skips++
+			lastReason = "wrong topic " + msg.TopicName
 			t.Logf("skip take arrived on %q want %q skips %d", msg.TopicName, forwardTopic, skips)
 			continue
 		}
 		text, derr := tryDecodeLiveString(msg.Payload)
 		if derr != nil {
 			skips++
+			lastReason = derr.Error()
 			t.Logf("skip take decode on %q skips %d: %v", msg.TopicName, skips, derr)
 			continue
 		}
 		if !strings.Contains(text, runID) {
 			skips++
+			lastReason = "payload without run ID " + text
 			t.Logf("skip take payload without run ID on %q skips %d got %q", msg.TopicName, skips, text)
 			continue
 		}
@@ -327,7 +337,7 @@ func checkQuietTake(t *testing.T, ctx context.Context, backend *dds.Backend, dom
 	if isExpectedTakeError(err) {
 		return
 	}
-	t.Logf("quiet take ended with %v, continuing lease check", err)
+	t.Fatalf("quiet take on domain %d ended with unexpected error %v, want timeout", domain, err)
 }
 
 // checkLeaseSweep proves 10s lease sweep removes after expiry.
@@ -528,7 +538,7 @@ func checkIsolationFlow(t *testing.T, ctx context.Context, listenerBackend, fore
 	if listenerTable.Len() != 0 {
 		t.Fatalf("listener table len = %d, want 0", listenerTable.Len())
 	}
-	_ = startLiveTalker(t, ctx, rosLiveIsoForeign, foreignTopic, foreignPayload)
+	_ = startLiveTalker(t, ctx, rosLiveIsoForeign, foreignTopic, foreignPayload, "2")
 	foreignMsg := transports.OutgoingMessage{
 		TopicName: foreignTopic,
 		TypeName:  rosLiveType,
@@ -554,7 +564,7 @@ func checkIsolationQuietTake(t *testing.T, ctx context.Context, listenerBackend 
 		t.Fatalf("listener on %d took foreign payload from %d, want isolation", rosLiveIsoListener, rosLiveIsoForeign)
 	}
 	if !isExpectedTakeError(err) {
-		t.Logf("isolation take ended with %v, still isolated", err)
+		t.Fatalf("isolation take on %d ended with unexpected error %v, want isolation timeout", rosLiveIsoListener, err)
 	}
 	if listenerTable.Len() != 0 {
 		t.Fatalf("listener table len = %d, want 0", listenerTable.Len())

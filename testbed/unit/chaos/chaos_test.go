@@ -270,6 +270,18 @@ func TestChaosDiscoveryFlapDebounced(t *testing.T) {
 	}
 }
 
+// waitForChaosProgress polls until the taker delivers at least once.
+func waitForChaosProgress(t *testing.T, backend *chaos.ChaosBackend) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for backend.Stats().Delivered == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no publisher progress before close: delivered = 0, want at least 1 of 5")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestChaosTeardownMidRun checks Close interrupts a draining taker.
 func TestChaosTeardownMidRun(t *testing.T) {
 	t.Parallel()
@@ -306,6 +318,8 @@ func TestChaosTeardownMidRun(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
+	waitForChaosProgress(t, backend)
+
 	err := backend.Close()
 	if err != nil {
 		t.Fatalf("close mid run: %v", err)
@@ -321,6 +335,12 @@ func TestChaosTeardownMidRun(t *testing.T) {
 	got := <-collected
 
 	stats := backend.Stats()
+	if stats.Delivered == 0 {
+		t.Fatalf("delivered = 0, want at least 1 to prove mid-drain interrupt, got = %d", got)
+	}
+	if got == 0 {
+		t.Fatalf("collected = 0, want at least 1 to prove mid-drain interrupt, delivered = %d", stats.Delivered)
+	}
 	if got != stats.Delivered {
 		t.Fatalf("collected = %d, delivered = %d", got, stats.Delivered)
 	}

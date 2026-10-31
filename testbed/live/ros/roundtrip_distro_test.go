@@ -67,7 +67,7 @@ func matrixRunForward(t *testing.T, ctx context.Context, bin string, peer helper
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), matrixCleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, peer.Container, peer.Domain, pidPath, live)
+		helpers.StopPeerProcAndWait(cleanupCtx, peer.Container, peer.Domain, pidPath, live)
 	})
 	helpers.Sleep(ctx, matrixForwardNap)
 	if ctx.Err() != nil {
@@ -126,7 +126,7 @@ func matrixRunReverse(t *testing.T, ctx context.Context, bin string, peer helper
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), matrixCleanWait)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, peer.Container, peer.Domain, pidPath, topic)
+		helpers.StopPeerProcAndWait(cleanupCtx, peer.Container, peer.Domain, pidPath, topic)
 	})
 	helpers.Sleep(ctx, matrixReverseNap)
 	if ctx.Err() != nil {

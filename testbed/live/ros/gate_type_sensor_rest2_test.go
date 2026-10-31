@@ -608,7 +608,7 @@ func TestROSTypeSensorPointCloud2Large(t *testing.T) {
 			t.Fatalf("ros echo did not see rest2 large pc2 %q: %v", runID, rerr)
 		}
 		if sensorRest2LargeAllowlisted(sensorRest2PC2RosType, sensorRestHashPointCloud2, time.Now()) {
-			t.Skipf("ros echo did not see rest2 large pc2 %q, allowlisted", runID)
+			t.Skipf("allowlisted live gap %s hash %s expires %s: ros echo did not see rest2 large pc2 %q", "sensor-pc2-large", sensorRestHashPointCloud2, time.Date(2027, time.March, 31, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest2 large pc2 %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

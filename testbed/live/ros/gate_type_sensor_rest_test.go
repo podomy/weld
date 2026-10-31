@@ -2640,7 +2640,7 @@ func TestROSTypeSensorImageLarge(t *testing.T) {
 			t.Fatalf("ros echo did not see rest large image %q: %v", runID, rerr)
 		}
 		if sensorRestLargeAllowlisted(largePayloadRosType, sensorRest2HashImage, time.Now()) {
-			t.Skipf("ros echo did not see rest large image %q, allowlisted", runID)
+			t.Skipf("allowlisted live gap %s hash %s expires %s: ros echo did not see rest large image %q", "sensor-image-large", sensorRest2HashImage, time.Date(2027, time.March, 31, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest large image %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

@@ -79,7 +79,7 @@ func TestCycloneSPDPDomain48DecodesNonLocal(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
 	})
 	found := false
 	successes := 0

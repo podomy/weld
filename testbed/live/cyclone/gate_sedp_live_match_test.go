@@ -365,7 +365,7 @@ func TestCycloneSEDPLiveParseMatch(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), sedpLiveCleanup)
 		defer cleanupCancel()
-		helpers.StopPeerProc(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
+		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, int(domain), pidPath, runID)
 	})
 	ep := captureSEDPWriter(t, ctx, local, sender, uni, metaZero, userZero, topic, domain)
 	if ep.DDSTopic == "" {

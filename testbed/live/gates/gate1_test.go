@@ -118,7 +118,7 @@ func TestGate1SPDPAcceptance(t *testing.T) {
 		if ann.GUID.Prefix == localPrefix {
 			continue
 		}
-		helpers.CheckWire(t, raw)
+		helpers.CheckWire(t, raw, domain, payloadID)
 		if ann.Sequence == 0 {
 			t.Fatalf("live sequence is zero")
 		}

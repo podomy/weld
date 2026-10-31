@@ -210,7 +210,7 @@ func qosDHCheckCompatible(t *testing.T, c qosDHCase, report core.CompatibilityRe
 // qosDHCheckIncompatible asserts an incompatible report names durability loudly.
 func qosDHCheckIncompatible(t *testing.T, c qosDHCase, report core.CompatibilityReport, offered, requested core.QoSProfile, publisher, subscriber string) {
 	t.Helper()
-	helpers.CheckQoSIncompatible(t, c.name, report, offered, requested, publisher, subscriber, c.wantPolicy, "qos durability history")
+	helpers.CheckQoSIncompatible(t, c.name, report, offered, requested, publisher, subscriber, c.wantPolicy, "qos durability history", 0, "")
 }
 
 // qosDHCheckCore asserts core compatibility matches the case expectation.

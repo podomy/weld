@@ -140,7 +140,7 @@ func TestGate0PortsAndSPDP(t *testing.T) {
 	if ann.GUID.Prefix != announcer.GUID().Prefix {
 		t.Fatalf("self GUID mismatch")
 	}
-	helpers.CheckWire(t, packet)
+	helpers.CheckWire(t, packet, domain, "gate0")
 }
 
 // TestGate0LaunchCorpusPresent pins the launch-argument gate files.

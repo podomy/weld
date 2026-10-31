@@ -118,6 +118,77 @@ func (d WireDuration) IsZero() bool {
 	return d.Seconds == 0 && d.Nanoseconds == 0
 }
 
+// WireQoSParseRefusal is the typed loud refusal for an unparseable wire value.
+//
+// It mirrors WireQoSRefusal for the parse path, which has no topic or
+// endpoint pair context: only the refusing policy kind plus a lowercase
+// detail travel. Callers test for it with IsWireQoSParseRefusal, never
+// with string matching.
+//
+//nolint:errname // refusal names policy context, Error suffix would obscure loud refusal intent
+type WireQoSParseRefusal struct {
+	// Policy is the refusing policy kind.
+	Policy WriterPolicyKind
+	// Detail explains the unparseable value in lowercase form.
+	Detail string
+}
+
+// Error renders the refusal with the policy kind.
+func (e *WireQoSParseRefusal) Error() string {
+	return fmt.Sprintf("dds: writerqos parse: policy %s: %s", string(e.Policy), e.Detail)
+}
+
+// IsWireQoSParseRefusal reports whether err is a wire QoS parse refusal.
+func IsWireQoSParseRefusal(err error) bool {
+	var refusal *WireQoSParseRefusal
+
+	return errors.As(err, &refusal)
+}
+
+// WireQoSReverseRefusal is the typed loud refusal for an untranslatable wire value.
+//
+// It mirrors WireQoSRefusal for the reverse path, which has no topic or
+// endpoint pair context: only the refusing policy kind plus a lowercase
+// detail travel. Transient, persistent, and manual-by-participant kinds
+// refuse here instead of mapping to Unknown. Callers test for it with
+// IsWireQoSReverseRefusal, never with string matching.
+//
+//nolint:errname // refusal names policy context, Error suffix would obscure loud refusal intent
+type WireQoSReverseRefusal struct {
+	// Policy is the refusing policy kind.
+	Policy WriterPolicyKind
+	// Detail explains the untranslatable kind in lowercase form.
+	Detail string
+}
+
+// Error renders the refusal with the policy kind.
+func (e *WireQoSReverseRefusal) Error() string {
+	return fmt.Sprintf("dds: writerqos reverse: policy %s: %s", string(e.Policy), e.Detail)
+}
+
+// IsWireQoSReverseRefusal reports whether err is a wire QoS reverse refusal.
+func IsWireQoSReverseRefusal(err error) bool {
+	var refusal *WireQoSReverseRefusal
+
+	return errors.As(err, &refusal)
+}
+
+// refuseParseError builds one loud parse refusal for one policy.
+func refuseParseError(policy WriterPolicyKind, format string, args ...any) error {
+	return &WireQoSParseRefusal{
+		Policy: policy,
+		Detail: fmt.Sprintf(format, args...),
+	}
+}
+
+// refuseReverseError builds one loud reverse refusal for one policy.
+func refuseReverseError(policy WriterPolicyKind, format string, args ...any) error {
+	return &WireQoSReverseRefusal{
+		Policy: policy,
+		Detail: fmt.Sprintf(format, args...),
+	}
+}
+
 // encode renders d as 8 little endian bytes: seconds plus nanoseconds.
 func (d WireDuration) encode() []byte {
 	out := make([]byte, 0, 8)
@@ -128,9 +199,9 @@ func (d WireDuration) encode() []byte {
 }
 
 // decodeWireDuration parses 8 little endian bytes into a wire duration.
-func decodeWireDuration(raw []byte) (WireDuration, error) {
+func decodeWireDuration(raw []byte, policy WriterPolicyKind) (WireDuration, error) {
 	if len(raw) != 8 {
-		return WireDuration{}, fmt.Errorf("dds: writerqos duration length %d, want 8", len(raw))
+		return WireDuration{}, refuseParseError(policy, "duration length %d, want 8", len(raw))
 	}
 
 	return WireDuration{
@@ -152,8 +223,9 @@ type WireQoS struct {
 	ReliabilityKind uint32
 	// MaxBlockingTime is infinite for reliable and zero for best effort.
 	MaxBlockingTime WireDuration
-	// DurabilityKind is volatile 0 or transient local 1 on forward. Reverse
-	// can also carry transient 2, persistent 3, or an unknown kind.
+	// DurabilityKind is volatile 0 or transient local 1 on forward. The wire
+	// can also carry transient 2, persistent 3, or an unknown kind;
+	// ReverseQoS refuses those loudly with WireQoSReverseRefusal.
 	DurabilityKind uint32
 	// HistoryKind is keep last 0 or keep all 1.
 	HistoryKind uint32
@@ -163,7 +235,8 @@ type WireQoS struct {
 	Deadline WireDuration
 	// Lifespan is message expiry in DDS range.
 	Lifespan WireDuration
-	// LivelinessKind is automatic 0 or manual by topic 2 on forward.
+	// LivelinessKind is automatic 0 or manual by topic 2 on forward. The wire
+	// can also carry manual by participant 1; ReverseQoS refuses it loudly.
 	LivelinessKind uint32
 	// LeaseDuration is liveliness lease in DDS range.
 	LeaseDuration WireDuration
@@ -470,18 +543,18 @@ func (q WireQoS) Params() []rtps.Param {
 func parseWireReliability(byID map[uint16][]byte) (uint32, WireDuration, error) {
 	raw, seen := byID[rtps.PIDReliability]
 	if !seen {
-		return 0, WireDuration{}, fmt.Errorf("dds: writerqos parse misses reliability: policy %s", string(core.PolicyReliability))
+		return 0, WireDuration{}, refuseParseError(core.PolicyReliability, "misses reliability")
 	}
 
 	if len(raw) != 12 {
-		return 0, WireDuration{}, fmt.Errorf("dds: writerqos parse reliability length %d, want 12: policy %s", len(raw), string(core.PolicyReliability))
+		return 0, WireDuration{}, refuseParseError(core.PolicyReliability, "reliability length %d, want 12", len(raw))
 	}
 
 	kind := binary.LittleEndian.Uint32(raw[:4])
 
-	blocking, err := decodeWireDuration(raw[4:12])
+	blocking, err := decodeWireDuration(raw[4:12], core.PolicyReliability)
 	if err != nil {
-		return 0, WireDuration{}, fmt.Errorf("dds: writerqos parse blocking time: %w: policy %s", err, string(core.PolicyReliability))
+		return 0, WireDuration{}, err
 	}
 
 	return kind, blocking, nil
@@ -491,11 +564,11 @@ func parseWireReliability(byID map[uint16][]byte) (uint32, WireDuration, error) 
 func parseWireDurability(byID map[uint16][]byte) (uint32, error) {
 	raw, seen := byID[rtps.PIDDurability]
 	if !seen {
-		return 0, fmt.Errorf("dds: writerqos parse misses durability: policy %s", string(core.PolicyDurability))
+		return 0, refuseParseError(core.PolicyDurability, "misses durability")
 	}
 
 	if len(raw) != 4 {
-		return 0, fmt.Errorf("dds: writerqos parse durability length %d, want 4: policy %s", len(raw), string(core.PolicyDurability))
+		return 0, refuseParseError(core.PolicyDurability, "durability length %d, want 4", len(raw))
 	}
 
 	return binary.LittleEndian.Uint32(raw), nil
@@ -505,11 +578,11 @@ func parseWireDurability(byID map[uint16][]byte) (uint32, error) {
 func parseWireHistory(byID map[uint16][]byte) (uint32, uint32, error) {
 	raw, seen := byID[rtps.PIDHistory]
 	if !seen {
-		return 0, 0, fmt.Errorf("dds: writerqos parse misses history: policy %s", string(WriterPolicyHistory))
+		return 0, 0, refuseParseError(WriterPolicyHistory, "misses history")
 	}
 
 	if len(raw) != 8 {
-		return 0, 0, fmt.Errorf("dds: writerqos parse history length %d, want 8: policy %s", len(raw), string(WriterPolicyHistory))
+		return 0, 0, refuseParseError(WriterPolicyHistory, "history length %d, want 8", len(raw))
 	}
 
 	return binary.LittleEndian.Uint32(raw[:4]), binary.LittleEndian.Uint32(raw[4:8]), nil
@@ -518,18 +591,18 @@ func parseWireHistory(byID map[uint16][]byte) (uint32, uint32, error) {
 // parseWireOptionalDurations decodes optional deadline, lifespan, and liveliness.
 func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 	if raw, seen := byID[writerQoSPIDDeadline]; seen {
-		deadline, err := decodeWireDuration(raw)
+		deadline, err := decodeWireDuration(raw, core.PolicyDeadline)
 		if err != nil {
-			return fmt.Errorf("dds: writerqos parse deadline: %w: policy %s", err, string(core.PolicyDeadline))
+			return err
 		}
 
 		out.Deadline = deadline
 	}
 
 	if raw, seen := byID[writerQoSPIDLifespan]; seen {
-		lifespan, err := decodeWireDuration(raw)
+		lifespan, err := decodeWireDuration(raw, WriterPolicyLifespan)
 		if err != nil {
-			return fmt.Errorf("dds: writerqos parse lifespan: %w: policy %s", err, string(WriterPolicyLifespan))
+			return err
 		}
 
 		out.Lifespan = lifespan
@@ -537,14 +610,14 @@ func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 
 	if raw, seen := byID[writerQoSPIDLiveliness]; seen {
 		if len(raw) != 12 {
-			return fmt.Errorf("dds: writerqos parse liveliness length %d, want 12: policy %s", len(raw), string(core.PolicyLiveliness))
+			return refuseParseError(core.PolicyLiveliness, "liveliness length %d, want 12", len(raw))
 		}
 
 		out.LivelinessKind = binary.LittleEndian.Uint32(raw[:4])
 
-		lease, err := decodeWireDuration(raw[4:12])
+		lease, err := decodeWireDuration(raw[4:12], core.PolicyLeaseDuration)
 		if err != nil {
-			return fmt.Errorf("dds: writerqos parse lease: %w: policy %s", err, string(core.PolicyLeaseDuration))
+			return err
 		}
 
 		out.LeaseDuration = lease
@@ -560,8 +633,8 @@ func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 // history are required because Weld has always announced them and matching
 // without them is meaningless; absent deadline, lifespan, or liveliness
 // maps to DDS infinite, which core matching treats exactly like the
-// unspecified default. Malformed value lengths refuse loudly with the
-// policy kind named.
+// unspecified default. Malformed value lengths refuse loudly with a typed
+// WireQoSParseRefusal naming the policy kind.
 func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	byID := make(map[uint16][]byte, len(params))
 
@@ -603,7 +676,8 @@ func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	out.LivelinessKind = writerQoSLivelinessAutomatic
 	out.LeaseDuration = InfiniteWireDuration()
 
-	if err := parseWireOptionalDurations(byID, &out); err != nil {
+	err = parseWireOptionalDurations(byID, &out)
+	if err != nil {
 		return WireQoS{}, err
 	}
 
@@ -621,11 +695,11 @@ func reverseWireDuration(d WireDuration, policy WriterPolicyKind) (core.Duration
 	}
 
 	if d.Seconds < 0 {
-		return core.Duration{}, fmt.Errorf("dds: writerqos reverse negative wire seconds %d: policy %s", d.Seconds, string(policy))
+		return core.Duration{}, refuseReverseError(policy, "negative wire seconds %d", d.Seconds)
 	}
 
 	if d.Nanoseconds >= writerQoSNanosPerSecond {
-		return core.Duration{}, fmt.Errorf("dds: writerqos reverse nanoseconds %d above range: policy %s", d.Nanoseconds, string(policy))
+		return core.Duration{}, refuseReverseError(policy, "nanoseconds %d above range", d.Nanoseconds)
 	}
 
 	return core.NewDuration(int64(d.Seconds), d.Nanoseconds), nil
@@ -636,14 +710,14 @@ func reverseHistory(q WireQoS) (core.HistoryPolicy, uint64, WriterPolicyKind, er
 	switch q.HistoryKind {
 	case sedpHistoryKeepLast:
 		if q.Depth == 0 {
-			return core.HistoryPolicy(0), 0, WriterPolicyHistory, errors.New("dds: writerqos reverse keep last depth 0 is not resolved")
+			return core.HistoryPolicy(0), 0, WriterPolicyHistory, refuseReverseError(WriterPolicyHistory, "keep last depth 0 is not resolved")
 		}
 
 		return core.HistoryKeepLast, uint64(q.Depth), "", nil
 	case writerQoSHistoryKeepAll:
 		return core.HistoryKeepAll, 0, "", nil
 	default:
-		return core.HistoryPolicy(0), 0, WriterPolicyHistory, fmt.Errorf("dds: writerqos reverse history kind %d is unknown", q.HistoryKind)
+		return core.HistoryPolicy(0), 0, WriterPolicyHistory, refuseReverseError(WriterPolicyHistory, "history kind %d is unknown", q.HistoryKind)
 	}
 }
 
@@ -655,25 +729,33 @@ func reverseReliability(q WireQoS) (core.ReliabilityPolicy, WriterPolicyKind, er
 	case writerQoSReliabilityBestEffort:
 		return core.ReliabilityBestEffort, "", nil
 	default:
-		return core.ReliabilityPolicy(0), core.PolicyReliability, fmt.Errorf("dds: writerqos reverse reliability kind %d is unknown", q.ReliabilityKind)
+		return core.ReliabilityPolicy(0), core.PolicyReliability, refuseReverseError(core.PolicyReliability, "reliability kind %d is unknown", q.ReliabilityKind)
 	}
 }
 
 // reverseDurability maps wire durability kind to core durability.
-func reverseDurability(q WireQoS) core.DurabilityPolicy {
+//
+// Volatile and transient local map directly. Transient, persistent, and
+// any unknown kind refuse loudly instead of mapping to Unknown: Unknown
+// would pass compat silently and misroute durability enforcement.
+func reverseDurability(q WireQoS) (core.DurabilityPolicy, WriterPolicyKind, error) {
 	switch q.DurabilityKind {
 	case sedpDurabilityVolatile:
-		return core.DurabilityVolatile
+		return core.DurabilityVolatile, "", nil
 	case sedpDurabilityTransientLocal:
-		return core.DurabilityTransientLocal
+		return core.DurabilityTransientLocal, "", nil
 	case writerQoSDurabilityTransient, writerQoSDurabilityPersistent:
-		return core.DurabilityUnknown
+		return core.DurabilityPolicy(0), core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d needs crypto-backed transient storage", q.DurabilityKind)
 	default:
-		return core.DurabilityUnknown
+		return core.DurabilityPolicy(0), core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d is unknown", q.DurabilityKind)
 	}
 }
 
 // reverseLiveliness maps wire liveliness kind to core liveliness.
+//
+// Automatic and manual by topic map directly. Manual by participant
+// refuses loudly instead of mapping to Unknown: Unknown would pass
+// compat silently. Unknown kinds refuse loudly with the policy named.
 func reverseLiveliness(q WireQoS) (core.LivelinessPolicy, WriterPolicyKind, error) {
 	switch q.LivelinessKind {
 	case writerQoSLivelinessAutomatic:
@@ -681,9 +763,9 @@ func reverseLiveliness(q WireQoS) (core.LivelinessPolicy, WriterPolicyKind, erro
 	case writerQoSLivelinessManualByTopic:
 		return core.LivelinessManualByTopic, "", nil
 	case writerQoSLivelinessManualByParticipant:
-		return core.LivelinessUnknown, "", nil
+		return core.LivelinessPolicy(0), core.PolicyLiveliness, refuseReverseError(core.PolicyLiveliness, "manual by participant kind %d has no core counterpart", q.LivelinessKind)
 	default:
-		return core.LivelinessPolicy(0), core.PolicyLiveliness, fmt.Errorf("dds: writerqos reverse liveliness kind %d is unknown", q.LivelinessKind)
+		return core.LivelinessPolicy(0), core.PolicyLiveliness, refuseReverseError(core.PolicyLiveliness, "liveliness kind %d is unknown", q.LivelinessKind)
 	}
 }
 
@@ -726,7 +808,13 @@ func reverseWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 	}
 
 	out.Reliability = reliability
-	out.Durability = reverseDurability(q)
+
+	durability, policy, err := reverseDurability(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Durability = durability
 
 	liveliness, policy, err := reverseLiveliness(q)
 	if err != nil {
@@ -749,15 +837,14 @@ func reverseWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 
 // ReverseQoS translates a wire QoS back to a core profile for matching.
 //
-// It mirrors the FastDDS ReverseQoS shape: keep all maps directly,
-// reliable and best effort map directly, transient and persistent
-// durability become unknown, manual by participant liveliness becomes
-// unknown, and durations convert with infinite mapping. Unknown history,
-// reliability, and liveliness kinds refuse loudly with the policy kind
-// named. The avoidance flag is never carried on the wire and returns
-// false. Unknown durability and liveliness markers map to core unknown
-// instead of flowing silently, so Validate still rejects them loudly
-// before entity creation.
+// It mirrors the FastDDS ReverseQoS shape: keep all maps directly and
+// reliable plus best effort map directly, while transient, persistent,
+// and manual by participant kinds refuse loudly with typed
+// WireQoSReverseRefusal instead of mapping to Unknown that would pass
+// compat silently. Unknown history, reliability, durability, and
+// liveliness kinds refuse loudly with the policy kind named. Durations
+// convert with infinite mapping. The avoidance flag is never carried on
+// the wire and returns false.
 func ReverseQoS(q WireQoS) (core.QoSProfile, error) {
 	out, policy, err := reverseWithPolicy(q)
 	if err != nil {

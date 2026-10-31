@@ -139,8 +139,8 @@ func TestLoanPoolBounds(t *testing.T) {
 	if pool.Free() != 2 {
 		t.Fatalf("free = %d, want capacity 2 after returns", pool.Free())
 	}
-	if pool.Returns() != 3 {
-		t.Fatalf("returns = %d, want 3 pooled returns", pool.Returns())
+	if pool.Returns() != 4 {
+		t.Fatalf("returns = %d, want 4 pooled plus exact-size returns", pool.Returns())
 	}
 	fourth, err := pool.Borrow(table, 8)
 	if err != nil {
@@ -161,30 +161,37 @@ func TestLoanPoolBounds(t *testing.T) {
 // TestLoanPoolInvalid checks constructor and borrow argument validation.
 func TestLoanPoolInvalid(t *testing.T) {
 	t.Parallel()
-	if _, err := NewLoanPool(0, 64); err == nil {
+	_, err := NewLoanPool(0, 64)
+	if err == nil {
 		t.Fatal("zero capacity accepted")
 	}
-	if _, err := NewLoanPool(2, 0); err == nil {
+	_, err = NewLoanPool(2, 0)
+	if err == nil {
 		t.Fatal("zero buffer size accepted")
 	}
-	if _, err := NewLoanPool(2, maxPayloadLen+1); err == nil {
+	_, err = NewLoanPool(2, maxPayloadLen+1)
+	if err == nil {
 		t.Fatal("oversize buffer accepted")
 	}
 	pool, err := NewLoanPool(2, 64)
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}
-	if _, err := pool.Borrow(nil, 8); !errors.Is(err, ErrLoanNotEligible) {
+	_, err = pool.Borrow(nil, 8)
+	if !errors.Is(err, ErrLoanNotEligible) {
 		t.Fatalf("nil table borrow = %v, want ErrLoanNotEligible", err)
 	}
-	if _, err := pool.Borrow(loanEligibleTable(), -1); err == nil {
+	_, err = pool.Borrow(loanEligibleTable(), -1)
+	if err == nil {
 		t.Fatal("negative size accepted")
 	}
-	if _, err := pool.Borrow(loanEligibleTable(), maxPayloadLen+1); err == nil {
+	_, err = pool.Borrow(loanEligibleTable(), maxPayloadLen+1)
+	if err == nil {
 		t.Fatal("oversize borrow accepted")
 	}
 	var nilPool *LoanPool
-	if _, err := nilPool.Borrow(loanEligibleTable(), 8); err == nil {
+	_, err = nilPool.Borrow(loanEligibleTable(), 8)
+	if err == nil {
 		t.Fatal("nil pool borrow succeeded")
 	}
 }
@@ -215,13 +222,16 @@ func TestLoanLifecycleDoubleReturn(t *testing.T) {
 	if loan.Valid() {
 		t.Fatal("handle still valid after return")
 	}
-	if _, err := loan.Bytes(); !errors.Is(err, ErrLoanReturned) {
+	_, err = loan.Bytes()
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("bytes after return = %v, want ErrLoanReturned", err)
 	}
-	if err := loan.Return(); !errors.Is(err, ErrLoanReturned) {
+	err = loan.Return()
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("double return = %v, want ErrLoanReturned", err)
 	}
-	if _, err := (*Loan)(nil).Bytes(); !errors.Is(err, ErrLoanReturned) {
+	_, err = (*Loan)(nil).Bytes()
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("nil bytes = %v, want ErrLoanReturned", err)
 	}
 }
@@ -263,7 +273,8 @@ func TestLoanNoAliasingAfterReturn(t *testing.T) {
 		t.Fatalf("reborrow: %v", err)
 	}
 	defer func() {
-		if err := next.Return(); err != nil {
+		err := next.Return()
+		if err != nil {
 			t.Errorf("return recycled: %v", err)
 		}
 	}()
@@ -323,7 +334,8 @@ func TestLoanBorrowRefusesNonEligible(t *testing.T) {
 		"boolvector": loanBoolVectorTable(),
 	}
 	for name, table := range tables {
-		if _, err := pool.Borrow(table, 8); !errors.Is(err, ErrLoanNotEligible) {
+		_, err = pool.Borrow(table, 8)
+		if !errors.Is(err, ErrLoanNotEligible) {
 			t.Fatalf("%s borrow = %v, want ErrLoanNotEligible", name, err)
 		}
 	}
@@ -433,7 +445,8 @@ func TestLoanedTakeRefusesNonEligible(t *testing.T) {
 	}
 	recv := newLoanedTestReceiver(t, pool)
 	frame := loanFrame(t, []byte{9, 9, 9, 9})
-	if _, err := recv.TakeLoaned(frame, loanStringTable()); !errors.Is(err, ErrLoanNotEligible) {
+	_, err = recv.TakeLoaned(frame, loanStringTable())
+	if !errors.Is(err, ErrLoanNotEligible) {
 		t.Fatalf("take loaned string = %v, want ErrLoanNotEligible", err)
 	}
 	if recv.Loans() != 0 {
@@ -455,7 +468,8 @@ func TestLoanedTakeEmptyPayload(t *testing.T) {
 		t.Fatalf("take loaned empty: %v", err)
 	}
 	defer func() {
-		if err := loan.Return(); err != nil {
+		err := loan.Return()
+		if err != nil {
 			t.Errorf("return empty loan: %v", err)
 		}
 	}()
@@ -480,7 +494,8 @@ func TestLoanedTakeRejectsBadFrame(t *testing.T) {
 	}
 	recv := newLoanedTestReceiver(t, pool)
 	before := recv.inner.DroppedCount()
-	if _, err := recv.TakeLoaned([]byte{0x00, 0x01}, loanEligibleTable()); err == nil {
+	_, err = recv.TakeLoaned([]byte{0x00, 0x01}, loanEligibleTable())
+	if err == nil {
 		t.Fatal("truncated frame accepted")
 	}
 	if recv.inner.DroppedCount() != before+1 {
@@ -502,7 +517,8 @@ func TestLoanChannelZeroCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new channel: %v", err)
 	}
-	if _, err := NewLoanChannel(0); err == nil {
+	_, err = NewLoanChannel(0)
+	if err == nil {
 		t.Fatal("zero depth accepted")
 	}
 	table := loanEligibleTable()
@@ -522,7 +538,8 @@ func TestLoanChannelZeroCopy(t *testing.T) {
 	if loan.Valid() {
 		t.Fatal("sender handle still valid after send")
 	}
-	if err := ch.Send(loan); !errors.Is(err, ErrLoanReturned) {
+	err = ch.Send(loan)
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("second send = %v, want ErrLoanReturned", err)
 	}
 	if ch.Transfers() != 1 {
@@ -548,7 +565,8 @@ func TestLoanChannelZeroCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("return: %v", err)
 	}
-	if err := got.Return(); !errors.Is(err, ErrLoanReturned) {
+	err = got.Return()
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("double return = %v, want ErrLoanReturned", err)
 	}
 }
@@ -563,17 +581,21 @@ func TestLoanChannelRespectsContext(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := ch.Recv(canceled); !errors.Is(err, context.Canceled) {
+	_, err = ch.Recv(canceled)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("recv canceled = %v, want context.Canceled", err)
 	}
-	if err := ch.Send(nil); !errors.Is(err, ErrLoanReturned) {
+	err = ch.Send(nil)
+	if !errors.Is(err, ErrLoanReturned) {
 		t.Fatalf("send nil = %v, want ErrLoanReturned", err)
 	}
 	var nilCh *LoanChannel
-	if err := nilCh.Send(nil); err == nil {
+	err = nilCh.Send(nil)
+	if err == nil {
 		t.Fatal("nil channel send succeeded")
 	}
-	if _, err := nilCh.Recv(context.Background()); err == nil {
+	_, err = nilCh.Recv(context.Background())
+	if err == nil {
 		t.Fatal("nil channel recv succeeded")
 	}
 }
@@ -623,7 +645,8 @@ func TestLoanConcurrentRace(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if err := loan.Return(); err != nil {
+			err = loan.Return()
+			if err != nil {
 				t.Errorf("return take loan: %v", err)
 			}
 		})
@@ -649,7 +672,8 @@ func TestLoanConcurrentRace(t *testing.T) {
 				t.Errorf("channel recv: %v", err)
 				return
 			}
-			if err := loan.Return(); err != nil {
+			err = loan.Return()
+			if err != nil {
 				t.Errorf("return channel loan: %v", err)
 			}
 		}
@@ -664,19 +688,23 @@ func TestLoanNewReceiverInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}
-	if _, err := NewLoanedReceiver(nil, pool); err == nil {
+	_, err = NewLoanedReceiver(nil, pool)
+	if err == nil {
 		t.Fatal("nil receiver accepted")
 	}
-	if _, err := NewLoanedReceiver(NewDataReceiver(), nil); err == nil {
+	_, err = NewLoanedReceiver(NewDataReceiver(), nil)
+	if err == nil {
 		t.Fatal("nil pool accepted")
 	}
 	var nilRecv *LoanedReceiver
-	if _, err := nilRecv.TakeLoaned([]byte{}, loanEligibleTable()); err == nil {
+	_, err = nilRecv.TakeLoaned([]byte{}, loanEligibleTable())
+	if err == nil {
 		t.Fatal("nil receiver take succeeded")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultLoanTestTimeout)
 	defer cancel()
-	if _, err := nilRecv.TakeLoanedFrom(ctx, nil, loanEligibleTable()); err == nil {
+	_, err = nilRecv.TakeLoanedFrom(ctx, nil, loanEligibleTable())
+	if err == nil {
 		t.Fatal("nil receiver take from succeeded")
 	}
 }

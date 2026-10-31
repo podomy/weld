@@ -466,52 +466,64 @@ func normalizeForWire(p core.QoSProfile) core.QoSProfile {
 
 // TestReverseQoSUnknownKinds proves wire only kinds map loudly, never silently.
 //
-//nolint:gocognit // test pins unknown wire kind mapping in one run, splitting would obscure intent
+//nolint:gocognit,cyclop // test pins unknown wire kind mapping in one run, splitting would obscure intent
 func TestReverseQoSUnknownKinds(t *testing.T) {
 	base, err := ForwardQoS(writerQoSTestTopic, writerQoSTestPublisher, writerQoSTestSubscriber, core.DefaultQoS())
 	if err != nil {
 		t.Fatalf("ForwardQoS default: %v", err)
 	}
 
-	t.Run("transient-durability-becomes-unknown", func(t *testing.T) {
+	t.Run("transient-durability-refuses-loudly", func(t *testing.T) {
 		q := base
 		q.DurabilityKind = writerQoSDurabilityTransient
 
-		back, err := ReverseQoS(q)
-		if err != nil {
-			t.Fatalf("ReverseQoS transient: %v", err)
+		_, err := ReverseQoS(q)
+		if err == nil {
+			t.Fatalf("ReverseQoS transient succeeded, want loud refusal")
 		}
 
-		if back.Durability != core.DurabilityUnknown {
-			t.Fatalf("transient durability = %v, want unknown", back.Durability)
+		if !IsWireQoSReverseRefusal(err) {
+			t.Fatalf("ReverseQoS transient error type %T, want *WireQoSReverseRefusal: %v", err, err)
+		}
+
+		if !strings.Contains(err.Error(), string(core.PolicyDurability)) {
+			t.Fatalf("transient error misses durability policy: %v", err)
 		}
 	})
 
-	t.Run("persistent-durability-becomes-unknown", func(t *testing.T) {
+	t.Run("persistent-durability-refuses-loudly", func(t *testing.T) {
 		q := base
 		q.DurabilityKind = writerQoSDurabilityPersistent
 
-		back, err := ReverseQoS(q)
-		if err != nil {
-			t.Fatalf("ReverseQoS persistent: %v", err)
+		_, err := ReverseQoS(q)
+		if err == nil {
+			t.Fatalf("ReverseQoS persistent succeeded, want loud refusal")
 		}
 
-		if back.Durability != core.DurabilityUnknown {
-			t.Fatalf("persistent durability = %v, want unknown", back.Durability)
+		if !IsWireQoSReverseRefusal(err) {
+			t.Fatalf("ReverseQoS persistent error type %T, want *WireQoSReverseRefusal: %v", err, err)
+		}
+
+		if !strings.Contains(err.Error(), string(core.PolicyDurability)) {
+			t.Fatalf("persistent error misses durability policy: %v", err)
 		}
 	})
 
-	t.Run("manual-by-participant-becomes-unknown", func(t *testing.T) {
+	t.Run("manual-by-participant-refuses-loudly", func(t *testing.T) {
 		q := base
 		q.LivelinessKind = writerQoSLivelinessManualByParticipant
 
-		back, err := ReverseQoS(q)
-		if err != nil {
-			t.Fatalf("ReverseQoS manual by participant: %v", err)
+		_, err := ReverseQoS(q)
+		if err == nil {
+			t.Fatalf("ReverseQoS manual by participant succeeded, want loud refusal")
 		}
 
-		if back.Liveliness != core.LivelinessUnknown {
-			t.Fatalf("manual by participant liveliness = %v, want unknown", back.Liveliness)
+		if !IsWireQoSReverseRefusal(err) {
+			t.Fatalf("ReverseQoS manual by participant error type %T, want *WireQoSReverseRefusal: %v", err, err)
+		}
+
+		if !strings.Contains(err.Error(), string(core.PolicyLiveliness)) {
+			t.Fatalf("manual by participant error misses liveliness policy: %v", err)
 		}
 	})
 
@@ -534,6 +546,10 @@ func TestReverseQoSUnknownKinds(t *testing.T) {
 			_, err := ReverseQoS(q)
 			if err == nil {
 				t.Fatalf("ReverseQoS unknown %s succeeded, want loud error", c.name)
+			}
+
+			if !IsWireQoSReverseRefusal(err) {
+				t.Fatalf("ReverseQoS unknown %s error type %T, want *WireQoSReverseRefusal: %v", c.name, err, err)
 			}
 
 			if !strings.Contains(err.Error(), string(c.policy)) {
@@ -560,6 +576,10 @@ func TestWriterQoSParseRules(t *testing.T) {
 			t.Fatal("ParseWireQoS without reliability succeeded, want loud error")
 		}
 
+		if !IsWireQoSParseRefusal(err) {
+			t.Fatalf("parse error type %T, want *WireQoSParseRefusal: %v", err, err)
+		}
+
 		if !strings.Contains(err.Error(), string(core.PolicyReliability)) {
 			t.Fatalf("parse error misses reliability policy: %v", err)
 		}
@@ -573,6 +593,10 @@ func TestWriterQoSParseRules(t *testing.T) {
 			t.Fatal("ParseWireQoS without durability succeeded, want loud error")
 		}
 
+		if !IsWireQoSParseRefusal(err) {
+			t.Fatalf("parse error type %T, want *WireQoSParseRefusal: %v", err, err)
+		}
+
 		if !strings.Contains(err.Error(), string(core.PolicyDurability)) {
 			t.Fatalf("parse error misses durability policy: %v", err)
 		}
@@ -584,6 +608,10 @@ func TestWriterQoSParseRules(t *testing.T) {
 		_, err := ParseWireQoS(params)
 		if err == nil {
 			t.Fatal("ParseWireQoS without history succeeded, want loud error")
+		}
+
+		if !IsWireQoSParseRefusal(err) {
+			t.Fatalf("parse error type %T, want *WireQoSParseRefusal: %v", err, err)
 		}
 
 		if !strings.Contains(err.Error(), string(WriterPolicyHistory)) {

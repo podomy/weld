@@ -332,7 +332,13 @@ type EffectiveDepthReport struct {
 // the peer vendor default. The bound is the minimum of both. Reduced is
 // true only for an explicit request cut by a smaller peer, so callers
 // surface the cut through actual-QoS shaped getters instead of silently
-// keeping less history than promised.
+// keeping less history than promised. Zero means unstated per the
+// DurabilityServiceQoS struct contract, where only positive values
+// constrain; resolveWriterDepth floors the same unset marker to 1 for
+// replay bounds while negotiation resolves it to vendor defaults. The
+// two resolutions disagree on purpose because they answer different
+// questions (negotiated promise versus replay floor), so neither path
+// changes the other.
 func NegotiateDepth(requestedDepth, peerDepth uint64, peerVendor PeerVendor) EffectiveDepthReport {
 	resolvedRequested := requestedDepth
 	if resolvedRequested == 0 {
@@ -374,11 +380,14 @@ func NegotiateDepth(requestedDepth, peerDepth uint64, peerVendor PeerVendor) Eff
 // untouched for kind 1. Unknown durability kinds yield zero fail-closed:
 // no replay is promised for an unrecognized kind.
 //
-// Caps with keep-all history apply max samples and max samples per
-// instance when positive. Caps with keep-last history also apply the caps
-// history depth when positive. Zero caps fields mean unstated (the peer
-// omitted the parameter, as Weld does today) and impose no bound; -1
-// means unlimited.
+// Caps with keep-all history apply max samples, max instances, and max
+// samples per instance when positive. Caps with keep-last history also
+// apply the caps history depth when positive. Zero caps fields mean
+// unstated (the peer omitted the parameter, as Weld does today) and
+// impose no bound; -1 means unlimited. Zero here follows the
+// DurabilityServiceQoS struct contract where 0 is unstated and only
+// positive values constrain; see CheckDurabilityServiceCompat for the
+// same rule on the matching path.
 func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS) uint64 {
 	if durabilityKind == sedpDurabilityVolatile {
 		return 0
@@ -402,6 +411,12 @@ func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps Dura
 		bound = min(bound, uint64(caps.MaxSamples))
 	}
 
+	if caps.MaxInstances > 0 {
+		// Keyless topics carry one instance, so the instance cap
+		// bounds the whole replay like the per-instance cap below.
+		bound = min(bound, uint64(caps.MaxInstances))
+	}
+
 	if caps.MaxSamplesPerInstance > 0 {
 		// Keyless topics carry one instance, so the per-instance cap
 		// bounds the whole replay.
@@ -412,7 +427,11 @@ func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps Dura
 }
 
 // resolveWriterDepth floors an unset writer depth to the smallest vendor
-// guarantee so an unset depth never promises zero replay.
+// guarantee so an unset depth never promises zero replay. Zero means
+// unstated per the DurabilityServiceQoS struct contract; NegotiateDepth
+// resolves the same marker to vendor defaults for matching while this
+// floors it to 1 for replay. The disagreement is intentional and neither
+// bound nor matching changes.
 func resolveWriterDepth(depth uint64) uint64 {
 	if depth == 0 {
 		return CycloneUnsetDepth
@@ -437,7 +456,10 @@ type DurabilityServiceResult struct {
 // which bound failed. Cleanup delay requests must not exceed the offer,
 // with an infinite offer satisfying any request. Keep-all history
 // requests need a keep-all offer. Keep-last depth requests must not
-// exceed a keep-last offer; a keep-all offer satisfies any depth. Each
+// exceed a keep-last offer; a keep-all offer satisfies any depth. A zero
+// keep-last depth on either side means unstated per the
+// DurabilityServiceQoS struct contract and imposes no constraint, so it
+// never mismatches here and matching stays unchanged. Each
 // resource limit request must not exceed the offer, where unlimited (-1)
 // needs unlimited and unstated (0) imposes no constraint on either side.
 func CheckDurabilityServiceCompat(offered, requested DurabilityServiceQoS) DurabilityServiceResult {
@@ -534,12 +556,11 @@ func checkResourceLimit(name string, offered, requested int32) string {
 
 // INTEGRATION hooks for wiring this file into the existing paths:
 //
-//  1. sedp.go announce: append DurabilityServiceParam(WeldDurabilityServiceQoS())
-//     to the params list in SerializeSEDPDATA beside the PIDHistory entry
-//     (internal/transports/dds/sedp.go:1323), so writers advertise history
+//  1. DONE sedp.go announce: DurabilityServiceParam(WeldDurabilityServiceQoS())
+//     is appended in SerializeSEDPDATA, so writers advertise history
 //     depth 100 consistently with the facade.
-//  2. sedp.go parse: read PIDDurabilityService in sedpEndpointFields via
-//     DecodeDurabilityService and carry the struct on SEDPEndpoint, so late
+//  2. DONE sedp.go parse: PIDDurabilityService is read in sedpEndpointFields via
+//     DecodeDurabilityService and carried on SEDPEndpoint, so late
 //     joiners learn the peer caps that bound ReplayBound.
 //  3. matcher.go extension: call CheckDurabilityServiceCompat from the
 //     endpoint pair path next to CheckCompatibility

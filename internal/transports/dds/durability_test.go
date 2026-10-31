@@ -157,39 +157,46 @@ func TestDurabilityServiceDecodeRejects(t *testing.T) {
 func TestDurabilityServiceValidate(t *testing.T) {
 	t.Parallel()
 
-	if err := DefaultDurabilityServiceQoS().Validate(); err != nil {
+	err := DefaultDurabilityServiceQoS().Validate()
+	if err != nil {
 		t.Fatalf("defaults invalid: %v", err)
 	}
 
-	if err := WeldDurabilityServiceQoS().Validate(); err != nil {
+	err = WeldDurabilityServiceQoS().Validate()
+	if err != nil {
 		t.Fatalf("weld offer invalid: %v", err)
 	}
 
 	badKind := DefaultDurabilityServiceQoS()
 	badKind.HistoryKind = 2
-	if err := badKind.Validate(); err == nil {
+	err = badKind.Validate()
+	if err == nil {
 		t.Fatalf("history kind 2 validated without error")
 	}
 
 	zeroDepth := DefaultDurabilityServiceQoS()
 	zeroDepth.HistoryDepth = 0
-	if err := zeroDepth.Validate(); err == nil {
+	err = zeroDepth.Validate()
+	if err == nil {
 		t.Fatalf("keep last depth 0 validated without error")
 	}
 
 	negativeDelay := DefaultDurabilityServiceQoS()
 	negativeDelay.CleanupDelaySec = -1
-	if err := negativeDelay.Validate(); err == nil {
+	err = negativeDelay.Validate()
+	if err == nil {
 		t.Fatalf("negative cleanup delay validated without error")
 	}
 
 	badLimit := DefaultDurabilityServiceQoS()
 	badLimit.MaxSamples = -2
-	if err := badLimit.Validate(); err == nil {
+	err = badLimit.Validate()
+	if err == nil {
 		t.Fatalf("max samples -2 validated without error")
 	}
 
-	if _, err := EncodeDurabilityService(badKind); err == nil {
+	_, err = EncodeDurabilityService(badKind)
+	if err == nil {
 		t.Fatalf("encode of bad kind succeeded without error")
 	}
 }

@@ -103,10 +103,16 @@ func keyedFail(op string, err error) error {
 // EndpointKeyed reports whether an endpoint uses a with-key entity kind.
 //
 // Writer kind 0x02 and reader kind 0x07 count as keyed; keyless kinds
-// 0x03 and 0x04 and any other kind count as unkeyed. The check reads only
-// the kind byte so builtin SEDP entities never confuse it.
+// 0x03 and 0x04 and any other kind count as unkeyed. Builtin entities
+// (kind byte with 0xC0 bits set, such as the SEDP 0xC2 writers in
+// sedp.go) are explicitly excluded before the kind comparison per the
+// RTPS EntityKind table, so builtin discovery traffic never reads as
+// keyed even though the check reads only the kind byte.
 func EndpointKeyed(ep SEDPEndpoint) bool {
 	kind := ep.ID.Entity[3]
+	if kind&0xC0 == 0xC0 {
+		return false
+	}
 	return kind == keyedUserWriterKind || kind == keyedUserReaderKind
 }
 

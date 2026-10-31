@@ -84,6 +84,15 @@ var (
 	ErrSecuredTransformUnavailable = errors.New("dds: secured transform unavailable")
 	// ErrSecuredDiscoveryRequiresCrypto reports a peer demanding protected discovery.
 	ErrSecuredDiscoveryRequiresCrypto = errors.New("dds: secured discovery requires crypto")
+	// ErrSecurityPropertyInvalid reports a malformed security property value.
+	//
+	// It is the warn-and-continue sentinel for ExtractSecurityInfo: malformed
+	// values warn with this error while discovery of sibling params keeps
+	// flowing. It never authorizes a must-reject decision; use
+	// ErrSecuredDiscoveryRequiresCrypto for protected-discovery rejects and
+	// ErrSecuredTransformUnavailable for protected-submessage drops so
+	// errors.Is distinguishes warnings from rejects.
+	ErrSecurityPropertyInvalid = errors.New("dds: invalid security property")
 	// ErrSecurityConfigInvalid reports an invalid security configuration.
 	ErrSecurityConfigInvalid = errors.New("dds: invalid security config")
 )
@@ -163,7 +172,10 @@ type SecurityInfo struct {
 // INTEGRATION: the SDK must construct this from flags or files, call
 // Validate, and pass it to backend construction. The CLI must add one flag
 // per path plus an enable flag. No call site exists yet; this type only
-// reserves the shape so future wiring has a pinned contract.
+// reserves the shape so future wiring has a pinned contract. Governance
+// and permissions documents are never read for access decisions: presence
+// of paths here grants nothing and enforces no topic allow or deny rules,
+// matching the honest-tolerance posture above.
 type SecurityConfig struct {
 	// Enabled selects secured operation once crypto exists. False means tolerate mode.
 	Enabled bool
@@ -286,7 +298,8 @@ func ExtractSecurityInfo(params []rtps.Param) (SecurityInfo, []error) {
 	var warnings []error
 
 	for _, p := range params {
-		if err := applySecurityParam(&info, p); err != nil {
+		err := applySecurityParam(&info, p)
+		if err != nil {
 			warnings = append(warnings, err)
 		}
 	}
@@ -375,10 +388,11 @@ func hasSecurityProperty(properties map[string]string) bool {
 //
 // The value holds a little endian uint32 attributes mask, optionally
 // followed by a plugin mask that is ignored for posture decisions.
-// Shorter values fail loudly so the caller can warn without killing the loop.
+// Shorter values fail loudly with the warning sentinel so the caller can
+// warn without killing the loop.
 func parseSecurityAttributes(value []byte) (uint32, error) {
 	if len(value) < 4 {
-		return 0, fmt.Errorf("dds: security attributes need 4 have %d: %w", len(value), ErrSecuredDiscoveryRequiresCrypto)
+		return 0, fmt.Errorf("dds: security attributes need 4 have %d: %w", len(value), ErrSecurityPropertyInvalid)
 	}
 
 	mask := binary.LittleEndian.Uint32(value[:4])
@@ -390,21 +404,15 @@ func parseSecurityAttributes(value []byte) (uint32, error) {
 //
 // The value is a CDR sequence of Property entries: a uint32 count then,
 // per entry, two CDR strings (name, value) plus one boolean propagate
-// byte. Little endian is tried first to match CycloneDDS wire order, then
-// big endian for tolerance. Malformed input fails loudly; callers warn and
-// continue the discovery loop. Duplicate names keep the first value,
+// byte. Only little endian decodes, matching CycloneDDS wire order;
+// big-endian values fail loudly with the warning sentinel instead of a
+// silent LE-then-BE fallback. Malformed input fails loudly; callers warn
+// and continue the discovery loop. Duplicate names keep the first value,
 // matching the SEDP first-wins convention.
 func ParseSecurityPropertyList(value []byte) (map[string]string, error) {
 	props, err := parseSecurityPropertyListEndian(value, true)
-	if err == nil {
-		return props, nil
-	}
-
-	leErr := err
-
-	props, err = parseSecurityPropertyListEndian(value, false)
 	if err != nil {
-		return nil, fmt.Errorf("dds: security property list malformed: %w", errors.Join(leErr, err))
+		return nil, fmt.Errorf("dds: security property list malformed: %w", errors.Join(ErrSecurityPropertyInvalid, err))
 	}
 
 	return props, nil
@@ -421,12 +429,12 @@ func ParseSecurityPropertyList(value []byte) (map[string]string, error) {
 // fail loudly.
 func parseSecurityPropertyListEndian(value []byte, littleEndian bool) (map[string]string, error) {
 	if len(value) < 4 {
-		return nil, fmt.Errorf("dds: security property count need 4 have %d: %w", len(value), ErrSecuredDiscoveryRequiresCrypto)
+		return nil, fmt.Errorf("dds: security property count need 4 have %d: %w", len(value), ErrSecurityPropertyInvalid)
 	}
 
 	count := securityUint32(value[:4], littleEndian)
 	if count > securityMaxProperties {
-		return nil, fmt.Errorf("dds: security property count %d above %d: %w", count, securityMaxProperties, ErrSecuredDiscoveryRequiresCrypto)
+		return nil, fmt.Errorf("dds: security property count %d above %d: %w", count, securityMaxProperties, ErrSecurityPropertyInvalid)
 	}
 
 	props := make(map[string]string)
@@ -468,34 +476,34 @@ func securityUint32(raw []byte, littleEndian bool) uint32 {
 // securityReadString reads one CDR string (length with NUL plus bytes) at off.
 func securityReadString(value []byte, off int, littleEndian bool) (string, int, error) {
 	if len(value)-off < 4 {
-		return "", 0, fmt.Errorf("dds: security string header need 4 have %d: %w", len(value)-off, ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string header need 4 have %d: %w", len(value)-off, ErrSecurityPropertyInvalid)
 	}
 
 	length := int(securityUint32(value[off:off+4], littleEndian))
 
 	if length < 1 || length > securityMaxPropertyStringLen+1 {
-		return "", 0, fmt.Errorf("dds: security string length %d: %w", length, ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string length %d: %w", length, ErrSecurityPropertyInvalid)
 	}
 
 	if len(value)-(off+4) < length {
-		return "", 0, fmt.Errorf("dds: security string need %d have %d: %w", length, len(value)-(off+4), ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string need %d have %d: %w", length, len(value)-(off+4), ErrSecurityPropertyInvalid)
 	}
 
 	raw := value[off+4 : off+4+length]
 	if raw[length-1] != 0x00 {
-		return "", 0, fmt.Errorf("dds: security string misses NUL terminator: %w", ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string misses NUL terminator: %w", ErrSecurityPropertyInvalid)
 	}
 
 	out := string(raw[:length-1])
 	if len(out) > securityMaxPropertyStringLen {
-		return "", 0, fmt.Errorf("dds: security string length %d above cap: %w", len(out), ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string length %d above cap: %w", len(out), ErrSecurityPropertyInvalid)
 	}
 
 	next := off + 4 + length
 	next += (4 - next%4) % 4
 
 	if next > len(value) {
-		return "", 0, fmt.Errorf("dds: security string pad overruns input: %w", ErrSecuredDiscoveryRequiresCrypto)
+		return "", 0, fmt.Errorf("dds: security string pad overruns input: %w", ErrSecurityPropertyInvalid)
 	}
 
 	return out, next, nil

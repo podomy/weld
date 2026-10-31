@@ -150,6 +150,8 @@ func TestSecurityParseTolerateMatrix(t *testing.T) {
 }
 
 // TestSecurityMalformedLoudWithoutKillingLoop checks bad values warn but never stop the loop.
+//
+//nolint:gocognit // test pins warning sentinel distinction plus presence and classification in one run, splitting would obscure intent
 func TestSecurityMalformedLoudWithoutKillingLoop(t *testing.T) {
 	goodEndpoint := rtps.Param{ID: PIDEndpointSecurityInfo, Value: []byte{0x01, 0x00, 0x00, 0x00}}
 	goodToken := rtps.Param{ID: PIDIdentityToken, Value: []byte{0xAA}}
@@ -187,6 +189,16 @@ func TestSecurityMalformedLoudWithoutKillingLoop(t *testing.T) {
 			info, warnings := ExtractSecurityInfo(tc.params)
 			if len(warnings) == 0 {
 				t.Fatalf("malformed security value must warn loudly")
+			}
+
+			for _, w := range warnings {
+				if !errors.Is(w, ErrSecurityPropertyInvalid) {
+					t.Fatalf("warning %v misses ErrSecurityPropertyInvalid", w)
+				}
+
+				if errors.Is(w, ErrSecuredDiscoveryRequiresCrypto) {
+					t.Fatalf("warning %v must not carry must-reject sentinel", w)
+				}
 			}
 
 			if !info.Present {
@@ -278,7 +290,8 @@ func TestSecuredTransformDropExactReason(t *testing.T) {
 		t.Fatalf("plain DATA must not count secured drops, have %d", got)
 	}
 
-	if err := DropProtectedSubmessage(nil, SecuredSubmessageSecBody); !errors.Is(err, ErrNilReceiver) {
+	err = DropProtectedSubmessage(nil, SecuredSubmessageSecBody)
+	if !errors.Is(err, ErrNilReceiver) {
 		t.Fatalf("nil receiver must fail loudly, got %v", err)
 	}
 }
@@ -286,7 +299,8 @@ func TestSecuredTransformDropExactReason(t *testing.T) {
 // TestSecuredDiscoveryLoud checks crypto-demanding peers fail while others flow.
 func TestSecuredDiscoveryLoud(t *testing.T) {
 	crypto := SecurityInfo{Present: true, Classification: SecurityRequiresCrypto}
-	if err := CheckProtectedDiscovery(crypto); !errors.Is(err, ErrSecuredDiscoveryRequiresCrypto) {
+	err := CheckProtectedDiscovery(crypto)
+	if !errors.Is(err, ErrSecuredDiscoveryRequiresCrypto) {
 		t.Fatalf("crypto peer must fail loudly, got %v", err)
 	}
 
@@ -294,7 +308,8 @@ func TestSecuredDiscoveryLoud(t *testing.T) {
 		{Classification: SecurityUnsecured},
 		{Present: true, Classification: SecurityCompatibleUnknown},
 	} {
-		if err := CheckProtectedDiscovery(info); err != nil {
+		err = CheckProtectedDiscovery(info)
+		if err != nil {
 			t.Fatalf("class %s must keep flowing, got %v", info.Classification, err)
 		}
 	}
@@ -310,11 +325,13 @@ func TestSecurityConfigMatrix(t *testing.T) {
 		GovernancePath:          "gov.p7s",
 	}
 
-	if err := (SecurityConfig{}).Validate(); err != nil {
+	err := (SecurityConfig{}).Validate()
+	if err != nil {
 		t.Fatalf("disabled empty config must pass, got %v", err)
 	}
 
-	if err := full.Validate(); err != nil {
+	err = full.Validate()
+	if err != nil {
 		t.Fatalf("enabled full config must pass, got %v", err)
 	}
 
@@ -349,7 +366,8 @@ func TestSecuredReceiverStaysHealthy(t *testing.T) {
 
 	recv := NewDataReceiver()
 
-	if _, err := HandleProtectedSubmessage(recv, rtps.RawSubmessage{ID: SecuredSubmessageSRTPSPrefix, Body: []byte{0x01}}); err == nil {
+	_, err := HandleProtectedSubmessage(recv, rtps.RawSubmessage{ID: SecuredSubmessageSRTPSPrefix, Body: []byte{0x01}})
+	if err == nil {
 		t.Fatalf("protected submessage must drop loudly")
 	}
 

@@ -619,7 +619,8 @@ func TestContentFilterTruncatedSweep(t *testing.T) {
 			corrupt[int(state>>16)%len(corrupt)] ^= byte(state >> 8) //nolint:gosec // G115: LCG byte extraction truncates intentionally for corruption sweep
 		}
 
-		if _, err := f.Evaluate(corrupt, desc); err != nil {
+		_, err = f.Evaluate(corrupt, desc)
+		if err != nil {
 			continue
 		}
 	}

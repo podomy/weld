@@ -280,8 +280,8 @@ func TestTakeHooksPlainNackNoSenderSkips(t *testing.T) {
 	}
 }
 
-// TestTakeHooksKeyedUnregisteredSkips checks unregistered types skip keyed handling.
-func TestTakeHooksKeyedUnregisteredSkips(t *testing.T) {
+// TestTakeHooksKeyedUnregisteredDrops checks unregistered keyed types drop loudly fail-closed.
+func TestTakeHooksKeyedUnregisteredDrops(t *testing.T) {
 	t.Parallel()
 
 	recv := NewDataReceiver()
@@ -290,8 +290,17 @@ func TestTakeHooksKeyedUnregisteredSkips(t *testing.T) {
 	guid[15] = 0x02
 
 	snap := recv.snapshotTakeHooks("/chatter", guid)
-	if rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "plain"), guid, true); rej != nil {
-		t.Fatalf("unregistered keyed sample rejected: %v", rej.err)
+	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "plain"), guid, true)
+	if rej == nil {
+		t.Fatalf("unregistered keyed sample passed, want loud drop")
+	}
+
+	if rej.reason == nil || *rej.reason != DropReasonKeyedDecodeFail {
+		t.Fatalf("keyed unregistered reason = %v, want keyed-decode-fail", rej.reason)
+	}
+
+	if !errors.Is(rej.err, ErrKeyedDecodeFail) {
+		t.Fatalf("keyed unregistered error %v misses ErrKeyedDecodeFail", rej.err)
 	}
 }
 

@@ -50,6 +50,13 @@ const (
 // ErrInvalidPartition reports a malformed partition name or list.
 var ErrInvalidPartition = errors.New("dds: invalid partition")
 
+// ErrPartitionBigEndian reports a big-endian partition value refused loudly.
+//
+// Partition values decode little endian only, matching CycloneDDS wire
+// order. A big-endian peer value is never silently mis-decoded; endian
+// aware callers refuse with this sentinel so errors.Is keeps working.
+var ErrPartitionBigEndian = errors.New("dds: partition big endian unsupported")
+
 // PartitionMismatchReason names why a partition match failed.
 type PartitionMismatchReason string
 
@@ -285,9 +292,13 @@ func appendPartitionString(out []byte, name string) []byte {
 // It reads the little endian count then each CDR string, tolerating both
 // Cyclone pad-in-length and standard excludes-pad lengths like the SEDP
 // param decoder does: the value is consumed to the next 4 byte boundary
-// either way. A zero count decodes to an empty list for the default
-// partition. Counts above MaxPartitionCount, short buffers, missing NUL
-// terminators, and names failing ValidatePartitionName all fail.
+// either way. Only little endian values decode, matching CycloneDDS wire
+// order; big-endian peers must use DecodePartitionQoSEndian, which refuses
+// loudly with ErrPartitionBigEndian instead of mis-decoding silently.
+// A zero count decodes to an empty list for the default partition.
+// Counts above MaxPartitionCount, short buffers, missing NUL
+// terminators, trailing garbage past the declared length, and names
+// failing ValidatePartitionName all fail.
 func DecodePartitionQoS(value []byte) ([]string, error) {
 	if len(value) < 4 {
 		return nil, fmt.Errorf("dds: partition value need 4 have %d: %w", len(value), ErrInvalidPartition)
@@ -323,6 +334,10 @@ func DecodePartitionQoS(value []byte) ([]string, error) {
 }
 
 // decodePartitionString reads one CDR string at off and returns the next offset.
+//
+// The length prefix is little endian only, matching CycloneDDS. Bytes
+// past the first NUL up to the declared length must be zero pad; any
+// trailing garbage fails loudly instead of decoding silently.
 func decodePartitionString(value []byte, off int) (string, int, error) {
 	if len(value)-off < 4 {
 		return "", 0, fmt.Errorf("dds: partition string need 4 have %d: %w", len(value)-off, ErrInvalidPartition)
@@ -352,6 +367,13 @@ func decodePartitionString(value []byte, off int) (string, int, error) {
 	}
 
 	name := string(raw[:nul])
+
+	for _, b := range raw[nul:] {
+		if b != 0x00 {
+			return "", 0, fmt.Errorf("dds: partition string has trailing garbage past NUL: %w", ErrInvalidPartition)
+		}
+	}
+
 	err := ValidatePartitionName(name)
 	if err != nil {
 		return "", 0, err
@@ -384,7 +406,11 @@ func PartitionParam(names []string) (rtps.Param, error) {
 // It returns the first PIDPartition entry decoded with DecodePartitionQoS,
 // or nil when no entry is present (the default partition). Later
 // duplicates are ignored: identity stays first-wins like the SEDP
-// endpoint parser.
+// endpoint parser. Values decode little endian only, matching CycloneDDS
+// wire order; the SEDP call sites in sedp.go carry a littleEndian flag
+// but threading it here would churn the exported signature, so big-endian
+// peers stay refused loudly through DecodePartitionQoSEndian and
+// FindPartitionParamEndian instead of mis-decoding silently.
 func FindPartitionParam(params []rtps.Param) ([]string, error) {
 	for _, p := range params {
 		if p.ID != PIDPartition {
@@ -400,6 +426,36 @@ func FindPartitionParam(params []rtps.Param) ([]string, error) {
 	}
 
 	return nil, nil
+}
+
+// DecodePartitionQoSEndian decodes a PID_PARTITION value with explicit endianness.
+//
+// Little endian values decode through DecodePartitionQoS. Big-endian
+// values refuse loudly with ErrPartitionBigEndian instead of
+// mis-decoding silently.
+func DecodePartitionQoSEndian(value []byte, littleEndian bool) ([]string, error) {
+	if !littleEndian {
+		return nil, fmt.Errorf("dds: partition big endian value refused: %w", ErrPartitionBigEndian)
+	}
+
+	return DecodePartitionQoS(value)
+}
+
+// FindPartitionParamEndian returns the partition list with explicit endianness.
+//
+// Little endian params decode through FindPartitionParam. Big-endian
+// params refuse loudly with ErrPartitionBigEndian instead of
+// mis-decoding silently.
+func FindPartitionParamEndian(params []rtps.Param, littleEndian bool) ([]string, error) {
+	if !littleEndian {
+		for _, p := range params {
+			if p.ID == PIDPartition {
+				return nil, fmt.Errorf("dds: partition big endian param refused: %w", ErrPartitionBigEndian)
+			}
+		}
+	}
+
+	return FindPartitionParam(params)
 }
 
 // PartitionRouteKey returns the effective discovery key for topic plus partitions.
@@ -425,14 +481,13 @@ func PartitionRouteKey(ddsTopic string, partitions []string) string {
 // INTEGRATION: spdp.go: announce participant partitions with
 //   MarshalAlivePacketWithPartitions(guid GUID, domain uint32, seq uint64, lease time.Duration, partitions []string)
 //   carrying a participant-level PIDPartition param, and extend Announcement with Partitions []string parsed back.
-// INTEGRATION: sedp.go: add Partitions []string to SEDPEndpoint, append
-//   PartitionParam(ep.Partitions) in SerializeSEDPDATA, decode PID_PARTITION
-//   via FindPartitionParam in sedpEndpointFields, and validate with
-//   ValidatePartitionList in sedpValidateRemote and sedpValidateMarshalEndpoint.
-// INTEGRATION: matcher.go: gate SEDPEndpointsMatch on
-//   MatchPartitions(writer.Partitions, reader.Partitions) so partition
-//   mismatch stays a quiet non-match (no_common_partition) instead of an
-//   RxO error, per the DDS rule that partition failure is not incompatible QoS.
+// INTEGRATION: DONE sedp.go: SEDPEndpoint carries Partitions []string,
+//   SerializeSEDPDATA appends PartitionParam, sedpEndpointFields decodes
+//   PID_PARTITION via FindPartitionParam, and declare plus validate paths
+//   check ValidatePartitionList.
+// INTEGRATION: DONE matcher.go: SEDPEndpointsMatch gates on
+//   MatchPartitions so partition mismatch stays a quiet non-match
+//   (no_common_partition) instead of an RxO error.
 // INTEGRATION: backend.go: key discovery routes and DATA demux by
 //   PartitionRouteKey(ddsTopic, partitions) so the same DDS topic on
 //   different partitions never shares endpoints, routes, or retention.

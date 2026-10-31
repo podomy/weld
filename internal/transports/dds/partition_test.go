@@ -59,11 +59,13 @@ func TestPartitionValidateName(t *testing.T) {
 func TestPartitionValidateList(t *testing.T) {
 	t.Parallel()
 
-	if err := ValidatePartitionList(nil); err != nil {
+	err := ValidatePartitionList(nil)
+	if err != nil {
 		t.Fatalf("ValidatePartitionList(nil) = %v, want nil", err)
 	}
 
-	if err := ValidatePartitionList([]string{"", "a"}); err != nil {
+	err = ValidatePartitionList([]string{"", "a"})
+	if err != nil {
 		t.Fatalf("ValidatePartitionList default plus one = %v, want nil", err)
 	}
 
@@ -71,7 +73,7 @@ func TestPartitionValidateList(t *testing.T) {
 	for i := range many {
 		many[i] = "a"
 	}
-	err := ValidatePartitionList(many)
+	err = ValidatePartitionList(many)
 	if err == nil {
 		t.Fatalf("ValidatePartitionList(%d names) = nil, want count error", len(many))
 	}

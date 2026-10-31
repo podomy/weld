@@ -502,7 +502,8 @@ func TestKeyedDescriptorsValidate(t *testing.T) {
 		"inner":  types.KeyedTestInnerMembers(),
 		"nested": types.KeyedTestNestedMembers(),
 	} {
-		if err := desc.Validate(); err != nil {
+		err := desc.Validate()
+		if err != nil {
 			t.Fatalf("descriptor %s invalid: %v", name, err)
 		}
 	}

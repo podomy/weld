@@ -39,6 +39,12 @@ var (
 	// allocate instead. It stays defined so callers can probe fallback
 	// accounting without string matching.
 	ErrLoanPoolExhausted = errors.New("dds: loan pool exhausted")
+	// ErrLoanInvalid reports invalid loan pool, receiver, or channel arguments.
+	//
+	// It keeps loan-domain argument validation distinct from the datapath
+	// ErrInvalidFrame sentinel so errors.Is distinguishes loan setup bugs
+	// from malformed DATA frames.
+	ErrLoanInvalid = errors.New("dds: invalid loan argument")
 )
 
 // LoanVendorWeld identifies the in-process Weld peer in loan offers.
@@ -77,16 +83,16 @@ type LoanPool struct {
 // uniform backing size. Both must be positive; bufSize must fit maxPayloadLen.
 func NewLoanPool(capacity, bufSize int) (*LoanPool, error) {
 	if capacity <= 0 {
-		return nil, fmt.Errorf("dds: new loan pool capacity %d must be positive", capacity)
+		return nil, fmt.Errorf("dds: new loan pool capacity %d must be positive: %w", capacity, ErrLoanInvalid)
 	}
 	if capacity > loanPoolMaxEntries {
-		return nil, fmt.Errorf("dds: new loan pool capacity %d above cap %d", capacity, loanPoolMaxEntries)
+		return nil, fmt.Errorf("dds: new loan pool capacity %d above cap %d: %w", capacity, loanPoolMaxEntries, ErrLoanInvalid)
 	}
 	if bufSize <= 0 {
-		return nil, fmt.Errorf("dds: new loan pool buffer size %d must be positive", bufSize)
+		return nil, fmt.Errorf("dds: new loan pool buffer size %d must be positive: %w", bufSize, ErrLoanInvalid)
 	}
 	if bufSize > maxPayloadLen {
-		return nil, fmt.Errorf("dds: new loan pool buffer size %d above cap %d: %w", bufSize, maxPayloadLen, ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: new loan pool buffer size %d above cap %d: %w", bufSize, maxPayloadLen, ErrLoanInvalid)
 	}
 	return &LoanPool{capacity: capacity, bufSize: bufSize}, nil
 }
@@ -192,15 +198,15 @@ func (p *LoanPool) Borrow(m *types.MessageMembers, size int) (*Loan, error) {
 		return nil, fmt.Errorf("dds: loan borrow refused: %s: %w", reason, ErrLoanNotEligible)
 	}
 	if size < 0 {
-		return nil, fmt.Errorf("dds: loan borrow size %d must not be negative: %w", size, ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loan borrow size %d must not be negative: %w", size, ErrLoanInvalid)
 	}
 	if size > maxPayloadLen {
-		return nil, fmt.Errorf("dds: loan borrow size %d above cap %d: %w", size, maxPayloadLen, ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loan borrow size %d above cap %d: %w", size, maxPayloadLen, ErrLoanInvalid)
 	}
 	p.borrows.Add(1)
 	if size > p.bufSize {
 		p.fallbacks.Add(1)
-		return &Loan{buf: make([]byte, size), pooled: false, valid: true}, nil
+		return &Loan{pool: p, buf: make([]byte, size), pooled: false, valid: true}, nil
 	}
 	p.mu.Lock()
 	if len(p.free) > 0 {
@@ -296,8 +302,10 @@ func (l *Loan) Valid() bool {
 // Return releases the handle exactly once.
 //
 // Pooled backing stores are zeroed and recycled when the pool has room;
-// anything else is dropped for the collector. A second Return is a loud
-// error, not silent corruption.
+// anything else is dropped for the collector. Every successful return
+// with a pool counts, including exact-size fallbacks that never recycle,
+// so Returns tracks completed lifetimes rather than recycles alone.
+// A second Return is a loud error, not silent corruption.
 func (l *Loan) Return() error {
 	if l == nil {
 		return fmt.Errorf("dds: loan return on nil handle: %w", ErrLoanReturned)
@@ -311,8 +319,10 @@ func (l *Loan) Return() error {
 	pooled := l.pooled
 	l.buf = nil
 	l.full = nil
-	if pooled && pool != nil && full != nil {
-		pool.recycle(full)
+	if pool != nil {
+		if pooled && full != nil {
+			pool.recycle(full)
+		}
 		pool.returns.Add(1)
 		return nil
 	}
@@ -381,10 +391,10 @@ type LoanedReceiver struct {
 // NewLoanedReceiver wraps inner with pool storage for loaned takes.
 func NewLoanedReceiver(inner *DataReceiver, pool *LoanPool) (*LoanedReceiver, error) {
 	if inner == nil {
-		return nil, fmt.Errorf("dds: new loaned receiver nil receiver: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: new loaned receiver nil receiver: %w", ErrLoanInvalid)
 	}
 	if pool == nil {
-		return nil, fmt.Errorf("dds: new loaned receiver nil pool: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: new loaned receiver nil pool: %w", ErrLoanInvalid)
 	}
 	return &LoanedReceiver{inner: inner, pool: pool}, nil
 }
@@ -427,10 +437,10 @@ func (r *LoanedReceiver) Pool() *LoanPool {
 // loud error.
 func (r *LoanedReceiver) TakeLoaned(frame []byte, m *types.MessageMembers) (*Loan, error) {
 	if r == nil {
-		return nil, fmt.Errorf("dds: loaned take on nil receiver: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take on nil receiver: %w", ErrLoanInvalid)
 	}
 	if r.inner == nil || r.pool == nil {
-		return nil, fmt.Errorf("dds: loaned take on incomplete receiver: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take on incomplete receiver: %w", ErrLoanInvalid)
 	}
 	ok, reason := loanEligible(m)
 	if !ok {
@@ -480,13 +490,13 @@ func (r *LoanedReceiver) TakeLoaned(frame []byte, m *types.MessageMembers) (*Loa
 // never claims a loan. The caller must Return the handle exactly once.
 func (r *LoanedReceiver) TakeLoanedFrom(ctx context.Context, s FrameSource, m *types.MessageMembers) (*Loan, error) {
 	if r == nil {
-		return nil, fmt.Errorf("dds: loaned take from on nil receiver: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take from on nil receiver: %w", ErrLoanInvalid)
 	}
 	if r.inner == nil || r.pool == nil {
-		return nil, fmt.Errorf("dds: loaned take from on incomplete receiver: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take from on incomplete receiver: %w", ErrLoanInvalid)
 	}
 	if s == nil {
-		return nil, fmt.Errorf("dds: loaned take from nil source: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take from nil source: %w", ErrLoanInvalid)
 	}
 	ok, reason := loanEligible(m)
 	if !ok {
@@ -512,7 +522,7 @@ func (r *LoanedReceiver) TakeLoanedFrom(ctx context.Context, s FrameSource, m *t
 	}
 	if decoded.guid != guid {
 		r.inner.countDrop()
-		return nil, fmt.Errorf("dds: loaned take from guid mismatch: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loaned take from guid mismatch: %w", ErrLoanInvalid)
 	}
 	return r.TakeLoaned(frame, m)
 }
@@ -537,16 +547,23 @@ type LoanChannel struct {
 // NewLoanChannel returns a channel buffering depth handles.
 func NewLoanChannel(depth int) (*LoanChannel, error) {
 	if depth <= 0 {
-		return nil, fmt.Errorf("dds: new loan channel depth %d must be positive", depth)
+		return nil, fmt.Errorf("dds: new loan channel depth %d must be positive: %w", depth, ErrLoanInvalid)
 	}
 	return &LoanChannel{ch: make(chan *Loan, depth)}, nil
 }
 
 // Send transfers one loan without copying. It consumes the handle: the
-// sender must not use it after Send returns nil.
+// sender must not use it after Send returns nil. The sender handle is
+// invalidated like Return, with buf and full cleared so a stale alias
+// never observes live data.
+//
+// Send blocks when the channel buffer is full until Recv drains one
+// slot; there is no non-blocking TrySend because no caller needs one.
+// If a non-blocking handoff is ever required, add TrySend as a separate
+// method rather than changing Send semantics.
 func (c *LoanChannel) Send(loan *Loan) error {
 	if c == nil {
-		return fmt.Errorf("dds: loan channel send on nil channel: %w", ErrInvalidFrame)
+		return fmt.Errorf("dds: loan channel send on nil channel: %w", ErrLoanInvalid)
 	}
 	if loan == nil {
 		return fmt.Errorf("dds: loan channel send nil handle: %w", ErrLoanReturned)
@@ -561,6 +578,8 @@ func (c *LoanChannel) Send(loan *Loan) error {
 	pool := loan.pool
 	topic := loan.TopicName
 	typeName := loan.TypeName
+	loan.buf = nil
+	loan.full = nil
 	carried := &Loan{pool: pool, full: full, buf: payload, pooled: pooled, valid: true, TopicName: topic, TypeName: typeName}
 	c.ch <- carried
 	c.transfers.Add(1)
@@ -571,10 +590,10 @@ func (c *LoanChannel) Send(loan *Loan) error {
 // returned handle and must Return it exactly once.
 func (c *LoanChannel) Recv(ctx context.Context) (*Loan, error) {
 	if c == nil {
-		return nil, fmt.Errorf("dds: loan channel recv on nil channel: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loan channel recv on nil channel: %w", ErrLoanInvalid)
 	}
 	if ctx == nil {
-		return nil, fmt.Errorf("dds: loan channel recv nil context: %w", ErrInvalidFrame)
+		return nil, fmt.Errorf("dds: loan channel recv nil context: %w", ErrLoanInvalid)
 	}
 	select {
 	case <-ctx.Done():

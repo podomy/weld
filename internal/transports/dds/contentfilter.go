@@ -497,14 +497,29 @@ type likeNode struct {
 	negate  bool
 }
 
+// isFilterNode marks literalNode as a filterNode.
 func (literalNode) isFilterNode() {}
-func (fieldNode) isFilterNode()   {}
-func (cmpNode) isFilterNode()     {}
-func (logicNode) isFilterNode()   {}
-func (notNode) isFilterNode()     {}
+
+// isFilterNode marks fieldNode as a filterNode.
+func (fieldNode) isFilterNode() {}
+
+// isFilterNode marks cmpNode as a filterNode.
+func (cmpNode) isFilterNode() {}
+
+// isFilterNode marks logicNode as a filterNode.
+func (logicNode) isFilterNode() {}
+
+// isFilterNode marks notNode as a filterNode.
+func (notNode) isFilterNode() {}
+
+// isFilterNode marks betweenNode as a filterNode.
 func (betweenNode) isFilterNode() {}
-func (inNode) isFilterNode()      {}
-func (likeNode) isFilterNode()    {}
+
+// isFilterNode marks inNode as a filterNode.
+func (inNode) isFilterNode() {}
+
+// isFilterNode marks likeNode as a filterNode.
+func (likeNode) isFilterNode() {}
 
 // parseFilter parses one full expression and requires EOF at the end.
 func parseFilter(toks []filterToken) (filterNode, error) {

@@ -127,10 +127,14 @@ func lookupDescriptorForIDL(typeIDL string) (*types.MessageMembers, error) {
 //
 // The kind byte is the last entity octet: 0x02 marks a keyed writer and
 // 0x07 a keyed reader, mirroring EndpointKeyed without an SEDP lookup so
-// the take hot path pays no snapshot cost. Unkeyed writers never reach
-// keyed handling.
+// the take hot path pays no snapshot cost. Kind bytes with 0xC0 bits set
+// are builtin entities (see the SEDP 0xC2 writers in sedp.go) and never
+// count as keyed. Unkeyed writers never reach keyed handling.
 func writerGUIDKeyed(guid WriterGUID) bool {
 	kind := guid[15]
+	if kind&0xC0 == 0xC0 {
+		return false
+	}
 
 	return kind == keyedUserWriterKind || kind == keyedUserReaderKind
 }
@@ -236,7 +240,8 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 		return
 	}
 
-	if err := send(ctx, guid, base); err != nil {
+	err := send(ctx, guid, base)
+	if err != nil {
 		r.countDropReason(DropReasonNackSendFailed)
 	}
 }
@@ -285,7 +290,13 @@ type takeHookSnapshot struct {
 // The fast path is one short RLock. When a topic carries a liveliness
 // config but the writer has no tracker yet, the tracker is created under
 // a full Lock so writers discovered after subscribe are still enforced
-// from their first take.
+// from their first take. The lively map has no eviction: entries are
+// created lazily per writer GUID and deleted only by explicit tracker
+// clear. The bound is the matched writer set, not the wire: a spoofed
+// GUID reaches this map only after SEDP matching admits the writer, so
+// unauthenticated traffic cannot grow it without a matching SEDP
+// announce first. No cap is added; capping would drop enforcement for
+// legitimate writers.
 func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHookSnapshot {
 	r.mu.RLock()
 	snap := takeHookSnapshot{
@@ -392,7 +403,9 @@ func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte,
 //
 // Misses and eval errors map to their distinct drop reasons with the
 // matching sentinel. A nil descriptor is an eval error, never a pass:
-// filtering without type shape would silently misroute.
+// filtering without type shape would silently misroute. Apply never
+// returns false with a nil error (misses carry ErrContentFilterMiss),
+// so the error branch below is the sole rejection path.
 func applyContentFilterHook(entry *contentFilterEntry, payload []byte) *takeHookReject {
 	if entry.desc == nil {
 		reason := DropReasonContentFilterEvalError
@@ -403,7 +416,7 @@ func applyContentFilterHook(entry *contentFilterEntry, payload []byte) *takeHook
 		}
 	}
 
-	ok, reason, err := entry.filter.Apply(payload, entry.desc)
+	_, reason, err := entry.filter.Apply(payload, entry.desc)
 	if err != nil {
 		r := DropReasonContentFilterEvalError
 		if reason == DropReasonContentFilterMiss {
@@ -413,15 +426,6 @@ func applyContentFilterHook(entry *contentFilterEntry, payload []byte) *takeHook
 		return &takeHookReject{reason: &r, err: err}
 	}
 
-	if !ok {
-		r := reason
-
-		return &takeHookReject{
-			reason: &r,
-			err:    fmt.Errorf("dds: content filter take miss: %w", ErrContentFilterMiss),
-		}
-	}
-
 	return nil
 }
 
@@ -429,15 +433,24 @@ func applyContentFilterHook(entry *contentFilterEntry, payload []byte) *takeHook
 //
 // Keyed extraction proves the sample carries a well-formed key; the
 // handle itself routes instances upstream. Truncated or malformed keys
-// drop loudly with the keyed reason. Endpoints that are not keyed never
-// reach here, so unkeyed flow is byte-identical with or without this hook.
+// drop loudly with the keyed reason. A keyed sample whose type is not
+// registered fails closed with the same reason instead of delivering
+// unkeyed: silent unkeyed delivery would misroute a keyed instance.
+// Endpoints that are not keyed never reach here, so unkeyed flow is
+// byte-identical with or without this hook.
 func applyKeyedHook(typeIDL string, payload []byte) *takeHookReject {
 	desc, err := lookupDescriptorForIDL(typeIDL)
 	if err != nil {
-		return nil
+		reason := DropReasonKeyedDecodeFail
+
+		return &takeHookReject{
+			reason: &reason,
+			err:    fmt.Errorf("dds: take keyed unregistered type %q: %w", typeIDL, errors.Join(ErrKeyedDecodeFail, err)),
+		}
 	}
 
-	if _, err := ExtractKeyBytes(payload, desc); err != nil {
+	_, err = ExtractKeyBytes(payload, desc)
+	if err != nil {
 		reason := DropReasonKeyedDecodeFail
 
 		return &takeHookReject{

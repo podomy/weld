@@ -194,13 +194,13 @@ func TestRunDoctorCheckClean(t *testing.T) {
 	}
 }
 
-// TestRunDoctorReportListsEntities checks --report lists topics with metrics.
+// TestRunDoctorReportListsEntities checks default run lists topics with metrics.
 func TestRunDoctorReportListsEntities(t *testing.T) {
 	fb := &fakeTopicBackend{hasSnap: true, snapshot: doctorTestMismatchSnapshot()}
 	stubTopicBackend(t, fb)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := runDoctorCommand(context.Background(), []string{"--report", "--domain", "42"}, &stdout, &stderr)
+	code := runDoctorCommand(context.Background(), []string{"--domain", "42"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("report code = %d, want 0\nstderr:\n%s", code, stderr.String())
 	}

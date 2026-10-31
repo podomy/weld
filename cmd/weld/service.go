@@ -257,58 +257,7 @@ func subscribeServiceReply(ctx context.Context, backend transports.Backend, serv
 
 // publishServiceRequest retries PublishBytes on ErrNoRoute until deadline or ctx ends.
 func publishServiceRequest(ctx context.Context, backend transports.Backend, out transports.OutgoingMessage, deadline time.Duration) error {
-	start := time.Now()
-
-	for {
-		err := backend.PublishBytes(ctx, out)
-		if err == nil {
-			return nil
-		}
-
-		if !errors.Is(err, dds.ErrNoRoute) {
-			return err
-		}
-
-		if time.Since(start) >= deadline {
-			return err
-		}
-
-		cerr := ctx.Err()
-		if cerr != nil {
-			if errors.Is(cerr, context.Canceled) {
-				return cerr
-			}
-
-			if time.Since(start) >= deadline {
-				return err
-			}
-
-			return cerr
-		}
-
-		timer := time.NewTimer(pubRouteRetryInterval)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			cerr = ctx.Err()
-			if cerr != nil {
-				if errors.Is(cerr, context.Canceled) {
-					return cerr
-				}
-
-				if errors.Is(err, dds.ErrNoRoute) {
-					return err
-				}
-
-				return cerr
-			}
-
-			return err
-		case <-timer.C:
-		}
-	}
+	return publishWithRouteRetry(ctx, backend, out, deadline)
 }
 
 // serviceCallWithBackend publishes one request and waits for the matching reply.
@@ -396,7 +345,7 @@ func serviceCallWithBackend(ctx context.Context, backend transports.Backend, ser
 func openSubscribedServiceBackend(ctx context.Context, domain uint32, service string) (transports.Backend, error) {
 	backend, err := openServiceBackendFunc(ctx, domain, serviceParticipant)
 	if err != nil {
-		return nil, fmt.Errorf("weld: open backend: %w", err)
+		return nil, fmt.Errorf("weld: open backend for service %q: %w", service, err)
 	}
 
 	err = subscribeServiceReply(ctx, backend, service)

@@ -214,58 +214,7 @@ func subscribeActionFeedback(ctx context.Context, backend transports.Backend, ac
 
 // publishActionGoal retries PublishBytes on ErrNoRoute until timeout or ctx ends.
 func publishActionGoal(ctx context.Context, backend transports.Backend, out transports.OutgoingMessage, timeout time.Duration) error {
-	start := time.Now()
-
-	for {
-		err := backend.PublishBytes(ctx, out)
-		if err == nil {
-			return nil
-		}
-
-		if !errors.Is(err, dds.ErrNoRoute) {
-			return err
-		}
-
-		if time.Since(start) >= timeout {
-			return err
-		}
-
-		cerr := ctx.Err()
-		if cerr != nil {
-			if errors.Is(cerr, context.Canceled) {
-				return cerr
-			}
-
-			if time.Since(start) >= timeout {
-				return err
-			}
-
-			return cerr
-		}
-
-		timer := time.NewTimer(pubRouteRetryInterval)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			cerr = ctx.Err()
-			if cerr != nil {
-				if errors.Is(cerr, context.Canceled) {
-					return cerr
-				}
-
-				if errors.Is(err, dds.ErrNoRoute) {
-					return err
-				}
-
-				return cerr
-			}
-
-			return err
-		case <-timer.C:
-		}
-	}
+	return publishWithRouteRetry(ctx, backend, out, timeout)
 }
 
 // actionSendWithBackend publishes one goal and streams feedback then result.
@@ -481,7 +430,7 @@ func actionSendWithBackend(ctx context.Context, backend transports.Backend, serv
 func openSubscribedActionBackend(ctx context.Context, domain uint32, action string) (transports.Backend, error) {
 	backend, err := openActionBackendFunc(ctx, domain, actionParticipant)
 	if err != nil {
-		return nil, fmt.Errorf("weld: open backend: %w", err)
+		return nil, fmt.Errorf("weld: open backend for action %q: %w", action, err)
 	}
 
 	err = subscribeActionFeedback(ctx, backend, action)

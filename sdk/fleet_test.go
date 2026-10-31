@@ -442,7 +442,9 @@ func testSupervision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new pooled group: %v", err)
 	}
-	defer pooled.Close()
+	defer func() {
+		_ = pooled.Close() //nolint:errcheck // test teardown is best effort
+	}()
 	const tasks = 8
 	var wg sync.WaitGroup
 	wg.Add(tasks)

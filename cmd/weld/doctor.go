@@ -125,14 +125,14 @@ func FormatDoctorReport(report DoctorReport) string {
 
 // printDoctorUsage writes doctor help.
 func printDoctorUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, "Usage: weld doctor [--report] [--check] [flags]\n\ndoctor: list Weld entities with per topic QoS compatibility\n  weld doctor --report --domain 42\n  weld doctor --check --domain 42\n\nFlags:\n  --report list entities with topic info plus mismatches plus metrics (default)\n  --check exit 1 when any mismatch exists, 0 when clean\n  --domain uint DDS domain id, default from ROS_DOMAIN_ID\n") //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(w, "Usage: weld doctor [--check] [flags]\n\ndoctor: list Weld entities with per topic QoS compatibility\n  weld doctor --domain 42\n  weld doctor --check --domain 42\n\nFlags:\n  --check exit 1 when any mismatch exists, 0 when clean\n  --domain uint DDS domain id, default from ROS_DOMAIN_ID\n") //nolint:errcheck // help output failure is not actionable
 }
 
 // runDoctorCommand parses doctor flags, snapshots discovery, prints topic
 // info display plus metrics, and checks compatibility loudly.
 //
 // The full report always prints to stdout and loud mismatch lines go to
-// stderr, so --report lists entities and --check gates on the same output:
+// stderr, so --check gates on the same output it verifies:
 // --check exits 1 when any mismatch exists and 0 when clean. Compatible
 // Weld pairs (facade reliable plus transient local against standard ROS
 // subscriptions) print explicit none lines with zero metrics.
@@ -148,10 +148,6 @@ func runDoctorCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	domainFlag := fs.Uint("domain", uint(defaultDomainID()), "DDS domain id, default from ROS_DOMAIN_ID")
 	checkFlag := fs.Bool("check", false, "exit 1 when any mismatch exists, 0 when clean")
-	// The report flag is accepted for explicitness: the full topic info
-	// display plus metrics prints in every mode so --check gates on the
-	// same output it verifies.
-	fs.Bool("report", false, "list entities with topic info plus mismatches plus metrics")
 	err := fs.Parse(args)
 	if err != nil {
 		return 2

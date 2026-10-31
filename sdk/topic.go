@@ -367,7 +367,16 @@ func (n *Node) NewPublisher(topic, typeName string, qos QoS) (*Publisher, error)
 	if n.IsClosed() {
 		return nil, fmt.Errorf("sdk: new publisher on %q: node closed", topic)
 	}
-	return &Publisher{node: n, topic: topic, typeName: typeName, qos: qos}, nil
+	pub := &Publisher{node: n, topic: topic, typeName: typeName, qos: qos}
+	n.trackPub(pub)
+	if n.IsClosed() {
+		err = pub.Close()
+		if err != nil {
+			return nil, fmt.Errorf("sdk: new publisher on %q: %w", topic, err)
+		}
+		return nil, fmt.Errorf("sdk: new publisher on %q: node closed", topic)
+	}
+	return pub, nil
 }
 
 // NewSubscription creates a topic subscriber with a validated QoS request.
@@ -455,6 +464,13 @@ func DefaultLoanOptions() LoanOptions {
 // the type is eligible. Every other combination answers false with a
 // reason naming the veto, so callers never assume a loan where a copy
 // happens. It is pure with no I/O.
+//
+// Contract mirror: this SDK offer path stays stdlib only and must not
+// import transport packages. The authorative eligibility checks live in
+// types.CanLoan (introspection self containment) and dds.CanLoanType
+// (local loan eligibility with reason). When loan rules change, update
+// this comment plus types.CanLoan plus dds.CanLoanType together so the
+// SDK offer and the transport checks keep identical veto semantics.
 func CanLoanOffer(opts LoanOptions) (bool, string) {
 	if opts.Policy != LoanIfEligible {
 		return false, "sdk: loan policy never: exchange copies"

@@ -38,6 +38,8 @@ type Node struct {
 	closed bool
 	// subs tracks subscriptions for teardown.
 	subs []*Subscription
+	// pubs tracks publishers for teardown.
+	pubs []*Publisher
 	// servers tracks service servers for teardown.
 	servers []*ServiceServer
 }
@@ -127,6 +129,19 @@ func (n *Node) trackSub(sub *Subscription) {
 	n.subs = append(n.subs, sub)
 }
 
+// trackPub records one publisher for teardown. A nil node drops it.
+func (n *Node) trackPub(pub *Publisher) {
+	if n == nil || pub == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return
+	}
+	n.pubs = append(n.pubs, pub)
+}
+
 // trackServer records one service server for teardown. A nil node drops it.
 func (n *Node) trackServer(srv *ServiceServer) {
 	if n == nil || srv == nil {
@@ -143,8 +158,9 @@ func (n *Node) trackServer(srv *ServiceServer) {
 // Close releases node resources and is idempotent.
 //
 // Close marks the node closed, closes Done, then closes tracked
-// subscriptions and unregisters tracked servers. Later Publish and Call
-// fail loudly instead of flowing. A second call returns nil.
+// publishers and subscriptions and unregisters tracked servers. Later
+// Publish and Call fail loudly instead of flowing. A second call
+// returns nil.
 func (n *Node) Close() error {
 	if n == nil {
 		return errors.New("sdk: close nil node") //nolint:wrapcheck // new error, nothing to wrap
@@ -156,16 +172,21 @@ func (n *Node) Close() error {
 	}
 	n.closed = true
 	close(n.done)
+	pubs := make([]*Publisher, len(n.pubs))
+	copy(pubs, n.pubs)
 	subs := make([]*Subscription, len(n.subs))
 	copy(subs, n.subs)
 	servers := make([]*ServiceServer, len(n.servers))
 	copy(servers, n.servers)
 	n.mu.Unlock()
+	for _, pub := range pubs {
+		_ = pub.Close() //nolint:errcheck // teardown is best effort, Close stays nil
+	}
 	for _, sub := range subs {
-		_ = sub.Close()
+		_ = sub.Close() //nolint:errcheck // teardown is best effort, Close stays nil
 	}
 	for _, srv := range servers {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // teardown is best effort, Close stays nil
 	}
 	return nil
 }

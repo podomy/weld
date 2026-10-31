@@ -24,7 +24,7 @@ var (
 	ErrNoSuchService = errors.New("sdk: no such service")
 	// ErrServiceServerGone reports a call on a closed node or server.
 	ErrServiceServerGone = errors.New("sdk: service server gone")
-	// ErrServiceClientGone reports server side work for a closed client node.
+	// ErrServiceClientGone reports a call on a closed client or node.
 	ErrServiceClientGone = errors.New("sdk: service client gone")
 )
 
@@ -232,7 +232,7 @@ func (n *Node) NewServiceServer(service string, handler ServiceHandler) (*Servic
 	}
 	n.trackServer(srv)
 	if n.IsClosed() {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // teardown is best effort, node closed error below carries the failure
 		return nil, fmt.Errorf("sdk: new service server on %q: node closed: %w", service, ErrServiceServerGone)
 	}
 	if srv.isClosed() {

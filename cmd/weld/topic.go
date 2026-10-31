@@ -595,7 +595,7 @@ func openAndSnapshotTopic(ctx context.Context, domain uint32) (GraphSnapshot, er
 
 		snap, err := fetchTopicSnapshot(backend)
 		if err != nil {
-			return GraphSnapshot{}, fmt.Errorf("weld: snapshot graph: %w", err)
+			return GraphSnapshot{}, fmt.Errorf("weld: snapshot graph on domain %d: %w", domain, err)
 		}
 
 		return snap, nil
@@ -603,7 +603,7 @@ func openAndSnapshotTopic(ctx context.Context, domain uint32) (GraphSnapshot, er
 
 	cerr := backend.Close()
 	if ferr != nil && cerr != nil {
-		return GraphSnapshot{}, fmt.Errorf("weld: topic snapshot: %w", errors.Join(ferr, cerr))
+		return GraphSnapshot{}, fmt.Errorf("weld: topic snapshot on domain %d: %w", domain, errors.Join(ferr, cerr))
 	}
 
 	if cerr != nil {

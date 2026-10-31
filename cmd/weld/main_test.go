@@ -115,13 +115,13 @@ func TestResolvePubText(t *testing.T) {
 		t.Fatalf("positional text = %q, want %q", got, "hello-pos")
 	}
 
-	got, err = resolvePubText("flag-wins", []string{"pos-ignored"})
-	if err != nil {
-		t.Fatalf("flag wins: %v", err)
+	_, err = resolvePubText("flag-wins", []string{"pos-ignored"})
+	if err == nil {
+		t.Fatal("flag plus positionals must fail")
 	}
 
-	if got != "flag-wins" {
-		t.Fatalf("flag wins = %q, want %q", got, "flag-wins")
+	if !strings.HasPrefix(err.Error(), "weld:") {
+		t.Fatalf("flag plus positionals error = %q, want weld: prefix", err.Error())
 	}
 
 	_, err = resolvePubText("", nil)

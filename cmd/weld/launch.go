@@ -39,7 +39,9 @@ func (s *stringSliceFlag) Set(v string) error {
 // argv appends to node options with last wins. Files plus CLI resolve with
 // FQN over wildcard, rewrites apply per namespace, SDF appends with sim
 // time forced on, and the canonical dump shares form with ros2 param dump.
-// A cancelled context terminates cleanly with code 0 and no output.
+// A cancelled context terminates cleanly with code 0 and no output. This
+// differs from params which reports cancel with code 1; the 0 here is
+// pinned by TestRunLaunchUsage and stays so launch cancel stays silent.
 func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	err := ctx.Err()
 	if err != nil {

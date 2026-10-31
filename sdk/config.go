@@ -648,7 +648,6 @@ func (s *Store) prepareBatchLocked(updates map[string]Value, source string, auto
 			hooks = append(hooks, hookCall{fn: fn, oldValue: old, newValue: newValue})
 		}
 	}
-	_ = source
 	event := Event{Version: next, Source: source, Changes: changes}
 	return event, hooks, nil
 }

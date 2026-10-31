@@ -232,6 +232,10 @@ func runPubCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 // resolvePubText picks the pub message from flag or positional arg.
 func resolvePubText(flagText string, args []string) (string, error) {
 	if flagText != "" {
+		if len(args) != 0 {
+			return "", errors.New("weld: pub takes one message, have flag plus positionals") //nolint:wrapcheck // new error, nothing to wrap
+		}
+
 		return flagText, nil
 	}
 
@@ -377,7 +381,7 @@ func runEcho(ctx context.Context, topic string, domain uint32, volatile bool, st
 
 	backend, err := openBackend(ctx, domain, echoParticipant)
 	if err != nil {
-		return fmt.Errorf("weld: open backend: %w", err)
+		return fmt.Errorf("weld: open backend for topic %q: %w", topic, err)
 	}
 
 	err = subscribeEchoReader(ctx, backend, topic, volatile)
@@ -424,7 +428,7 @@ func runPub(ctx context.Context, topic, text string, domain uint32, stdout io.Wr
 
 	backend, err := openBackend(ctx, domain, pubParticipant)
 	if err != nil {
-		return fmt.Errorf("weld: open backend: %w", err)
+		return fmt.Errorf("weld: open backend for topic %q: %w", topic, err)
 	}
 
 	payload, err := encodeStringPayload(text)
@@ -468,47 +472,11 @@ func runPub(ctx context.Context, topic, text string, domain uint32, stdout io.Wr
 
 // publishWithRouteWait retries PublishBytes on ErrNoRoute until a route appears or the wait ends.
 //
-// SPDP exchange needs time after JoinDiscovery, so the first publish can
-// see empty routes. Only ErrNoRoute retries with a short sleep; other
-// errors return at once. The wait is bounded by pubRouteRetryTimeout or
-// ctx cancel, whichever ends first.
+// It shares publishWithRouteRetry with service and action verbs so retry,
+// timeout, and cancel semantics stay identical. The wait is bounded by
+// pubRouteRetryTimeout or ctx cancel, whichever ends first.
 func publishWithRouteWait(ctx context.Context, backend transports.Backend, msg transports.OutgoingMessage) error {
-	start := time.Now()
-
-	for {
-		err := backend.PublishBytes(ctx, msg)
-		if err == nil {
-			return nil
-		}
-
-		if !errors.Is(err, dds.ErrNoRoute) {
-			return err
-		}
-
-		if time.Since(start) >= pubRouteRetryTimeout {
-			return err
-		}
-
-		cerr := ctx.Err()
-		if cerr != nil {
-			return cerr
-		}
-
-		timer := time.NewTimer(pubRouteRetryInterval)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			cerr = ctx.Err()
-			if cerr != nil {
-				return cerr
-			}
-
-			return err
-		case <-timer.C:
-		}
-	}
+	return publishWithRouteRetry(ctx, backend, msg, pubRouteRetryTimeout)
 }
 
 // lossCounter is implemented by backends that count gap loss.
@@ -670,7 +638,7 @@ func openBackend(ctx context.Context, domain uint32, participant string) (transp
 
 	backend, err := dds.NewBackend(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("new backend: %w", err)
+		return nil, fmt.Errorf("new backend on domain %d: %w", domain, err)
 	}
 
 	stored := backend.Config()
@@ -684,10 +652,10 @@ func openBackend(ctx context.Context, domain uint32, participant string) (transp
 	if err != nil {
 		cerr := backend.Close()
 		if cerr != nil {
-			return nil, fmt.Errorf("join discovery: %w", errors.Join(err, cerr))
+			return nil, fmt.Errorf("join discovery on domain %d as %q: %w", domain, participant, errors.Join(err, cerr))
 		}
 
-		return nil, fmt.Errorf("join discovery: %w", err)
+		return nil, fmt.Errorf("join discovery on domain %d as %q: %w", domain, participant, err)
 	}
 
 	return backend, nil
@@ -772,7 +740,7 @@ func oneLine(err error) string {
 
 // printUsage writes CLI help.
 func printUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, "Usage: weld <echo|pub|topic|service|action|doctor|params|launch> [flags]\n\necho: print std_msgs/String payloads until interrupt\n  weld echo --topic /chatter --domain 42 --timeout 30s\n\npub: publish one std_msgs/String message then exit\n  weld pub --topic /chatter --domain 42 --text hello\n\ntopic list: list topics with counts plus types plus hashes\n  weld topic list --domain 42\n\ntopic info: show endpoints plus type hashes plus mismatches\n  weld topic info --topic /chatter --domain 42\n\nservice call: call one service with per-call deadline then exit\n  weld service call --service /add_two_ints --request hello --deadline 5s --domain 42\n\naction send: send one action goal with feedback then result\n  weld action send --name /navigate_to_pose --goal hello --timeout 60s\n\ndoctor: list entities with topic info plus mismatches plus metrics\n  weld doctor --report --domain 42\n\nparams: read and write node parameters\n  weld params get my_param --node /weld\n\nlaunch: resolve node config and print canonical dump\n  weld launch --node talker --namespace /ns\n\nFlags:\n  --topic string   ROS topic name such as /chatter (default /chatter)\n  --domain uint    DDS domain id, default from ROS_DOMAIN_ID\n  --text string    pub message data (or one positional arg)\n  --timeout duration echo stop delay, 0 runs until interrupt (default 30s)\n  --qos-durability string echo requested durability: volatile or transient_local (default volatile)\n  --include-hidden show hidden underscore topics in topic list\n  --service string ROS service name such as /add_two_ints\n  --request string service request data (or one positional arg)\n  --deadline duration service per-call timeout (default 5s)\n") //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(w, "Usage: weld <echo|pub|topic|service|action|doctor|params|launch> [flags]\n\necho: print std_msgs/String payloads until interrupt\n  weld echo --topic /chatter --domain 42 --timeout 30s\n\npub: publish one std_msgs/String message then exit\n  weld pub --topic /chatter --domain 42 --text hello\n\ntopic list: list topics with counts plus types plus hashes\n  weld topic list --domain 42\n\ntopic info: show endpoints plus type hashes plus mismatches\n  weld topic info --topic /chatter --domain 42\n\nservice call: call one service with per-call deadline then exit\n  weld service call --service /add_two_ints --request hello --deadline 5s --domain 42\n\naction send: send one action goal with feedback then result\n  weld action send --name /navigate_to_pose --goal hello --timeout 60s\n\ndoctor: list entities with topic info plus mismatches plus metrics\n  weld doctor --domain 42\n\nparams: read and write node parameters\n  weld params get my_param --node /weld\n\nlaunch: resolve node config and print canonical dump\n  weld launch --node talker --namespace /ns\n\nFlags:\n  --topic string   ROS topic name such as /chatter (default /chatter)\n  --domain uint    DDS domain id, default from ROS_DOMAIN_ID\n  --text string    pub message data (or one positional arg)\n  --timeout duration echo stop delay, 0 runs until interrupt (default 30s)\n  --qos-durability string echo requested durability: volatile or transient_local (default volatile)\n  --include-hidden show hidden underscore topics in topic list\n  --service string ROS service name such as /add_two_ints\n  --request string service request data (or one positional arg)\n  --deadline duration service per-call timeout (default 5s)\n") //nolint:errcheck // help output failure is not actionable
 }
 
 // handleRunError maps run errors to exit codes with friendly text.

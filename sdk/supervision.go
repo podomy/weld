@@ -632,14 +632,14 @@ func (g *PooledGroup) Submit(task func()) (bool, error) {
 }
 
 // Close discards pending tasks and joins workers cleanly.
-func (g *PooledGroup) Close() {
+func (g *PooledGroup) Close() error {
 	if g == nil {
-		return
+		return errors.New("sdk: pooled group close on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		return
+		return nil
 	}
 	g.closed = true
 	for i := range g.queue {
@@ -649,6 +649,7 @@ func (g *PooledGroup) Close() {
 	g.cond.Broadcast()
 	g.mu.Unlock()
 	g.wg.Wait()
+	return nil
 }
 
 // loop runs tasks until Close.

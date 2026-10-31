@@ -124,7 +124,7 @@ func (b *Backend) ingestMulticastDatagram(ctx context.Context, data []byte, loca
 
 	if !bytes.HasPrefix(data, []byte(rtps.Magic)) {
 		b.bumpDemuxError()
-		log.Printf("dds: %s demux dropped %d non-RTPS bytes", sourceLabel(true), len(data))
+		sampleDropLog("dds: %s demux dropped %d non-RTPS bytes", sourceLabel(true), len(data))
 
 		return
 	}
@@ -151,32 +151,41 @@ func (b *Backend) mcastIngressLoop(ctx context.Context, snapshot func() (*rtps.M
 			return
 		}
 
-		data, err := mcast.Receive(ctx)
-		if err != nil {
-			cerr := ctx.Err()
-			if cerr != nil {
-				return
-			}
-
-			if b.isClosed() {
-				return
-			}
-
-			b.bumpDemuxError()
-			log.Printf("dds: %s demux receive failed: %v", sourceLabel(true), err)
-
-			continue
+		if !b.handleMcastReceive(ctx, mcast, spdpCh, sedpCh, dataCh, local) {
+			return
 		}
-
-		if len(data) < 4 {
-			b.bumpDemuxError()
-			log.Printf("dds: %s demux dropped short %d byte datagram", sourceLabel(true), len(data))
-
-			continue
-		}
-
-		b.ingestMulticastDatagram(ctx, data, local, spdpCh, sedpCh, dataCh)
 	}
+}
+
+// handleMcastReceive reads one group datagram and reports whether to continue.
+func (b *Backend) handleMcastReceive(ctx context.Context, mcast *rtps.MulticastConn, spdpCh, sedpCh chan []byte, dataCh chan dataItem, local *LocalParticipant) bool {
+	data, err := mcast.Receive(ctx)
+	if err != nil {
+		cerr := ctx.Err()
+		if cerr != nil {
+			return false
+		}
+
+		if b.isClosed() {
+			return false
+		}
+
+		b.bumpDemuxError()
+		log.Printf("dds: %s demux receive failed: %v", sourceLabel(true), err)
+
+		return true
+	}
+
+	if len(data) < 4 {
+		b.bumpDemuxError()
+		sampleDropLog("dds: %s demux dropped short %d byte datagram", sourceLabel(true), len(data))
+
+		return true
+	}
+
+	b.ingestMulticastDatagram(ctx, data, local, spdpCh, sedpCh, dataCh)
+
+	return true
 }
 
 // snapshotMcastUserIngress captures the user-traffic socket plus queues.

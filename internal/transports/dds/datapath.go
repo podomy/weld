@@ -739,6 +739,7 @@ func (r *DataReceiver) evictStaleProvisionalLocked(now time.Time) {
 	}
 }
 
+// ensureProvisional returns the stored provisional for an unknown writer.
 func (r *DataReceiver) ensureProvisional(guid WriterGUID, qos ProvisionalQoS, hasQoS bool) (ProvisionalEndpoint, bool) {
 	if _, ok := r.remoteForGUID(guid); ok {
 		r.mu.Lock()

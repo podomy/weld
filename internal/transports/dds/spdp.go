@@ -23,6 +23,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/podomy/weld/internal/transports"
@@ -75,6 +76,9 @@ var (
 	// ErrInvalidPeriod reports a non positive loop period.
 	ErrInvalidPeriod = errors.New("dds: non positive period")
 )
+
+// spdpParseDrops counts SPDP DATA entries skipped after a parse failure.
+var spdpParseDrops atomic.Uint64
 
 // GUIDPrefix is the 12 byte RTPS GUID prefix.
 type GUIDPrefix [12]byte
@@ -672,7 +676,10 @@ func ParseAnnouncement(data []byte) (Announcement, error) {
 
 		ann, err := announcementFromData(sub.Data)
 		if err != nil {
-			return out, err
+			n := spdpParseDrops.Add(1)
+			log.Printf("dds: spdp parse data dropped %d: %v", n, err)
+
+			continue
 		}
 
 		return ann, nil
@@ -720,7 +727,8 @@ func announcementSecurityFields(params []rtps.Param, out *Announcement) {
 
 	out.Security = secInfo
 
-	if err := CheckProtectedDiscovery(secInfo); err != nil {
+	err := CheckProtectedDiscovery(secInfo)
+	if err != nil {
 		log.Printf("dds: spdp secured peer detected, crypto unavailable: %v", err)
 	}
 }
@@ -780,7 +788,8 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 
 	out.Alive = true
 
-	if err := announcementAliveFields(params, &out); err != nil {
+	err = announcementAliveFields(params, &out)
+	if err != nil {
 		return out, err
 	}
 

@@ -11,6 +11,7 @@ import (
 	"log"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/podomy/weld/internal/core"
@@ -40,6 +41,12 @@ const (
 	legacySPDPrefix = "SPDP"
 	// legacySEDPrefix routes legacy custom SEDP datagrams in the demux.
 	legacySEDPrefix = "SEDP"
+	// maxRoutesPerPrefix caps stored unicast ports per SPDP prefix.
+	maxRoutesPerPrefix = 16
+	// fallbackAckInterval is the minimum gap between fallback broadcasts.
+	fallbackAckInterval = 100 * time.Millisecond
+	// demuxDropLogEvery samples high-volume drop logs every Nth drop.
+	demuxDropLogEvery = 128
 )
 
 // Writer entity bytes for user DATA on the wire.
@@ -302,6 +309,8 @@ type Backend struct {
 	remoteTrack map[WriterGUID]*remoteTracker
 	// sedpHighSeq tracks the highest SEDP DATA seq per remote builtin writer.
 	sedpHighSeq map[WriterGUID]uint64
+	// sedpHeartbeatLast tracks the last SEDP heartbeat LastSequence per writer.
+	sedpHeartbeatLast map[WriterGUID]uint64
 	// fragReasm reassembles DATA_FRAG samples.
 	fragReasm *fragReassembler
 }
@@ -472,6 +481,30 @@ func (b *Backend) bumpDemuxError() {
 	b.demuxErrors++
 }
 
+// demuxDropLogCount counts sampled drop logs process wide.
+var demuxDropLogCount atomic.Uint64
+
+// shouldLogDemuxDrop reports whether one high-volume drop should log.
+func shouldLogDemuxDrop() (bool, uint64) {
+	n := demuxDropLogCount.Add(1)
+	if n%uint64(demuxDropLogEvery) != 0 {
+		return false, n
+	}
+
+	return true, n
+}
+
+// sampleDropLog logs one high-volume drop every demuxDropLogEvery occurrence.
+func sampleDropLog(format string, args ...any) {
+	ok, n := shouldLogDemuxDrop()
+	if !ok {
+		return
+	}
+
+	args = append(args, n)
+	log.Printf(format+" (drop %d)", args...)
+}
+
 // bumpTypeHashMiss counts one publish with no known type hash.
 func (b *Backend) bumpTypeHashMiss() {
 	b.mu.Lock()
@@ -616,7 +649,9 @@ func (b *Backend) advertiseWriterHistory(ctx context.Context) {
 			continue
 		}
 
-		if err := b.sendUserControl(ctx, msg); err != nil {
+		err = b.sendUserControl(ctx, msg)
+		if err != nil {
+			b.bumpDemuxError()
 			log.Printf("dds: user heartbeat send %x: %v", guid[:], err)
 		}
 	}
@@ -1252,10 +1287,13 @@ func (b *Backend) snoopAnnouncement(
 		return nil, false
 	}
 
+	ports, truncated := filterAnnouncementPorts(ann)
+
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.closed {
+		b.mu.Unlock()
+
 		return nil, true
 	}
 
@@ -1266,17 +1304,41 @@ func (b *Backend) snoopAnnouncement(
 	if !ann.Alive {
 		delete(b.routes, ann.GUID.Prefix)
 	} else if len(ann.Ports) != 0 {
-		ports := make([]int, 0, len(ann.Ports))
-		for _, port := range ann.Ports {
-			ports = append(ports, int(port))
-		}
-
 		b.routes[ann.GUID.Prefix] = ports
+	}
+
+	b.mu.Unlock()
+
+	if truncated {
+		b.bumpDemuxError()
+		log.Printf("dds: spdp routes truncated to %d for %x", maxRoutesPerPrefix, ann.GUID.Prefix)
 	}
 
 	out := ann
 
 	return &out, true
+}
+
+// filterAnnouncementPorts drops zero ports and caps per-prefix storage.
+func filterAnnouncementPorts(ann Announcement) ([]int, bool) {
+	if !ann.Alive || len(ann.Ports) == 0 {
+		return nil, false
+	}
+
+	filtered := make([]int, 0, len(ann.Ports))
+	for _, port := range ann.Ports {
+		if port == 0 {
+			continue
+		}
+
+		filtered = append(filtered, int(port))
+	}
+
+	if len(filtered) > maxRoutesPerPrefix {
+		return filtered[:maxRoutesPerPrefix], true
+	}
+
+	return filtered, false
 }
 
 // sedpSender sends SEDP DATA bytes over unicast to discovered peers.
@@ -1294,7 +1356,7 @@ func (s *sedpSender) SendSEDP(ctx context.Context, data []byte) error {
 	ports, uni := s.backend.snapshotRoutesAndUnicast()
 
 	if len(ports) == 0 {
-		return nil
+		return fmt.Errorf("dds: sedp send without route: %w", ErrNoRoute)
 	}
 
 	if uni == nil {
@@ -1306,6 +1368,10 @@ func (s *sedpSender) SendSEDP(ctx context.Context, data []byte) error {
 	sent, last := sendToPorts(ctx, uni, ports, cp)
 	if sent == 0 && last != nil {
 		return fmt.Errorf("dds: sedp send: %w", last)
+	}
+
+	if sent == 0 {
+		return fmt.Errorf("dds: sedp send without route: %w", ErrNoRoute)
 	}
 
 	s.backend.bumpSEDP()
@@ -1776,8 +1842,12 @@ func (b *Backend) sendData(
 
 	seq := b.nextRTPSSeqFor(guid)
 
-	if b.repairHistory != nil {
-		b.repairHistory.store(guid, seq, payload)
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	if history != nil {
+		history.store(guid, seq, payload)
 	}
 
 	msg, err := b.buildDataMessage(guid, payload, seq)
@@ -1881,6 +1951,15 @@ func reportFragSend(ctx context.Context, b *Backend, uni *rtps.UnicastConn, port
 
 // sendPlainFrags emits one large plain sample as ordered DATA_FRAG.
 func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []byte, sampleSize uint32, fragmentSize uint16, total uint32, ports []int) error {
+	err := ctx.Err()
+	if err != nil {
+		return fmt.Errorf("dds: send frag context: %w", err)
+	}
+
+	if len(ports) == 0 {
+		return fmt.Errorf("dds: send frag without route: %w", ErrNoRoute)
+	}
+
 	uni := b.snapshotUnicast()
 	if uni == nil {
 		return fmt.Errorf("dds: send frag without transport: %w", ErrDataPathNotWired)
@@ -1888,11 +1967,15 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 
 	seq := b.claimPlainFragSeq(guid)
 
-	if b.repairHistory != nil {
-		b.repairHistory.store(guid, seq, sample)
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	if history != nil {
+		history.store(guid, seq, sample)
 	}
 
-	err := b.sendPlainFragRun(ctx, uni, ports, guid, seq, sample, sampleSize, fragmentSize, total)
+	err = b.sendPlainFragRun(ctx, uni, ports, guid, seq, sample, sampleSize, fragmentSize, total)
 	if err != nil {
 		return err
 	}
@@ -1902,7 +1985,7 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 	return b.sendPlainFragHeartbeat(ctx, uni, ports, guid, seq)
 }
 
-// claimPlainFragSeq peeks the next DATA sequence for one writer.
+// claimPlainFragSeq claims the next DATA sequence for one writer.
 func (b *Backend) claimPlainFragSeq(guid WriterGUID) uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1913,24 +1996,21 @@ func (b *Backend) claimPlainFragSeq(guid WriterGUID) uint64 {
 	if !ok || seq == 0 {
 		seq = FirstSequenceNumber
 	}
-	return seq
-}
-
-// commitPlainFragSeq advances the DATA sequence after a successful run.
-func (b *Backend) commitPlainFragSeq(guid WriterGUID, seq uint64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if cur, ok := b.rtpsSeqByWriter[guid]; !ok || cur == seq {
-		b.rtpsSeqByWriter[guid] = seq + 1
-		if b.rtpsSeqByWriter[guid] == 0 {
-			b.rtpsSeqByWriter[guid] = FirstSequenceNumber
-		}
+	next := seq + 1
+	if next == 0 {
+		next = FirstSequenceNumber
 	}
-	// Compat: keep global counting.
+	b.rtpsSeqByWriter[guid] = next
+	// Compat: keep global counting with the claim like nextRTPSSeqFor.
 	b.rtpsSeq++
 	if b.rtpsSeq == 0 {
 		b.rtpsSeq = FirstSequenceNumber
 	}
+	return seq
+}
+
+// commitPlainFragSeq keeps compatibility after a successful run.
+func (b *Backend) commitPlainFragSeq(_ WriterGUID, _ uint64) {
 }
 
 // sendPlainFragRun emits each DATA_FRAG in order.
@@ -2119,11 +2199,9 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 	lastLocals := idx.LocalEndpoints()
 	lastRoutes := b.sortedRoutesSnapshot()
 
-	if len(lastRoutes) != 0 {
-		err = sedpAnnounceSnapshot(ctx, sender, lastLocals)
-		if err != nil {
-			return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
-		}
+	err = b.announceInitial(ctx, sender, lastLocals, lastRoutes)
+	if err != nil {
+		return err
 	}
 
 	lastSend := time.Now()
@@ -2145,6 +2223,20 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 	}
 }
 
+// announceInitial sends one snapshot when routes exist, tolerating no-route races.
+func (b *Backend) announceInitial(ctx context.Context, sender *sedpSender, locals []SEDPEndpoint, routes []int) error {
+	if len(routes) == 0 {
+		return nil
+	}
+
+	err := sedpAnnounceSnapshot(ctx, sender, locals)
+	if err != nil && !errors.Is(err, ErrNoRoute) {
+		return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
+	}
+
+	return nil
+}
+
 // announceTick checks routes and announces when endpoints or routes change.
 func (b *Backend) announceTick(ctx context.Context, sender *sedpSender, idx *SEDPIndex, lastLocals []SEDPEndpoint, lastRoutes []int, lastSend time.Time) ([]SEDPEndpoint, []int, time.Time, error) {
 	currentLocals := idx.LocalEndpoints()
@@ -2157,6 +2249,10 @@ func (b *Backend) announceTick(ctx context.Context, sender *sedpSender, idx *SED
 	}
 	err := sedpAnnounceSnapshot(ctx, sender, currentLocals)
 	if err != nil {
+		if errors.Is(err, ErrNoRoute) {
+			return currentLocals, currentRoutes, lastSend, nil
+		}
+
 		return lastLocals, lastRoutes, lastSend, sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
 	}
 	return currentLocals, currentRoutes, time.Now(), nil
@@ -2204,27 +2300,38 @@ func (b *Backend) demuxLoop(ctx context.Context) {
 			continue
 		}
 
-		if bytes.HasPrefix(data, []byte(legacySEDPrefix)) {
-			b.enqueueSEDP(ctx, sedpCh, data)
-
-			continue
-		}
-
-		if bytes.HasPrefix(data, []byte(legacySPDPrefix)) {
-			b.enqueueSPDP(ctx, spdpCh, data)
-
-			continue
-		}
-
-		if !bytes.HasPrefix(data, []byte(rtps.Magic)) {
-			b.bumpDemuxError()
-			log.Printf("dds: demux dropped %d non-RTPS bytes", len(data))
-
-			continue
-		}
-
-		b.dispatchRTPS(ctx, data, spdpCh, sedpCh, dataCh)
+		b.handleDemuxDatagram(ctx, data, spdpCh, sedpCh, dataCh)
 	}
+}
+
+// handleDemuxDatagram routes one unicast datagram to its queue.
+func (b *Backend) handleDemuxDatagram(
+	ctx context.Context,
+	data []byte,
+	spdpCh chan []byte,
+	sedpCh chan []byte,
+	dataCh chan dataItem,
+) {
+	if bytes.HasPrefix(data, []byte(legacySEDPrefix)) {
+		b.enqueueSEDP(ctx, sedpCh, data)
+
+		return
+	}
+
+	if bytes.HasPrefix(data, []byte(legacySPDPrefix)) {
+		b.enqueueSPDP(ctx, spdpCh, data)
+
+		return
+	}
+
+	if !bytes.HasPrefix(data, []byte(rtps.Magic)) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux dropped %d non-RTPS bytes", len(data))
+
+		return
+	}
+
+	b.dispatchRTPS(ctx, data, spdpCh, sedpCh, dataCh)
 }
 
 // snapshotDemux returns unicast plus queues under lock.
@@ -2262,7 +2369,7 @@ func (b *Backend) receiveDemux(ctx context.Context, uni *rtps.UnicastConn) ([]by
 
 	if len(data) < 4 {
 		b.bumpDemuxError()
-		log.Printf("dds: demux dropped short %d byte datagram", len(data))
+		sampleDropLog("dds: demux dropped short %d byte datagram", len(data))
 
 		return nil, true
 	}
@@ -2320,7 +2427,7 @@ func (b *Backend) dispatchRTPS(
 	header, subs, err := rtps.DecodeMessage(data, nil)
 	if err != nil {
 		b.bumpDemuxError()
-		log.Printf("dds: demux decode failed: %v", err)
+		sampleDropLog("dds: demux decode failed: %v", err)
 
 		return
 	}
@@ -2402,7 +2509,8 @@ func (b *Backend) sendPlainNack(ctx context.Context, guid WriterGUID, base uint6
 		return nil
 	}
 
-	if err := b.sendUserAckNack(ctx, guid, b.readerEntityForWriter(guid), base, 0, nil); err != nil {
+	err := b.sendUserAckNack(ctx, guid, b.readerEntityForWriter(guid), base, 0, nil)
+	if err != nil {
 		return fmt.Errorf("dds: plain nack send: %w", err)
 	}
 
@@ -2562,6 +2670,14 @@ func (b *Backend) ackSedpHeartbeat(ctx context.Context, header rtps.Header, sub 
 	var remote WriterGUID
 	copy(remote[:12], header.Prefix[:])
 	copy(remote[12:16], beat.WriterID[:])
+	b.mu.Lock()
+
+	if b.sedpHeartbeatLast == nil {
+		b.sedpHeartbeatLast = make(map[WriterGUID]uint64)
+	}
+
+	b.sedpHeartbeatLast[remote] = beat.LastSequence
+	b.mu.Unlock()
 	base := b.sedpBase(remote, beat.FirstSequence)
 	bitmap, numBits, _ := planSedpNack(base, beat.LastSequence)
 	ack, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap, numBits == 0)
@@ -2740,7 +2856,7 @@ func (b *Backend) enqueueData(
 	decoded, err := rtps.DecodeSubmessage(sub, nil)
 	if err != nil {
 		b.bumpDemuxError()
-		log.Printf("dds: demux submessage decode failed: %v", err)
+		sampleDropLog("dds: demux submessage decode failed: %v", err)
 
 		return
 	}
@@ -3210,11 +3326,12 @@ func (b *Backend) SubscribeWithQoS(ctx context.Context, topic, typeName, typeHas
 // partition with writers, otherwise the pair stays silent without an RxO
 // error per the DDS rule.
 func (b *Backend) SubscribeWithPartitions(ctx context.Context, topic, typeName, typeHash string, partitions []string) error {
-	if err := ValidatePartitionList(partitions); err != nil {
+	err := ValidatePartitionList(partitions)
+	if err != nil {
 		return fmt.Errorf("dds: subscribe partitions: %w", err)
 	}
 
-	err := b.Subscribe(ctx, topic, typeName, typeHash)
+	err = b.Subscribe(ctx, topic, typeName, typeHash)
 	if err != nil {
 		return err
 	}
@@ -3715,10 +3832,24 @@ func (b *Backend) Close() error {
 		close(done)
 	}
 
+	firstErr := closeTeardown(peer, mcastRx, mcastUserRx)
+
+	b.evictBackendCaches(local)
+
+	b.runWG.Wait()
+
+	return firstErr
+}
+
+// closeTeardown closes discovery sockets and returns the first error.
+func closeTeardown(peer UDPPeer, mcastRx, mcastUserRx *rtps.MulticastConn) error {
+	var firstErr error
+
 	if peer != nil {
 		err := peer.Close()
 		if err != nil {
 			log.Printf("dds: peer close failed: %v", err)
+			firstErr = fmt.Errorf("dds: peer close: %w", err)
 		}
 	}
 
@@ -3726,6 +3857,9 @@ func (b *Backend) Close() error {
 		err := mcastRx.Close()
 		if err != nil {
 			log.Printf("dds: multicast receive close failed: %v", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("dds: multicast receive close: %w", err)
+			}
 		}
 	}
 
@@ -3733,12 +3867,41 @@ func (b *Backend) Close() error {
 		err := mcastUserRx.Close()
 		if err != nil {
 			log.Printf("dds: user multicast receive close failed: %v", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("dds: user multicast receive close: %w", err)
+			}
 		}
 	}
 
-	b.runWG.Wait()
+	return firstErr
+}
 
-	return nil
+// evictBackendCaches drops per-backend entries for prompt NACK and SEDP seq.
+func (b *Backend) evictBackendCaches(local *LocalParticipant) {
+	promptNackMu.Lock()
+	for key := range promptNackCounts {
+		if key.backend == b {
+			delete(promptNackCounts, key)
+		}
+	}
+	promptNackMu.Unlock()
+
+	if local == nil {
+		return
+	}
+
+	lg := local.GUID()
+
+	var prefix SEDPGUIDPrefix
+	copy(prefix[:], lg.Prefix[:])
+
+	sedpWriterSeq.Lock()
+	for key := range sedpWriterSeqLast {
+		if key.prefix == prefix {
+			delete(sedpWriterSeqLast, key)
+		}
+	}
+	sedpWriterSeq.Unlock()
 }
 
 // Compile time check that Backend exposes the Backend contract.

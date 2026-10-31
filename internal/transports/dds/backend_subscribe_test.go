@@ -19,7 +19,8 @@ func TestBackendSubscribeWithQoSAnnouncesTranslatedOffer(t *testing.T) {
 
 	backend := newLiveBackend(t, domain, "qos-sub")
 	defer func() {
-		if err := backend.Close(); err != nil {
+		err := backend.Close()
+		if err != nil {
 			t.Errorf("close: %v", err)
 		}
 	}()
@@ -35,7 +36,8 @@ func TestBackendSubscribeWithQoSAnnouncesTranslatedOffer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := backend.SubscribeWithQoS(ctx, "/qos", "std_msgs__msg__String", StringTypeHash, profile); err != nil {
+	err := backend.SubscribeWithQoS(ctx, "/qos", "std_msgs__msg__String", StringTypeHash, profile)
+	if err != nil {
 		t.Fatalf("subscribe with qos: %v", err)
 	}
 
@@ -73,7 +75,8 @@ func TestBackendSubscribeWithQoSRefusesLoudly(t *testing.T) {
 
 	backend := newLiveBackend(t, domain, "qos-refuse")
 	defer func() {
-		if err := backend.Close(); err != nil {
+		err := backend.Close()
+		if err != nil {
 			t.Errorf("close: %v", err)
 		}
 	}()
@@ -107,7 +110,8 @@ func TestBackendSubscribeWithPartitionsStampsLocals(t *testing.T) {
 
 	backend := newLiveBackend(t, domain, "part-sub")
 	defer func() {
-		if err := backend.Close(); err != nil {
+		err := backend.Close()
+		if err != nil {
 			t.Errorf("close: %v", err)
 		}
 	}()
@@ -115,7 +119,8 @@ func TestBackendSubscribeWithPartitionsStampsLocals(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := backend.SubscribeWithPartitions(ctx, "/part", "std_msgs__msg__String", StringTypeHash, []string{"A"}); err != nil {
+	err := backend.SubscribeWithPartitions(ctx, "/part", "std_msgs__msg__String", StringTypeHash, []string{"A"})
+	if err != nil {
 		t.Fatalf("subscribe with partitions: %v", err)
 	}
 
@@ -136,7 +141,8 @@ func TestBackendSubscribeWithPartitionsStampsLocals(t *testing.T) {
 		t.Fatalf("no local reader for /part after SubscribeWithPartitions")
 	}
 
-	if err := backend.SubscribeWithPartitions(ctx, "/part-bad", "std_msgs__msg__String", StringTypeHash, []string{"a,b"}); err == nil {
+	err = backend.SubscribeWithPartitions(ctx, "/part-bad", "std_msgs__msg__String", StringTypeHash, []string{"a,b"})
+	if err == nil {
 		t.Fatalf("comma partition subscribed, want loud reject")
 	}
 }
@@ -149,7 +155,8 @@ func TestBackendSubscribeWithContentFilterHooksTake(t *testing.T) {
 
 	backend := newLiveBackend(t, domain, "filter-sub")
 	defer func() {
-		if err := backend.Close(); err != nil {
+		err := backend.Close()
+		if err != nil {
 			t.Errorf("close: %v", err)
 		}
 	}()
@@ -159,11 +166,13 @@ func TestBackendSubscribeWithContentFilterHooksTake(t *testing.T) {
 
 	hookTestStringDesc(t)
 
-	if err := backend.SubscribeWithContentFilter(ctx, "/filter", "hook_test__msg__Hooked", "", "data = 'keep-me'"); err != nil {
+	err := backend.SubscribeWithContentFilter(ctx, "/filter", "hook_test__msg__Hooked", "", "data = 'keep-me'")
+	if err != nil {
 		t.Fatalf("subscribe with content filter: %v", err)
 	}
 
-	if err := backend.SubscribeWithContentFilter(ctx, "/filter-bad", "hook_test__msg__Hooked", "", "data === 'broken"); err == nil {
+	err = backend.SubscribeWithContentFilter(ctx, "/filter-bad", "hook_test__msg__Hooked", "", "data === 'broken")
+	if err == nil {
 		t.Fatalf("bad filter expression subscribed, want loud parse error")
 	}
 

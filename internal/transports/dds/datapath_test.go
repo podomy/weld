@@ -1812,7 +1812,8 @@ func TestProvisionalConfirmCleanupAndTTL(t *testing.T) {
 		DomainID: 65,
 	}
 
-	if err := idx.UpsertRemote(confirmed); err != nil {
+	err = idx.UpsertRemote(confirmed)
+	if err != nil {
 		t.Fatalf("upsert confirmed: %v", err)
 	}
 

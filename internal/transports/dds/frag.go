@@ -212,9 +212,16 @@ func fragSliceLen(fragNum, total uint32, fragmentSize uint16, sampleSize uint32)
 
 // copyFragRun copies one submessage run into the entry buffer.
 func copyFragRun(entry *fragEntry, frag rtps.DataFrag) error {
+	if entry == nil {
+		return fmt.Errorf("dds: datafrag run without entry: %w", ErrInvalidFrame)
+	}
+
 	offInPayload := uint64(0)
 	for i := range uint64(frag.FragmentsInSubmessage) {
 		fragNum := uint64(frag.FragmentStartingNum) + i
+		if fragNum == 0 || fragNum > uint64(entry.total) {
+			return fmt.Errorf("dds: datafrag frag %d out of %d: %w", fragNum, entry.total, ErrInvalidFrame)
+		}
 		idx := fragNum - 1
 		wantLen := fragSliceLen(uint32(fragNum), entry.total, entry.fragmentSize, entry.sampleSize) //nolint:gosec // G115: fragNum bounds by total fragments above
 		if offInPayload+wantLen > uint64(len(frag.Payload)) {

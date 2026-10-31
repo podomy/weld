@@ -744,7 +744,8 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 // topic, and bumps generation once when any record changes so the next
 // announce carries the set. Unknown topics change nothing and report nil.
 func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions []string) {
-	if err := ValidatePartitionList(partitions); err != nil {
+	err := ValidatePartitionList(partitions)
+	if err != nil {
 		return
 	}
 
@@ -1329,7 +1330,8 @@ func sedpMatchKeyed(reader, writer SEDPEndpoint) bool {
 	// Keyed-vs-unkeyed mismatch is a loud incompatible, never a silent
 	// filter drop. CheckKeyedMatch names the mismatch; here it gates
 	// matching while the caller surfaces the reason.
-	if ok, err := CheckKeyedMatch(reader, writer); err != nil || !ok {
+	ok, err := CheckKeyedMatch(reader, writer)
+	if err != nil || !ok {
 		sedpTracef("match reject keyed reader=%s writer=%s err=%v", reader.ID.String(), writer.ID.String(), err)
 		return false
 	}
@@ -1583,6 +1585,7 @@ func sedpSerializeOptionalParams(ep SEDPEndpoint, params []rtps.Param) ([]rtps.P
 	return params, nil
 }
 
+// SerializeSEDPDATA serializes an endpoint as an RTPS DATA sample.
 func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 	err := sedpValidateMarshalEndpoint(ep)
 	if err != nil {
@@ -2021,6 +2024,10 @@ type sedpEndpointWireFields struct {
 func sedpCollectParams(body []byte, flags byte) ([]rtps.Param, []byte, error) {
 	littleEndian := flags&sedpFlagLittleEndian != 0
 
+	if len(body) < sedpDataFixedLen {
+		return nil, nil, fmt.Errorf("dds: sedp collect params need %d have %d: %w", sedpDataFixedLen, len(body), ErrSEDPInvalidDATA)
+	}
+
 	var params []rtps.Param
 
 	rest := body[sedpDataFixedLen:]
@@ -2203,7 +2210,8 @@ func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEnd
 
 	fields.security = secInfo
 
-	if err := CheckProtectedDiscovery(secInfo); err != nil {
+	err := CheckProtectedDiscovery(secInfo)
+	if err != nil {
 		sedpTracef("parse secured peer crypto unavailable err=%v", err)
 	}
 
@@ -2239,11 +2247,13 @@ func sedpEndpointFields(params []rtps.Param, littleEndian bool) (sedpEndpointWir
 
 	byID := sedpFirstParams(params)
 
-	if err := sedpFieldsIdentity(byID, littleEndian, &fields); err != nil {
+	err := sedpFieldsIdentity(byID, littleEndian, &fields)
+	if err != nil {
 		return fields, err
 	}
 
-	if err := sedpFieldsOptionals(byID, littleEndian, &fields); err != nil {
+	err = sedpFieldsOptionals(byID, littleEndian, &fields)
+	if err != nil {
 		return fields, err
 	}
 
@@ -2451,7 +2461,7 @@ func sedpDecodeOctetSequence(value []byte, littleEndian bool) (string, error) {
 		return "", fmt.Errorf("dds: sedp parse sequence length: %w", err)
 	}
 
-	if count < 0 || count > sedpMaxNameLen+4 {
+	if count > sedpMaxNameLen+4 {
 		return "", fmt.Errorf("dds: sedp parse sequence length %d: %w", count, ErrSEDPInvalidDATA)
 	}
 
@@ -2569,7 +2579,8 @@ func sedpParseEndpointUserdata(raw string) (sedpUserdataFields, error) {
 			return fields, fmt.Errorf("dds: sedp parse userdata %q misses equals: %w", chunk, ErrSEDPInvalidDATA)
 		}
 
-		if err := sedpApplyUserdataField(&fields, key, value); err != nil {
+		err := sedpApplyUserdataField(&fields, key, value)
+		if err != nil {
 			return fields, err
 		}
 	}
@@ -2699,7 +2710,8 @@ func sedpValidateMarshalEndpoint(ep SEDPEndpoint) error {
 		return fmt.Errorf("dds: sedp serialize idl %q vs %q: %w", ep.TypeIDL, decodedIDL, ErrSEDPInvalidType)
 	}
 
-	if err := ValidatePartitionList(ep.Partitions); err != nil {
+	err = ValidatePartitionList(ep.Partitions)
+	if err != nil {
 		return fmt.Errorf("dds: sedp serialize partitions: %w", err)
 	}
 

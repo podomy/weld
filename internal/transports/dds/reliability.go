@@ -397,11 +397,15 @@ func (r *DataReceiver) ApplyGap(
 func (b *Backend) repairHistoryFirst(
 	guid WriterGUID,
 ) uint64 {
-	if b.repairHistory == nil {
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	if history == nil {
 		return FirstSequenceNumber
 	}
 
-	first := b.repairHistory.first(guid)
+	first := history.first(guid)
 	if first == 0 {
 		return FirstSequenceNumber
 	}
@@ -413,11 +417,15 @@ func (b *Backend) repairHistoryFirst(
 func (b *Backend) repairHistoryLast(
 	guid WriterGUID,
 ) uint64 {
-	if b.repairHistory == nil {
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	if history == nil {
 		return 0
 	}
 
-	return b.repairHistory.last(guid)
+	return history.last(guid)
 }
 
 // remoteSeenCap bounds one writer's out-of-order set.
@@ -439,6 +447,10 @@ type remoteTracker struct {
 	contig uint64
 	// seen holds received seqs above a gap, bounded by remoteSeenCap.
 	seen map[uint64]struct{}
+	// lastHeartbeatLast is the last heartbeat LastSequence bound, zero when unknown.
+	lastHeartbeatLast uint64
+	// lastFallback is the last fallback broadcast time for rate limiting.
+	lastFallback time.Time
 }
 
 // observe records one received seq.
@@ -493,8 +505,27 @@ func (t *remoteTracker) base() uint64 {
 
 // skipTo advances contiguity past a GAP range the writer will never send.
 func (t *remoteTracker) skipTo(seq uint64) {
+	if t == nil {
+		return
+	}
+
 	if seq <= t.contig {
 		return
+	}
+
+	if t.lastHeartbeatLast != 0 {
+		maxAllowed := t.lastHeartbeatLast + 1
+		if maxAllowed == 0 {
+			maxAllowed = ^uint64(0)
+		}
+
+		if seq > maxAllowed {
+			seq = maxAllowed
+		}
+
+		if seq <= t.contig {
+			return
+		}
 	}
 
 	t.contig = seq
@@ -629,6 +660,17 @@ func (b *Backend) applySedpGap(guid WriterGUID, gapStart uint64) {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if last, ok := b.sedpHeartbeatLast[guid]; ok && last != 0 {
+		maxAllowed := last + 1
+		if maxAllowed == 0 {
+			maxAllowed = ^uint64(0)
+		}
+
+		if gapStart > maxAllowed {
+			gapStart = maxAllowed
+		}
+	}
 
 	if b.sedpHighSeq == nil {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
@@ -975,7 +1017,9 @@ func (b *Backend) buildAckMessage(
 // response must always stay possible. The send fans out to the writer
 // participant's route ports and falls back to all routes when the
 // participant has none yet, since NACKs during discovery must still go
-// out. Failures return loudly so callers count them.
+// out. Fallback broadcasts are rate limited per writer to one per
+// fallbackAckInterval; direct-route sends stay unlimited. Failures return
+// loudly so callers count them.
 func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader rtps.EntityID, base uint64, numBits uint32, bitmap []uint32) error {
 	if base == 0 {
 		return fmt.Errorf("dds: user nack base 0: %w", ErrInvalidFrame)
@@ -991,14 +1035,31 @@ func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader
 	ports := b.snapshotRoutePorts(prefix)
 	b.mu.RLock()
 	uni := b.uni
+	clock := b.clock
 	b.mu.RUnlock()
+
+	fallback := false
 
 	if len(ports) == 0 {
 		ports = b.snapshotRoutes()
+		fallback = true
 	}
 
 	if len(ports) == 0 {
-		return nil
+		return fmt.Errorf("dds: user nack without route: %w", ErrNoRoute)
+	}
+
+	if fallback {
+		var now time.Time
+		if clock != nil {
+			now = clock.Now()
+		} else {
+			now = time.Now()
+		}
+
+		if b.shouldRateLimitFallback(remote, now) {
+			return nil
+		}
 	}
 
 	if uni == nil {
@@ -1022,6 +1083,30 @@ func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader
 	return fmt.Errorf("dds: user nack no route to writer: %w", ErrNoRoute)
 }
 
+// shouldRateLimitFallback reports whether one fallback broadcast should drop.
+func (b *Backend) shouldRateLimitFallback(remote WriterGUID, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.remoteTrack == nil {
+		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
+	}
+
+	tracker, ok := b.remoteTrack[remote]
+	if !ok {
+		tracker = &remoteTracker{}
+		b.remoteTrack[remote] = tracker
+	}
+
+	if !tracker.lastFallback.IsZero() && now.Sub(tracker.lastFallback) < fallbackAckInterval {
+		return true
+	}
+
+	tracker.lastFallback = now
+
+	return false
+}
+
 // sendUserControl fanouts one control datagram to all routes best effort.
 func (b *Backend) sendUserControl(
 	ctx context.Context,
@@ -1038,7 +1123,7 @@ func (b *Backend) sendUserControl(
 	ports, uni := b.snapshotRoutesAndUnicast()
 
 	if len(ports) == 0 {
-		return nil
+		return fmt.Errorf("dds: user control without route: %w", ErrNoRoute)
 	}
 
 	if uni == nil {
@@ -1060,7 +1145,7 @@ func (b *Backend) sendUserControl(
 		)
 	}
 
-	return nil
+	return fmt.Errorf("dds: user control without route: %w", ErrNoRoute)
 }
 
 // repairWindow bounds repair to window and returns start, first, last, end. It reports false when no
@@ -1100,7 +1185,12 @@ func (b *Backend) repairWindow(
 		return 0, 0, 0, 0, false
 	}
 	if end-start+1 > bound {
-		end = start + bound - 1
+		newEnd := start + bound - 1
+		if newEnd < start {
+			newEnd = last
+		}
+
+		end = newEnd
 	}
 
 	return start, first, last, end, true
@@ -1114,7 +1204,11 @@ func (b *Backend) repairOneSeq(
 	first uint64,
 	last uint64,
 ) error {
-	payload, ok := b.repairHistory.load(guid, seq)
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	payload, ok := history.load(guid, seq)
 	if ok {
 		msg, err := b.buildRepairMessage(
 			guid,
@@ -1162,7 +1256,123 @@ func (b *Backend) repairOneSeq(
 // receivable.
 const repairPace = 2 * time.Millisecond
 
-// repairFromAck resends history from base plus GAP for missing in window. It bounds work to
+// repairQueueDepth bounds the async repair FIFO.
+const repairQueueDepth = 128
+
+// repairTask is one queued ACKNACK repair.
+type repairTask struct {
+	// backend serves the repair.
+	backend *Backend
+	// writer names the targeted writer.
+	writer rtps.EntityID
+	// base is the first wanted sequence.
+	base uint64
+}
+
+// repairQueue holds pending repairs for the single FIFO worker.
+var repairQueue chan repairTask
+
+// repairOnce starts the single repair worker.
+var repairOnce sync.Once
+
+// ensureRepairWorker starts the single bounded FIFO repair worker.
+func ensureRepairWorker() {
+	repairOnce.Do(func() {
+		repairQueue = make(chan repairTask, repairQueueDepth)
+		go repairWorkerLoop()
+	})
+}
+
+// repairWorkerLoop serves queued repairs serially to preserve per-writer order.
+func repairWorkerLoop() {
+	for task := range repairQueue {
+		if task.backend == nil {
+			continue
+		}
+
+		task.backend.serveRepair(task)
+	}
+}
+
+// serveRepair resends history for one queued ACKNACK.
+func (b *Backend) serveRepair(task repairTask) {
+	ctx := context.Background()
+
+	b.mu.RLock()
+	local := b.local
+	b.mu.RUnlock()
+
+	if local == nil {
+		return
+	}
+
+	var guid WriterGUID
+
+	lg := local.GUID()
+	copy(guid[:12], lg.Prefix[:])
+	copy(guid[12:16], task.writer[:])
+
+	start, first, last, end, ok := b.repairWindow(guid, task.base)
+	if !ok {
+		return
+	}
+
+	serveRepairWindow(b, ctx, guid, start, first, last, end)
+}
+
+// serveRepairWindow sends one bounded repair window with pacing.
+func serveRepairWindow(b *Backend, ctx context.Context, guid WriterGUID, start, first, last, end uint64) {
+	timer := time.NewTimer(repairPace)
+	defer timer.Stop()
+
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+
+	for seq := start; ; seq++ {
+		err := ctx.Err()
+		if err != nil {
+			return
+		}
+
+		err = b.repairOneSeq(ctx, guid, seq, first, last)
+		if err != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux repair: %v", err)
+
+			return
+		}
+
+		if seq == end {
+			break
+		}
+
+		if !paceRepair(timer, ctx) {
+			return
+		}
+
+		if seq == ^uint64(0) {
+			break
+		}
+	}
+}
+
+// paceRepair waits one pacing interval and reports whether to continue.
+func paceRepair(timer *time.Timer, ctx context.Context) bool {
+	timer.Reset(repairPace)
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// repairFromAck queues history repair from base plus GAP for missing in window. It bounds work to
 // userRepairWindow seq. Base 0 and unknown writers are ignored without repair.
 func (b *Backend) repairFromAck(
 	ctx context.Context,
@@ -1177,6 +1387,13 @@ func (b *Backend) repairFromAck(
 		return nil
 	}
 
+	if ctx != nil {
+		err := ctx.Err()
+		if err != nil {
+			return fmt.Errorf("dds: repair context: %w", err)
+		}
+	}
+
 	b.mu.RLock()
 	local := b.local
 	b.mu.RUnlock()
@@ -1185,53 +1402,16 @@ func (b *Backend) repairFromAck(
 		return nil
 	}
 
-	var guid WriterGUID
+	ensureRepairWorker()
 
-	lg := local.GUID()
-	copy(guid[:12], lg.Prefix[:])
-	copy(guid[12:16], writer[:])
+	task := repairTask{backend: b, writer: writer, base: base}
 
-	start, first, last, end, ok := b.repairWindow(
-		guid,
-		base,
-	)
-	if !ok {
+	select {
+	case repairQueue <- task:
 		return nil
+	default:
+		return fmt.Errorf("dds: repair queue full base %d: %w", base, ErrNoRoute)
 	}
-
-	for seq := start; seq <= end; seq++ {
-		err := ctx.Err()
-		if err != nil {
-			return fmt.Errorf(
-				"dds: repair context: %w",
-				err,
-			)
-		}
-
-		err = b.repairOneSeq(
-			ctx,
-			guid,
-			seq,
-			first,
-			last,
-		)
-		if err != nil {
-			return err
-		}
-
-		if seq != end {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf(
-					"dds: repair context: %w",
-					ctx.Err(),
-				)
-			case <-time.After(repairPace):
-			}
-		}
-	}
-
-	return nil
 }
 
 // readerEntityForWriter resolves our local reader entity for NACKs.
@@ -1292,6 +1472,23 @@ func (b *Backend) ackUserHeartbeat(
 	var remote WriterGUID
 	copy(remote[:12], header.Prefix[:])
 	copy(remote[12:16], beat.WriterID[:])
+
+	if beat.LastSequence != 0 {
+		b.mu.Lock()
+
+		if b.remoteTrack == nil {
+			b.remoteTrack = make(map[WriterGUID]*remoteTracker)
+		}
+
+		tracker, ok := b.remoteTrack[remote]
+		if !ok {
+			tracker = &remoteTracker{}
+			b.remoteTrack[remote] = tracker
+		}
+
+		tracker.lastHeartbeatLast = beat.LastSequence
+		b.mu.Unlock()
+	}
 
 	base := max(
 		b.remoteBase(remote, beat.FirstSequence),
@@ -1374,6 +1571,10 @@ func (b *Backend) sendPromptNack(
 
 	err := b.sendUserAckNack(ctx, remote, b.readerEntityForWriter(remote), base, 0, nil)
 	if err != nil {
+		if errors.Is(err, ErrNoRoute) {
+			return
+		}
+
 		b.bumpDemuxError()
 		log.Printf("dds: demux prompt ack send: %v", err)
 	}

@@ -28,6 +28,7 @@ func run(ctx context.Context, name string, arg ...string) {
 	}
 }
 
+// main runs the pre-commit verification steps.
 func main() {
 	ctx := context.Background()
 

@@ -34,9 +34,9 @@ The non goals for the first version are deliberate limits:
 
 - No source compatibility with rclcpp. The Go API is designed, not transliterated.
 - No intra process transport in version one. Local delivery honors QoS or rejects at creation; that work follows network interop.
-- No zero copy loans or shared memory in version one. Shared pointer delivery plus the byte path covers throughput first.
+- No zero copy loans or shared memory in version one, except in-process loan honesty: loan-eligible types are detected and refused loudly outside the in-process path, with no shared-memory transport yet. Shared pointer delivery plus the byte path covers throughput first.
 - No bag storage engine in version one. Weld reads and writes the exchange formats.
-- No FastDDS, Zenoh, or MQTT transports in version one. CycloneDDS via sidecar is the v1 reference peer; the other backends land after first interop behind the same interface.
+- No FastDDS, Zenoh, or MQTT transports in version one. CycloneDDS via sidecar is the v1 reference peer; the other backends exist in tree as stubs behind the same interface and land after first interop.
 
 Consider what this means for a perception pipeline. A camera node named usb_cam publishes sensor_msgs/msg/Image on /image_raw at 30 Hz with a 640 by 480 frame. Weld does not promise zero copy delivery of that frame in version one. It does promise that the bytes on the wire decode identically against CycloneDDS (FastDDS follows after v1), that a late joining recorder still reads the bag, and that a QoS disagreement surfaces loudly instead of producing silence.
 
@@ -184,7 +184,7 @@ Packages follow the architecture diagram. Each package has one job and one direc
 - internal/core: entities, RxO matcher, router, service calls, action workflows, config store, clock domain, graph index, supervision groups.
 - internal/time: clock sources, fake clocks, jump handling, rate policies.
 - internal/graph: snapshots, compatibility reporting, tool queries.
-- sdk (separate module): Node, Topics with generic bytes, Services with deadlines, Workflows for actions, Config with schema and watch, Time, Supervision groups. No transport imports.
+- sdk (separate module): Node, Topics with generic bytes, Services with deadlines, Workflows for actions, Config with schema and watch, Time, Supervision groups. No transport imports. The SDK mirrors core loan and QoS logic in stdlib-only form instead of importing it, so the module stays dependency-free; mirror copies name their core counterparts in contract comments and update together.
 - cmd/weld: conformance CLI covering the compatibility list.
 
 Proof Plan

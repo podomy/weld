@@ -242,18 +242,17 @@ func effectiveServiceTimeout(timeout Duration) Duration {
 
 // computeServiceDeadline returns the absolute expiry in the now domain.
 //
-// Infinite never expires and maps to max int64. Other totals add saturating
-// at max int64 so a fake clock near the top still terminates cleanly.
+// Infinite never expires and maps to max int64. Other totals add through
+// tfAddSaturating so a negative injected startNanos cannot overflow the
+// MaxInt64 minus start check to MaxUint64 and so a fake clock near the top
+// still terminates cleanly.
 func computeServiceDeadline(startNanos int64, timeout Duration) int64 {
 	eff := effectiveServiceTimeout(timeout)
 	if eff.IsInfinite() {
 		return math.MaxInt64
 	}
 	total := eff.TotalNanoseconds()
-	if total > math.MaxInt64-startNanos {
-		return math.MaxInt64
-	}
-	return startNanos + total
+	return tfAddSaturating(startNanos, total)
 }
 
 // isServiceExpired reports whether now reached a finite deadline.
@@ -360,6 +359,8 @@ func (c *ServiceClient) emitClientTrace(trace ServiceTrace, enabled bool, hook S
 // duplicate key for exact one to one routing. Unspecified timeout means the
 // five second default; infinite means no timeout. On success it emits
 // request sent with sequence and client GUID when introspection is enabled.
+// Sequence is uint64 with no wrap handling: 2^64 calls on one client GUID
+// is unreachable, so wrap is documented as not handled by design.
 func (c *ServiceClient) BeginCall(ctx context.Context, service string, client [8]byte, seq uint64, timeout Duration) error {
 	if c == nil {
 		return errors.New("core: begin service call: nil client") //nolint:wrapcheck // new error, nothing to wrap
@@ -384,8 +385,15 @@ func (c *ServiceClient) BeginCall(ctx context.Context, service string, client [8
 		c.mu.Unlock()
 		return fmt.Errorf("core: begin service call on %q seq %d: %w", service, seq, ErrServiceDuplicate)
 	}
-	start := c.now()
+	nowFn := c.now
+	c.mu.Unlock()
+	start := nowFn()
 	deadline := computeServiceDeadline(start, timeout)
+	c.mu.Lock()
+	if _, dup := c.pending[key]; dup {
+		c.mu.Unlock()
+		return fmt.Errorf("core: begin service call on %q seq %d: %w", service, seq, ErrServiceDuplicate)
+	}
 	c.pending[key] = servicePendingCall{key: key, startNanos: start, deadlineNanos: deadline, done: ctx.Done()}
 	enabled := c.traceEnabled
 	hook := c.traceHook

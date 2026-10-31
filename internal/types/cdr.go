@@ -134,8 +134,11 @@ func (e *Encoder) Bytes() []byte {
 
 // Align pads with zeroes until the buffer offset is a multiple of n.
 //
-// Valid n values are 1, 2, 4, and 8. Any other n is a caller bug and
-// leaves the buffer unchanged without reporting an error. This differs
+// Precondition: callers pass 1, 2, 4, or 8. All current callers satisfy
+// this, so the silent ignore below never triggers in practice. Any other
+// n is a caller bug and leaves the buffer unchanged without reporting an
+// error. The signature stays void to avoid rippling through every write
+// path; changing it would force error returns on all callers. This differs
 // from Decoder.Align which returns an error for invalid n without
 // counting a drop.
 //
@@ -1057,7 +1060,10 @@ func (d *Decoder) ReadOctetSequence() ([]byte, error) {
 // fields, when Offset equals HeaderSize. The 8+8 header is packed outside
 // the CDR alignment domain: GUID at 4..12 and sequence at 12..20 stay
 // contiguous with no Align(8) pad, so user payload is rebased at offset
-// 20. The sequence uses the negotiated byte order via
+// 20. The pad here uses the relative origin (off minus payloadStart)
+// shared with Encoder.Align; HeaderSize is 4, a multiple of 4, so the
+// relative and absolute forms agree and the wire stays identical. The
+// sequence uses the negotiated byte order via
 // decodeServiceSequence. The GUID is the opaque 8 byte rmw request id
 // echoed verbatim in the reply.
 //
@@ -1075,7 +1081,7 @@ func (d *Decoder) ReadServiceHeader() ([8]byte, uint64, error) {
 	}
 	copy(guid[:], d.data[d.off:d.off+ServiceGUIDSize])
 	d.off += ServiceGUIDSize
-	pad := alignPad(d.off, 4)
+	pad := alignPad(d.off-d.payloadStart, 4)
 	if d.off+pad+ServiceSequenceSize > len(d.data) {
 		d.drops++
 		return guid, 0, fmt.Errorf("cdr: truncated service sequence: %w", ErrTruncated)
@@ -1094,7 +1100,13 @@ func (d *Decoder) ReadServiceHeader() ([8]byte, uint64, error) {
 // pads the wire, so a message ending with a 1 byte bool like PointCloud2
 // is_dense leaves up to 3 zero bytes that are not trailing garbage.
 // Those bytes must be all zero and must equal the pad needed from the
-// consumed offset relative to the user payload start. Any other
+// consumed offset relative to the user payload start. A plain empty
+// message with no fields read carries one dummy zero byte plus pad from
+// Encoder.Bytes and MarshalMessage; Finish consumes that dummy plus pad
+// as success so plain empty payloads round trip. Service empty messages
+// carry no dummy by ROS convention (WriteServiceHeader sets noDummy and
+// MarshalServiceMessage emits no dummy), so the dummy path is gated on
+// the plain origin and the service path stays byte-identical. Any other
 // remainder counts a drop and returns an error. Opaque UnmarshalMessage
 // views require this step for strict validation because they do not check
 // trailing garbage on their own.
@@ -1103,20 +1115,43 @@ func (d *Decoder) Finish() error {
 	if remaining == 0 {
 		return nil
 	}
+	if d.tryConsumeEmptyDummy(remaining) {
+		return nil
+	}
 	expected := alignPad(d.off-d.payloadStart, 4)
-	if remaining == expected {
-		ok := true
-		for _, b := range d.data[d.off:] {
-			if b != nulByte {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			d.off = len(d.data)
-			return nil
-		}
+	if remaining == expected && isZeroBytes(d.data[d.off:]) {
+		d.off = len(d.data)
+		return nil
 	}
 	d.drops++
 	return fmt.Errorf("cdr: %d trailing bytes: %w", remaining, ErrInvalid)
+}
+
+// tryConsumeEmptyDummy consumes the plain empty dummy plus pad on success.
+// It applies only when no user bytes were read on the plain origin; the
+// service origin stays byte-identical with no dummy. It reports whether it
+// consumed.
+func (d *Decoder) tryConsumeEmptyDummy(remaining int) bool {
+	if d.off != d.payloadStart || d.payloadStart != HeaderSize {
+		return false
+	}
+	want := 1 + alignPad(d.off+1, 4)
+	if remaining != want {
+		return false
+	}
+	if !isZeroBytes(d.data[d.off:]) {
+		return false
+	}
+	d.off = len(d.data)
+	return true
+}
+
+// isZeroBytes reports whether all bytes are zero.
+func isZeroBytes(b []byte) bool {
+	for _, v := range b {
+		if v != nulByte {
+			return false
+		}
+	}
+	return true
 }

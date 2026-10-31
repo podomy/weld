@@ -60,6 +60,17 @@ const FacadeHistoryDepth = 100
 // for slow consumers; see transport byte cap tests.
 const KeepAllRetentionBound = 1000
 
+// MaxHistoryCacheEntries caps every history cache entry count.
+//
+// No existing test expects more than 1000 entries (facade 100, keep all
+// 1000, slow consumer 100); 100000 is the documented ceiling. It bounds
+// count memory for small samples to a few megabytes while transports bound
+// bytes separately for large samples. RetentionCapacity clamps larger keep
+// last depths to this ceiling and NewHistoryCache clamps direct
+// constructions, so overflow past the ceiling evicts oldest with loud Lost
+// counting instead of growing without bound.
+const MaxHistoryCacheEntries = 100000
+
 // FacadeAdvertisedQoS returns the profile Weld advertises on the wire:
 // reliable plus transient local with a bounded keep last.
 //
@@ -134,18 +145,24 @@ func FacadeDeliveryBehavior() DeliveryBehavior {
 }
 
 // RetentionCapacity returns the history cache bound for a resolved profile:
-// depth for keep last, KeepAllRetentionBound for keep all.
+// depth for keep last clamped to MaxHistoryCacheEntries, KeepAllRetentionBound for keep all.
 //
 // Unresolved history or keep last with depth zero is an error: call
 // ResolveSystemDefaults first so vendors converge before entity creation.
 // Feed the returned capacity directly into NewHistoryCache, which panics on
 // zero so an unresolved depth can never silently become a capacity of one.
-// Unknown, invalid, and system default histories are errors.
+// Unknown, invalid, and system default histories are errors. Depths past
+// MaxHistoryCacheEntries clamp to the ceiling so a huge depth cannot force
+// unbounded allocation; overflow past the ceiling evicts oldest with loud
+// Lost counting in HistoryCache.
 func RetentionCapacity(p QoSProfile) (uint64, error) {
 	switch p.History {
 	case HistoryKeepLast:
 		if p.Depth == 0 {
 			return 0, errors.New("core: retention capacity: keep last depth 0 means not set; call ResolveSystemDefaults first") //nolint:wrapcheck // new error, nothing to wrap
+		}
+		if p.Depth > MaxHistoryCacheEntries {
+			return MaxHistoryCacheEntries, nil
 		}
 		return p.Depth, nil
 	case HistoryKeepAll:

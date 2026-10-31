@@ -250,7 +250,9 @@ func CheckCompatibility(offered, requested QoSProfile) CompatibilityReport {
 // checkNegativeDurations records an error when either side carries a
 // malformed negative deadline or lease duration. Lifespan never participates
 // in matching so it is ignored here and rejected loudly by Validate instead.
-// This guard runs first so skipped validation still fails loudly in matching.
+// Nanoseconds at or above one second likewise stay Validate's job and are not
+// checked here. This guard runs first so skipped validation still fails loudly
+// in matching.
 func checkNegativeDurations(offered, requested QoSProfile, report *CompatibilityReport) {
 	if offered.Deadline.Seconds < 0 || requested.Deadline.Seconds < 0 {
 		report.Errors = append(report.Errors, CompatibilityIssue{
@@ -295,6 +297,10 @@ func checkDurability(offered, requested QoSProfile, report *CompatibilityReport)
 // while an offered infinite stays slow. Best available sentinels on either
 // side skip the error check so the pair warns instead; the marker is checked
 // before any String call so sentinel values never leak into error text.
+// The early returns above guarantee requested is finite here, so the switch
+// needs no second unspecified conjuncts. Nanoseconds at or above one second
+// and lifespan never participate here; they stay Validate's job and are
+// documented there, not widened in matching.
 func checkDeadline(offered, requested QoSProfile, report *CompatibilityReport) {
 	if IsBestAvailableDuration(offered.Deadline) || IsBestAvailableDuration(requested.Deadline) {
 		return
@@ -303,12 +309,12 @@ func checkDeadline(offered, requested QoSProfile, report *CompatibilityReport) {
 		return
 	}
 	switch {
-	case offered.Deadline.IsUnspecified() && !requested.Deadline.IsUnspecified():
+	case offered.Deadline.IsUnspecified():
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind:   PolicyDeadline,
 			Detail: "offered default deadline cannot satisfy requested deadline " + requested.Deadline.String(),
 		})
-	case !offered.Deadline.IsUnspecified() && !requested.Deadline.IsUnspecified() &&
+	case !offered.Deadline.IsUnspecified() &&
 		requested.Deadline.Compare(offered.Deadline) < 0:
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind: PolicyDeadline,

@@ -100,11 +100,11 @@ func ParseHeader(data []byte) (bool, error) {
 
 // padTo4 returns the zero pad needed to reach a 4 byte boundary.
 //
-// padTo4(n) equals alignPad(n, 4). The two helpers share the same modular
-// rule; padTo4 is kept for call sites that always target 4 byte wire pad
-// while alignPad takes an explicit alignment for CDR Align steps.
+// padTo4(n) equals alignPad(n, 4). It is kept as a thin wrapper so all
+// 4 byte wire pad shares the single modular rule in alignPad and the two
+// helpers cannot diverge; behavior is identical.
 func padTo4(n int) int {
-	return (4 - (n % 4)) % 4
+	return alignPad(n, 4)
 }
 
 // alignPad returns the pad needed to advance offset off to a multiple of n.

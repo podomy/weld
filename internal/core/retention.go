@@ -30,10 +30,17 @@ type HistoryCache[T any] struct {
 // not set: RetentionCapacity errors on keep last depth zero and on
 // unresolved history, so zero must never silently normalize to one. This
 // documents the conflict explicitly instead of hiding an unresolved profile
-// behind a capacity of one.
+// behind a capacity of one. Capacities past MaxHistoryCacheEntries clamp to
+// the ceiling so direct constructions cannot force unbounded allocation;
+// overflow past the ceiling evicts oldest with loud Lost counting in Push.
+// Panic on zero capacity is by design: it fails loudly at construction
+// instead of hiding a misconfigured depth.
 func NewHistoryCache[T any](capacity uint64) *HistoryCache[T] {
 	if capacity == 0 {
 		panic("core: NewHistoryCache: capacity 0 means not set; call RetentionCapacity first")
+	}
+	if capacity > MaxHistoryCacheEntries {
+		capacity = MaxHistoryCacheEntries
 	}
 	return &HistoryCache[T]{capacity: capacity}
 }

@@ -5,6 +5,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -30,7 +31,10 @@ type DeadlineTracker struct {
 }
 
 // NewDeadlineTracker starts tracking topic plus endpoint against deadline,
-// with the last sample seen at startNanos.
+// with the last sample seen at startNanos. Returns a value containing a
+// mutex by design like NewLivelinessTracker: callers hold it without copying
+// after first use and use pointer receivers; switching to a pointer return
+// would ripple through transport call sites, so the value form is kept.
 func NewDeadlineTracker(topic, endpoint string, deadline Duration, startNanos int64) DeadlineTracker {
 	return DeadlineTracker{topic: topic, endpoint: endpoint, deadline: deadline, lastNanos: startNanos}
 }
@@ -98,7 +102,7 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 		t.alerted = false
 		return DeadlineAlert{}, false
 	}
-	elapsed := nowNanos - t.lastNanos
+	elapsed := saturatingSub(nowNanos, t.lastNanos)
 	if elapsed < t.deadline.TotalNanoseconds() {
 		t.alerted = false
 		return DeadlineAlert{}, false
@@ -135,18 +139,20 @@ func DeadlineExceeded(deadline Duration, elapsedNanos int64) bool {
 //
 // Unlike Check it never fires, never latches, and never rebases: backward
 // time yields a negative elapsed so callers see the rewind. Tests prefer
-// this peek for gating assertions.
+// this peek for gating assertions. Elapsed uses saturating subtraction
+// mirroring tfAddSaturating so near-range edges cannot overflow.
 func (t *DeadlineTracker) ElapsedAt(nowNanos int64) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return nowNanos - t.lastNanos
+	return saturatingSub(nowNanos, t.lastNanos)
 }
 
 // MissedAt reports whether the deadline window elapsed at nowNanos.
 //
 // It never fires, never latches, and never rebases, so repeated calls are
 // stable and gating stays pure. Unspecified, infinite, sentinel, and
-// negative deadlines never miss. Backward time never misses.
+// negative deadlines never miss. Backward time never misses. Elapsed uses
+// saturating subtraction mirroring tfAddSaturating.
 func (t *DeadlineTracker) MissedAt(nowNanos int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -165,7 +171,22 @@ func (t *DeadlineTracker) MissedAt(nowNanos int64) bool {
 	if nowNanos < t.lastNanos {
 		return false
 	}
-	return nowNanos-t.lastNanos >= t.deadline.TotalNanoseconds()
+	return saturatingSub(nowNanos, t.lastNanos) >= t.deadline.TotalNanoseconds()
+}
+
+// saturatingSub returns a minus b saturating at the int64 range.
+//
+// Positive overflow saturates to max int64 and negative overflow saturates
+// to min int64. It mirrors tfAddSaturating for elapsed math in this file so
+// near-range fake clocks cannot overflow the subtraction.
+func saturatingSub(a, b int64) int64 {
+	if b > 0 && a < math.MinInt64+b {
+		return math.MinInt64
+	}
+	if b < 0 && a > math.MaxInt64+b {
+		return math.MaxInt64
+	}
+	return a - b
 }
 
 // DeadlineAlert is one fired freshness alarm with topic plus endpoint names.

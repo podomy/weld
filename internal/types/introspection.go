@@ -239,7 +239,9 @@ func (m *MessageMember) NestedMembers() (*MessageMembers, error) {
 
 // nestedMembersLocked implements NestedMembers with nestedPatchMu held.
 // Callers must hold nestedPatchMu; EnsureNestedPatched relies on this
-// to keep reads of Members race free while patching.
+// to keep reads of Members race free while patching. It resolves through
+// the registry directly (not the cloning Lookup) so lazy patching stores
+// the shared table and pointer identity is preserved for patch callers.
 func (m *MessageMember) nestedMembersLocked() (*MessageMembers, error) {
 	if !m.IsNested() {
 		return nil, fmt.Errorf("types: member %q is not nested", m.Name)
@@ -250,9 +252,11 @@ func (m *MessageMember) nestedMembersLocked() (*MessageMembers, error) {
 	if m.NestedNamespace == "" || m.NestedName == "" {
 		return nil, fmt.Errorf("types: member %q has no nested reference", m.Name)
 	}
-	resolved, err := LookupMessageMembers(m.NestedNamespace, m.NestedName)
-	if err != nil {
-		return nil, fmt.Errorf("types: resolve nested %s/%s: %w", m.NestedNamespace, m.NestedName, err)
+	introspectionMu.RLock()
+	resolved, ok := messageRegistry[registryKey(m.NestedNamespace, m.NestedName)]
+	introspectionMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("types: resolve nested %s/%s: message %s/%s not registered", m.NestedNamespace, m.NestedName, m.NestedNamespace, m.NestedName)
 	}
 	m.Members = resolved
 	return m.Members, nil
@@ -284,6 +288,9 @@ func (m *MessageMember) GetConst(base any, index uint) (any, error) {
 
 // GetCopy returns a copy of the element at index.
 // It is an explicit alias for GetConst that names the copy semantics.
+// Kept by design alongside GetConst/Get: the three accessors all return
+// copies (Go has no C style const pointer), and the alias preserves
+// call-site intent without changing behavior.
 func (m *MessageMember) GetCopy(base any, index uint) (any, error) {
 	v, err := m.GetConst(base, index)
 	if err != nil {
@@ -293,7 +300,10 @@ func (m *MessageMember) GetCopy(base any, index uint) (any, error) {
 }
 
 // Get calls the accessor for array members.
-// The returned value is a copy; use Assign to mutate in place.
+// The returned value is a copy; use Assign to mutate in place. Kept by
+// design alongside GetConst/GetCopy: all three return copies because the Go
+// port exposes no mutable C style pointer, and the names preserve call-site
+// intent without changing behavior.
 func (m *MessageMember) Get(base any, index uint) (any, error) {
 	if m.GetFunc == nil {
 		return nil, fmt.Errorf("types: member %q has no get function", m.Name)
@@ -720,6 +730,14 @@ func RegisterMessageMembers(m *MessageMembers) error {
 }
 
 // LookupMessageMembers returns a registered message table by namespace and name.
+//
+// The returned table is a clone like Registry.LookupType: the struct and
+// its Members slice are copied so callers cannot mutate the registry
+// table without holding a lock. Nested table pointers remain shared;
+// callers are read-only and must not mutate through them. Lazy patching
+// uses the direct registry pointer internally (see nestedMembersLocked)
+// so patch identity is preserved while direct Lookup callers stay
+// isolated.
 func LookupMessageMembers(namespace, name string) (*MessageMembers, error) {
 	introspectionMu.RLock()
 	defer introspectionMu.RUnlock()
@@ -727,7 +745,20 @@ func LookupMessageMembers(namespace, name string) (*MessageMembers, error) {
 	if !ok {
 		return nil, fmt.Errorf("types: message %s/%s not registered", namespace, name)
 	}
-	return m, nil
+	return cloneMessageMembers(m), nil
+}
+
+// cloneMessageMembers copies the table struct plus its Members slice.
+// Member funcs and nested table pointers are shared; the copy isolates
+// top-level mutation (for example setting Members on the clone) from the
+// registry entry.
+func cloneMessageMembers(m *MessageMembers) *MessageMembers {
+	if m == nil {
+		return nil
+	}
+	out := *m
+	out.Members = append([]MessageMember(nil), m.Members...)
+	return &out
 }
 
 // ValueKind names the DDS value type family derived from introspection.
@@ -782,10 +813,15 @@ func ValueKindFor(m MessageMember) ValueKind {
 
 // IsSelfContained reports false when any string, sequence, or bool vector is present.
 // It returns an error for missing nested tables, failed lookups, and cycles.
+// The walk holds nestedPatchMu for its duration to match the
+// EnsureNestedPatched write path, so concurrent patching cannot race the
+// reads of Members.
 func IsSelfContained(m *MessageMembers) (bool, error) {
 	if m == nil {
 		return false, errors.New("types: nil message table") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	nestedPatchMu.Lock()
+	defer nestedPatchMu.Unlock()
 	visited := map[string]bool{}
 	inStack := map[string]bool{}
 	ok, err := selfContainedInner(m, visited, inStack)
@@ -1219,9 +1255,15 @@ func sequenceResizeFunc(field string, maxSize uint) ResizeFunc {
 }
 
 // checkResizeBound rejects sizes above the sequence max.
+// Unbounded sequences with maxSize zero are still capped by
+// maxSequenceElements before reflect allocation so a huge size returns an
+// error instead of panicking or OOM on MakeSlice.
 func checkResizeBound(size, maxSize uint) error {
 	if maxSize != 0 && size > maxSize {
 		return fmt.Errorf("types: resize %d above max %d", size, maxSize)
+	}
+	if uint64(size) > uint64(maxSequenceElements) {
+		return fmt.Errorf("types: resize %d exceeds cap %d", size, maxSequenceElements)
 	}
 	return nil
 }

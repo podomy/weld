@@ -203,10 +203,15 @@ func (s *Sequence[T]) Fini() error {
 
 // Resize applies fini plus init resize within the bound.
 // Growth uses MakeSlice with len equal cap, so spare capacity is dropped.
+// Unbounded sizes are capped by maxSequenceElements before allocation so a
+// corrupt huge size returns an error instead of panicking or OOM on make.
 func (s *Sequence[T]) Resize(size uint, bound SequenceBound) error {
 	err := CheckSequenceLength(size, bound)
 	if err != nil {
 		return fmt.Errorf("types: resize sequence: %w", err)
+	}
+	if uint64(size) > uint64(maxSequenceElements) {
+		return fmt.Errorf("types: sequence len %d exceeds cap %d", size, maxSequenceElements)
 	}
 	next := make([]T, size)
 	limit := len(s.Data)

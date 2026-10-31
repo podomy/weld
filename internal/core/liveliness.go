@@ -201,7 +201,9 @@ func EffectiveLeaseDuration(offered, requested Duration) Duration {
 // freshness expectation has nothing to enforce. A finite request yields
 // the request: the reader expectation governs enforcement while the offer
 // governs matching only. Offered input is carried for call site symmetry
-// and ignored beyond documentation.
+// and ignored beyond documentation. Kept by design: removing the unused
+// offered param would ripple through call sites and tests for no behavior
+// gain, so the symmetry documents the matcher inputs instead.
 func EffectiveDeadlineDuration(offered, requested Duration) Duration {
 	if livelinessNoConstraint(requested) {
 		return UnspecifiedDuration()
@@ -252,7 +254,12 @@ type LivelinessTracker struct {
 //
 // StartNanos is the last assert time; callers pass the creation tick for
 // determinism. Resolve profiles with ResolveSystemDefaults before building
-// the tracker so markers never reach enforcement silently.
+// the tracker so markers never reach enforcement silently. Returns a value
+// containing a mutex by design: callers hold it in a variable and use
+// pointer receivers without copying after first use (vet copylocks
+// enforces this). Switching to a pointer return would ripple through
+// transport call sites that take the address of the value, so the value
+// form is kept and tests stay green.
 func NewLivelinessTracker(topic, writer string, kind LivelinessPolicy, lease Duration, startNanos int64) LivelinessTracker {
 	return LivelinessTracker{topic: topic, writer: writer, kind: kind, lease: lease, lastAssertNanos: startNanos, state: LivelinessAlive}
 }
@@ -421,19 +428,6 @@ func (t *LivelinessTracker) StateNow() LivelinessState {
 		return t.LatchedState()
 	}
 	return t.StateAt(now)
-}
-
-// GenerationNow returns the generation after advancing with the clock.
-//
-// With no clock it returns the latched generation. It exists so clock
-// driven readers observe expiry edges without calling StateNow first.
-func (t *LivelinessTracker) GenerationNow() uint64 {
-	now, ok := t.clockNow()
-	if !ok {
-		return t.Generation()
-	}
-	_ = t.StateAt(now)
-	return t.Generation()
 }
 
 // clockNow reads the installed clock without holding the tracker lock.

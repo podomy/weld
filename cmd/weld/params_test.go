@@ -239,22 +239,28 @@ func TestParamsUsage(t *testing.T) {
 	if !strings.Contains(stderr, "unknown params subcommand") {
 		t.Fatalf("unknown stderr = %q", stderr)
 	}
-	code, _, stderr = paramsRun([]string{}, store)
+	code, _, _ = paramsRun([]string{}, store)
 	if code != 2 {
 		t.Fatalf("empty code = %d, want 2", code)
 	}
 }
 
 // TestParamsDumpLoadRoundTrip checks dump to load preserves values.
-func TestParamsDumpLoadRoundTrip(t *testing.T) {
-	first := paramsTestStore()
-	_, _, _ = paramsRun([]string{"declare", "--type", "bool", "flag", "true"}, first)
-	_, _, _ = paramsRun([]string{"declare", "--type", "integer", "count", "42"}, first)
-	_, _, _ = paramsRun([]string{"declare", "--type", "double", "ratio", "2.5"}, first)
-	_, _, _ = paramsRun([]string{"declare", "--type", "string", "name", "weld"}, first)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "params.yaml")
-	code, _, stderr := paramsRun([]string{"dump", "--file", path}, first)
+// declareDumpFixture declares four typed params for dump tests.
+func declareDumpFixture(t *testing.T, store *dds.MemoryStore) {
+	t.Helper()
+
+	_, _, _ = paramsRun([]string{"declare", "--type", "bool", "flag", "true"}, store)
+	_, _, _ = paramsRun([]string{"declare", "--type", "integer", "count", "42"}, store)
+	_, _, _ = paramsRun([]string{"declare", "--type", "double", "ratio", "2.5"}, store)
+	_, _, _ = paramsRun([]string{"declare", "--type", "string", "name", "weld"}, store)
+}
+
+// checkDumpFile dumps store to path and checks header plus flag.
+func checkDumpFile(t *testing.T, store *dds.MemoryStore, path string) {
+	t.Helper()
+
+	code, _, stderr := paramsRun([]string{"dump", "--file", path}, store)
 	if code != 0 {
 		t.Fatalf("dump code = %d: %q", code, stderr)
 	}
@@ -269,27 +275,33 @@ func TestParamsDumpLoadRoundTrip(t *testing.T) {
 	if !strings.Contains(text, "flag: true") {
 		t.Fatalf("dump misses flag:\n%s", text)
 	}
+}
+
+// checkLoadedValue gets one param and checks it contains want.
+func checkLoadedValue(t *testing.T, store *dds.MemoryStore, name, want string) {
+	t.Helper()
+
+	code, stdout, _ := paramsRun([]string{"get", name}, store)
+	if code != 0 || !strings.Contains(stdout, want) {
+		t.Fatalf("loaded %s = %d %q, want %q", name, code, stdout, want)
+	}
+}
+
+func TestParamsDumpLoadRoundTrip(t *testing.T) {
+	first := paramsTestStore()
+	declareDumpFixture(t, first)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "params.yaml")
+	checkDumpFile(t, first, path)
 	second := paramsTestStore()
-	code, _, stderr = paramsRun([]string{"load", "--file", path}, second)
+	code, _, stderr := paramsRun([]string{"load", "--file", path}, second)
 	if code != 0 {
 		t.Fatalf("load code = %d: %q", code, stderr)
 	}
-	code, stdout, _ := paramsRun([]string{"get", "flag"}, second)
-	if code != 0 || !strings.Contains(stdout, "true") {
-		t.Fatalf("loaded flag = %d %q", code, stdout)
-	}
-	code, stdout, _ = paramsRun([]string{"get", "count"}, second)
-	if code != 0 || !strings.Contains(stdout, "42") {
-		t.Fatalf("loaded count = %d %q", code, stdout)
-	}
-	code, stdout, _ = paramsRun([]string{"get", "ratio"}, second)
-	if code != 0 || !strings.Contains(stdout, "2.5") {
-		t.Fatalf("loaded ratio = %d %q", code, stdout)
-	}
-	code, stdout, _ = paramsRun([]string{"get", "name"}, second)
-	if code != 0 || !strings.Contains(stdout, "weld") {
-		t.Fatalf("loaded name = %d %q", code, stdout)
-	}
+	checkLoadedValue(t, second, "flag", "true")
+	checkLoadedValue(t, second, "count", "42")
+	checkLoadedValue(t, second, "ratio", "2.5")
+	checkLoadedValue(t, second, "name", "weld")
 }
 
 // TestParamsDumpStdout checks dump to stdout contains header.

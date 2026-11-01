@@ -19,7 +19,7 @@ Plain words first, then the technical term.
 - Facade: Weld advertises reliable plus transient local with bounded keep last. It answers matching only.
 - Type hash: RIHS01_ plus 64 hex chars. Name plus hash keys the registry.
 - Introspection: runtime tables describing fields, offsets, bounds, and init behavior.
-- Sidecar: CycloneDDS helper process over localhost. Weld does not link its C library.
+- Sidecar: CycloneDDS config validator stub. It checks domain, peer, and range, but its data path is not implemented; the live backend speaks RTPS directly.
 - Domain id: integer isolating one robot fleet on shared multicast. Set per run via ROS_DOMAIN_ID.
 - Liveliness: endpoint aliveness plus lease. Silence past lease means gone.
 - Backpressure: slow the producer instead of blind drops or unbounded growth. Core exposes Full plus eviction signals; caller slows the producer.

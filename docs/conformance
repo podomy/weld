@@ -8,7 +8,8 @@ Scope
 v1 gates cover CycloneDDS only. Design pins bit level compatibility
 with CycloneDDS peers in v1 (docs/design:31, docs/overview:31)
 and lists FastDDS, Zenoh, and MQTT as post v1
-(docs/design:41, docs/transports:38). CycloneDDS runs as a sidecar process
+(docs/design:41, docs/transports:38). The live backend speaks RTPS
+directly; the Sidecar type is a validator stub only
 (docs/transports:30).
 
 Cyclone checks and ROS checks stay separate. SPDP checks assert wire
@@ -73,10 +74,9 @@ SEDP
   testbed/unit/sedp/conformance_test.go:530.
 - Every DATA carries HEARTBEATs: publications announce from 0x000002c2
   plus the CycloneDDS variant 0x000003c2, subscriptions from 0x000004c2
-  (internal/transports/dds/sedp.go:149-157,
-  append at internal/transports/dds/sedp.go:954-964,
-  writers at internal/transports/dds/sedp.go:962).
-  Heartbeat body is 28 bytes (internal/transports/dds/sedp.go:131-132).
+  (internal/transports/dds/sedp.go:157-164; announce loop
+  at internal/transports/dds/sedp.go:1006).
+  Heartbeat body is 28 bytes (internal/transports/dds/sedp.go:132-133).
   Pinned by testbed/unit/sedp/conformance_test.go:604.
   Announce repeats every 1 s with fresh sequences
   (internal/transports/dds/sedp.go:633).
@@ -87,8 +87,9 @@ SEDP
   Writers offer transient-local durability; readers request volatile like
   ros2 topic echo, which flows against both volatile talkers (the
   ros2 topic pub default) and transient talkers including their
-  backlog. Pinned by testbed/unit/sedp/conformance_test.go:653
-  (writer offer) and TestSEDPReaderRequestsVolatile (reader request).
+  backlog. Pinned by testbed/unit/sedp/conformance_test.go:648
+  (writer offer) and TestSEDPReaderRequestsVolatile in
+  internal/transports/dds/sedp_test.go:2693 (reader request).
 - SPDP announces the actually bound unicast ports, not participant-zero
   ports, so a second participant on one host does not divert its
   metatraffic and user DATA to the first participant's socket.
@@ -98,8 +99,8 @@ SEDP
   of depending on per-reader unicast. Pinned by
   TestBackendUserMulticastDeliversData.
 - Writer set is 0x000002c2 plus 0x000003c2 plus 0x000004c2
-  (internal/transports/dds/sedp.go:149-157).
-  Pinned by testbed/unit/sedp/conformance_test.go:804.
+  (internal/transports/dds/sedp.go:157-164).
+  Pinned by testbed/unit/sedp/conformance_test.go:799.
 
 Type hashes
 
@@ -130,30 +131,35 @@ Type coverage
 124 corpus rows in topological order (internal/types/corpus.go:108,
 manifest pin in internal/types/corpus_test.go:450, shape pin in
 internal/types/corpus_test.go:13). Status values: live is forward plus
-reverse pub and echo on domain 42 (testbed/live/ros/roundtrip_test.go:24,
+reverse pub and echo on allocated pooled domains 70 through 101
+(testbed/live/ros/roundtrip_test.go:107 and :160,
 large payloads on domain 55 at testbed/live/ros/gate_large_payload_test.go,
 46 abandoned for host-container traffic) with
 per-run topics. Every live gate calls SkipIfNoPeer first and skips when
-the peer or the ROS type is absent (testbed/live/helpers/helpers.go:412,
-testbed/live/ros/gate_type_matrix_test.go:177). pure-Go-only is XCDR
+the peer or the ROS type is absent (testbed/live/helpers/helpers.go:444,
+testbed/live/ros/gate_type_matrix_test.go:179). pure-Go-only is XCDR
 envelope round trip with no topic path. service is KindService on rq
 and rr with no rt topic gate, so the Live gate column is N/A and the
 Pure-Go pin cites the service XCDR test, except std_srvs/Trigger
 which is live-gated forward plus reverse plus deadline
-(testbed/live/ros/gate_service_call_test.go:471,508,560).
+(testbed/live/ros/gate_service_call_test.go:442,481,545).
 missing is corpus structural
 pin only with no wire codec or live gate. Counts: live 115,
 pure-Go-only 2, service 7, missing 0.
 All 124 rows have gates or pure-Go pins. The 13 former std_msgs missing
 rows (Int16, Int64, UInt64 plus the 10 multi-array types other than
 ByteMultiArray) now have live gates in
-testbed/live/ros/gate_type_std_multi_test.go with pure-Go XCDR pins in
-testbed/unit/std_multis_extra_test.go. Rest2 alias gates in
-testbed/live/ros/gate_type_std_rest2_test.go:100,
-testbed/live/ros/gate_type_geometry_rest2_test.go:71,
-testbed/live/ros/gate_type_viz_rest2_test.go:33,
-testbed/live/ros/gate_type_diag_rest2_test.go:398, and
-testbed/live/ros/gate_type_misc_rest2_test.go:86 reuse existing corpus rows.
+testbed/live/ros/gate_type_std_multi_test.go (one Test per type covering
+forward plus reverse, TestROSTypeStdInt16 at :975 through
+TestROSTypeStdUInt8MultiArray at :1095) with pure-Go XCDR pins in
+testbed/unit/datapath/conformance_std_multis_test.go
+(TestStdMultiPrimitives at :194 for Int16 plus Int64 plus UInt64,
+TestStdMultiArrays at :357 for all ten multi-array layouts). Rest2 alias gates in
+testbed/live/ros/gate_type_std_rest2_test.go:102,
+testbed/live/ros/gate_type_geometry_rest2_test.go:72,
+testbed/live/ros/gate_type_viz_rest2_test.go:35,
+testbed/live/ros/gate_type_diag_rest2_test.go:537, and
+testbed/live/ros/gate_type_misc_rest2_test.go:84 reuse existing corpus rows.
 std_msgs/ByteMultiArray forward uses per-element !!binary YAML
 (testbed/live/ros/gate_type_std_rest_test.go:300) because the integer list
 form crashes the ROS CLI talker with SIGABRT (see docs/interop:124).
@@ -169,28 +175,28 @@ form crashes the ROS CLI talker with SIGABRT (see docs/interop:124).
 | std_msgs/Float32 | message | internal/types/corpus.go:119 | testbed/live/ros/gate_type_std_extra_test.go:591, testbed/live/ros/gate_type_std_extra_test.go:98 | internal/types/corpus_test.go:13 | live |
 | std_msgs/Float64 | message | internal/types/corpus.go:120 | testbed/live/ros/gate_type_matrix_test.go:781, testbed/live/ros/gate_type_matrix_test.go:115 | testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:30 | live |
 | std_msgs/Header | message | internal/types/corpus.go:121 | testbed/live/ros/gate_type_std_extra_test.go:637, testbed/live/ros/gate_type_std_extra_test.go:138 | internal/types/corpus_test.go:13 | live |
-| std_msgs/Int16 | message | internal/types/corpus.go:122 | testbed/live/ros/gate_type_std_multi_test.go:973, testbed/live/ros/gate_type_std_multi_test.go:86 | testbed/unit/std_multis_extra_test.go:194 | live |
+| std_msgs/Int16 | message | internal/types/corpus.go:122 | testbed/live/ros/gate_type_std_multi_test.go:975 | testbed/unit/datapath/conformance_std_multis_test.go:194 | live |
 | std_msgs/Int32 | message | internal/types/corpus.go:123 | testbed/live/ros/gate_type_matrix_test.go:770, testbed/live/ros/gate_type_matrix_test.go:105 | testbed/unit/datapath/conformance_plain_cdr_matrix_test.go:29 | live |
-| std_msgs/Int64 | message | internal/types/corpus.go:124 | testbed/live/ros/gate_type_std_multi_test.go:981, testbed/live/ros/gate_type_std_multi_test.go:96 | testbed/unit/std_multis_extra_test.go:194 | live |
+| std_msgs/Int64 | message | internal/types/corpus.go:124 | testbed/live/ros/gate_type_std_multi_test.go:985 | testbed/unit/datapath/conformance_std_multis_test.go:194 | live |
 | std_msgs/Int8 | message | internal/types/corpus.go:125 | testbed/live/ros/gate_type_std_extra_test.go:547, testbed/live/ros/gate_type_std_extra_test.go:68 | internal/types/corpus_test.go:13 | live |
 | std_msgs/String | message | internal/types/corpus.go:126 | testbed/live/ros/roundtrip_test.go:45, testbed/live/ros/roundtrip_test.go:94 | testbed/unit/datapath/conformance_test.go:491 | live |
 | std_msgs/UInt16 | message | internal/types/corpus.go:127 | testbed/live/ros/gate_type_std_extra_test.go:569, testbed/live/ros/gate_type_std_extra_test.go:78 | internal/types/corpus_test.go:13 | live |
 | std_msgs/UInt32 | message | internal/types/corpus.go:128 | testbed/live/ros/gate_type_std_extra_test.go:580, testbed/live/ros/gate_type_std_extra_test.go:88 | internal/types/corpus_test.go:13 | live |
-| std_msgs/UInt64 | message | internal/types/corpus.go:129 | testbed/live/ros/gate_type_std_multi_test.go:989, testbed/live/ros/gate_type_std_multi_test.go:106 | testbed/unit/std_multis_extra_test.go:194 | live |
+| std_msgs/UInt64 | message | internal/types/corpus.go:129 | testbed/live/ros/gate_type_std_multi_test.go:995 | testbed/unit/datapath/conformance_std_multis_test.go:194 | live |
 | std_msgs/UInt8 | message | internal/types/corpus.go:130 | testbed/live/ros/gate_type_std_extra_test.go:547, testbed/live/ros/gate_type_std_extra_test.go:58 | internal/types/corpus_test.go:13 | live |
 | std_msgs/MultiArrayDimension | message | internal/types/corpus.go:131 | testbed/live/ros/gate_type_std_rest_test.go:401, testbed/live/ros/gate_type_std_rest_test.go:64 | internal/types/corpus_test.go:13 | live |
 | std_msgs/MultiArrayLayout | message | internal/types/corpus.go:132 | testbed/live/ros/gate_type_std_rest_test.go:412, testbed/live/ros/gate_type_std_rest_test.go:74 | internal/types/corpus_test.go:13 | live |
 | std_msgs/ByteMultiArray | message | internal/types/corpus.go:133 | testbed/live/ros/gate_type_std_rest_test.go:438, testbed/live/ros/gate_type_std_rest_test.go:300 | internal/types/corpus_test.go:13 | live |
-| std_msgs/Float32MultiArray | message | internal/types/corpus.go:134 | testbed/live/ros/gate_type_std_multi_test.go:997, testbed/live/ros/gate_type_std_multi_test.go:116 | testbed/unit/std_multis_extra_test.go:252 | live |
-| std_msgs/Float64MultiArray | message | internal/types/corpus.go:135 | testbed/live/ros/gate_type_std_multi_test.go:1005, testbed/live/ros/gate_type_std_multi_test.go:126 | testbed/unit/std_multis_extra_test.go:263 | live |
-| std_msgs/Int16MultiArray | message | internal/types/corpus.go:136 | testbed/live/ros/gate_type_std_multi_test.go:1013, testbed/live/ros/gate_type_std_multi_test.go:136 | testbed/unit/std_multis_extra_test.go:274 | live |
-| std_msgs/Int32MultiArray | message | internal/types/corpus.go:137 | testbed/live/ros/gate_type_std_multi_test.go:1021, testbed/live/ros/gate_type_std_multi_test.go:146 | testbed/unit/std_multis_extra_test.go:285 | live |
-| std_msgs/Int64MultiArray | message | internal/types/corpus.go:138 | testbed/live/ros/gate_type_std_multi_test.go:1029, testbed/live/ros/gate_type_std_multi_test.go:156 | testbed/unit/std_multis_extra_test.go:296 | live |
-| std_msgs/Int8MultiArray | message | internal/types/corpus.go:139 | testbed/live/ros/gate_type_std_multi_test.go:1037, testbed/live/ros/gate_type_std_multi_test.go:166 | testbed/unit/std_multis_extra_test.go:307 | live |
-| std_msgs/UInt16MultiArray | message | internal/types/corpus.go:140 | testbed/live/ros/gate_type_std_multi_test.go:1045, testbed/live/ros/gate_type_std_multi_test.go:176 | testbed/unit/std_multis_extra_test.go:314 | live |
-| std_msgs/UInt32MultiArray | message | internal/types/corpus.go:141 | testbed/live/ros/gate_type_std_multi_test.go:1053, testbed/live/ros/gate_type_std_multi_test.go:186 | testbed/unit/std_multis_extra_test.go:325 | live |
-| std_msgs/UInt64MultiArray | message | internal/types/corpus.go:142 | testbed/live/ros/gate_type_std_multi_test.go:1061, testbed/live/ros/gate_type_std_multi_test.go:196 | testbed/unit/std_multis_extra_test.go:336 | live |
-| std_msgs/UInt8MultiArray | message | internal/types/corpus.go:143 | testbed/live/ros/gate_type_std_multi_test.go:1069, testbed/live/ros/gate_type_std_multi_test.go:206 | testbed/unit/std_multis_extra_test.go:347 | live |
+| std_msgs/Float32MultiArray | message | internal/types/corpus.go:134 | testbed/live/ros/gate_type_std_multi_test.go:1005 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/Float64MultiArray | message | internal/types/corpus.go:135 | testbed/live/ros/gate_type_std_multi_test.go:1015 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/Int16MultiArray | message | internal/types/corpus.go:136 | testbed/live/ros/gate_type_std_multi_test.go:1025 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/Int32MultiArray | message | internal/types/corpus.go:137 | testbed/live/ros/gate_type_std_multi_test.go:1035 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/Int64MultiArray | message | internal/types/corpus.go:138 | testbed/live/ros/gate_type_std_multi_test.go:1045 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/Int8MultiArray | message | internal/types/corpus.go:139 | testbed/live/ros/gate_type_std_multi_test.go:1055 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/UInt16MultiArray | message | internal/types/corpus.go:140 | testbed/live/ros/gate_type_std_multi_test.go:1065 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/UInt32MultiArray | message | internal/types/corpus.go:141 | testbed/live/ros/gate_type_std_multi_test.go:1075 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/UInt64MultiArray | message | internal/types/corpus.go:142 | testbed/live/ros/gate_type_std_multi_test.go:1085 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
+| std_msgs/UInt8MultiArray | message | internal/types/corpus.go:143 | testbed/live/ros/gate_type_std_multi_test.go:1095 | testbed/unit/datapath/conformance_std_multis_test.go:357 | live |
 | geometry_msgs/Point | message | internal/types/corpus.go:146 | testbed/live/ros/gate_type_geometry_rest_test.go:1600, testbed/live/ros/gate_type_geometry_rest_test.go:1354 | internal/types/corpus_test.go:13 | live |
 | geometry_msgs/Point32 | message | internal/types/corpus.go:147 | testbed/live/ros/gate_type_geometry_rest_test.go:1611, testbed/live/ros/gate_type_geometry_rest_test.go:1364 | internal/types/corpus_test.go:13 | live |
 | geometry_msgs/Quaternion | message | internal/types/corpus.go:148 | testbed/live/ros/gate_type_geometry_extra_test.go:303, testbed/live/ros/gate_type_geometry_extra_test.go:256 | internal/types/corpus_test.go:13 | live |
@@ -356,11 +362,12 @@ multi-writer contention test, and no stream above the 32 MiB cap is claimed.
 
 CLI
 
-- echo declares an SEDP reader via Subscribe
-  (cmd/weld/main.go:242-255).
-- pub waits for SPDP routes: retries PublishBytes on ErrNoRoute every
-  50 ms up to 5 s (cmd/weld/main.go:47-50,
-  cmd/weld/main.go:370), then prints sent: <text>.
+- echo declares an SEDP reader via subscribeEchoReader
+  (cmd/weld/main.go:302) with SubscribeWithDurability
+  (cmd/weld/main.go:308).
+- pub waits for SPDP routes: publishWithRouteWait retries PublishBytes
+  on ErrNoRoute every 50 ms up to 5 s (cmd/weld/main.go:47-50,
+  cmd/weld/main.go:478), then prints sent: <text>.
 - action send sends one goal and waits for result
   (weld action send, backend live-gated accept plus cancel plus timeout,
   testbed/live/ros/gate_action_workflow_test.go).
@@ -369,14 +376,17 @@ Gates
 
 Run: unit with go test ./testbed/unit/... -count=1, live with
 go test -tags live ./testbed/live/... -count=1 against the already running
-weld-jazzy peer (see testbed/live/helpers/helpers.go:412).
+weld-jazzy peer (see testbed/live/helpers/helpers.go:444).
 Only one run per domain and topic at a time.
-Domain split is 42 for ROS String, 48 for SPDP, 47 for the single entrypoint
-live gate, 43 plus 44 for the Humble plus Rolling distro matrix, 55 for
-large payloads (46 abandoned, no host-container multicast), and 60
-through 69 for ephemeral isolation. See testbed/live/helpers/helpers.go:40-44,
-testbed/live/ros/roundtrip_test.go:24,
-testbed/live/cyclone/gate1_spdp_test.go:20.
+Parallel live tests allocate exclusive domains 70 through 101
+(testbed/live/helpers/domainpool.go); fixed numbers stay reserved: 42
+for the canonical ROS peer, 48 for SPDP, 47 for the serial
+single-entrypoint gate, 43 plus 44 for the Humble plus Rolling distro
+matrix, 55 for large payloads (46 abandoned, no host-container
+multicast), and 60 through 69 for ephemeral isolation. See
+testbed/live/helpers/helpers.go:41-53,
+testbed/live/ros/roundtrip_test.go:107 and :160,
+testbed/live/cyclone/gate1_spdp_test.go:379 and :421.
 
 - Gate 0 green: go build, go vet, gofumpt, golangci-lint, go test
   (testbed/live/gates/gate0_test.go:37). Launch corpus presence is pinned
@@ -390,15 +400,20 @@ testbed/live/cyclone/gate1_spdp_test.go:20.
   failures.
 - Gate 2 forward green after plain CDR receive plus SEDP fixes; reverse green
   after writer 03c2 plus announce now plus Heartbeat. Forward plain CDR is
-  in the datapath plain-CDR fallback path with String fallback in the same
-  file and the TakeFrom fallback in DataReceiver.TakeFrom. Writer 03c2 is in
-  internal/transports/dds/sedp.go:149-157, the announce loop is the SEDP
-  resend path in the same file, DATA plus Heartbeat is the backend repair
-  plus history-heartbeat path. Checks are
-  testbed/live/ros/roundtrip_test.go:45 plus
-  testbed/live/ros/roundtrip_test.go:94 on domain 42 and the single
-  entrypoint equivalents on domain 47 at testbed/live/gates/gate2_test.go:27
-  plus testbed/live/gates/gate2_test.go:81.
+  decodePlainCDR (internal/transports/dds/datapath.go:1075) with String
+  fallback decodeCycloneChatter
+  (internal/transports/dds/datapath.go:802) and the TakeFrom fallback in
+  DataReceiver.TakeFrom (internal/transports/dds/datapath.go:1322).
+  Writer 03c2 is sedpPublicationsWriterCyclone
+  (internal/transports/dds/sedp.go:160-162), the announce loop is
+  SEDPIndex.AnnounceLoop with a 1 s resend interval
+  (internal/transports/dds/sedp.go:1006,
+  internal/transports/dds/sedp.go:139), DATA plus Heartbeat is the backend
+  user heartbeat path (internal/transports/dds/backend.go:591). Checks are
+  testbed/live/ros/roundtrip_test.go:107 plus
+  testbed/live/ros/roundtrip_test.go:160 on allocated pooled domains and the
+  parallel equivalents at testbed/live/gates/gate2_test.go:33
+  plus testbed/live/gates/gate2_test.go:102.
 - The SPDP acceptance probe (gate 1, direct UDP) stays separate from the
   ROS String round-trip test (gate 2).
 - Full verified matrix, all PASS live unless noted: full type matrix

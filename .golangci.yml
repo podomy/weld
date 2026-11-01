@@ -82,6 +82,16 @@ linters:
     - goheader
     - iotamixing
     - nolintlint
+  exclusions:
+    rules:
+      # cmd/weld stays outside go.work so the CLI builds without the
+      # testbed and SDK graphs; its self-module local replace keeps
+      # offline GOWORK=off builds working. Only cmd/weld/go.mod carries
+      # a replace directive, so this carve-out affects exactly that file;
+      # the replace-local ban still applies everywhere else.
+      - path: go\.mod$
+        linters:
+          - gomoddirectives
   settings:
     bodyclose:
       check-consumption: true

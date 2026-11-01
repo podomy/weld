@@ -14,7 +14,7 @@ Backend is publish bytes, take bytes, join discovery, report liveliness, plus id
 
 DomainConfig.ResolveDomainID accepts unset and empty as caller value, trims spaces, accepts 042 and +42, rejects non-integral input, overflow, and values above the platform maximum. DiscoveryRange covers not-set, off, localhost, subnet, and system default; NotSet normalizes to system default in the sidecar.
 
-v1 is topics-only best effort. Type hash, QoS offer, GID, and sequence are reserved as the documented v2 extension so services and actions do not force a breaking change.
+v1 covers topics, services, and actions over the live RTPS backend, all gated. Trigger service calls, param verbs, TF lookup, and action accept plus cancel plus timeout pass live, with extended wire gates for keyed, durability, partitions, writer QoS, content filters, loans, liveliness, and secured payloads (docs/conformance:404).
 
 Code: internal/transports/transport.go.
 
@@ -27,11 +27,18 @@ Naming
 
 Sidecar
 
-CycloneDDS runs as a sidecar process, not cgo linked. No license mixing, no C toolchain in Weld builds. Weld talks to it over localhost.
+The Sidecar type is a validator stub, not a running peer. NewSidecar
+validates the config (domain range, peer address, discovery range),
+trims the peer, normalizes the range, and resolves the domain, but
+Connect and every Backend data path method return
+ErrSidecarNotImplemented; only Close works, as idempotent nil for
+teardown. The live backend speaks RTPS directly over UDP with no cgo
+and no sidecar process, so Weld builds need no C toolchain and link
+no C library. The stub documents that the real backend must honor
+context cancellation and require a prior JoinDiscovery.
 
-SidecarConfig carries domain id and peer address (loopback default, remote allowed for tests) plus discovery range. Validate checks domain range and unknown ranges. NewSidecar trims the peer, normalizes range, and resolves the domain. Sidecar implements Backend; current methods return ErrSidecarNotImplemented except Close, which is idempotent nil to satisfy teardown. The stub documents that the real backend must honor context cancellation.
-
-Code: internal/transports/dds/sidecar.go.
+Code: internal/transports/dds/sidecar.go for the stub,
+internal/transports/dds/backend.go for the live RTPS backend.
 
 Post v1
 

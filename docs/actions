@@ -30,7 +30,7 @@ Three gates before merge (docs/design:196, docs/invariants:318):
 2. Interop against rclcpp on CycloneDDS with a navigation goal that survives late attachment (docs/design:217).
 3. Chaos under race detection: loss, duplicate feedback, teardown mid result, multi rate sim.
 
-OPEN ITEM: whether core requires an explicit per-goal timeout with a default is decided before Nav2 conformance (docs/invariants:209).
+RESOLVED: core requires an explicit per-goal timeout defaulting to 60 s from acceptance (DefaultActionGoalTimeoutNanos in internal/core/action.go); unset takes the default, never an infinite wait.
 
 Live gate
 

@@ -8,12 +8,12 @@ builtin_interfaces, std_msgs, geometry_msgs, sensor_msgs plus SetCameraInfo, tra
 
 Each entry carries:
 
-- Package, Name, Kind (message or service; actions are out of scope for Phase 1)
+- Package, Name, Kind (message or service; actions carry no corpus rows and are covered by live workflow gates instead, per docs/conformance:404)
 - Summary (human only, never parsed)
 - HeaderNote (header semantics only, empty when no header rule)
 - Dependencies (direct package/name requirements, Header first, field order)
 - HasHeader (direct std_msgs/Header field; Header itself is false)
-- TypeHash (reserved RIHS01_..., empty in Phase 1)
+- TypeHash (reserved RIHS01_... slot, empty in fixtures; the 8 wire IDL hashes shipped and are pinned live in docs/conformance:106)
 
 Code: internal/types/corpus.go.
 

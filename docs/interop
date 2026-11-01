@@ -131,7 +131,7 @@ Known toolchain quirks (not Weld gaps; ByteMultiArray below is PASS, not a skip)
 - String encoding is minimal-alignment: no pad after NUL unless the next member needs it. See section 1.
 - DATA_FRAG fixed header is 32 bytes, offset field 28. See section 2.
 - Humble is hashless, transient-capable, and batches SEDP. Test against it for all three.
-- When a take test flakes, check in order: talker actually running with transient flags, writer in SEDP remotes (WELD_SEDP_TRACE=1), NACKs eliciting retransmit, then payload decode.
+- When a take test flakes, check in order: talker actually running with transient flags, writer in SEDP remotes (WELD_SEDP_TRACE=1), NACKs eliciting retransmit, then payload decode (WELD_TAKE_DEBUG=1 logs the raw frame at internal/transports/dds/datapath.go:1339).
 
 11. Service wire interop notes
 

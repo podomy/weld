@@ -10,11 +10,15 @@ No rotation: x=0, y=0, z=0, w=1. ROS uses it as the default orientation in poses
 
 Why one binary for Humble, Jazzy, and Rolling?
 
-Weld ships no C ABI. It negotiates per peer by type hash, introspection topics, and message hashes, keyed by name plus hash. Parsing stays tolerant and sending stays strict. The matrix runs in CI with CycloneDDS as reference.
+Weld ships no C ABI. It negotiates per peer by type hash, introspection topics, and message hashes, keyed by name plus hash. Parsing stays tolerant and sending stays strict. The matrix runs as live testbed gates with CycloneDDS as reference, not in CI (CI has no fleet).
 
-Why a CycloneDDS sidecar?
+Why no CycloneDDS sidecar process?
 
-No license mixing and no C toolchain in Weld builds. Weld speaks to the sidecar over localhost. Core stays pure Go with no C linkage.
+The Sidecar type is a validator stub: it checks config and resolves
+the domain, but its data path returns ErrSidecarNotImplemented except
+Close. The live backend speaks RTPS directly over UDP. No license
+mixing, no C toolchain in Weld builds, and core stays pure Go with
+no C linkage.
 
 Why do FastDDS, Zenoh, and MQTT come later?
 

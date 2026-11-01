@@ -35,4 +35,6 @@ Service checks live in testbed/live/services/ and assert only request plus reply
 
 Current state
 
-v1 is topics-only best effort. Type hash, QoS offer, GID, and sequence are reserved as the documented v2 extension so services do not force a breaking change (docs/transports:17).
+Services are live and gated, not topics-only: Trigger forward plus
+reverse plus deadline, params declare plus atomic set plus validation
+reject, and per-profile writer QoS all pass (docs/conformance:404).

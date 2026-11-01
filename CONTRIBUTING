@@ -22,14 +22,15 @@ not a no.
 Prerequisites  Go >=1.26.3 (go.work:1) and golangci-lint v2.14.0
 +               Install: https://golangci-lint.run/welcome/install/
 
-1. Build        go build .
-2. Verify       go run ./check/   # tidy + golangci-lint fmt (gofumpt/goimports @.golangci.yml:7) + goheader fix + golangci-lint run + go test + git diff --exit-code
+1. Build        go build ./...
+2. Verify       go run ./check/   # go mod tidy (root, sdk, cmd/weld with GOWORK=off) + git diff --exit-code + golangci-lint fmt --diff (gofumpt/goimports @.golangci.yml:7) + goheader check + golangci-lint run + go vet + go test, per module
 3. Test         go test ./...   # already in verify
 4. Pick an issue or go over the code
 
-Local check, not a step: git config core.hooksPath .githooks runs the
-verify script on every commit via .githooks/pre-commit. It never leaves the
-machine; a commit is done when the hook passes.
+0. Setup        make setup sets git config core.hooksPath .githooks so the
+verify script runs on every commit via .githooks/pre-commit. It never
+leaves the machine; a commit is done when the hook passes. Run once
+per fresh clone.
 
 5. Send an RFC to contact@podomy.com if the change is not small
 6. Submit a PR

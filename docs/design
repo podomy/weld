@@ -36,7 +36,7 @@ The non goals for the first version are deliberate limits:
 - No intra process transport in version one. Local delivery honors QoS or rejects at creation; that work follows network interop.
 - No zero copy loans or shared memory in version one, except in-process loan honesty: loan-eligible types are detected and refused loudly outside the in-process path, with no shared-memory transport yet. Shared pointer delivery plus the byte path covers throughput first.
 - No bag storage engine in version one. Weld reads and writes the exchange formats.
-- No FastDDS, Zenoh, or MQTT transports in version one. CycloneDDS via sidecar is the v1 reference peer; the other backends exist in tree as stubs behind the same interface and land after first interop.
+- No FastDDS, Zenoh, or MQTT transports in version one. The direct RTPS backend against CycloneDDS peers is the v1 reference path; the other backends exist in tree as stubs behind the same interface and land after first interop.
 
 Consider what this means for a perception pipeline. A camera node named usb_cam publishes sensor_msgs/msg/Image on /image_raw at 30 Hz with a 640 by 480 frame. Weld does not promise zero copy delivery of that frame in version one. It does promise that the bytes on the wire decode identically against CycloneDDS (FastDDS follows after v1), that a late joining recorder still reads the bag, and that a QoS disagreement surfaces loudly instead of producing silence.
 
@@ -173,7 +173,7 @@ The contract is interaction, not structure. A program written against rclcpp or 
 
 One Binary Across All ROS Releases
 
-Weld ships no C ABI, so there is nothing to version that way and nothing that breaks when ROS moves from Humble to Jazzy to Rolling. What Weld does instead is wire version awareness, quarantined in the transport backends. Each peer is negotiated individually: type hash present means Iron or newer, introspection topics mean service tracing is available, message hashes identify exact field sets, and Weld speaks that peer's variant. The type registry keys every message by name plus hash, so a Humble publisher and a Rolling subscriber each match their own version simultaneously. Parsing stays tolerant and sending stays strict, so new keys and fields never break old peers. The release matrix in CI runs interop against every supported distro, and the table of verified distros ships in the repo. One binary, all supported distros, per peer negotiation with a tested matrix behind it. The version patchwork lives at the border behind the backend interface; the core and the Go API stay single and coherent.
+Weld ships no C ABI, so there is nothing to version that way and nothing that breaks when ROS moves from Humble to Jazzy to Rolling. What Weld does instead is wire version awareness, quarantined in the transport backends. Each peer is negotiated individually: type hash present means Iron or newer, introspection topics mean service tracing is available, message hashes identify exact field sets, and Weld speaks that peer's variant. The type registry keys every message by name plus hash, so a Humble publisher and a Rolling subscriber each match their own version simultaneously. Parsing stays tolerant and sending stays strict, so new keys and fields never break old peers. The release matrix runs as live testbed gates against every supported distro, not in CI (CI has no fleet: live gates need the Docker peers and multicast), and the table of verified distros ships in the repo. One binary, all supported distros, per peer negotiation with a tested matrix behind it. The version patchwork lives at the border behind the backend interface; the core and the Go API stay single and coherent.
 
 Packages
 
@@ -223,7 +223,7 @@ These are decisions recorded early so later work does not reopen them silently. 
 
 - RESOLVED: Zenoh domain isolation is separate sessions. Users expect real isolation; prefix mode needs interop proof to be reconsidered.
 - RESOLVED: v1 interoperates with Humble, Jazzy, and Rolling against CycloneDDS as the reference peer. Humble pins the pre hash wire variants; Jazzy and Rolling pin current behavior.
-- RESOLVED: CycloneDDS runs as a sidecar process, not cgo linked. No license mixing, no C toolchain in Weld builds; Weld talks to it over localhost.
+- RESOLVED: Weld links no C code and needs no C toolchain in builds. The Sidecar type stays a validator stub returning ErrSidecarNotImplemented except Close; the live backend speaks RTPS directly over UDP.
 - RESOLVED: v1 scope is CDR plus types plus DDS unreliable round trip plus CLI echo plus one green interop test.
 - RESOLVED: FastDDS, Zenoh, and MQTT ship past v1. DDS via CycloneDDS only in v1; the FastDDS, Zenoh, and MQTT mappings (topics, retained messages, will messages, QoS mapping) are designed alongside the CycloneDDS backend, built after.
 - RESOLVED: static transform overwrite is replace on rebroadcast, clear is sticky across clear. Tests pin both.

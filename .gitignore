@@ -1,3 +1,6 @@
+# Go test and tool logs
+*.log
+
 # Go build/test artifacts
 *.test
 coverage.out

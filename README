@@ -24,10 +24,16 @@ Documentation
   Introspection and bounds - /docs/introspection: reflection tables
     and limits.
   Corpus - /docs/corpus: message families and fixtures.
+  Actions - /docs/actions: goals, feedback, results, timeouts.
+  Services - /docs/services: calls, deadlines, discovery.
+  Config - /docs/config: versioned parameter store.
+  Supervision - /docs/supervision: serial and pooled groups.
+  Time - /docs/time: clock domains, jumps, overload.
   QoS - /docs/qos: matching, best-available, facade, retention.
   Transports - /docs/transports: backend interface and DDS sidecar.
   Interop - /docs/interop: field notes from CycloneDDS interop.
   Testbed - /docs/testbed: Docker peers and first interop.
+  Testbed Go - /docs/testbed-go: live harness, domains, file split.
   Conformance - /docs/conformance: wire end state and gate record.
   Wireless - /docs/wireless: Rappaport distilled for WiFi fleets.
   CLI - /docs/cli: the weld echo/pub commands plus weld action send.

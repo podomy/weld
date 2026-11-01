@@ -821,6 +821,17 @@ func (b *Backend) SubscribeService(ctx context.Context, service, idlBase string,
 // DATA so single shot callers do not exit before matching. Empty routes
 // report ErrNoRoute for retry loops. Non plain payloads fail loudly
 // instead of falling back to framed topics.
+// servicePublishTarget resolves the DDS topic, type, and request flag for
+// one service publish role. The reply topic serves every role except the
+// client, which publishes on the request topic.
+func servicePublishTarget(eps ServiceEndpoints, role ServiceRole) (ddsTopic, ddsType string, isRequest bool) {
+	if role == ServiceRoleClient {
+		return eps.RequestTopic, eps.RequestType, true
+	}
+
+	return eps.ReplyTopic, eps.ResponseType, false
+}
+
 func (b *Backend) PublishService(ctx context.Context, service, idlBase string, role ServiceRole, payload []byte, typeHash string) error {
 	snap, err := b.loadPublishSnapshot(ctx)
 	if err != nil {
@@ -830,18 +841,8 @@ func (b *Backend) PublishService(ctx context.Context, service, idlBase string, r
 	if err != nil {
 		return err
 	}
-	var ddsTopic, ddsType, idlName string
-	var isRequest bool
-	if role == ServiceRoleClient {
-		ddsTopic = eps.RequestTopic
-		ddsType = eps.RequestType
-		isRequest = true
-	} else {
-		ddsTopic = eps.ReplyTopic
-		ddsType = eps.ResponseType
-		isRequest = false
-	}
-	idlName, err = DemangleTypeName(ddsType)
+	ddsTopic, ddsType, isRequest := servicePublishTarget(eps, role)
+	idlName, err := DemangleTypeName(ddsType)
 	if err != nil {
 		return fmt.Errorf("dds: publish service demangle: %w", err)
 	}
@@ -861,10 +862,16 @@ func (b *Backend) PublishService(ctx context.Context, service, idlBase string, r
 	}
 	writer := b.writerForPublish(snap, ep)
 	msg := outgoingForService(service, idlName, payload)
-	if err := b.announceWriterForPublish(ctx, msg, ep, writer, snap); err != nil {
+	err = b.announceWriterForPublish(ctx, msg, ep, writer, snap)
+	if err != nil {
 		return err
 	}
-	if err := b.publishPlain(ctx, msg, snap, writer); err != nil {
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		return routeError(service, snap.domain, ErrNoRoute)
+	}
+	err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+	if err != nil {
 		return err
 	}
 	return nil

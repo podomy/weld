@@ -386,18 +386,22 @@ func captureDatagram(t *testing.T, conn net.PacketConn) []byte {
 	defer cancel()
 	pub := exec.CommandContext(ctx, "docker", "exec", "weld-jazzy", "bash", "-lc", "source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp timeout 8 ros2 topic pub /chatter std_msgs/msg/String 'data: live' --rate 5")
 	if err := pub.Start(); err != nil {
-		t.Skipf("start publisher: %v", err)
+		t.Fatalf("start publisher with docker present: %v", err)
 	}
 	defer func() {
 		if err := pub.Process.Kill(); err != nil {
 			t.Logf("kill publisher: %v", err)
+		}
+		_, waitErr := pub.Process.Wait()
+		if waitErr != nil {
+			t.Logf("wait publisher: %v", waitErr)
 		}
 	}()
 	buf := make([]byte, 65507)
 	for {
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			t.Skipf("no SPDP datagram: %v", err)
+			t.Fatalf("missing SPDP datagram with docker present and publisher started: %v", err)
 		}
 		if n < 20 || string(buf[:4]) != "RTPS" {
 			continue

@@ -33,6 +33,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -377,6 +379,11 @@ type SEDPIndex struct {
 	remotes    map[SEDPGUID]SEDPEndpoint
 	generation uint64
 	onChange   func(uint64)
+	onRemove   func(SEDPGUID)
+	// lastSeq tracks the last SEDP DATA sequence per endpoint GUID for
+	// monotonic ingest gating. Stale or reordered samples are rejected
+	// without upserting.
+	lastSeq map[SEDPGUID]uint64
 }
 
 // NewSEDPIndex returns an SEDP index for one participant prefix and domain.
@@ -400,6 +407,18 @@ func (idx *SEDPIndex) SetOnChange(fn func(uint64)) {
 	defer idx.mu.Unlock()
 
 	idx.onChange = fn
+}
+
+// SetOnRemove installs the hook fired for each removed remote endpoint.
+//
+// The backend wires this to evict per-writer reliability state so SEDP
+// removal does not leave stale NACK bases or sequence tracking behind.
+// It self-locks and is safe for concurrent use.
+func (idx *SEDPIndex) SetOnRemove(fn func(SEDPGUID)) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.onRemove = fn
 }
 
 // Generation returns the current remote mutation generation.
@@ -741,8 +760,10 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 // StampLocalPartitions records partitions on matching local readers.
 //
 // It validates the names loudly, updates every local reader for the ROS
-// topic, and bumps generation once when any record changes so the next
-// announce carries the set. Unknown topics change nothing and report nil.
+// topic, and bumps generation once when any record actually changes so the
+// next announce carries the set. Unchanged partitions bump nothing and
+// fire no hook, matching the once-per-change contract. Unknown topics
+// change nothing and report nil.
 func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions []string) {
 	err := ValidatePartitionList(partitions)
 	if err != nil {
@@ -750,8 +771,7 @@ func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions
 	}
 
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
+	changed := false
 	for id, ep := range idx.locals {
 		if !ep.IsReader {
 			continue
@@ -761,9 +781,25 @@ func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions
 			continue
 		}
 
+		if slices.Equal(ep.Partitions, partitions) {
+			continue
+		}
+
 		ep.Partitions = append([]string(nil), partitions...)
 		idx.locals[id] = ep
+		changed = true
+	}
+	var gen uint64
+	var hook func(uint64)
+	if changed {
 		idx.generation++
+		gen = idx.generation
+		hook = idx.onChange
+	}
+	idx.mu.Unlock()
+
+	if changed && hook != nil {
+		hook(gen)
 	}
 }
 
@@ -857,15 +893,21 @@ func (idx *SEDPIndex) RemoveRemote(id SEDPGUID) bool {
 	}
 
 	delete(idx.remotes, id)
+	delete(idx.lastSeq, id)
 	idx.generation++
 
 	gen := idx.generation
 	hook := idx.onChange
+	removeHook := idx.onRemove
 
 	idx.mu.Unlock()
 
 	if hook != nil {
 		hook(gen)
+	}
+
+	if removeHook != nil {
+		removeHook(id)
 	}
 
 	return true
@@ -932,11 +974,14 @@ func (idx *SEDPIndex) ProvisionalInstall(ep SEDPEndpoint) error {
 // An entry expires when now is at or past FirstSeen plus the TTL. A zero
 // FirstSeen is treated as expired so a malformed placeholder cannot
 // linger. It bumps generation once when any entry expires, fires the
-// change hook once, and returns the number removed.
+// change hook once, fires the remove hook per removed GUID for backend
+// eviction, and returns the number removed.
 func (idx *SEDPIndex) ExpireProvisional(now time.Time) int {
 	idx.mu.Lock()
 
 	removed := 0
+
+	var removedIDs []SEDPGUID
 
 	for id, ep := range idx.remotes {
 		if !ep.Provisional {
@@ -945,7 +990,9 @@ func (idx *SEDPIndex) ExpireProvisional(now time.Time) int {
 
 		if ep.FirstSeen.IsZero() {
 			delete(idx.remotes, id)
+			delete(idx.lastSeq, id)
 			removed++
+			removedIDs = append(removedIDs, id)
 
 			continue
 		}
@@ -955,7 +1002,9 @@ func (idx *SEDPIndex) ExpireProvisional(now time.Time) int {
 		}
 
 		delete(idx.remotes, id)
+		delete(idx.lastSeq, id)
 		removed++
+		removedIDs = append(removedIDs, id)
 	}
 
 	if removed == 0 {
@@ -968,11 +1017,18 @@ func (idx *SEDPIndex) ExpireProvisional(now time.Time) int {
 
 	gen := idx.generation
 	hook := idx.onChange
+	removeHook := idx.onRemove
 
 	idx.mu.Unlock()
 
 	if hook != nil {
 		hook(gen)
+	}
+
+	if removeHook != nil {
+		for _, id := range removedIDs {
+			removeHook(id)
+		}
 	}
 
 	return removed
@@ -1056,12 +1112,13 @@ func (idx *SEDPIndex) AnnounceLoop(ctx context.Context, s SEDPSender) error {
 
 // ListenLoop receives DATA samples until ctx is done.
 //
-// Each non-empty sample feeds ParseSEDPDATA then UpsertRemote, so every
+// Each non-empty sample feeds ingestSample then UpsertRemote, so every
 // valid announce bumps the remote generation through the existing upsert
 // path and fires the change hook. Empty samples are treated as no-data
-// polls from non-blocking receivers and are skipped. Malformed samples
-// return the parse error instead of being dropped silently.
-//
+// polls from non-blocking receivers and are skipped. Availability stays:
+// a single poison datagram never ends the loop; it counts loudly per
+// failure class (receive, parse, upsert) via log plus trace and the loop
+// keeps listening. Only transport errors or context cancel end the loop.
 // A sender that omits the domain, such as CycloneDDS, parses with domain
 // zero. The loop stamps such samples with the index domain before upsert
 // because SEDP traffic arrives on domain scoped ports, so a missing value
@@ -1103,8 +1160,8 @@ func (idx *SEDPIndex) ListenLoop(ctx context.Context, r SEDPReceiver) error {
 
 		err = idx.ingestSample(data)
 		if err != nil {
-			// A single poison datagram must not kill discovery: log
-			// through the SEDP trace and keep listening for the next
+			// A single poison datagram must not kill discovery: count
+			// loudly per failure class and keep listening for the next
 			// sample, matching the backend receiver which already
 			// continues on unparseable or off-domain DATA. Only a
 			// transport error or context cancel ends the loop.
@@ -1112,6 +1169,7 @@ func (idx *SEDPIndex) ListenLoop(ctx context.Context, r SEDPReceiver) error {
 				return ctxErr //nolint:wrapcheck // cancel semantics require unwrapped ctx.Err
 			}
 			sedpTracef("ingest skip poison len=%d err=%v", len(data), err)
+			log.Printf("dds: sedp listen ingest dropped len=%d: %v", len(data), err)
 			continue
 		}
 	}
@@ -1125,11 +1183,14 @@ func (idx *SEDPIndex) ListenLoop(ctx context.Context, r SEDPReceiver) error {
 // only SEDP HEARTBEAT or ACKNACK without endpoint DATA are skipped
 // without error so reliable peers do not break the listen loop. Each
 // entry upserts independently so one malformed or invalid endpoint does
-// not drop the others. It returns nil when at least one entry installs,
+// not drop the others. Endpoint upserts gate on SEDP DATA sequence per
+// endpoint GUID: stale or reordered samples are rejected without upsert
+// so an old retransmit cannot clobber newer state. It returns nil when at
+// least one entry installs or when all entries are stale replays,
 // otherwise the first parse or upsert error.
 func (idx *SEDPIndex) ingestSample(data []byte) error {
 	sedpTracef("ingest recv wire len=%d", len(data))
-	eps, err := ParseSEDPDATAs(data)
+	bodies, flags, err := sedpFindAllEndpointDATA(data)
 	if err != nil {
 		sedpTracef("ingest parse reject len=%d err=%v", len(data), err)
 		if errors.Is(err, ErrSEDPInvalidDATA) && sedpIsSEDPControl(data) {
@@ -1143,38 +1204,123 @@ func (idx *SEDPIndex) ingestSample(data []byte) error {
 
 	installed := 0
 
-	for _, ep := range eps {
-		sedpTracef("ingest parse accept guid=%s ros=%q dds=%q typeDDS=%q typeIDL=%q hash=%q domain=%d reader=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.TypeIDL, ep.TypeHash, ep.DomainID, ep.IsReader)
+	stale := 0
 
-		if ep.DomainID == 0 {
-			ep.DomainID = idx.stampDomain()
-			sedpTracef("ingest stamp domain=%d guid=%s", ep.DomainID, ep.ID.String())
+	for i := range bodies {
+		didInstall, wasStale, err := idx.ingestOneEndpoint(data, bodies[i], flags[i], i, len(bodies))
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
-
-		err = idx.UpsertRemote(ep)
-		if err != nil {
-			sedpTracef("ingest upsert reject guid=%s err=%v", ep.ID.String(), err)
-			if firstErr == nil {
-				firstErr = err
-			}
-
-			continue
+		if didInstall {
+			installed++
 		}
+		if wasStale {
+			stale++
+		}
+	}
+	return ingestOutcomeError(installed, stale, firstErr)
+}
 
-		installed++
-
-		sedpTracef("ingest upsert ok guid=%s ros=%q domain=%d", ep.ID.String(), ep.ROSTopic, ep.DomainID)
+// ingestOutcomeError maps an ingest tally to its result.
+//
+// Installed endpoints succeed. With none installed, the first parse or
+// upsert error reports loudly; all-stale replays succeed quietly since the
+// peer already has newer state; anything else is invalid input.
+func ingestOutcomeError(installed, stale int, firstErr error) error {
+	if installed != 0 {
+		return nil
+	}
+	if firstErr != nil {
+		return fmt.Errorf("dds: sedp listen upsert: %w", firstErr)
+	}
+	if stale > 0 {
+		return nil
 	}
 
-	if installed == 0 {
-		if firstErr != nil {
-			return fmt.Errorf("dds: sedp listen upsert: %w", firstErr)
-		}
+	return fmt.Errorf("dds: sedp listen ingest no endpoint installed: %w", ErrSEDPInvalidDATA)
+}
 
-		return fmt.Errorf("dds: sedp listen ingest no endpoint installed: %w", ErrSEDPInvalidDATA)
+// ingestOneEndpoint decodes, gates, and upserts one endpoint DATA body.
+//
+// It reports whether the endpoint installed, whether it was a stale replay,
+// and any parse or upsert error for the caller to keep as first failure.
+func (idx *SEDPIndex) ingestOneEndpoint(data, body []byte, flag uint8, index, total int) (bool, bool, error) {
+	littleEndian := flag&sedpFlagLittleEndian != 0
+	seq := sedpDecodeDataSeq(body, littleEndian)
+	ep, err := sedpDecodeEndpoint(body, flag)
+	if err != nil {
+		sedpTracef("ingest parse reject index=%d/%d len=%d flags=%#02x err=%v", index, total, len(data), flag, err)
+
+		return false, false, err
+	}
+	sedpTracef("ingest parse accept guid=%s ros=%q dds=%q typeDDS=%q typeIDL=%q hash=%q domain=%d reader=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.TypeIDL, ep.TypeHash, ep.DomainID, ep.IsReader)
+
+	if ep.DomainID == 0 {
+		ep.DomainID = idx.stampDomain()
+		sedpTracef("ingest stamp domain=%d guid=%s", ep.ID.String())
 	}
 
-	return nil
+	if !idx.checkAndStoreSedpSeq(ep.ID, seq) {
+		sedpTracef("ingest stale seq=%d guid=%s", seq, ep.ID.String())
+
+		return false, true, nil
+	}
+
+	err = idx.UpsertRemote(ep)
+	if err != nil {
+		sedpTracef("ingest upsert reject guid=%s err=%v", ep.ID.String(), err)
+
+		return false, false, err
+	}
+
+	sedpTracef("ingest upsert ok guid=%s ros=%q domain=%d", ep.ID.String(), ep.ROSTopic, ep.DomainID)
+
+	return true, false, nil
+}
+
+// sedpDecodeDataSeq returns the DATA sequence number from one endpoint body.
+//
+// The caller guarantees the body holds the fixed prefix. Zero means the
+// sequence was absent or invalid and never gates upserts.
+func sedpDecodeDataSeq(body []byte, littleEndian bool) uint64 {
+	if len(body) < sedpDATASeqOff+sedpSeqLen {
+		return 0
+	}
+	raw := body[sedpDATASeqOff : sedpDATASeqOff+sedpSeqLen]
+	if littleEndian {
+		high := binary.LittleEndian.Uint32(raw[0:4])
+		low := binary.LittleEndian.Uint32(raw[4:8])
+		return uint64(high)<<32 | uint64(low)
+	}
+	high := binary.BigEndian.Uint32(raw[0:4])
+	low := binary.BigEndian.Uint32(raw[4:8])
+	return uint64(high)<<32 | uint64(low)
+}
+
+// checkAndStoreSedpSeq gates one endpoint upsert on DATA sequence.
+//
+// It tracks the last accepted sequence per endpoint GUID. Zero sequences
+// never gate and always pass. A sequence at or below the last accepted
+// value reports false for stale or reordered input. Otherwise it stores
+// the new high and reports true. It self-locks and is safe for concurrent
+// use.
+func (idx *SEDPIndex) checkAndStoreSedpSeq(id SEDPGUID, seq uint64) bool {
+	if seq == 0 {
+		return true
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if idx.lastSeq == nil {
+		idx.lastSeq = make(map[SEDPGUID]uint64)
+	}
+	last, seen := idx.lastSeq[id]
+	if seen && seq <= last {
+		return false
+	}
+	idx.lastSeq[id] = seq
+
+	return true
 }
 
 // sedpAnnounceSnapshot serializes and sends one local snapshot.
@@ -1586,6 +1732,10 @@ func sedpSerializeOptionalParams(ep SEDPEndpoint, params []rtps.Param) ([]rtps.P
 }
 
 // SerializeSEDPDATA serializes an endpoint as an RTPS DATA sample.
+//
+// Body size validates before the SEDP sequence number is consumed so
+// oversize samples fail without burning a sequence and breaking
+// contiguity for reliable peers.
 func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 	err := sedpValidateMarshalEndpoint(ep)
 	if err != nil {
@@ -1614,9 +1764,14 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 	payload := sedpEncodeParamListPayload(params)
 	payload = append(payload, ep.QoS...)
 
+	bodyLen := sedpDataFixedLen + len(inline) + len(payload)
+	if bodyLen > sedpMaxBodyLen {
+		return nil, fmt.Errorf("dds: sedp serialize body %d above %d: %w", bodyLen, sedpMaxBodyLen, ErrSEDPInvalidEndpoint)
+	}
+
 	seq := nextSedpSeq(ep.ID.Prefix, writer)
 
-	body := make([]byte, 0, sedpDataFixedLen+len(inline)+len(payload))
+	body := make([]byte, 0, bodyLen)
 	body = append(body, sedpDATAReserved, sedpDATAReserved)
 	body = binary.LittleEndian.AppendUint16(body, sedpOctetsToInlineQoS)
 	body = append(body, sedpEntityUnknown[:]...)
@@ -1625,10 +1780,6 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 	body = binary.LittleEndian.AppendUint32(body, uint32(seq)) //nolint:gosec // G115: low word truncation is the layout
 	body = append(body, inline...)
 	body = append(body, payload...)
-
-	if len(body) > sedpMaxBodyLen {
-		return nil, fmt.Errorf("dds: sedp serialize body %d above %d: %w", len(body), sedpMaxBodyLen, ErrSEDPInvalidEndpoint)
-	}
 
 	out := make([]byte, 0, sedpRTPSHeaderLen+sedpSubmessageHeaderLen+len(body)+2*(sedpSubmessageHeaderLen+sedpHeartbeatSize))
 	out = append(out, sedpRTPSMagic...)
@@ -2028,11 +2179,18 @@ func sedpCollectParams(body []byte, flags byte) ([]rtps.Param, []byte, error) {
 		return nil, nil, fmt.Errorf("dds: sedp collect params need %d have %d: %w", sedpDataFixedLen, len(body), ErrSEDPInvalidDATA)
 	}
 
+	if len(body) > sedpMaxBodyLen+sedpRTPSHeaderLen {
+		return nil, nil, fmt.Errorf("dds: sedp collect params body %d above cap: %w", len(body), ErrSEDPInvalidDATA)
+	}
+
 	var params []rtps.Param
 
 	rest := body[sedpDataFixedLen:]
 
 	if flags&sedpFlagInlineQoS != 0 {
+		if len(rest) < 4 {
+			return nil, nil, fmt.Errorf("dds: sedp collect inline need 4 have %d: %w", len(rest), ErrSEDPInvalidDATA)
+		}
 		parsed, consumed, err := sedpDecodeParams(rest, littleEndian)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dds: sedp collect inline params: %w", err)
@@ -2202,7 +2360,12 @@ func sedpFieldsOptionals(byID map[uint16][]byte, littleEndian bool, fields *sedp
 }
 
 // sedpFieldsExtensions extracts security, partitions, and durability service.
-func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) {
+//
+// It returns errors loudly for malformed partition or durability-service
+// params instead of installing defaults. Security decode skips stay
+// best-effort with trace because unknown vendor PIDs must not break
+// matching.
+func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) error {
 	secInfo, secErrs := ExtractSecurityInfo(params)
 	for _, secErr := range secErrs {
 		sedpTracef("parse security skip err=%v", secErr)
@@ -2217,20 +2380,20 @@ func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEnd
 
 	partitionNames, err := FindPartitionParam(params)
 	if err != nil {
-		sedpTracef("parse partition skip err=%v", err)
-	} else {
-		fields.partitions = partitionNames
+		return fmt.Errorf("dds: sedp parse fields partitions: %w", err)
 	}
+	fields.partitions = partitionNames
 
 	if rawDurabilityService, seen := byID[PIDDurabilityService]; seen {
 		durabilityService, err := DecodeDurabilityService(rawDurabilityService, littleEndian)
 		if err != nil {
-			sedpTracef("parse durability-service skip err=%v", err)
-		} else {
-			fields.durabilityService = durabilityService
-			fields.hasDurabilityService = true
+			return fmt.Errorf("dds: sedp parse fields durability-service: %w", err)
 		}
+		fields.durabilityService = durabilityService
+		fields.hasDurabilityService = true
 	}
+
+	return nil
 }
 
 // sedpEndpointFields extracts the endpoint identity from params.
@@ -2257,7 +2420,10 @@ func sedpEndpointFields(params []rtps.Param, littleEndian bool) (sedpEndpointWir
 		return fields, err
 	}
 
-	sedpFieldsExtensions(params, byID, littleEndian, &fields)
+	err = sedpFieldsExtensions(params, byID, littleEndian, &fields)
+	if err != nil {
+		return fields, err
+	}
 
 	return fields, nil
 }
@@ -2879,6 +3045,9 @@ func sedpCloneEndpoint(ep SEDPEndpoint) SEDPEndpoint {
 	ep.QoS = sedpCloneBytes(ep.QoS)
 	ep.TypeObject = sedpCloneBytes(ep.TypeObject)
 	ep.Partitions = append([]string(nil), ep.Partitions...)
+	if ep.Security.Properties != nil {
+		ep.Security.Properties = maps.Clone(ep.Security.Properties)
+	}
 	if ep.WireOffer != nil {
 		offer := *ep.WireOffer
 		ep.WireOffer = &offer

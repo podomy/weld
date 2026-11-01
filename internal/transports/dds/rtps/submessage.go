@@ -779,8 +779,11 @@ func (a AckNack) Encode(littleEndian bool) ([]byte, error) {
 }
 
 // Gap is a decoded GAP submessage: the writer irrevocably skipped samples
-// from GapStart through the skipped list. v1 keeps only the start; the
-// sequence set that follows is skipped by length as tolerant input.
+// from GapStart through the skipped list. GapListBase names the sequence
+// number set base that follows GapStart, NumBits counts meaningful bits in
+// Bitmap, and Bitmap holds ceil(NumBits/32) words with MSB first per word.
+// A set bit names an additional skipped sequence at base plus bit index.
+// An empty list means only GapStart is skipped.
 type Gap struct {
 	// ReaderID names the destination entity.
 	ReaderID EntityID
@@ -788,10 +791,24 @@ type Gap struct {
 	WriterID EntityID
 	// GapStart is the first skipped sequence number.
 	GapStart uint64
+	// GapListBase is the base of the trailing sequence set, zero when absent.
+	GapListBase uint64
+	// NumBits counts meaningful bits in Bitmap.
+	NumBits uint32
+	// Bitmap holds the trailing skipped set, MSB first.
+	Bitmap []uint32
 }
 
-// DecodeGap parses a GAP body through gap start and skips the sequence
-// set that follows. Short bodies drop with a counter increment.
+// gapListFixedSize is base plus numBits after GapStart.
+const gapListFixedSize = 12
+
+// gapListMaxBits caps one GAP sequence set for bounded decode work.
+const gapListMaxBits = 4096
+
+// DecodeGap parses a GAP body through gap start plus the trailing sequence
+// set. Short bodies drop with a counter increment. A present list must be
+// fully covered by the body length and NumBits must stay under the cap;
+// otherwise the datagram drops loudly instead of trusting declared bits.
 func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	var out Gap
 	if len(body) < gapMinSize {
@@ -802,7 +819,57 @@ func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	copy(out.ReaderID[:], body[gapReaderOff:gapReaderOff+entityIDSize])
 	copy(out.WriterID[:], body[gapWriterOff:gapWriterOff+entityIDSize])
 	out.GapStart = seqNumberValue(body[gapStartOff:gapStartOff+gapStartSize], littleEndian)
+	if len(body) == gapMinSize {
+		return out, nil
+	}
+	if len(body) < gapMinSize+gapListFixedSize {
+		drops.RecordDrop()
+		return out, fmt.Errorf("rtps: gap list need %d have %d", gapMinSize+gapListFixedSize, len(body))
+	}
+	baseOff := gapMinSize
+	bitsOff := gapMinSize + 8
+	out.GapListBase = seqNumberValue(body[baseOff:baseOff+8], littleEndian)
+	out.NumBits = uint32Value(body[bitsOff:bitsOff+wordSize], littleEndian)
+	if out.NumBits > gapListMaxBits {
+		drops.RecordDrop()
+		return out, fmt.Errorf("rtps: gap bits %d above %d", out.NumBits, gapListMaxBits)
+	}
+	words := (uint64(out.NumBits) + 31) / 32
+	need := uint64(gapMinSize) + uint64(gapListFixedSize) + words*4
+	if uint64(len(body)) < need {
+		drops.RecordDrop()
+		return out, fmt.Errorf("rtps: gap need %d have %d", need, len(body))
+	}
+	out.Bitmap = make([]uint32, words)
+	off := gapMinSize + gapListFixedSize
+	for i := range out.Bitmap {
+		out.Bitmap[i] = uint32Value(body[off:off+4], littleEndian)
+		off += 4
+	}
 	return out, nil
+}
+
+// SkippedSequences returns every skipped sequence in wire order.
+//
+// It always starts with GapStart, then appends base plus bit index for
+// each set bit with MSB first per word. Invalid bit patterns beyond
+// NumBits in the final word are ignored.
+func (g Gap) SkippedSequences() []uint64 {
+	out := make([]uint64, 0, 1+len(g.Bitmap))
+	if g.GapStart == 0 {
+		return out
+	}
+	out = append(out, g.GapStart)
+	for n := range int(g.NumBits) {
+		i := uint32(n)
+		word := g.Bitmap[i/32]
+		shift := 31 - (i % 32)
+		if word&(1<<shift) == 0 {
+			continue
+		}
+		out = append(out, g.GapListBase+uint64(i))
+	}
+	return out
 }
 
 // EncodePad returns length zero bytes for submessage alignment. Lengths

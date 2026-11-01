@@ -52,6 +52,16 @@ type fragKey struct {
 	seq  uint64
 }
 
+// fragSendEntry holds one outbound fragmented sample for repair history.
+type fragSendEntry struct {
+	sampleSize   uint32
+	fragmentSize uint16
+	total        uint32
+	buf          []byte
+	received     []bool
+	count        uint32
+}
+
 // fragEntry holds one in progress sample.
 type fragEntry struct {
 	sampleSize    uint32
@@ -275,6 +285,9 @@ func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool
 }
 
 // handleDataFrag reassembles one DATA_FRAG and enqueues the complete payload.
+//
+// Tracking advances only after successful enqueue; on queue-full drop the
+// sample stays unmarked so repair can serve it, and the drop counts loudly.
 func (b *Backend) handleDataFrag(ctx context.Context, header rtps.Header, sub rtps.RawSubmessage, dataCh chan dataItem) bool {
 	err := ctx.Err()
 	if err != nil {
@@ -315,8 +328,14 @@ func (b *Backend) handleDataFrag(ctx context.Context, header rtps.Header, sub rt
 	if !done {
 		return true
 	}
-	b.noteRemoteData(guid, frag.SequenceNumber)
 	cp := append([]byte(nil), complete...)
-	enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: frag.SequenceNumber, payload: cp})
+	queued := enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: frag.SequenceNumber, payload: cp})
+	if !queued {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux datafrag queue full guid=%x seq=%d", guid, frag.SequenceNumber)
+
+		return true
+	}
+	b.noteRemoteData(guid, frag.SequenceNumber)
 	return true
 }

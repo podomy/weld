@@ -230,7 +230,7 @@ func TestBackendFragOrderedSameSeq(t *testing.T) {
 	ctx := context.Background()
 	uni, err := rtps.DialUnicast(ctx, 71)
 	if err != nil {
-		t.Skipf("dial unicast: %v", err)
+		t.Fatalf("dial unicast fixed domain 71: %v", err)
 	}
 	defer func() {
 		cerr := uni.Close()
@@ -320,7 +320,7 @@ func TestBackendSendPlainFragsAdvancesOnce(t *testing.T) {
 	ctx := context.Background()
 	uni, err := rtps.DialUnicast(ctx, 72)
 	if err != nil {
-		t.Skipf("dial unicast: %v", err)
+		t.Fatalf("dial unicast fixed domain 72: %v", err)
 	}
 	defer func() {
 		cerr := uni.Close()

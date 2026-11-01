@@ -50,6 +50,8 @@ const (
 const (
 	// maxSubmessageBody caps one submessage body to uint16 range.
 	maxSubmessageBody = 0xFFFF
+	// maxSubmessagesPerDatagram caps decoded submessages for bounded work.
+	maxSubmessagesPerDatagram = 4096
 	// vendorIDFirst is the first CycloneDDS vendor id byte.
 	vendorIDFirst = 0x01
 	// vendorIDSecond is the second CycloneDDS vendor id byte.
@@ -259,7 +261,9 @@ func EncodeMessage(h Header, subs []RawSubmessage) ([]byte, error) {
 // A datagram is atomic: any truncation drops the whole message with one
 // counter increment and an error. Unknown submessage ids are preserved as
 // raw bodies for the dispatcher; see DecodeSubmessage. Bodies are copied,
-// so buf may be reused after return.
+// so buf may be reused after return. Submessage count is capped at
+// maxSubmessagesPerDatagram so a crafted header chain cannot force
+// unbounded allocation; over-cap datagrams drop loudly.
 func DecodeMessage(buf []byte, drops *Counter) (Header, []RawSubmessage, error) {
 	var zero Header
 	hdr, err := DecodeHeader(buf)
@@ -270,6 +274,10 @@ func DecodeMessage(buf []byte, drops *Counter) (Header, []RawSubmessage, error) 
 	var subs []RawSubmessage
 	off := HeaderSize
 	for off < len(buf) {
+		if len(subs) >= maxSubmessagesPerDatagram {
+			drops.RecordDrop()
+			return zero, nil, fmt.Errorf("rtps: decode message submessages above %d", maxSubmessagesPerDatagram)
+		}
 		sub, next, err := decodeOne(buf, off)
 		if err != nil {
 			drops.RecordDrop()

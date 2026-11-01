@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
 
@@ -151,10 +153,13 @@ func (h *userHistory) load(
 	return append([]byte(nil), raw...), true
 }
 
-// first returns the first kept seq or 0.
-func (h *userHistory) first(guid WriterGUID) uint64 {
+// bounds returns the first and last kept seq under one lock.
+//
+// It snapshots both ends atomically so callers never observe a torn
+// window where first advances past last between two separate locks.
+func (h *userHistory) bounds(guid WriterGUID) (uint64, uint64) {
 	if h == nil {
-		return 0
+		return 0, 0
 	}
 
 	h.mu.Lock()
@@ -162,27 +167,24 @@ func (h *userHistory) first(guid WriterGUID) uint64 {
 
 	ord := h.order[guid]
 	if len(ord) == 0 {
-		return 0
+		return 0, 0
 	}
 
-	return ord[0]
+	return ord[0], ord[len(ord)-1]
+}
+
+// first returns the first kept seq or 0.
+func (h *userHistory) first(guid WriterGUID) uint64 {
+	first, _ := h.bounds(guid)
+
+	return first
 }
 
 // last returns the last kept seq or 0.
 func (h *userHistory) last(guid WriterGUID) uint64 {
-	if h == nil {
-		return 0
-	}
+	_, last := h.bounds(guid)
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	ord := h.order[guid]
-	if len(ord) == 0 {
-		return 0
-	}
-
-	return ord[len(ord)-1]
+	return last
 }
 
 // ackRequest is one decoded user ACKNACK.
@@ -449,6 +451,10 @@ type remoteTracker struct {
 	seen map[uint64]struct{}
 	// lastHeartbeatLast is the last heartbeat LastSequence bound, zero when unknown.
 	lastHeartbeatLast uint64
+	// lastHeartbeatCount is the last heartbeat Count, zero when unknown.
+	lastHeartbeatCount int32
+	// lastHeartbeatFirst is the last heartbeat FirstSequence bound.
+	lastHeartbeatFirst uint64
 	// lastFallback is the last fallback broadcast time for rate limiting.
 	lastFallback time.Time
 }
@@ -457,7 +463,9 @@ type remoteTracker struct {
 //
 // It returns false for zero, duplicates, and already contiguous seqs.
 // Otherwise it records the sample, advances contiguity through filled
-// gaps, and returns true.
+// gaps, and returns true. When the out-of-order set reaches the cap,
+// contiguity advances to the highest seen instead of dropping evidence,
+// so the NACK base converges instead of re-requesting from an old gap.
 func (t *remoteTracker) observe(seq uint64) bool {
 	if seq == 0 || seq <= t.contig {
 		return false
@@ -472,7 +480,13 @@ func (t *remoteTracker) observe(seq uint64) bool {
 	}
 
 	if len(t.seen) >= remoteSeenCap {
-		t.seen = make(map[uint64]struct{})
+		t.advanceToHighestSeen()
+		if seq <= t.contig {
+			return false
+		}
+		if _, ok := t.seen[seq]; ok {
+			return false
+		}
 	}
 
 	t.seen[seq] = struct{}{}
@@ -491,6 +505,29 @@ func (t *remoteTracker) observe(seq uint64) bool {
 	}
 
 	return true
+}
+
+// advanceToHighestSeen moves contiguity to the highest out-of-order seq.
+//
+// The caller holds no additional lock beyond the backend mu that guards
+// the tracker. It clears evidence at or below the new contiguity so the
+// bounded set cannot grow without limit while the NACK base still moves
+// forward over the abandoned gap.
+func (t *remoteTracker) advanceToHighestSeen() {
+	var highest uint64
+	for s := range t.seen {
+		if s > highest {
+			highest = s
+		}
+	}
+	if highest > t.contig {
+		t.contig = highest
+	}
+	for s := range t.seen {
+		if s <= t.contig {
+			delete(t.seen, s)
+		}
+	}
 }
 
 // base returns the first missing sequence, at least 1.
@@ -648,36 +685,54 @@ func (b *Backend) sedpBase(guid WriterGUID, first uint64) uint64 {
 }
 
 // applySedpGap advances SEDP tracking for one GAP.
+func (b *Backend) applySedpGap(guid WriterGUID, gapStart uint64) {
+	b.applySedpGaps(guid, []uint64{gapStart})
+}
+
+// applySedpGaps advances SEDP tracking for each skipped sequence.
 //
 // Why: a GAP means the writer will never send the seq, so the next
 // heartbeat must not NACK it or the peer retransmits nothing and the NACK
 // repeats forever. Updates are monotonic and zero is ignored, which keeps
-// re-NACKs idempotent and bounded when GAPs repeat.
-func (b *Backend) applySedpGap(guid WriterGUID, gapStart uint64) {
-	if gapStart == 0 {
+// re-NACKs idempotent and bounded when GAPs repeat. Sequences apply in
+// increasing order so every contiguous run from the decoded list advances.
+func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
+	filtered := make([]uint64, 0, len(seqs))
+	for _, seq := range seqs {
+		if seq == 0 {
+			continue
+		}
+		filtered = append(filtered, seq)
+	}
+	if len(filtered) == 0 {
 		return
 	}
+	slices.Sort(filtered)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	var maxAllowed uint64
+	hasBound := false
 	if last, ok := b.sedpHeartbeatLast[guid]; ok && last != 0 {
-		maxAllowed := last + 1
+		maxAllowed = last + 1
 		if maxAllowed == 0 {
 			maxAllowed = ^uint64(0)
 		}
-
-		if gapStart > maxAllowed {
-			gapStart = maxAllowed
-		}
+		hasBound = true
 	}
 
 	if b.sedpHighSeq == nil {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
 	}
 
-	if gapStart > b.sedpHighSeq[guid] {
-		b.sedpHighSeq[guid] = gapStart
+	for _, gapStart := range filtered {
+		if hasBound && gapStart > maxAllowed {
+			gapStart = maxAllowed
+		}
+		if gapStart > b.sedpHighSeq[guid] {
+			b.sedpHighSeq[guid] = gapStart
+		}
 	}
 }
 
@@ -704,14 +759,24 @@ func planSedpNack(base, last uint64) ([]uint32, uint32, bool) {
 	return bitmap, numBits, true
 }
 
-// applyRemoteGap advances remote tracking plus DataReceiver skip for one GAP.
-func (b *Backend) applyRemoteGap(
-	guid WriterGUID,
-	gapStart uint64,
-) {
-	if gapStart == 0 {
+// applyRemoteGaps advances remote tracking plus DataReceiver skip for each
+// skipped sequence in wire order.
+//
+// The caller decodes the full GAP list via Gap.SkippedSequences so every
+// contiguous run advances contiguity, not just GapStart. Zero entries are
+// ignored and sequences apply in increasing order.
+func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
+	filtered := make([]uint64, 0, len(seqs))
+	for _, seq := range seqs {
+		if seq == 0 {
+			continue
+		}
+		filtered = append(filtered, seq)
+	}
+	if len(filtered) == 0 {
 		return
 	}
+	slices.Sort(filtered)
 
 	b.mu.Lock()
 	if b.remoteTrack == nil {
@@ -724,13 +789,17 @@ func (b *Backend) applyRemoteGap(
 		b.remoteTrack[guid] = tracker
 	}
 
-	tracker.skipTo(gapStart)
+	for _, seq := range filtered {
+		tracker.skipTo(seq)
+	}
 
 	receiver := b.receiver
 	b.mu.Unlock()
 
 	if receiver != nil {
-		receiver.ApplyGap(guid, gapStart)
+		for _, seq := range filtered {
+			receiver.ApplyGap(guid, seq)
+		}
 	}
 }
 
@@ -1148,17 +1217,38 @@ func (b *Backend) sendUserControl(
 	return fmt.Errorf("dds: user control without route: %w", ErrNoRoute)
 }
 
+// repairHistoryBounds snapshots the first and last kept seq under one lock.
+//
+// It holds b.mu only to load the history pointer, then uses the history
+// atomic bounds so first and last come from one instant without TOCTOU.
+func (b *Backend) repairHistoryBounds(guid WriterGUID) (uint64, uint64) {
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	if history == nil {
+		return 0, 0
+	}
+
+	first, last := history.bounds(guid)
+	if first == 0 {
+		first = FirstSequenceNumber
+	}
+
+	return first, last
+}
+
 // repairWindow bounds repair to window and returns start, first, last, end. It reports false when no
 // repair is needed. Start is base even when base precedes history first so evicted prefix
 // yields GAP instead of silent skip; each evicted seq keeps reasoned accounting through GAP
 // while retained seq repairs from history. End caps to base plus window so per ACK work stays
 // bounded and larger gaps converge over later ACKs as the reader advances on GAP.
+// First and last snapshot under one lock via repairHistoryBounds.
 func (b *Backend) repairWindow(
 	guid WriterGUID,
 	base uint64,
 ) (uint64, uint64, uint64, uint64, bool) {
-	first := b.repairHistoryFirst(guid)
-	last := b.repairHistoryLast(guid)
+	first, last := b.repairHistoryBounds(guid)
 
 	if last == 0 {
 		return 0, 0, 0, 0, false
@@ -1259,38 +1349,104 @@ const repairPace = 2 * time.Millisecond
 // repairQueueDepth bounds the async repair FIFO.
 const repairQueueDepth = 128
 
-// repairTask is one queued ACKNACK repair.
+// repairTaskKind selects repair versus ACK work for one queued task.
+type repairTaskKind int
+
+const (
+	// repairTaskRepair resends history for one queued ACKNACK.
+	repairTaskRepair repairTaskKind = iota
+	// repairTaskAck sends one queued ACKNACK for a heartbeat gap.
+	repairTaskAck
+)
+
+// repairTask is one queued ACKNACK repair or ACK send.
 type repairTask struct {
-	// backend serves the repair.
-	backend *Backend
-	// writer names the targeted writer.
+	// gen is the backend generation; stale tasks skip work.
+	gen uint64
+	// kind selects repair versus ACK send.
+	kind repairTaskKind
+	// writer names the targeted writer for repair.
 	writer rtps.EntityID
+	// remote names the writer for an ACK send.
+	remote WriterGUID
+	// reader names the local reader for an ACK send.
+	reader rtps.EntityID
 	// base is the first wanted sequence.
 	base uint64
+	// numBits counts bitmap bits for an ACK send.
+	numBits uint32
+	// bitmap holds repair bits for an ACK send.
+	bitmap []uint32
 }
 
-// repairQueue holds pending repairs for the single FIFO worker.
-var repairQueue chan repairTask
-
-// repairOnce starts the single repair worker.
-var repairOnce sync.Once
-
-// ensureRepairWorker starts the single bounded FIFO repair worker.
-func ensureRepairWorker() {
-	repairOnce.Do(func() {
-		repairQueue = make(chan repairTask, repairQueueDepth)
-		go repairWorkerLoop()
-	})
+// ensureRepairWorkerLocked starts the per-backend FIFO repair worker.
+//
+// The caller must hold b.mu for write; it adds one WaitGroup count
+// immediately before the go statement so Close cannot Wait until the Add
+// completes. The worker serves queued repairs and ACK sends serially to
+// preserve per-writer order. The queue is bounded; full queues report
+// loudly via ErrNoRoute so demux counts instead of blocking.
+func (b *Backend) ensureRepairWorkerLocked() {
+	if b.repairQueue != nil {
+		return
+	}
+	b.repairQueue = make(chan repairTask, repairQueueDepth)
+	b.repairDone = make(chan struct{})
+	b.repairGen++
+	q := b.repairQueue
+	done := b.repairDone
+	b.runWG.Add(1)
+	go b.repairWorkerLoop(q, done)
 }
 
-// repairWorkerLoop serves queued repairs serially to preserve per-writer order.
-func repairWorkerLoop() {
-	for task := range repairQueue {
-		if task.backend == nil {
-			continue
+// repairWorkerLoop serves queued repairs and ACKs until Close bumps generation.
+//
+// It skips tasks whose generation no longer matches the backend generation
+// so Close does not serve stale work after teardown starts.
+func (b *Backend) repairWorkerLoop(q chan repairTask, done <-chan struct{}) {
+	defer b.runWG.Done()
+
+	for {
+		select {
+		case task, ok := <-q:
+			if !ok {
+				return
+			}
+			if task.gen != b.currentRepairGen() {
+				continue
+			}
+			switch task.kind {
+			case repairTaskAck:
+				b.serveAckSend(task)
+			case repairTaskRepair:
+				b.serveRepair(task)
+			default:
+				b.bumpDemuxError()
+				log.Printf("dds: demux repair unknown task kind %d", task.kind)
+			}
+		case <-done:
+			return
 		}
+	}
+}
 
-		task.backend.serveRepair(task)
+// currentRepairGen returns the backend repair generation under lock.
+func (b *Backend) currentRepairGen() uint64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	return b.repairGen
+}
+
+// serveAckSend sends one queued ACKNACK best effort.
+//
+// Failures count a demux error loudly instead of failing silently.
+func (b *Backend) serveAckSend(task repairTask) {
+	ctx := context.Background()
+	err := b.sendUserAckNack(ctx, task.remote, task.reader, task.base, task.numBits, task.bitmap)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux queued ack send: %v", err)
 	}
 }
 
@@ -1374,6 +1530,8 @@ func paceRepair(timer *time.Timer, ctx context.Context) bool {
 
 // repairFromAck queues history repair from base plus GAP for missing in window. It bounds work to
 // userRepairWindow seq. Base 0 and unknown writers are ignored without repair.
+// It queues to the per-backend worker; a full queue reports loudly so demux
+// counts instead of blocking.
 func (b *Backend) repairFromAck(
 	ctx context.Context,
 	writer rtps.EntityID,
@@ -1396,21 +1554,65 @@ func (b *Backend) repairFromAck(
 
 	b.mu.RLock()
 	local := b.local
+	closed := b.closed
+	q := b.repairQueue
+	gen := b.repairGen
 	b.mu.RUnlock()
 
 	if local == nil {
 		return nil
 	}
 
-	ensureRepairWorker()
+	if closed {
+		return fmt.Errorf("dds: repair after close base %d: %w", base, transports.ErrBackendClosed)
+	}
 
-	task := repairTask{backend: b, writer: writer, base: base}
+	if q == nil {
+		return fmt.Errorf("dds: repair worker without queue base %d: %w", base, ErrDataPathNotWired)
+	}
+
+	task := repairTask{gen: gen, kind: repairTaskRepair, writer: writer, base: base}
 
 	select {
-	case repairQueue <- task:
+	case q <- task:
 		return nil
 	default:
 		return fmt.Errorf("dds: repair queue full base %d: %w", base, ErrNoRoute)
+	}
+}
+
+// queueUserAck queues one ACKNACK send through the per-backend worker.
+//
+// It is used by the demux heartbeat path instead of inline sends so a slow
+// peer cannot block demux. A full queue reports loudly so the caller counts
+// a demux error. It self-locks and is safe for concurrent use.
+func (b *Backend) queueUserAck(remote WriterGUID, reader rtps.EntityID, base uint64, numBits uint32, bitmap []uint32) error {
+	if base == 0 {
+		return fmt.Errorf("dds: user nack base 0: %w", ErrInvalidFrame)
+	}
+
+	b.mu.RLock()
+	closed := b.closed
+	q := b.repairQueue
+	gen := b.repairGen
+	b.mu.RUnlock()
+
+	if closed {
+		return fmt.Errorf("dds: user ack after close base %d: %w", base, transports.ErrBackendClosed)
+	}
+
+	if q == nil {
+		return fmt.Errorf("dds: user ack without queue: %w", ErrDataPathNotWired)
+	}
+
+	cp := append([]uint32(nil), bitmap...)
+	task := repairTask{gen: gen, kind: repairTaskAck, remote: remote, reader: reader, base: base, numBits: numBits, bitmap: cp}
+
+	select {
+	case q <- task:
+		return nil
+	default:
+		return fmt.Errorf("dds: ack queue full base %d: %w", base, ErrNoRoute)
 	}
 }
 
@@ -1452,12 +1654,60 @@ func (b *Backend) readerEntityForWriter(guid WriterGUID) rtps.EntityID {
 }
 
 // ackUserHeartbeat answers one user HEARTBEAT with ACKNACK. Base is next wanted from remote tracking.
+//
+// It validates First through Last like the SEDP path, ignores replayed
+// heartbeats by Count, and never regresses the Last bound. ACK sends queue
+// through the per-backend worker so demux never blocks on the socket.
+// heartbeatTrackerFor returns the contiguity tracker for a remote writer,
+// allocating it under the backend lock. The caller must hold b.mu for write.
+func (b *Backend) heartbeatTrackerFor(remote WriterGUID) *remoteTracker {
+	if b.remoteTrack == nil {
+		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
+	}
+
+	tracker, ok := b.remoteTrack[remote]
+	if !ok {
+		tracker = &remoteTracker{}
+		b.remoteTrack[remote] = tracker
+	}
+
+	return tracker
+}
+
+// heartbeatIsReplay reports whether a heartbeat is a replay of already
+// processed state: a nonzero count at or below the last count with no new
+// last sequence. Replays draw no ACK so spoofed duplicates stay quiet.
+func heartbeatIsReplay(beat rtps.Heartbeat, tracker *remoteTracker) bool {
+	return beat.Count != 0 && tracker.lastHeartbeatCount != 0 &&
+		beat.Count <= tracker.lastHeartbeatCount &&
+		beat.LastSequence <= tracker.lastHeartbeatLast
+}
+
+// recordHeartbeatBound advances the tracker monotonic bound from one
+// heartbeat. Last only moves forward and Count only moves up, so delayed
+// or replayed heartbeats never reopen old ACK ranges.
+func recordHeartbeatBound(beat rtps.Heartbeat, tracker *remoteTracker) {
+	if beat.LastSequence > tracker.lastHeartbeatLast {
+		tracker.lastHeartbeatLast = beat.LastSequence
+		tracker.lastHeartbeatFirst = beat.FirstSequence
+	}
+	if beat.Count != 0 && beat.Count > tracker.lastHeartbeatCount {
+		tracker.lastHeartbeatCount = beat.Count
+	}
+}
+
 func (b *Backend) ackUserHeartbeat(
-	ctx context.Context,
 	header rtps.Header,
 	beat rtps.Heartbeat,
 ) {
 	if !isUserWriterEntity(beat.WriterID) {
+		return
+	}
+
+	if beat.FirstSequence == 0 || beat.LastSequence < beat.FirstSequence {
+		b.bumpDemuxError()
+		log.Printf("dds: demux user heartbeat range first=%d last=%d", beat.FirstSequence, beat.LastSequence)
+
 		return
 	}
 
@@ -1473,21 +1723,16 @@ func (b *Backend) ackUserHeartbeat(
 	copy(remote[:12], header.Prefix[:])
 	copy(remote[12:16], beat.WriterID[:])
 
-	if beat.LastSequence != 0 {
-		b.mu.Lock()
+	b.mu.Lock()
+	tracker := b.heartbeatTrackerFor(remote)
+	replay := heartbeatIsReplay(beat, tracker)
+	if !replay {
+		recordHeartbeatBound(beat, tracker)
+	}
+	b.mu.Unlock()
 
-		if b.remoteTrack == nil {
-			b.remoteTrack = make(map[WriterGUID]*remoteTracker)
-		}
-
-		tracker, ok := b.remoteTrack[remote]
-		if !ok {
-			tracker = &remoteTracker{}
-			b.remoteTrack[remote] = tracker
-		}
-
-		tracker.lastHeartbeatLast = beat.LastSequence
-		b.mu.Unlock()
+	if replay {
+		return
 	}
 
 	base := max(
@@ -1508,10 +1753,10 @@ func (b *Backend) ackUserHeartbeat(
 		bitmap, numBits = sedpNackBitmap(beat.LastSequence - base + 1)
 	}
 
-	err := b.sendUserAckNack(ctx, remote, b.readerEntityForWriter(remote), base, numBits, bitmap)
+	err := b.queueUserAck(remote, b.readerEntityForWriter(remote), base, numBits, bitmap)
 	if err != nil {
 		b.bumpDemuxError()
-		log.Printf("dds: demux ack send: %v", err)
+		log.Printf("dds: demux ack queue: %v", err)
 	}
 }
 
@@ -1559,9 +1804,12 @@ func promptNackBase(seq uint64) uint64 {
 	return FirstSequenceNumber
 }
 
-// sendPromptNack emits one best effort ACKNACK for an initial gap.
+// sendPromptNack queues one best effort ACKNACK for an initial gap.
+//
+// It routes through the per-backend worker so demux never blocks on the
+// socket. A full queue counts loudly via ErrNoRoute; other queue failures
+// also count a demux error.
 func (b *Backend) sendPromptNack(
-	ctx context.Context,
 	remote WriterGUID,
 	base uint64,
 ) {
@@ -1569,14 +1817,19 @@ func (b *Backend) sendPromptNack(
 		return
 	}
 
-	err := b.sendUserAckNack(ctx, remote, b.readerEntityForWriter(remote), base, 0, nil)
+	err := b.queueUserAck(remote, b.readerEntityForWriter(remote), base, 0, nil)
 	if err != nil {
+		if errors.Is(err, ErrDataPathNotWired) {
+			return
+		}
 		if errors.Is(err, ErrNoRoute) {
+			b.bumpDemuxError()
+			log.Printf("dds: demux prompt ack queue full: %v", err)
 			return
 		}
 
 		b.bumpDemuxError()
-		log.Printf("dds: demux prompt ack send: %v", err)
+		log.Printf("dds: demux prompt ack queue: %v", err)
 	}
 }
 
@@ -1587,7 +1840,6 @@ func (b *Backend) sendPromptNack(
 // repair window bounds per NACK work. Failures only bump demux errors so the
 // data path never blocks on repair and lost counting stays in Take.
 func (b *Backend) maybePromptNackOnData(
-	ctx context.Context,
 	remote WriterGUID,
 	seq uint64,
 ) {
@@ -1614,7 +1866,7 @@ func (b *Backend) maybePromptNackOnData(
 		return
 	}
 
-	b.sendPromptNack(ctx, remote, promptNackBase(seq))
+	b.sendPromptNack(remote, promptNackBase(seq))
 }
 
 // handleUserAck routes one ACKNACK for a user writer to repair, not to dataCh.
@@ -1639,7 +1891,6 @@ func (b *Backend) handleUserAck(
 
 // handleUserHeartbeat routes one HEARTBEAT for a user writer to ACK, not to dataCh.
 func (b *Backend) handleUserHeartbeat(
-	ctx context.Context,
 	header rtps.Header,
 	sub rtps.RawSubmessage,
 ) {
@@ -1657,11 +1908,11 @@ func (b *Backend) handleUserHeartbeat(
 		return
 	}
 
-	b.ackUserHeartbeat(ctx, header, beat)
+	b.ackUserHeartbeat(header, beat)
 }
 
-// handleUserGap routes one GAP for a user writer to skip, not to dataCh. Only GapStart is honored; the
-// list is tolerated but not expanded, which fits single-seq GAPs used for repair.
+// handleUserGap routes one GAP for a user writer to skip, not to dataCh. The full
+// gap list applies in order so every contiguous run advances contiguity.
 func (b *Backend) handleUserGap(
 	sub rtps.RawSubmessage,
 	header rtps.Header,
@@ -1688,12 +1939,13 @@ func (b *Backend) handleUserGap(
 	copy(remote[:12], header.Prefix[:])
 	copy(remote[12:16], gap.WriterID[:])
 
-	b.applyRemoteGap(remote, gap.GapStart)
+	b.applyRemoteGaps(remote, gap.SkippedSequences())
 }
 
 // handleUserControl processes user control subs before DATA queueing. It handles ACKNACK with repair,
 // HEARTBEAT with ACK, GAP with skip, and DATA_FRAG with reassembly to dataCh. It returns true when sub
-// was user control and must not reach dataCh through the DATA path.
+// was user control and must not reach dataCh through the DATA path. Malformed
+// control submessages count a demux error loudly instead of skipping silently.
 func (b *Backend) handleUserControl(
 	ctx context.Context,
 	header rtps.Header,
@@ -1732,14 +1984,17 @@ func (b *Backend) handleUserControl(
 			&drops,
 		)
 		if err != nil {
-			return false
+			b.bumpDemuxError()
+			log.Printf("dds: demux user heartbeat decode: %v", err)
+
+			return true
 		}
 
 		if !isUserWriterEntity(beat.WriterID) {
 			return false
 		}
 
-		b.handleUserHeartbeat(ctx, header, sub)
+		b.handleUserHeartbeat(header, sub)
 
 		return true
 	case rtps.SubmessageGap:
@@ -1751,7 +2006,10 @@ func (b *Backend) handleUserControl(
 			&drops,
 		)
 		if err != nil {
-			return false
+			b.bumpDemuxError()
+			log.Printf("dds: demux user gap decode: %v", err)
+
+			return true
 		}
 
 		if !isUserWriterEntity(gap.WriterID) {

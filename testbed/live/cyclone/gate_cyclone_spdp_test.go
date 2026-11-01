@@ -299,16 +299,30 @@ func TestCycloneSPDPUnicastLoopback(t *testing.T) {
 //
 // It uses docker argv with no shell through the shared helpers. It skips
 // cleanly when no daemon or weld-jazzy container is present and never
-// starts the compose stack. Failures never fail the suite because the log
-// is only a cross-check next to the direct UDP assertions above.
+// starts the compose stack. Empty container logs are an environment
+// property of the log driver, not a product signal, so they skip loudly
+// instead of failing; the direct UDP assertions above remain the loud
+// product proof of SPDP traffic.
 func TestCycloneSPDPContainerLogCrossCheck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), cycloneDockerTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	raw, err := helpers.DockerExec(ctx, "logs", "--tail", "20", helpers.Container)
 	if err != nil {
-		t.Logf("docker logs unavailable: %v", err)
-		return
+		t.Fatalf("docker logs unavailable with peer present: %v", err)
 	}
-	t.Logf("container %s logs tail bytes %d", helpers.Container, len(string(raw)))
+	text := string(raw)
+	if len(text) == 0 {
+		t.Skipf("container %s logs empty, log retention is environmental", helpers.Container)
+	}
+	rows := 0
+	for _, c := range text {
+		if c == '\n' {
+			rows++
+		}
+	}
+	if rows == 0 {
+		rows = 1
+	}
+	t.Logf("container %s logs tail bytes %d rows %d", helpers.Container, len(text), rows)
 }

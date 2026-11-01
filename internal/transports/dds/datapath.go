@@ -681,6 +681,25 @@ func (r *DataReceiver) DropReasonCount(reason DropReason) uint64 {
 	return r.reasonCounts[reason]
 }
 
+// EvictWriter drops per-writer take state for one removed writer.
+//
+// It deletes sequence tracking, plain NACK state, provisional records, and
+// liveliness trackers so a later writer reusing the GUID restarts clean
+// instead of inheriting stale gaps or NACK bases. It self-locks and is safe
+// for concurrent use.
+func (r *DataReceiver) EvictWriter(guid WriterGUID) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.last, guid)
+	delete(r.plainNack, guid)
+	delete(r.provisional, guid)
+	delete(r.lively, guid)
+}
+
 // ProvisionalForGUID returns the provisional record for one writer GUID.
 //
 // The second result reports whether a provisional was installed. Confirmed
@@ -1260,28 +1279,54 @@ func (r *DataReceiver) Take(frame []byte) (transports.IncomingMessage, error) {
 // It returns the hook rejection when a decoded sample is filtered, keyed
 // invalid, or liveliness gated, so TakeFrom counts exactly once under the
 // right reason instead of falling through to the unknown-writer path.
+// Plain samples run through trackSequenceLocked for dedupe and LostCount
+// matching the framed path, plus plain NACK tracking for repair. Sequence
+// zero means the queue predates sequence tracking, so those samples deliver
+// without tracking: they can neither dedupe nor advance NACK contiguity,
+// which keeps unknown seqs from poisoning loss accounting.
 func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, seq uint64, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, *takeHookReject, bool) {
 	var empty transports.IncomingMessage
 
-	if msg, ok := r.decodePlainCDRWithQoS(guid, payload, qos, hasQoS); ok {
-		r.notePlainSample(ctx, guid, seq)
-		snap := r.snapshotTakeHooks(msg.TopicName, guid)
-		if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
-			return empty, rej, false
-		}
-
-		return msg, nil, true
+	msg, ok := r.decodePlainCDRWithQoS(guid, payload, qos, hasQoS)
+	if !ok {
+		var chatterOk bool
+		msg, chatterOk = r.decodeCycloneChatter(guid, payload)
+		ok = chatterOk
 	}
-	if msg, ok := r.decodeCycloneChatter(guid, payload); ok {
-		r.notePlainSample(ctx, guid, seq)
-		snap := r.snapshotTakeHooks(msg.TopicName, guid)
-		if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
-			return empty, rej, false
-		}
-
-		return msg, nil, true
+	if !ok {
+		return empty, nil, false
 	}
-	return empty, nil, false
+
+	if seq != 0 {
+		err := r.trackPlainSequence(guid, seq)
+		if err != nil {
+			return empty, &takeHookReject{err: err}, false
+		}
+		r.notePlainSample(ctx, guid, seq)
+	}
+	snap := r.snapshotTakeHooks(msg.TopicName, guid)
+	if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
+		return empty, rej, false
+	}
+
+	return msg, nil, true
+}
+
+// trackPlainSequence records one plain-path sequence for dedupe and loss.
+//
+// It self-locks and runs trackSequenceLocked so plain vendor samples share
+// framed-path duplicate suppression and LostCount. Stale sequences count a
+// drop inside trackSequenceLocked and report ErrStaleSequence loudly.
+func (r *DataReceiver) trackPlainSequence(guid WriterGUID, seq uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	err := r.trackSequenceLocked(guid, seq)
+	if err != nil {
+		return fmt.Errorf("dds: take from plain sequence: %w", err)
+	}
+
+	return nil
 }
 
 // takeValidatedFrame finishes TakeFrom for one validated Weld frame.

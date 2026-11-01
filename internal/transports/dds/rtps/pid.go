@@ -105,6 +105,8 @@ const (
 
 // Locator wire sizes and offsets.
 const (
+	// maxParamsPerList caps one decoded parameter list for bounded work.
+	maxParamsPerList = 1024
 	// locatorSize is kind plus port plus 16 byte address.
 	locatorSize = 24
 	// ipv4TailSize is the 4 byte IPv4 tail inside the address.
@@ -234,37 +236,56 @@ func decodePIDSentinel(length int) error {
 // 0x8003, 0x8007, 0x800c, and 0x8019. PIDPad entries are skipped so
 // alignment fill never surfaces. Lengths that include
 // trailing pad are tolerated because senders vary: the value is read and
-// the offset advances to the next 4 byte boundary either way.
+// the offset advances to the next 4 byte boundary either way. Param count
+// stays capped during decode so a crafted list cannot force unbounded
+// allocation; the cap is enforced incrementally before the full list is
+// retained.
 func DecodeParamsEndian(b []byte, littleEndian bool) ([]Param, int, error) {
 	var out []Param
 	off := 0
 	for {
-		id, length, ok := paramHeaderAt(b, off, littleEndian)
-		if !ok {
-			return nil, 0, fmt.Errorf("rtps: param header need %d have %d: %w", parameterHeaderSize, len(b)-off, ErrInvalidParam)
+		if len(out) >= maxParamsPerList {
+			return nil, 0, fmt.Errorf("rtps: param count above %d: %w", maxParamsPerList, ErrInvalidParam)
 		}
-		off += parameterHeaderSize
-		if id == PIDSentinel {
-			err := decodePIDSentinel(length)
-			if err != nil {
-				return nil, 0, err
-			}
-			return out, off, nil
-		}
-		if id == PIDPad {
-			value, next, err := copyPIDValue(b, off, length, id)
-			if err != nil {
-				return nil, 0, err
-			}
-			_ = value
-			off = next
-			continue
-		}
-		value, next, err := copyPIDValue(b, off, length, id)
+		done, nextOut, nextOff, err := decodeParamStep(b, off, littleEndian, out)
 		if err != nil {
 			return nil, 0, err
 		}
-		out = append(out, Param{ID: id, Value: value})
-		off = next
+		out = nextOut
+		off = nextOff
+		if done {
+			return out, off, nil
+		}
 	}
+}
+
+// decodeParamStep decodes one parameter at off and reports completion.
+//
+// It returns done true when the sentinel terminates the list. Pad entries
+// advance without surfacing. All errors join ErrInvalidParam loudly.
+func decodeParamStep(b []byte, off int, littleEndian bool, out []Param) (bool, []Param, int, error) {
+	id, length, ok := paramHeaderAt(b, off, littleEndian)
+	if !ok {
+		return false, out, 0, fmt.Errorf("rtps: param header need %d have %d: %w", parameterHeaderSize, len(b)-off, ErrInvalidParam)
+	}
+	off += parameterHeaderSize
+	if id == PIDSentinel {
+		err := decodePIDSentinel(length)
+		if err != nil {
+			return false, out, 0, err
+		}
+		return true, out, off, nil
+	}
+	if id == PIDPad {
+		_, next, err := copyPIDValue(b, off, length, id)
+		if err != nil {
+			return false, out, 0, err
+		}
+		return false, out, next, nil
+	}
+	value, next, err := copyPIDValue(b, off, length, id)
+	if err != nil {
+		return false, out, 0, err
+	}
+	return false, append(out, Param{ID: id, Value: value}), next, nil
 }

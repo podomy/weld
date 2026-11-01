@@ -642,6 +642,12 @@ func MarshalDisposePacket(guid GUID, domain uint32, seq uint64) ([]byte, error) 
 	return frameSPDP(guid.Prefix, data)
 }
 
+// maxSPDPLease caps one announced lease for bounded expiry work.
+//
+// Leases above this bound clamp loudly instead of trusting the peer for
+// hours; the default is 10s and Cyclone peers stay far below the cap.
+const maxSPDPLease = 5 * time.Minute
+
 // ParseAnnouncement parses one RTPS SPDP packet into fields.
 //
 // It decodes the RTPS message, scans submessages for the first DATA
@@ -650,12 +656,15 @@ func MarshalDisposePacket(guid GUID, domain uint32, seq uint64) ([]byte, error) 
 // inline QoS params merge so live Cyclone payloads with a PL_CDR
 // encapsulation header parse under the same rules as inline QoS
 // announcements. Non SPDP DATA is ignored. Key flagged DATA is a
-// dispose with zero lease and no ports.
+// dispose with zero lease and no ports. The GUID prefix must match the
+// RTPS header prefix; mismatches drop loudly instead of installing a
+// spoofed route. Leases above maxSPDPLease clamp loudly to the cap.
+// Zero sequences and dispose anomalies fail loudly.
 func ParseAnnouncement(data []byte) (Announcement, error) {
 	var out Announcement
 	var drops rtps.Counter
 
-	_, raws, err := rtps.DecodeMessage(data, &drops)
+	header, raws, err := rtps.DecodeMessage(data, &drops)
 	if err != nil {
 		return out, fmt.Errorf("dds: decode RTPS message: %w", errors.Join(err, ErrInvalidSPDP))
 	}
@@ -680,6 +689,18 @@ func ParseAnnouncement(data []byte) (Announcement, error) {
 			log.Printf("dds: spdp parse data dropped %d: %v", n, err)
 
 			continue
+		}
+
+		if GUIDPrefix(header.Prefix) != ann.GUID.Prefix {
+			n := spdpParseDrops.Add(1)
+			log.Printf("dds: spdp guid prefix %x mismatches header %x, dropping %d", ann.GUID.Prefix, header.Prefix, n)
+
+			continue
+		}
+
+		if ann.Alive && ann.Lease > maxSPDPLease {
+			log.Printf("dds: spdp lease %v above cap %v, clamping", ann.Lease, maxSPDPLease)
+			ann.Lease = maxSPDPLease
 		}
 
 		return ann, nil
@@ -757,10 +778,12 @@ func announcementIdentity(params []rtps.Param) (GUID, uint32, error) {
 // Key flagged DATA is a dispose carrying GUID plus domain. Other DATA
 // is alive and requires a positive lease plus at least one UDPv4 unicast
 // locator. Missing GUID, zero sequence, over range domain, or absent
-// alive params are explicit errors. Manual liveliness count and builtin
-// endpoint QoS are optional and default to zero when absent; present
-// values must be 4 bytes. Vendor PIDs such as 0x8003, 0x8007, 0x8019,
-// and 0x800c are ignored for matching but preserved by the codec.
+// alive params are explicit errors. Dispose packets with a positive lease
+// or unicast locators are anomalies and fail loudly instead of silently
+// removing. Manual liveliness count and builtin endpoint QoS are optional
+// and default to zero when absent; present values must be 4 bytes. Vendor
+// PIDs such as 0x8003, 0x8007, 0x8019, and 0x800c are ignored for matching
+// but preserved by the codec.
 func announcementFromData(d *rtps.Data) (Announcement, error) {
 	var out Announcement
 
@@ -783,6 +806,12 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 	out.Sequence = d.SequenceNumber
 
 	if d.Key {
+		if hasLeaseParam(params) {
+			return out, fmt.Errorf("dds: dispose carries lease: %w", ErrInvalidSPDP)
+		}
+		if hasUnicastLocatorParam(params) {
+			return out, fmt.Errorf("dds: dispose carries locator: %w", ErrInvalidSPDP)
+		}
 		return out, nil
 	}
 
@@ -796,6 +825,28 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 	announcementSecurityFields(params, &out)
 
 	return out, nil
+}
+
+// hasLeaseParam reports whether a lease param is present.
+func hasLeaseParam(params []rtps.Param) bool {
+	for _, p := range params {
+		if p.ID == rtps.PIDParticipantLeaseDuration {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUnicastLocatorParam reports whether a unicast locator param is present.
+func hasUnicastLocatorParam(params []rtps.Param) bool {
+	for _, p := range params {
+		if p.ID == rtps.PIDMetatrafficUnicastLocator ||
+			p.ID == rtps.PIDDefaultUnicastLocatorStandard ||
+			p.ID == rtps.PIDDefaultUnicastLocator {
+			return true
+		}
+	}
+	return false
 }
 
 // collectParams merges inline QoS and payload params.

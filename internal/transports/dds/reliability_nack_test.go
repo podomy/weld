@@ -563,7 +563,7 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 
 	ctx := t.Context()
 	for range 10 {
-		backend.maybePromptNackOnData(ctx, remote, 5)
+		backend.maybePromptNackOnData(remote, 5)
 	}
 
 	if got := promptNackCountForTest(backend, remote); got != userPromptNackMaxAttempts {

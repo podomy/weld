@@ -140,8 +140,10 @@ var securityHardRequireKeys = map[string]bool{
 //
 // Masks are raw wire values read little endian, matching CycloneDDS wire
 // order; exact bit semantics are out of scope and undocumented here on
-// purpose. Classification is the only decision input. Presence of this
-// record grants nothing and decrypts nothing.
+// purpose. Classification is the only decision input. Presence flags record
+// PID sightings even when the value is malformed so classification stays
+// fail-closed instead of treating a malformed secured peer as unsecured.
+// Presence of this record grants nothing and decrypts nothing.
 type SecurityInfo struct {
 	// Present reports any security PID or dds.sec.* property was seen.
 	Present bool
@@ -161,6 +163,8 @@ type SecurityInfo struct {
 	DataTagsPresent bool
 	// IdentityStatusPresent reports PID 0x1006 was seen.
 	IdentityStatusPresent bool
+	// PropertyListPresent reports PID 0x0059 was seen, even when malformed.
+	PropertyListPresent bool
 	// Properties holds decoded key-value properties, including dds.sec.* entries.
 	Properties map[string]string
 	// Classification is the peer posture derived from markers and properties.
@@ -311,21 +315,26 @@ func ExtractSecurityInfo(params []rtps.Param) (SecurityInfo, []error) {
 
 // applySecurityParam folds one param into the record, returning a loud
 // warning for malformed security values and nil for clean or ignored params.
+//
+// PID presence is recorded even when the value is malformed so
+// classification stays fail-closed: a malformed secured peer never reads
+// as unsecured. Malformed masks keep zero attributes but keep the presence
+// flag; malformed property lists keep the list flag with no properties.
 func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 	switch p.ID {
 	case PIDParticipantSecurityInfo:
+		info.HasParticipantSecurityInfo = true
 		mask, err := parseSecurityAttributes(p.Value)
 		if err != nil {
 			return fmt.Errorf("dds: security participant info: %w", err)
 		}
-		info.HasParticipantSecurityInfo = true
 		info.ParticipantSecurityAttributes = mask
 	case PIDEndpointSecurityInfo:
+		info.HasEndpointSecurityInfo = true
 		mask, err := parseSecurityAttributes(p.Value)
 		if err != nil {
 			return fmt.Errorf("dds: security endpoint info: %w", err)
 		}
-		info.HasEndpointSecurityInfo = true
 		info.EndpointSecurityAttributes = mask
 	case PIDIdentityToken:
 		info.IdentityTokenPresent = true
@@ -336,6 +345,7 @@ func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 	case PIDIdentityStatusToken:
 		info.IdentityStatusPresent = true
 	case PIDPropertyList:
+		info.PropertyListPresent = true
 		props, err := ParseSecurityPropertyList(p.Value)
 		if err != nil {
 			return fmt.Errorf("dds: security property list: %w", err)
@@ -363,7 +373,8 @@ func securityMarkersSeen(info *SecurityInfo) bool {
 		info.IdentityTokenPresent ||
 		info.PermissionsTokenPresent ||
 		info.DataTagsPresent ||
-		info.IdentityStatusPresent
+		info.IdentityStatusPresent ||
+		info.PropertyListPresent
 }
 
 // finalizeSecurityInfo derives presence and posture from markers and properties.
@@ -426,7 +437,8 @@ func ParseSecurityPropertyList(value []byte) (map[string]string, error) {
 // single propagate byte plus pad after each value; the parser accepts
 // that shape too by falling back to a propagate skip when the next bytes
 // do not validate as a string header. Genuinely malformed entries still
-// fail loudly.
+// fail loudly. Trailing bytes past the declared entries fail loudly
+// instead of decoding silently.
 func parseSecurityPropertyListEndian(value []byte, littleEndian bool) (map[string]string, error) {
 	if len(value) < 4 {
 		return nil, fmt.Errorf("dds: security property count need 4 have %d: %w", len(value), ErrSecurityPropertyInvalid)
@@ -459,6 +471,10 @@ func parseSecurityPropertyListEndian(value []byte, littleEndian bool) (map[strin
 		}
 
 		off = next
+	}
+
+	if off != len(value) {
+		return nil, fmt.Errorf("dds: security property list has %d trailing bytes: %w", len(value)-off, ErrSecurityPropertyInvalid)
 	}
 
 	return props, nil
@@ -584,19 +600,19 @@ func DropProtectedSubmessage(r *DataReceiver, id byte) error {
 // It returns handled false with nil error for ordinary submessages so the
 // normal path keeps flowing untouched. Protected kinds count one
 // secured-transform-unavailable drop and return a loud error. This is the
-// one-line hook for the datapath demux; see INTEGRATION below.
+// one-line hook for the datapath demux.
 //
-// INTEGRATION:
-//   - spdp.go announcementFromData (spdp.go:686): after collectParams,
-//     call ExtractSecurityInfo(params) and carry the SecurityInfo on the
-//     participant record; on CheckProtectedDiscovery error, log loudly and
-//     keep the unsecured path.
-//   - sedp.go sedpEndpointFields (sedp.go:1857): after byID assembly, call
-//     ExtractSecurityInfo on inline plus payload params and carry the
+// INTEGRATION state: pure tolerance helpers are done here, including PID
+// presence recorded even when malformed for fail-closed classification and
+// strict trailing-length checks on property lists. Wiring stays out:
+//   - spdp.go announcementFromData: after collectParams, call
+//     ExtractSecurityInfo and carry SecurityInfo on the participant record;
+//     on CheckProtectedDiscovery error, log loudly and keep the unsecured path.
+//   - sedp.go sedpEndpointFields: after byID assembly, call
+//     ExtractSecurityInfo on inline plus payload params and carry
 //     SecurityInfo on SEDPEndpoint.
-//   - backend.go routeBuiltinSub/dispatchRTPS (backend.go:2246/2178):
-//     before DecodeSubmessage, call HandleProtectedSubmessage(r, sub) and
-//     continue the loop when handled is true.
+//   - backend.go routeBuiltinSub/dispatchRTPS: before DecodeSubmessage,
+//     call HandleProtectedSubmessage and continue when handled is true.
 //   - sdk/cli config plumbing: construct SecurityConfig from flags or
 //     files, call Validate, pass into backend construction. No call site
 //     exists yet.

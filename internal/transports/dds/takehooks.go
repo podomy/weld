@@ -290,13 +290,13 @@ type takeHookSnapshot struct {
 // The fast path is one short RLock. When a topic carries a liveliness
 // config but the writer has no tracker yet, the tracker is created under
 // a full Lock so writers discovered after subscribe are still enforced
-// from their first take. The lively map has no eviction: entries are
-// created lazily per writer GUID and deleted only by explicit tracker
-// clear. The bound is the matched writer set, not the wire: a spoofed
-// GUID reaches this map only after SEDP matching admits the writer, so
-// unauthenticated traffic cannot grow it without a matching SEDP
-// announce first. No cap is added; capping would drop enforcement for
-// legitimate writers.
+// from their first take. The lively map has no eviction by design: entries
+// are created lazily per writer GUID and deleted only by explicit tracker
+// clear or UnsetLivelinessTrackerForTopic. The bound is the matched writer
+// set, not the wire: a spoofed GUID reaches this map only after SEDP
+// matching admits the writer, so unauthenticated traffic cannot grow it
+// without a matching SEDP announce first. No cap is added; capping would
+// drop enforcement for legitimate writers.
 func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHookSnapshot {
 	r.mu.RLock()
 	snap := takeHookSnapshot{
@@ -327,8 +327,10 @@ func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHook
 // topic and installs trackers for currently matched writers.
 //
 // Writers discovered later get trackers lazily on first take, so the
-// contract holds without re-subscribing. A nil lease config clears the
-// contract; explicit nil writer lists only store the config.
+// contract holds without re-subscribing. Reconfiguration updates existing
+// writers in place through Reconfigure so a lease or kind change applies
+// without resetting outage history. Explicit nil writer lists only store
+// the config.
 func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.LivelinessPolicy, lease core.Duration, writers []WriterGUID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -344,12 +346,39 @@ func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.Live
 	}
 
 	for _, guid := range writers {
-		if _, ok := r.lively[guid]; ok {
+		if existing, ok := r.lively[guid]; ok {
+			existing.Reconfigure(kind, lease)
+
 			continue
 		}
 
 		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), kind, lease, time.Now().UnixNano())
 		r.lively[guid] = &tracker
+	}
+}
+
+// UnsetLivelinessTrackerForTopic removes the liveliness contract for one
+// topic plus every tracker installed for that topic.
+//
+// It deletes the per-topic config and scans the lively map for trackers
+// whose topic matches, so lazy trackers created on first take do not
+// outlive the subscription. Writers on other topics are untouched. It
+// self-locks and is safe for concurrent use.
+func (r *DataReceiver) UnsetLivelinessTrackerForTopic(topic string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.livelyCfg, topic)
+
+	for guid, tracker := range r.lively {
+		if tracker == nil {
+			delete(r.lively, guid)
+
+			continue
+		}
+		if tracker.Topic() == topic {
+			delete(r.lively, guid)
+		}
 	}
 }
 
@@ -465,10 +494,14 @@ func applyKeyedHook(typeIDL string, payload []byte) *takeHookReject {
 // evalLivelinessHook records the sample and gates delivery by writer state.
 //
 // Automatic writers record each sample; manual writers only assert through
-// the explicit API. Expired writers drop loudly naming lease duration.
-// Stale writers hold without counting. Missing trackers or topics pass
-// through untouched, preserving the unwatched take path exactly. The
-// snapshot carries preloaded pointers, so this never takes receiver locks.
+// the explicit API. Accepted samples anchor the deadline tracker through
+// MarkSeen so enforcement follows traffic, not registration time. Expired
+// writers drop loudly naming lease duration. Stale writers hold without
+// counting. Missing trackers or topics pass through untouched, preserving
+// the unwatched take path exactly, with accepted samples still anchoring
+// the deadline window. Out-of-range gate decisions fail closed with a loud
+// drop naming the invalid decision instead of delivering. The snapshot
+// carries preloaded pointers, so this never takes receiver locks.
 func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
 	now := time.Now().UnixNano()
 
@@ -487,6 +520,10 @@ func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
 			}
 		}
 
+		if snap.deadline != nil {
+			snap.deadline.MarkSeen(now)
+		}
+
 		return nil
 	}
 
@@ -495,6 +532,10 @@ func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
 
 	switch outcome.Decision {
 	case core.GateDeliver:
+		if snap.deadline != nil {
+			snap.deadline.MarkSeen(now)
+		}
+
 		return nil
 	case core.GateHold:
 		return &takeHookReject{err: fmt.Errorf("dds: take held stale writer: %w", ErrLivelinessHold)}
@@ -510,7 +551,7 @@ func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
 
 		return &takeHookReject{
 			reason: &reason,
-			err:    fmt.Errorf("dds: take expired writer: %w", errors.Join(ErrLivelinessExpired, errors.New(outcome.Reason))),
+			err:    fmt.Errorf("dds: take invalid gate decision %d: %w", int(outcome.Decision), errors.Join(ErrLivelinessExpired, errors.New("invalid gate decision"))),
 		}
 	}
 }

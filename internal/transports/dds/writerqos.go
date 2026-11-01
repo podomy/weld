@@ -522,13 +522,115 @@ func (q WireQoS) encodeLiveliness() []byte {
 	return out
 }
 
-// Params renders q as SEDP inline QoS params in canonical order.
+// Validate checks that q carries only announcable wire values.
 //
-// Order is reliability, history, durability, then deadline, lifespan, and
-// liveliness: the first three keep their existing SerializeSEDPDATA
-// relative order and the new PIDs append after, so a future announce call
-// site can splice this list in without reordering the old bytes.
-func (q WireQoS) Params() []rtps.Param {
+// It mirrors the forward contract: reliability best effort or reliable,
+// durability volatile or transient local, history keep last with positive
+// depth or keep all with zero depth, liveliness automatic or manual by
+// topic, and durations either infinite or finite in DDS range with
+// nanoseconds below one second. Blocking matches reliability: infinite for
+// reliable, zero for best effort. Failures return a loud
+// WireQoSParseRefusal naming the policy so callers fail closed before
+// encoding. It never touches topic context; forward refusals with topic
+// come from ForwardQoS.
+// validateWireReliability checks the reliability kind plus blocking time.
+func (q WireQoS) validateWireReliability() error {
+	if q.ReliabilityKind != sedpReliabilityReliable && q.ReliabilityKind != writerQoSReliabilityBestEffort {
+		return refuseParseError(core.PolicyReliability, "reliability kind %d is unknown", q.ReliabilityKind)
+	}
+
+	if q.ReliabilityKind == sedpReliabilityReliable {
+		if !q.MaxBlockingTime.IsInfinite() {
+			return refuseParseError(core.PolicyReliability, "reliable blocking must be infinite")
+		}
+	} else if !q.MaxBlockingTime.IsZero() {
+		return refuseParseError(core.PolicyReliability, "best effort blocking must be zero")
+	}
+
+	return nil
+}
+
+// validateWireHistory checks the history kind plus depth.
+func (q WireQoS) validateWireHistory() error {
+	if q.HistoryKind != sedpHistoryKeepLast && q.HistoryKind != writerQoSHistoryKeepAll {
+		return refuseParseError(WriterPolicyHistory, "history kind %d is unknown", q.HistoryKind)
+	}
+
+	if q.HistoryKind == sedpHistoryKeepLast {
+		if q.Depth == 0 {
+			return refuseParseError(WriterPolicyHistory, "keep last depth 0 is not resolved")
+		}
+	} else if q.Depth != 0 {
+		return refuseParseError(WriterPolicyHistory, "keep all depth %d must be zero", q.Depth)
+	}
+
+	return nil
+}
+
+func (q WireQoS) Validate() error {
+	if err := q.validateWireReliability(); err != nil {
+		return err
+	}
+
+	if q.DurabilityKind != sedpDurabilityVolatile && q.DurabilityKind != sedpDurabilityTransientLocal {
+		return refuseParseError(core.PolicyDurability, "durability kind %d is not announcable", q.DurabilityKind)
+	}
+
+	if err := q.validateWireHistory(); err != nil {
+		return err
+	}
+
+	if err := validateWireDuration(q.Deadline, core.PolicyDeadline); err != nil {
+		return err
+	}
+
+	if err := validateWireDuration(q.Lifespan, WriterPolicyLifespan); err != nil {
+		return err
+	}
+
+	if q.LivelinessKind != writerQoSLivelinessAutomatic && q.LivelinessKind != writerQoSLivelinessManualByTopic {
+		return refuseParseError(core.PolicyLiveliness, "liveliness kind %d is not announcable", q.LivelinessKind)
+	}
+
+	if err := validateWireDuration(q.LeaseDuration, core.PolicyLeaseDuration); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateWireDuration checks one wire duration is infinite or finite in range.
+func validateWireDuration(d WireDuration, policy WriterPolicyKind) error {
+	if d.IsInfinite() {
+		return nil
+	}
+
+	if d.Seconds < 0 {
+		return refuseParseError(policy, "negative wire seconds %d", d.Seconds)
+	}
+
+	if d.Seconds > writerQoSMaxFiniteSeconds {
+		return refuseParseError(policy, "finite seconds %d above DDS range", d.Seconds)
+	}
+
+	if d.Nanoseconds >= writerQoSNanosPerSecond {
+		return refuseParseError(policy, "nanoseconds %d above range", d.Nanoseconds)
+	}
+
+	return nil
+}
+
+// ValidatedParams renders q as SEDP params after validation.
+//
+// It validates before encoding so an invalid WireQoS fails loudly with the
+// refusing policy instead of announcing bad bytes. The error preserves the
+// loud refusal end to end through the SEDP announce path.
+func (q WireQoS) ValidatedParams() ([]rtps.Param, error) {
+	err := q.Validate()
+	if err != nil {
+		return nil, err
+	}
+
 	return []rtps.Param{
 		{ID: rtps.PIDReliability, Value: q.encodeReliability()},
 		{ID: rtps.PIDHistory, Value: q.encodeHistory()},
@@ -536,7 +638,27 @@ func (q WireQoS) Params() []rtps.Param {
 		{ID: writerQoSPIDDeadline, Value: q.Deadline.encode()},
 		{ID: writerQoSPIDLifespan, Value: q.Lifespan.encode()},
 		{ID: writerQoSPIDLiveliness, Value: q.encodeLiveliness()},
+	}, nil
+}
+
+// Params renders q as SEDP inline QoS params in canonical order.
+//
+// Order is reliability, history, durability, then deadline, lifespan, and
+// liveliness: the first three keep their existing SerializeSEDPDATA
+// relative order and the new PIDs append after, so a future announce call
+// site can splice this list in without reordering the old bytes. It
+// validates before encoding and panics loudly on invalid input because a
+// manually constructed invalid WireQoS is a programmer error; production
+// ForwardQoS output always validates. Callers that need an error instead
+// of a panic must use ValidatedParams, which the SEDP announce path uses
+// to preserve the loud refusal end to end.
+func (q WireQoS) Params() []rtps.Param {
+	params, err := q.ValidatedParams()
+	if err != nil {
+		panic(err)
 	}
+
+	return params
 }
 
 // parseWireReliability decodes the required reliability PID value.
@@ -854,18 +976,69 @@ func ReverseQoS(q WireQoS) (core.QoSProfile, error) {
 	return out, nil
 }
 
+// reverseRxOWithPolicy translates only RxO-relevant wire fields back for matching.
+//
+// It reverses reliability, durability, deadline, liveliness, and lease and
+// delegates to core.CheckCompatibility, so history, depth, lifespan, and the
+// avoidance flag never affect the verdict, matching the documented contract
+// and core semantics. Non-RxO translation failures are ignored; RxO failures
+// yield a refusing policy for the loud incompatible report. ReverseQoS stays
+// for callers that need the full profile including history and lifespan.
+func reverseRxOWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
+	var out core.QoSProfile
+
+	reliability, policy, err := reverseReliability(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Reliability = reliability
+
+	durability, policy, err := reverseDurability(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Durability = durability
+
+	liveliness, policy, err := reverseLiveliness(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Liveliness = liveliness
+
+	deadline, err := reverseWireDuration(q.Deadline, core.PolicyDeadline)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyDeadline, err
+	}
+
+	out.Deadline = deadline
+
+	lease, err := reverseWireDuration(q.LeaseDuration, core.PolicyLeaseDuration)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyLeaseDuration, err
+	}
+
+	out.LeaseDuration = lease
+
+	return out, "", nil
+}
+
 // CheckWireCompatibility applies the core RxO rules to translated wire values.
 //
-// It reverses both sides back to core profiles and delegates to
+// It reverses only RxO-relevant fields (reliability, durability, deadline,
+// liveliness, lease) back to core profiles and delegates to
 // core.CheckCompatibility, so the verdict reuses the exact matcher
-// semantics for reliability, durability, deadline, liveliness, and lease:
-// translated offers match identically to facade offers. A side that fails
-// reverse translation yields an incompatible report naming the refusing
-// policy instead of flowing silently. History, depth, lifespan, and the
-// avoidance flag never affect the result, matching core.
+// semantics for those policies: translated offers match identically to
+// facade offers. History, depth, lifespan, and the avoidance flag never
+// affect the result, matching core. A side that fails RxO reverse
+// translation yields an incompatible report naming the refusing policy
+// instead of flowing silently. ReverseQoS stays for callers that need the
+// full profile.
 func CheckWireCompatibility(offered, requested WireQoS) core.CompatibilityReport {
-	offeredProfile, offeredPolicy, offeredErr := reverseWithPolicy(offered)
-	requestedProfile, requestedPolicy, requestedErr := reverseWithPolicy(requested)
+	offeredProfile, offeredPolicy, offeredErr := reverseRxOWithPolicy(offered)
+	requestedProfile, requestedPolicy, requestedErr := reverseRxOWithPolicy(requested)
 
 	if offeredErr != nil || requestedErr != nil {
 		report := core.CompatibilityReport{Compatible: false}

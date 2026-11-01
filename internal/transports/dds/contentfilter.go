@@ -35,19 +35,25 @@ package dds
 // Notes on the subset: comparisons work on scalar numeric, string, and bool
 // fields including nested dotted paths such as header.frame_id. BETWEEN is
 // inclusive on both ends. IN holds one or more operands. LIKE matches %
-// against any run of chars and _ against exactly one char, and is case
+// against any run of runes and _ against exactly one rune, and is case
 // sensitive. AND binds tighter than OR, NOT binds tightest, and parens
-// group explicitly. A bare boolean field or literal reads as a predicate.
-// Keywords are case insensitive, field names are case sensitive. Strings
-// use single quotes with '' as an escaped quote. Numeric, string, and bool
-// operands never mix in one comparison: mixing yields an eval error, never
-// a silent false. Array and sequence fields are not filterable: decoding
-// skips them to keep later field offsets right, and referencing one yields
-// an eval error.
+// group explicitly. AND and OR short-circuit: the right side never evaluates
+// when the left decides the outcome, so a skipped error never surfaces. A
+// bare boolean field or literal reads as a predicate. Keywords are case
+// insensitive, field names are case sensitive. Strings use single quotes
+// with '' as an escaped quote. Integer literals without fraction or exponent
+// that fit int64 compare as exact int64; anything else compares as float64.
+// NaN never matches: any comparison with NaN reports false with no error.
+// Numeric, string, and bool operands never mix in one comparison: mixing
+// yields an eval error, never a silent false. Array and sequence fields are
+// not filterable: decoding skips them to keep later field offsets right,
+// and referencing one yields an eval error. Expressions above 1024 tokens or
+// nested deeper than 32 NOT plus paren levels refuse loudly at compile time.
 
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -75,6 +81,19 @@ var (
 	ErrContentFilterEvalError = errors.New("dds: content filter eval error")
 	// ErrContentFilterParse reports a filter expression that failed to parse.
 	ErrContentFilterParse = errors.New("dds: content filter parse error")
+)
+
+// Content filter expression limits bound adversarial inputs.
+//
+// Token count caps lexer output so a megabyte of operators cannot exhaust
+// memory. Nesting depth caps NOT chains plus parenthesized groups so deeply
+// nested input cannot exhaust the call stack. Both refuse loudly with the
+// parse sentinel instead of truncating silently.
+const (
+	// maxFilterTokens caps lexer tokens in one expression excluding EOF.
+	maxFilterTokens = 1024
+	// maxFilterDepth caps NOT plus paren nesting in one expression.
+	maxFilterDepth = 32
 )
 
 // ParseError is a typed filter parse failure naming the byte position.
@@ -127,6 +146,10 @@ type filterToken struct {
 	kind filterTokenKind
 	text string
 	num  float64
+	// isInt reports the literal parsed as an exact int64.
+	isInt bool
+	// ival holds the exact int64 value when isInt is true.
+	ival int64
 	pos  int
 }
 
@@ -215,6 +238,9 @@ func lexFilterNext(expr string, i int) (filterToken, int, error) {
 }
 
 // lexFilter tokenizes one filter expression, naming positions on failure.
+//
+// Token count above maxFilterTokens refuses loudly with the parse sentinel
+// instead of growing without bound.
 func lexFilter(expr string) ([]filterToken, error) {
 	var toks []filterToken
 
@@ -232,6 +258,10 @@ func lexFilter(expr string) ([]filterToken, error) {
 		}
 
 		toks = append(toks, tok)
+		if len(toks) > maxFilterTokens {
+			return nil, &ParseError{Pos: tok.pos, Msg: fmt.Sprintf("expression exceeds %d tokens", maxFilterTokens)}
+		}
+
 		i = next
 	}
 
@@ -276,6 +306,10 @@ func scanFilterExponent(expr string, e int) (int, error) {
 }
 
 // lexFilterNumber scans one numeric literal starting at a digit.
+//
+// Integer text without fraction or exponent parses as an exact int64 when
+// it fits, so large counters compare exactly instead of through float64.
+// Anything else parses as float64. Malformed text refuses loudly.
 func lexFilterNumber(expr string, start int) (filterToken, int, error) {
 	i := scanFilterDigits(expr, start)
 	i = scanFilterFraction(expr, i)
@@ -290,6 +324,13 @@ func lexFilterNumber(expr string, start int) (filterToken, int, error) {
 	}
 
 	text := expr[start:i]
+
+	if !strings.ContainsAny(text, ".eE") {
+		ival, err := strconv.ParseInt(text, 10, 64)
+		if err == nil {
+			return filterToken{kind: tokNumber, text: text, num: float64(ival), isInt: true, ival: ival, pos: start}, i, nil
+		}
+	}
 
 	num, err := strconv.ParseFloat(text, 64)
 	if err != nil {
@@ -407,6 +448,8 @@ func lexFilterSymbol(expr string, i int) (filterToken, int, bool) {
 type filterParser struct {
 	toks []filterToken
 	pos  int
+	// depth tracks NOT plus paren nesting against maxFilterDepth.
+	depth int
 }
 
 // peek returns the current token without consuming it.
@@ -580,8 +623,17 @@ func (p *filterParser) parseAnd() (filterNode, error) {
 }
 
 // parseNot parses one optional NOT prefix.
+//
+// NOT chains nest against maxFilterDepth so adversarial input cannot
+// exhaust the call stack.
 func (p *filterParser) parseNot() (filterNode, error) {
 	if p.peek().kind == tokNot {
+		if p.depth >= maxFilterDepth {
+			return nil, p.fail(fmt.Sprintf("filter nesting exceeds %d", maxFilterDepth))
+		}
+		p.depth++
+		defer func() { p.depth-- }()
+
 		p.next()
 
 		inner, err := p.parseNot()
@@ -596,22 +648,49 @@ func (p *filterParser) parseNot() (filterNode, error) {
 }
 
 // parsePredicate parses one comparison, BETWEEN, IN, LIKE, group, or bare operand.
+//
+// Parenthesized groups nest against maxFilterDepth so adversarial input
+// cannot exhaust the call stack.
+// parseParenPredicate parses a parenthesized subexpression. The caller has
+// already seen the opening parenthesis; depth is enforced before descending.
+func (p *filterParser) parseParenPredicate() (filterNode, error) {
+	if p.depth >= maxFilterDepth {
+		return nil, p.fail(fmt.Sprintf("filter nesting exceeds %d", maxFilterDepth))
+	}
+	p.depth++
+	defer func() { p.depth-- }()
+
+	p.next()
+
+	inner, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.peek().kind != tokRParen {
+		return nil, p.fail("missing closing parenthesis")
+	}
+
+	p.next()
+
+	return inner, nil
+}
+
+// parseNotSuffix parses NOT followed by BETWEEN, IN, or LIKE.
+func (p *filterParser) parseNotSuffix(left filterNode) (filterNode, error) {
+	switch p.peekAt(1).kind { //nolint:exhaustive // default rejects NOT not followed by BETWEEN, IN, or LIKE
+	case tokBetween, tokIn, tokLike:
+		p.next()
+
+		return p.parseSuffix(left, true)
+	default:
+		return nil, p.fail("NOT must precede AND, OR, BETWEEN, IN, or LIKE")
+	}
+}
+
 func (p *filterParser) parsePredicate() (filterNode, error) {
 	if p.peek().kind == tokLParen {
-		p.next()
-
-		inner, err := p.parseOr()
-		if err != nil {
-			return nil, err
-		}
-
-		if p.peek().kind != tokRParen {
-			return nil, p.fail("missing closing parenthesis")
-		}
-
-		p.next()
-
-		return inner, nil
+		return p.parseParenPredicate()
 	}
 
 	left, err := p.parseOperand()
@@ -632,14 +711,7 @@ func (p *filterParser) parsePredicate() (filterNode, error) {
 	case tokBetween, tokIn, tokLike:
 		return p.parseSuffix(left, false)
 	case tokNot:
-		switch p.peekAt(1).kind { //nolint:exhaustive // default rejects NOT not followed by BETWEEN, IN, or LIKE
-		case tokBetween, tokIn, tokLike:
-			p.next()
-
-			return p.parseSuffix(left, true)
-		default:
-			return nil, p.fail("NOT must precede AND, OR, BETWEEN, IN, or LIKE")
-		}
+		return p.parseNotSuffix(left)
 	default:
 		return left, nil
 	}
@@ -765,12 +837,32 @@ func (p *filterParser) parseOperandField(tok filterToken) (filterNode, error) {
 }
 
 // parseOperandSigned parses a signed numeric literal starting at sign.
+//
+// Integer text without fraction or exponent stays an exact int64, including
+// the minimum int64 spelled as minus plus 9223372036854775808. Anything
+// else stays float64.
 func (p *filterParser) parseOperandSigned(sign filterToken) (filterNode, error) {
 	p.next()
 
 	num, err := p.nextNumber()
 	if err != nil {
 		return nil, err
+	}
+
+	if num.isInt {
+		if sign.kind == tokMinus {
+			return literalNode{val: numSignedValue(-num.ival)}, nil
+		}
+
+		return literalNode{val: numSignedValue(num.ival)}, nil
+	}
+
+	if sign.kind == tokMinus && !strings.ContainsAny(num.text, ".eE") {
+		negText := "-" + num.text
+		ival, perr := strconv.ParseInt(negText, 10, 64)
+		if perr == nil {
+			return literalNode{val: numSignedValue(ival)}, nil
+		}
 	}
 
 	if sign.kind == tokMinus {
@@ -781,10 +873,17 @@ func (p *filterParser) parseOperandSigned(sign filterToken) (filterNode, error) 
 }
 
 // parseOperandAtom parses one unsigned literal token.
+//
+// Integer text without fraction or exponent becomes an exact int64 value
+// when it fits; anything else becomes float64.
 func (p *filterParser) parseOperandAtom(tok filterToken) (filterNode, error) {
 	switch tok.kind { //nolint:exhaustive // default rejects non-literal tokens with a typed error
 	case tokNumber:
 		p.next()
+
+		if tok.isInt {
+			return literalNode{val: numSignedValue(tok.ival)}, nil
+		}
 
 		return literalNode{val: numFloatValue(tok.num)}, nil
 	case tokString:
@@ -1019,20 +1118,23 @@ func compareFilterNums(a, b filterNum) int {
 // likeMatch reports whether s matches pattern with % and _ wildcards.
 //
 // Percent matches any run including empty, underscore matches exactly one
-// char, and all other chars match literally. Matching is case sensitive.
+// rune, and all other runes match literally. Matching runs on runes, not
+// bytes, so multibyte characters count as one. Matching is case sensitive.
 func likeMatch(s, pattern string) bool {
+	sRunes := []rune(s)
+	pRunes := []rune(pattern)
 	si, pi := 0, 0
 	star, mark := -1, 0
 
-	for si < len(s) {
-		if pi < len(pattern) && (pattern[pi] == '_' || pattern[pi] == s[si]) {
+	for si < len(sRunes) {
+		if pi < len(pRunes) && (pRunes[pi] == '_' || pRunes[pi] == sRunes[si]) {
 			si++
 			pi++
 
 			continue
 		}
 
-		if pi < len(pattern) && pattern[pi] == '%' {
+		if pi < len(pRunes) && pRunes[pi] == '%' {
 			star = pi
 			mark = si
 			pi++
@@ -1051,11 +1153,11 @@ func likeMatch(s, pattern string) bool {
 		return false
 	}
 
-	for pi < len(pattern) && pattern[pi] == '%' {
+	for pi < len(pRunes) && pRunes[pi] == '%' {
 		pi++
 	}
 
-	return pi == len(pattern)
+	return pi == len(pRunes)
 }
 
 // decodeFilterFields decodes one XCDR1 sample into dotted-path field values.
@@ -1453,19 +1555,36 @@ func evalFilterValue(node filterNode, fields map[string]filterValue) (filterValu
 }
 
 // evalFilterLogic evaluates one AND or OR of two predicates.
+//
+// Evaluation is lazy with short-circuit semantics: AND skips the right side
+// when the left is false and OR skips the right side when the left is true,
+// so an error on the skipped side never surfaces. Documented by design.
 func evalFilterLogic(n logicNode, fields map[string]filterValue) (bool, error) {
 	left, err := evalFilterPredicate(n.left, fields)
 	if err != nil {
 		return false, err
 	}
 
+	if n.op == tokAnd {
+		if !left {
+			return false, nil
+		}
+
+		right, err := evalFilterPredicate(n.right, fields)
+		if err != nil {
+			return false, err
+		}
+
+		return left && right, nil
+	}
+
+	if left {
+		return true, nil
+	}
+
 	right, err := evalFilterPredicate(n.right, fields)
 	if err != nil {
 		return false, err
-	}
-
-	if n.op == tokAnd {
-		return left && right, nil
 	}
 
 	return left || right, nil
@@ -1539,6 +1658,37 @@ func evalFilterCmp(n cmpNode, fields map[string]filterValue) (bool, error) {
 }
 
 // compareFilterValues applies one comparison operator to two values.
+//
+// NaN never matches: any comparison with a NaN operand reports false with
+// no error, including equality and inequality, so corrupt floats filter out
+// instead of matching or erroring.
+// compareFilterNumsOrdered applies one operator to two numbers.
+//
+// NaN never matches: any comparison with a NaN operand reports false with
+// no error, including equality and inequality, so corrupt floats filter out
+// instead of matching or erroring.
+func compareFilterNumsOrdered(op filterTokenKind, left, right filterNum) (bool, error) {
+	if isFilterNaN(left) || isFilterNaN(right) {
+		return false, nil
+	}
+
+	return compareFilterOp(op, compareFilterNums(left, right)), nil
+}
+
+// compareFilterBool applies one operator to two booleans.
+//
+// Only equality operators apply; ordering operators fail loudly.
+func compareFilterBool(op filterTokenKind, left, right bool) (bool, error) {
+	switch op { //nolint:exhaustive // default rejects non-equality bool operators with a typed error
+	case tokEq:
+		return left == right, nil
+	case tokNe:
+		return left != right, nil
+	default:
+		return false, errors.New("dds: content filter eval bool supports only = and <>") //nolint:wrapcheck // new error, nothing to wrap
+	}
+}
+
 func compareFilterValues(op filterTokenKind, left, right filterValue) (bool, error) {
 	if left.kind == fvNull || right.kind == fvNull {
 		return false, errors.New("dds: content filter eval null comparison") //nolint:wrapcheck // new error, nothing to wrap
@@ -1554,18 +1704,11 @@ func compareFilterValues(op filterTokenKind, left, right filterValue) (bool, err
 
 	switch left.kind {
 	case fvNum:
-		return compareFilterOp(op, compareFilterNums(left.num, right.num)), nil
+		return compareFilterNumsOrdered(op, left.num, right.num)
 	case fvStr:
 		return compareFilterOp(op, strings.Compare(left.str, right.str)), nil
 	case fvBool:
-		switch op { //nolint:exhaustive // default rejects non-equality bool operators with a typed error
-		case tokEq:
-			return left.boolean == right.boolean, nil
-		case tokNe:
-			return left.boolean != right.boolean, nil
-		default:
-			return false, errors.New("dds: content filter eval bool supports only = and <>") //nolint:wrapcheck // new error, nothing to wrap
-		}
+		return compareFilterBool(op, left.boolean, right.boolean)
 	case fvNull, fvUnsupported:
 		return false, fmt.Errorf(
 			"dds: content filter eval cannot compare %s values",
@@ -1577,6 +1720,17 @@ func compareFilterValues(op filterTokenKind, left, right filterValue) (bool, err
 			valueKindName(left.kind),
 		)
 	}
+}
+
+// isFilterNaN reports whether n is a float NaN.
+//
+// Only float flavor can be NaN; integer flavors never are.
+func isFilterNaN(n filterNum) bool {
+	if n.flavor != numFloat {
+		return false
+	}
+
+	return math.IsNaN(n.f)
 }
 
 // compareFilterOp maps one ordering to one comparison operator result.

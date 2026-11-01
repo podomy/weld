@@ -219,15 +219,18 @@ func PartitionsMatch(requested, offered []string) bool {
 // CheckCompatibility offered then requested order in internal/core
 // matcher.go. Either list may be nil or empty for the default partition.
 // The result is pure: it validates nothing and treats every element as
-// opaque bytes, so callers validate at declare and parse time.
+// opaque bytes, so callers validate at declare and parse time. Detail always
+// carries the normalized offered and requested lists for logs, empty on no
+// path because normalization is total.
 func MatchPartitions(offered, requested []string) PartitionMatchOutcome {
 	want := normalizePartitions(requested)
 	have := normalizePartitions(offered)
+	detail := "requested=" + partitionListString(want) + " offered=" + partitionListString(have)
 
 	for _, r := range want {
 		for _, o := range have {
 			if partitionPairMatches(r, o) {
-				return PartitionMatchOutcome{Matched: true, Reason: PartitionMismatchNone}
+				return PartitionMatchOutcome{Matched: true, Reason: PartitionMismatchNone, Detail: detail}
 			}
 		}
 	}
@@ -235,7 +238,7 @@ func MatchPartitions(offered, requested []string) PartitionMatchOutcome {
 	return PartitionMatchOutcome{
 		Matched: false,
 		Reason:  PartitionMismatchNoCommonPartition,
-		Detail:  "requested=" + partitionListString(want) + " offered=" + partitionListString(have),
+		Detail:  detail,
 	}
 }
 
@@ -476,11 +479,10 @@ func PartitionRouteKey(ddsTopic string, partitions []string) string {
 	return ddsTopic + "\x00" + strings.Join(sorted, "\x00")
 }
 
-// INTEGRATION hooks needing new signatures in existing files (read only here):
+// INTEGRATION state: per-participant tables are the recorded design, so no
+// participant-level partition announce exists here. SEDP endpoints carry
+// the partition contract; SPDP stays partition free by design.
 //
-// INTEGRATION: spdp.go: announce participant partitions with
-//   MarshalAlivePacketWithPartitions(guid GUID, domain uint32, seq uint64, lease time.Duration, partitions []string)
-//   carrying a participant-level PIDPartition param, and extend Announcement with Partitions []string parsed back.
 // INTEGRATION: DONE sedp.go: SEDPEndpoint carries Partitions []string,
 //   SerializeSEDPDATA appends PartitionParam, sedpEndpointFields decodes
 //   PID_PARTITION via FindPartitionParam, and declare plus validate paths

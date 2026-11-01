@@ -387,8 +387,71 @@ func NegotiateDepth(requestedDepth, peerDepth uint64, peerVendor PeerVendor) Eff
 // impose no bound; -1 means unlimited. Zero here follows the
 // DurabilityServiceQoS struct contract where 0 is unstated and only
 // positive values constrain; see CheckDurabilityServiceCompat for the
-// same rule on the matching path.
+// same rule on the matching path. This is the keyless single-instance
+// entry: it assumes one instance so per-instance caps bound the total.
+// Keyed topics must use ReplayBoundWithInstances with the live instance
+// count instead of sharing this total.
 func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS) uint64 {
+	return ReplayBoundWithInstances(published, writerDepth, durabilityKind, caps, 1)
+}
+
+// ReplayBoundWithInstances computes late-joiner replay for an explicit instance count.
+//
+// InstanceCount names distinct keyed instances in history; zero means one
+// for keyless callers. One instance returns exactly ReplayBound so keyless
+// behavior never changes. More instances scale per-instance caps instead of
+// applying them to the total: max samples per instance multiplies by the
+// effective instance total, max instances caps the instance total, and max
+// samples still caps the grand total. Unstated (0) and unlimited (-1) keep
+// the struct contract.
+func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS, instanceCount uint64) uint64 {
+	if instanceCount == 0 {
+		instanceCount = 1
+	}
+
+	if instanceCount == 1 {
+		return replayBoundKeyless(published, writerDepth, durabilityKind, caps)
+	}
+
+	if durabilityKind == sedpDurabilityVolatile {
+		return 0
+	}
+
+	if durabilityKind == sedpDurabilityTransientLocal {
+		return min(published, resolveWriterDepth(writerDepth)*instanceCount)
+	}
+
+	if durabilityKind != durabilityKindTransient && durabilityKind != durabilityKindPersistent {
+		return 0
+	}
+
+	perInstance := resolveWriterDepth(writerDepth)
+
+	if caps.HistoryKind == durabilityServiceHistoryKeepLast && caps.HistoryDepth > 0 {
+		perInstance = min(perInstance, uint64(caps.HistoryDepth))
+	}
+
+	if caps.MaxSamplesPerInstance > 0 {
+		perInstance = min(perInstance, uint64(caps.MaxSamplesPerInstance))
+	}
+
+	effectiveInstances := instanceCount
+	if caps.MaxInstances > 0 {
+		effectiveInstances = min(effectiveInstances, uint64(caps.MaxInstances))
+	}
+
+	bound := effectiveInstances * perInstance
+	bound = min(bound, published)
+
+	if caps.MaxSamples > 0 {
+		bound = min(bound, uint64(caps.MaxSamples))
+	}
+
+	return bound
+}
+
+// replayBoundKeyless is the single-instance bound preserved for keyless topics.
+func replayBoundKeyless(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS) uint64 {
 	if durabilityKind == sedpDurabilityVolatile {
 		return 0
 	}
@@ -554,7 +617,7 @@ func checkResourceLimit(name string, offered, requested int32) string {
 	return ""
 }
 
-// INTEGRATION hooks for wiring this file into the existing paths:
+// INTEGRATION state for durability-service wiring:
 //
 //  1. DONE sedp.go announce: DurabilityServiceParam(WeldDurabilityServiceQoS())
 //     is appended in SerializeSEDPDATA, so writers advertise history
@@ -562,10 +625,15 @@ func checkResourceLimit(name string, offered, requested int32) string {
 //  2. DONE sedp.go parse: PIDDurabilityService is read in sedpEndpointFields via
 //     DecodeDurabilityService and carried on SEDPEndpoint, so late
 //     joiners learn the peer caps that bound ReplayBound.
-//  3. matcher.go extension: call CheckDurabilityServiceCompat from the
+//  3. DONE replay bound: ReplayBoundWithInstances threads an explicit
+//     instance count so per-instance caps scale instead of capping the
+//     total; ReplayBound stays as the keyless single-instance wrapper with
+//     identical behavior. The single reliability.go caller still passes the
+//     keyless path (read only here); keyed callers pass the live count next.
+//  4. matcher.go extension: call CheckDurabilityServiceCompat from the
 //     endpoint pair path next to CheckCompatibility
 //     (internal/core/matcher.go:234) once SEDPEndpoint carries both sides;
 //     history, depth, and lifespan stay RxO neutral there as today.
-//  4. actual-QoS getter: surface NegotiateDepth through an EffectiveDepth
+//  5. actual-QoS getter: surface NegotiateDepth through an EffectiveDepth
 //     field on the endpoint actual profile shape (see ActualQoS in
 //     internal/core/endpoint.go:169) without changing RequestedQoS.

@@ -53,6 +53,10 @@ const LoanVendorWeld = "weld"
 // loanPoolMaxEntries caps the number of recycled buffers in one pool.
 const loanPoolMaxEntries = 1024
 
+// loanChannelMaxDepth caps LoanChannel buffering so a misconfigured depth
+// cannot exhaust memory. Oversize depths refuse loudly with ErrLoanInvalid.
+const loanChannelMaxDepth = 1024
+
 // LoanPool is a bounded pool of reusable sample buffers.
 //
 // Capacity bounds recycled entries; BufferSize is the uniform backing size.
@@ -191,7 +195,7 @@ func CanLoanType(m *types.MessageMembers) (bool, string) {
 // once.
 func (p *LoanPool) Borrow(m *types.MessageMembers, size int) (*Loan, error) {
 	if p == nil {
-		return nil, errors.New("dds: loan borrow on nil pool") //nolint:wrapcheck // new error, nothing to wrap
+		return nil, fmt.Errorf("dds: loan borrow on nil pool: %w", ErrLoanInvalid)
 	}
 	ok, reason := loanEligible(m)
 	if !ok {
@@ -246,8 +250,12 @@ func (p *LoanPool) recycle(full []byte) {
 // A Loan must not be copied after first use; pass the pointer. Return
 // consumes the handle, so use after return is a loud error, never silent
 // aliasing. TopicName and TypeName are set by TakeLoaned and stay empty for
-// raw Borrow handles.
+// raw Borrow handles. It is safe for concurrent use through its mutex:
+// Bytes, Len, Pooled, Valid, and Return self-lock, and LoanChannel.Send
+// locks the handle while consuming it.
 type Loan struct {
+	// mu guards valid plus buf and full across Bytes, Return, and Send.
+	mu sync.Mutex
 	// pool recycles pooled backing stores on Return.
 	pool *LoanPool
 	// full is the pooled backing store, nil for exact-size fallbacks.
@@ -269,6 +277,8 @@ func (l *Loan) Bytes() ([]byte, error) {
 	if l == nil {
 		return nil, fmt.Errorf("dds: loan bytes on nil handle: %w", ErrLoanReturned)
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if !l.valid {
 		return nil, fmt.Errorf("dds: loan bytes after return: %w", ErrLoanReturned)
 	}
@@ -277,7 +287,12 @@ func (l *Loan) Bytes() ([]byte, error) {
 
 // Len returns the exposed byte count, or -1 after return.
 func (l *Loan) Len() int {
-	if l == nil || !l.valid {
+	if l == nil {
+		return -1
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.valid {
 		return -1
 	}
 	return len(l.buf)
@@ -288,6 +303,8 @@ func (l *Loan) Pooled() bool {
 	if l == nil {
 		return false
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.pooled
 }
 
@@ -296,6 +313,8 @@ func (l *Loan) Valid() bool {
 	if l == nil {
 		return false
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.valid
 }
 
@@ -310,6 +329,8 @@ func (l *Loan) Return() error {
 	if l == nil {
 		return fmt.Errorf("dds: loan return on nil handle: %w", ErrLoanReturned)
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if !l.valid {
 		return fmt.Errorf("dds: loan double return: %w", ErrLoanReturned)
 	}
@@ -545,17 +566,23 @@ type LoanChannel struct {
 }
 
 // NewLoanChannel returns a channel buffering depth handles.
+//
+// Depth must be positive and at most loanChannelMaxDepth; oversize depths
+// refuse loudly with ErrLoanInvalid instead of allocating without bound.
 func NewLoanChannel(depth int) (*LoanChannel, error) {
 	if depth <= 0 {
 		return nil, fmt.Errorf("dds: new loan channel depth %d must be positive: %w", depth, ErrLoanInvalid)
 	}
+	if depth > loanChannelMaxDepth {
+		return nil, fmt.Errorf("dds: new loan channel depth %d above cap %d: %w", depth, loanChannelMaxDepth, ErrLoanInvalid)
+	}
 	return &LoanChannel{ch: make(chan *Loan, depth)}, nil
 }
 
-// Send transfers one loan without copying. It consumes the handle: the
-// sender must not use it after Send returns nil. The sender handle is
-// invalidated like Return, with buf and full cleared so a stale alias
-// never observes live data.
+// Send transfers one loan without copying. It consumes the sender handle: the
+// sender must not use it after Send returns nil and must drop its alias.
+// The sender handle is invalidated like Return, with buf and full cleared
+// under the handle mutex so a stale alias observes nil, never live data.
 //
 // Send blocks when the channel buffer is full until Recv drains one
 // slot; there is no non-blocking TrySend because no caller needs one.
@@ -568,6 +595,8 @@ func (c *LoanChannel) Send(loan *Loan) error {
 	if loan == nil {
 		return fmt.Errorf("dds: loan channel send nil handle: %w", ErrLoanReturned)
 	}
+	loan.mu.Lock()
+	defer loan.mu.Unlock()
 	if !loan.valid {
 		return fmt.Errorf("dds: loan channel send after return: %w", ErrLoanReturned)
 	}

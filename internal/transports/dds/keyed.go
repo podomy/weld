@@ -16,10 +16,11 @@ package dds
 // flow exactly as before, keyed content decodes through helpers here, and
 // anything unparseable reports a typed error the caller maps to a drop.
 //
-// This file holds only pure helpers plus endpoint record support. Wiring
-// into datapath.go TakeFrom, the SEDP upsert and matching paths, and the
-// backend publish path is listed in the INTEGRATION trailer of the task
-// report and stays out of this file so no existing file changes.
+// INTEGRATION state: pure helpers plus decoder completion are done here.
+// ExtractKeyBytes verifies decoder completion like the content-filter
+// decoder so trailing garbage fails loudly. Wiring into datapath.go
+// TakeFrom, the SEDP upsert and matching paths, and the backend publish
+// path stays out of this file so no existing file changes.
 import (
 	"crypto/sha256"
 	"encoding/binary"
@@ -175,9 +176,12 @@ func CheckKeyedMatch(local, remote SEDPEndpoint) (bool, error) {
 // relative to the key buffer start in the payload byte order, so key bytes
 // never depend on surrounding non-key fields. Types with no keys return
 // an empty slice and nil error. Truncated payloads, unresolvable nested
-// tables, sequence members flagged as keys, and member types without a
-// CDR codec all return an error wrapping ErrKeyedDecodeFail. The walk
-// bounds checks every read through types.Decoder and never panics.
+// tables, sequence members flagged as keys, trailing garbage past the
+// decoded fields, and member types without a CDR codec all return an error
+// wrapping ErrKeyedDecodeFail. The walk bounds checks every read through
+// types.Decoder and never panics. Decoder completion is verified like the
+// content-filter decoder: trailing bytes fail loudly instead of decoding
+// silently.
 func ExtractKeyBytes(payload []byte, desc *types.MessageMembers) ([]byte, error) {
 	if desc == nil {
 		return nil, keyedFail("extract nil descriptor", errors.New("dds: keyed nil descriptor"))
@@ -190,6 +194,10 @@ func ExtractKeyBytes(payload []byte, desc *types.MessageMembers) ([]byte, error)
 	err = extractWalkMembers(dec, enc, desc)
 	if err != nil {
 		return nil, err
+	}
+	err = dec.Finish()
+	if err != nil {
+		return nil, keyedFail("extract trailing bytes", err)
 	}
 	if enc.Len() == types.HeaderSize {
 		return []byte{}, nil

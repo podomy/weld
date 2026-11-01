@@ -29,8 +29,12 @@ func TestMixedFleetInMemory(t *testing.T) {
 		t.Fatalf("new tracker node: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = planner.Close()
-		_ = tracker.Close()
+		if err := planner.Close(); err != nil {
+			t.Errorf("close planner node: %v", err)
+		}
+		if err := tracker.Close(); err != nil {
+			t.Errorf("close tracker node: %v", err)
+		}
 	})
 	testConfig(t, ctx, planner)
 	testClock(t, planner, tracker)
@@ -48,6 +52,20 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	if store == nil {
 		t.Fatalf("node config is nil")
 	}
+	desc, hookCalls := testConfigDeclare(t, store)
+	version, ch, stop := testConfigStartup(t, store)
+	defer stop()
+	testConfigWatchEvent(t, ch, version)
+	if *hookCalls != 1 {
+		t.Fatalf("apply hooks = %d, want 1", *hookCalls)
+	}
+	testConfigRejects(t, store)
+	testConfigSchema(t, store, desc, version)
+}
+
+// testConfigDeclare pins declaration plus validator and hook setup.
+func testConfigDeclare(t *testing.T, store *sdk.Store) (sdk.Descriptor, *int) {
+	t.Helper()
 	desc := sdk.Descriptor{Type: sdk.ParamTypeDouble, Description: "max linear velocity in m/s"}
 	err := store.Declare("max_vel_x", sdk.NewDoubleValue(1.0), desc)
 	if err != nil {
@@ -55,7 +73,7 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	}
 	err = store.AddValidator("max_vel_x", func(_, newValue sdk.Value) error {
 		if newValue.Type == sdk.ParamTypeDouble && newValue.Double < 0 {
-			return fmt.Errorf("max_vel_x must be non-negative")
+			return errors.New("max_vel_x must be non-negative")
 		}
 		return nil
 	})
@@ -69,8 +87,13 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	if err != nil {
 		t.Fatalf("add apply hook: %v", err)
 	}
-	version, ch, hookCancel := store.Watch()
-	defer hookCancel()
+	return desc, &hookCalls
+}
+
+// testConfigStartup pins fixed precedence files plus CLI plus code.
+func testConfigStartup(t *testing.T, store *sdk.Store) (uint64, <-chan sdk.Event, func()) {
+	t.Helper()
+	version, ch, cancel := store.Watch()
 	files := map[string]sdk.Value{"max_vel_x": sdk.NewDoubleValue(1.0)}
 	cli := map[string]sdk.Value{"max_vel_x": sdk.NewDoubleValue(2.0)}
 	code := map[string]sdk.Value{"max_vel_x": sdk.NewDoubleValue(3.0)}
@@ -91,6 +114,12 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	if !got.Equal(sdk.NewDoubleValue(3.0)) {
 		t.Fatalf("precedence: got %v, want 3.0", got.Double)
 	}
+	return version, ch, cancel
+}
+
+// testConfigWatchEvent pins one watch delivery for the startup version.
+func testConfigWatchEvent(t *testing.T, ch <-chan sdk.Event, version uint64) {
+	t.Helper()
 	select {
 	case evt := <-ch:
 		if evt.Version != version+1 {
@@ -99,10 +128,12 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("watch timed out waiting for startup event")
 	}
-	if hookCalls != 1 {
-		t.Fatalf("apply hooks = %d, want 1", hookCalls)
-	}
-	err = store.Set("max_vel_x", sdk.NewStringValue("fast"))
+}
+
+// testConfigRejects pins type and validator rejections on set.
+func testConfigRejects(t *testing.T, store *sdk.Store) {
+	t.Helper()
+	err := store.Set("max_vel_x", sdk.NewStringValue("fast"))
 	if err == nil {
 		t.Fatalf("string fast accepted for double max_vel_x")
 	}
@@ -110,9 +141,14 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 	if err == nil {
 		t.Fatalf("negative max_vel_x accepted despite validator")
 	}
+}
+
+// testConfigSchema pins schema validation plus history replay.
+func testConfigSchema(t *testing.T, store *sdk.Store, desc sdk.Descriptor, version uint64) {
+	t.Helper()
 	schema := sdk.Schema{"max_vel_x": desc}
 	snapshot := map[string]sdk.Value{"max_vel_x": sdk.NewDoubleValue(3.0)}
-	err = schema.Validate(snapshot)
+	err := schema.Validate(snapshot)
 	if err != nil {
 		t.Fatalf("schema validate: %v", err)
 	}
@@ -129,6 +165,14 @@ func testConfig(t *testing.T, ctx context.Context, planner *sdk.Node) {
 
 // testClock covers one domain per context, jumps, fallback, and agreement.
 func testClock(t *testing.T, planner, tracker *sdk.Node) {
+	t.Helper()
+	testClockSim(t, planner)
+	testClockAgreement(t, planner)
+	testClockFallback(t, tracker)
+}
+
+// testClockSim pins fake clock steps, jump callbacks, and unregister.
+func testClockSim(t *testing.T, planner *sdk.Node) {
 	t.Helper()
 	fake := sdk.NewFakeClock(1000000000)
 	clk := planner.Clock()
@@ -164,32 +208,50 @@ func testClock(t *testing.T, planner, tracker *sdk.Node) {
 	if len(jumps) != 2 {
 		t.Fatalf("callbacks fired after unregister")
 	}
-	err = clk.CheckPeerAgreement(sdk.DomainWall)
+}
+
+// testClockAgreement pins sim-versus-wall rejection and wall agreement.
+func testClockAgreement(t *testing.T, planner *sdk.Node) {
+	t.Helper()
+	clk := planner.Clock()
+	err := clk.CheckPeerAgreement(sdk.DomainWall)
 	if err == nil {
 		t.Fatalf("sim versus wall agreement passed silently")
 	}
-	jump, err = clk.SetDomain(sdk.DomainWall)
-	if err != nil {
+	if _, err := clk.SetDomain(sdk.DomainWall); err != nil {
 		t.Fatalf("set domain wall: %v", err)
 	}
-	_ = jump
 	err = clk.CheckPeerAgreement(sdk.DomainWall)
 	if err != nil {
 		t.Fatalf("wall versus wall agreement failed: %v", err)
 	}
+}
+
+// testClockFallback pins wall fallback without samples and domain rejection.
+func testClockFallback(t *testing.T, tracker *sdk.Node) {
+	t.Helper()
 	tclk := tracker.Clock()
 	tclk.SetUseSimTime(true)
 	if !tclk.UsingFallback() {
 		t.Fatalf("sim without sample did not report wall fallback")
 	}
-	_, badErr := tclk.SetDomain(sdk.Domain(99))
-	if badErr == nil {
+	if _, err := tclk.SetDomain(sdk.Domain(99)); err == nil {
 		t.Fatalf("invalid domain accepted silently")
 	}
 }
 
 // testTopics covers byte publish and subscribe with order and mismatch.
 func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
+	t.Helper()
+	pub, sub := testTopicsSetup(t, planner, tracker)
+	testTopicsPublish(t, ctx, pub)
+	testTopicsDrain(t, ctx, sub)
+	testTopicsCompatible(t)
+	testTopicsCopy(t, ctx, pub, sub)
+}
+
+// testTopicsSetup pins publisher and subscription creation.
+func testTopicsSetup(t *testing.T, planner, tracker *sdk.Node) (*sdk.Publisher, *sdk.Subscription) {
 	t.Helper()
 	pubQos := sdk.DefaultQoS()
 	pubQos.Depth = 20
@@ -201,15 +263,27 @@ func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
 	if err != nil {
 		t.Fatalf("new subscription: %v", err)
 	}
+	return pub, sub
+}
+
+// testTopicsPublish pins ordered publish of the twist fixture.
+func testTopicsPublish(t *testing.T, ctx context.Context, pub *sdk.Publisher) {
+	t.Helper()
 	const count = 20
-	for i := 0; i < count; i++ {
-		payload := []byte(fmt.Sprintf("twist-%02d", i))
-		err = pub.Publish(ctx, payload)
+	for i := range count {
+		payload := fmt.Appendf(nil, "twist-%02d", i)
+		err := pub.Publish(ctx, payload)
 		if err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
 	}
-	for i := 0; i < count; i++ {
+}
+
+// testTopicsDrain pins ordered receive of the twist fixture.
+func testTopicsDrain(t *testing.T, ctx context.Context, sub *sdk.Subscription) {
+	t.Helper()
+	const count = 20
+	for i := range count {
 		callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
 		msg, err := sub.Next(callCtx)
 		callCancel()
@@ -224,6 +298,11 @@ func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
 	if sub.Lost() != 0 {
 		t.Fatalf("lost = %d, want 0", sub.Lost())
 	}
+}
+
+// testTopicsCompatible pins reliability mismatch detail.
+func testTopicsCompatible(t *testing.T) {
+	t.Helper()
 	ok, detail := sdk.Compatible(sdk.SensorDataQoS(), sdk.DefaultQoS())
 	if ok {
 		t.Fatalf("best effort to reliable reported compatible")
@@ -231,8 +310,13 @@ func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
 	if detail == "" {
 		t.Fatalf("mismatch reported empty detail")
 	}
+}
+
+// testTopicsCopy pins ingress copy plus canceled publish rejection.
+func testTopicsCopy(t *testing.T, ctx context.Context, pub *sdk.Publisher, sub *sdk.Subscription) {
+	t.Helper()
 	raw := []byte("mutable")
-	err = pub.Publish(ctx, raw)
+	err := pub.Publish(ctx, raw)
 	if err != nil {
 		t.Fatalf("publish mutable: %v", err)
 	}
@@ -246,7 +330,7 @@ func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
 	if string(msg) != "mutable" {
 		t.Fatalf("ingress copy broken: got %q", msg)
 	}
-	canceled, cancelFunc := context.WithCancel(context.Background())
+	canceled, cancelFunc := context.WithCancel(ctx)
 	cancelFunc()
 	err = pub.Publish(canceled, []byte("late"))
 	if err == nil {
@@ -256,6 +340,14 @@ func testTopics(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
 
 // testServices covers deadlines, gone servers, and duplicate names.
 func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
+	t.Helper()
+	server, client := testServicesHappyPath(t, ctx, planner, tracker)
+	testServicesDeadline(t, ctx, planner, tracker)
+	testServicesLifecycle(t, ctx, tracker, server, client)
+}
+
+// testServicesHappyPath pins one successful call and reply.
+func testServicesHappyPath(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) (*sdk.ServiceServer, *sdk.ServiceClient) {
 	t.Helper()
 	server, err := tracker.NewServiceServer("/plan", func(_ context.Context, req []byte) ([]byte, error) {
 		return append([]byte("plan-ok:"), req...), nil
@@ -276,14 +368,20 @@ func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node)
 	if string(reply) != "plan-ok:goal-a3f1" {
 		t.Fatalf("reply = %q, want plan-ok:goal-a3f1", reply)
 	}
+	return server, client
+}
+
+// testServicesDeadline pins deadline propagation to a slow handler.
+func testServicesDeadline(t *testing.T, ctx context.Context, planner, tracker *sdk.Node) {
+	t.Helper()
 	slow, err := tracker.NewServiceServer("/slow", func(callCtx context.Context, _ []byte) ([]byte, error) {
 		select {
 		case <-callCtx.Done():
 			cerr := callCtx.Err()
 			if cerr != nil {
-				return nil, cerr
+				return nil, fmt.Errorf("slow handler: %w", cerr)
 			}
-			return nil, fmt.Errorf("slow handler: context done")
+			return nil, errors.New("slow handler: context done")
 		case <-time.After(5 * time.Second):
 			return []byte("slow-ok"), nil
 		}
@@ -292,12 +390,10 @@ func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node)
 		t.Fatalf("new slow server: %v", err)
 	}
 	defer func() {
-		_ = slow.Close()
+		if err := slow.Close(); err != nil {
+			t.Errorf("close slow server: %v", err)
+		}
 	}()
-	slowCtx, slowCancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer slowCancel()
-	_, err = client.Call(slowCtx, []byte("x"))
-	_ = err
 	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer deadlineCancel()
 	slowClient, err := planner.NewServiceClient("/slow")
@@ -311,7 +407,12 @@ func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("slow call error = %v, want deadline exceeded", err)
 	}
-	_, err = tracker.NewServiceServer("/plan", func(_ context.Context, req []byte) ([]byte, error) {
+}
+
+// testServicesLifecycle pins duplicate rejection, gone servers, and cancel.
+func testServicesLifecycle(t *testing.T, ctx context.Context, tracker *sdk.Node, server *sdk.ServiceServer, client *sdk.ServiceClient) {
+	t.Helper()
+	_, err := tracker.NewServiceServer("/plan", func(_ context.Context, req []byte) ([]byte, error) {
 		return req, nil
 	})
 	if err == nil {
@@ -330,7 +431,7 @@ func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node)
 	if !errors.Is(err, sdk.ErrNoSuchService) {
 		t.Fatalf("gone server error = %v, want no such service", err)
 	}
-	canceled, cancelFunc := context.WithCancel(context.Background())
+	canceled, cancelFunc := context.WithCancel(ctx)
 	cancelFunc()
 	_, err = client.Call(canceled, []byte("canceled"))
 	if err == nil {
@@ -344,12 +445,28 @@ func testServices(t *testing.T, ctx context.Context, planner, tracker *sdk.Node)
 // testSupervision covers serial order, bond liveness, and pooled work.
 func testSupervision(t *testing.T) {
 	t.Helper()
+	group := testSupervisionSerial(t)
+	testSupervisionBonds(t, group)
+	testSupervisionPooled(t)
+}
+
+// testSupervisionSerial pins serial attach plus ordered delivery.
+func testSupervisionSerial(t *testing.T) *sdk.SerialGroup {
+	t.Helper()
 	group, err := sdk.NewSerialGroup("bringup")
 	if err != nil {
 		t.Fatalf("new serial group: %v", err)
 	}
 	var orderMu sync.Mutex
 	var order []string
+	testSupervisionAttach(t, group, &orderMu, &order)
+	testSupervisionDrive(t, group, &orderMu, &order)
+	return group
+}
+
+// testSupervisionAttach pins priority attach of the bringup fixture.
+func testSupervisionAttach(t *testing.T, group *sdk.SerialGroup, orderMu *sync.Mutex, order *[]string) {
+	t.Helper()
 	attach := func(name string, priority int) {
 		t.Helper()
 		done := false
@@ -362,7 +479,7 @@ func testSupervision(t *testing.T) {
 				}
 				done = true
 				orderMu.Lock()
-				order = append(order, name)
+				*order = append(*order, name)
 				orderMu.Unlock()
 				return true
 			},
@@ -374,7 +491,12 @@ func testSupervision(t *testing.T) {
 	attach("planner_server", 2)
 	attach("odometry_filter", 1)
 	attach("motor_driver", 0)
-	err = group.Configure()
+}
+
+// testSupervisionDrive pins configure, activate, spins, and order.
+func testSupervisionDrive(t *testing.T, group *sdk.SerialGroup, orderMu *sync.Mutex, order *[]string) {
+	t.Helper()
+	err := group.Configure()
 	if err != nil {
 		t.Fatalf("serial configure: %v", err)
 	}
@@ -382,7 +504,7 @@ func testSupervision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serial activate: %v", err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !group.SpinOnce() {
 			t.Fatalf("spin %d did no work", i)
 		}
@@ -391,14 +513,21 @@ func testSupervision(t *testing.T) {
 		t.Fatalf("extra spin did work with nothing ready")
 	}
 	want := []string{"motor_driver", "odometry_filter", "planner_server"}
-	if len(order) != len(want) {
-		t.Fatalf("serial order = %v, want %v", order, want)
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(*order) != len(want) {
+		t.Fatalf("serial order = %v, want %v", *order, want)
 	}
 	for i := range want {
-		if order[i] != want[i] {
-			t.Fatalf("serial order = %v, want %v", order, want)
+		if (*order)[i] != want[i] {
+			t.Fatalf("serial order = %v, want %v", *order, want)
 		}
 	}
+}
+
+// testSupervisionBonds pins heartbeat liveness plus deactivate and close.
+func testSupervisionBonds(t *testing.T, group *sdk.SerialGroup) {
+	t.Helper()
 	fake := sdk.NewFakeClock(0)
 	now, err := fake.Advance(1000000000)
 	if err != nil {
@@ -438,6 +567,11 @@ func testSupervision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serial second close: %v", err)
 	}
+}
+
+// testSupervisionPooled pins bounded pooled execution without loss.
+func testSupervisionPooled(t *testing.T) {
+	t.Helper()
 	pooled, err := sdk.NewPooledGroup(2, 16)
 	if err != nil {
 		t.Fatalf("new pooled group: %v", err)
@@ -450,7 +584,7 @@ func testSupervision(t *testing.T) {
 	wg.Add(tasks)
 	var poolMu sync.Mutex
 	ran := 0
-	for i := 0; i < tasks; i++ {
+	for range tasks {
 		_, err = pooled.Submit(func() {
 			poolMu.Lock()
 			ran++

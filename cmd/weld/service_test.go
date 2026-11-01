@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +40,7 @@ type fakeServiceBackend struct {
 func (f *fakeServiceBackend) PublishBytes(ctx context.Context, msg transports.OutgoingMessage) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("fake service publish context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -71,7 +72,7 @@ func (f *fakeServiceBackend) PublishBytes(ctx context.Context, msg transports.Ou
 func (f *fakeServiceBackend) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
 	err := ctx.Err()
 	if err != nil {
-		return transports.IncomingMessage{}, err
+		return transports.IncomingMessage{}, fmt.Errorf("fake service take context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -108,22 +109,20 @@ func (f *fakeServiceBackend) TakeBytes(ctx context.Context) (transports.Incoming
 
 	f.mu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		err := ctx.Err()
-		if err != nil {
-			return transports.IncomingMessage{}, err
-		}
-
-		return transports.IncomingMessage{}, context.DeadlineExceeded
+	<-ctx.Done()
+	err = ctx.Err()
+	if err != nil {
+		return transports.IncomingMessage{}, fmt.Errorf("fake service take context: %w", err)
 	}
+
+	return transports.IncomingMessage{}, context.DeadlineExceeded
 }
 
 // JoinDiscovery records a successful join.
 func (f *fakeServiceBackend) JoinDiscovery(ctx context.Context, info transports.DiscoveryInfo) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("fake service join context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -142,7 +141,7 @@ func (f *fakeServiceBackend) JoinDiscovery(ctx context.Context, info transports.
 func (f *fakeServiceBackend) ReportLiveliness(ctx context.Context, report transports.LivelinessReport) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("fake service liveliness context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -173,7 +172,7 @@ func (f *fakeServiceBackend) Close() error {
 func (f *fakeServiceBackend) Subscribe(ctx context.Context, topic, typeName, typeHash string) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("fake service subscribe context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -200,7 +199,7 @@ type plainServiceBackend struct {
 func (f *plainServiceBackend) PublishBytes(ctx context.Context, msg transports.OutgoingMessage) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("plain service publish context: %w", err)
 	}
 
 	_ = msg
@@ -212,7 +211,7 @@ func (f *plainServiceBackend) PublishBytes(ctx context.Context, msg transports.O
 func (f *plainServiceBackend) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
 	err := ctx.Err()
 	if err != nil {
-		return transports.IncomingMessage{}, err
+		return transports.IncomingMessage{}, fmt.Errorf("plain service take context: %w", err)
 	}
 
 	return transports.IncomingMessage{}, context.DeadlineExceeded
@@ -222,7 +221,7 @@ func (f *plainServiceBackend) TakeBytes(ctx context.Context) (transports.Incomin
 func (f *plainServiceBackend) JoinDiscovery(ctx context.Context, info transports.DiscoveryInfo) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("plain service join context: %w", err)
 	}
 
 	_ = info
@@ -235,7 +234,7 @@ func (f *plainServiceBackend) JoinDiscovery(ctx context.Context, info transports
 func (f *plainServiceBackend) ReportLiveliness(ctx context.Context, report transports.LivelinessReport) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("plain service liveliness context: %w", err)
 	}
 
 	_ = report
@@ -271,69 +270,41 @@ func mustEncodeServiceRequest(t *testing.T, request string, guid [8]byte, seq ui
 }
 
 // TestResolveServiceCallArgs checks flag wins plus positional fallback.
+// checkServiceCallSuccess checks one successful args resolution.
+func checkServiceCallSuccess(t *testing.T, flagService, flagRequest string, args []string, wantService, wantRequest, label string) {
+	t.Helper()
+
+	service, request, err := resolveServiceCallArgs(flagService, flagRequest, args)
+	if err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+	if service != wantService || request != wantRequest {
+		t.Fatalf("%s = (%q, %q), want (%q, %q)", label, service, request, wantService, wantRequest)
+	}
+}
+
+// checkServiceCallFailure checks one failing args resolution keeps weld prefix.
+func checkServiceCallFailure(t *testing.T, flagService, flagRequest string, args []string, label string) {
+	t.Helper()
+
+	_, _, err := resolveServiceCallArgs(flagService, flagRequest, args)
+	if err == nil {
+		t.Fatal(label + " must fail")
+	}
+	if !strings.HasPrefix(err.Error(), "weld:") {
+		t.Fatalf("%s error = %q, want weld prefix", label, err.Error())
+	}
+}
+
 func TestResolveServiceCallArgs(t *testing.T) {
-	service, request, err := resolveServiceCallArgs("/flag-svc", "flag-req", nil)
-	if err != nil {
-		t.Fatalf("flag wins: %v", err)
-	}
-
-	if service != "/flag-svc" || request != "flag-req" {
-		t.Fatalf("flag wins = (%q, %q), want (/flag-svc, flag-req)", service, request)
-	}
-
-	service, request, err = resolveServiceCallArgs("", "", []string{"/pos-svc", "pos-req"})
-	if err != nil {
-		t.Fatalf("two positionals: %v", err)
-	}
-
-	if service != "/pos-svc" || request != "pos-req" {
-		t.Fatalf("two positionals = (%q, %q)", service, request)
-	}
-
-	service, request, err = resolveServiceCallArgs("/flag-svc", "", nil)
-	if err != nil {
-		t.Fatalf("flag service alone: %v", err)
-	}
-
-	if service != "/flag-svc" || request != "" {
-		t.Fatalf("flag service alone = (%q, %q), want empty request", service, request)
-	}
-
-	service, request, err = resolveServiceCallArgs("", "", []string{"/only-svc"})
-	if err != nil {
-		t.Fatalf("one positional: %v", err)
-	}
-
-	if service != "/only-svc" || request != "" {
-		t.Fatalf("one positional = (%q, %q), want empty request", service, request)
-	}
-
-	_, _, err = resolveServiceCallArgs("", "", nil)
-	if err == nil {
-		t.Fatal("missing service must fail")
-	}
-
-	if !strings.HasPrefix(err.Error(), "weld:") {
-		t.Fatalf("missing service error = %q, want weld prefix", err.Error())
-	}
-
-	_, _, err = resolveServiceCallArgs("/svc", "flag-req", []string{"extra"})
-	if err == nil {
-		t.Fatal("flag plus positional must fail")
-	}
-
-	if !strings.HasPrefix(err.Error(), "weld:") {
-		t.Fatalf("flag plus positional error = %q, want weld prefix", err.Error())
-	}
-
-	_, _, err = resolveServiceCallArgs("", "", []string{"/svc", "one", "two"})
-	if err == nil {
-		t.Fatal("three positionals must fail")
-	}
-
-	if !strings.HasPrefix(err.Error(), "weld:") {
-		t.Fatalf("three positionals error = %q, want weld prefix", err.Error())
-	}
+	checkServiceCallSuccess(t, "/flag-svc", "flag-req", nil, "/flag-svc", "flag-req", "flag wins")
+	checkServiceCallSuccess(t, "", "", []string{"/pos-svc", "pos-req"}, "/pos-svc", "pos-req", "two positionals")
+	checkServiceCallFailure(t, "/flag-svc", "", nil, "flag service alone without request")
+	checkServiceCallFailure(t, "", "", []string{"/only-svc"}, "one positional without request")
+	checkServiceCallFailure(t, "/flag-svc", "", []string{""}, "empty request")
+	checkServiceCallFailure(t, "", "", nil, "missing service")
+	checkServiceCallFailure(t, "/svc", "flag-req", []string{"extra"}, "flag plus positional")
+	checkServiceCallFailure(t, "", "", []string{"/svc", "one", "two"}, "three positionals")
 }
 
 // TestValidateServiceDeadline checks positive passes and zero plus negative fail.
@@ -462,8 +433,8 @@ func TestNewServiceGUID(t *testing.T) {
 		t.Fatalf("new GUID: %v", err)
 	}
 
-	if len(guid) != 8 {
-		t.Fatalf("GUID length = %d, want 8", len(guid))
+	if len(guid[:]) != 8 {
+		t.Fatalf("GUID length = %d, want 8", len(guid[:]))
 	}
 }
 
@@ -779,7 +750,7 @@ type echoServiceBackend struct {
 func (f *echoServiceBackend) JoinDiscovery(ctx context.Context, info transports.DiscoveryInfo) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service join context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -798,7 +769,7 @@ func (f *echoServiceBackend) JoinDiscovery(ctx context.Context, info transports.
 func (f *echoServiceBackend) PublishBytes(ctx context.Context, msg transports.OutgoingMessage) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service publish context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -816,22 +787,22 @@ func (f *echoServiceBackend) PublishBytes(ctx context.Context, msg transports.Ou
 
 	dec, err := types.NewDecoder(msg.Payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service decode header: %w", err)
 	}
 
 	guid, seq, err := dec.ReadServiceHeader()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service read header: %w", err)
 	}
 
 	req, err := dec.ReadString()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service read request: %w", err)
 	}
 
 	err = dec.Finish()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service finish decode: %w", err)
 	}
 
 	replyWire, err := encodeServiceRequest("echo:"+req, guid, seq)
@@ -852,7 +823,7 @@ func (f *echoServiceBackend) PublishBytes(ctx context.Context, msg transports.Ou
 func (f *echoServiceBackend) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
 	err := ctx.Err()
 	if err != nil {
-		return transports.IncomingMessage{}, err
+		return transports.IncomingMessage{}, fmt.Errorf("echo service take context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -879,22 +850,20 @@ func (f *echoServiceBackend) TakeBytes(ctx context.Context) (transports.Incoming
 
 	f.mu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		err := ctx.Err()
-		if err != nil {
-			return transports.IncomingMessage{}, err
-		}
-
-		return transports.IncomingMessage{}, context.DeadlineExceeded
+	<-ctx.Done()
+	err = ctx.Err()
+	if err != nil {
+		return transports.IncomingMessage{}, fmt.Errorf("echo service take context: %w", err)
 	}
+
+	return transports.IncomingMessage{}, context.DeadlineExceeded
 }
 
 // ReportLiveliness accepts one liveliness report after join.
 func (f *echoServiceBackend) ReportLiveliness(ctx context.Context, report transports.LivelinessReport) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service liveliness context: %w", err)
 	}
 
 	f.mu.Lock()
@@ -922,10 +891,10 @@ func (f *echoServiceBackend) Close() error {
 }
 
 // Subscribe records a reader declaration.
-func (f *echoServiceBackend) Subscribe(ctx context.Context, topic, typeName, typeHash string) error {
+func (f *echoServiceBackend) Subscribe(ctx context.Context, _, _, _ string) error {
 	err := ctx.Err()
 	if err != nil {
-		return err
+		return fmt.Errorf("echo service subscribe context: %w", err)
 	}
 
 	f.mu.Lock()

@@ -6,7 +6,7 @@ package sdk
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -86,8 +86,10 @@ type Clock struct {
 
 // NewClock returns a clock with explicit wall and steady fallbacks.
 //
-// An invalid domain normalizes to wall; negative ticks clamp to
-// zero. Sim ticks arrive through SetSimTime.
+// An invalid domain normalizes to wall because the signature cannot
+// report an error; use SetDomain to reject invalid domains loudly.
+// Negative wall and steady ticks clamp to zero. Sim ticks arrive
+// through SetSimTime.
 func NewClock(domain Domain, wallNanos, steadyNanos int64) *Clock {
 	if !isValidDomain(domain) {
 		domain = DomainWall
@@ -202,6 +204,7 @@ func (d *Clock) nowLocked() int64 {
 }
 
 // SetWallTime replaces the wall source tick for deterministic tests.
+// Negative ticks clamp to zero.
 func (d *Clock) SetWallTime(nanos int64) {
 	if d == nil {
 		return
@@ -215,6 +218,7 @@ func (d *Clock) SetWallTime(nanos int64) {
 }
 
 // SetSteadyTime replaces the steady source tick for deterministic tests.
+// Negative ticks clamp to zero.
 func (d *Clock) SetSteadyTime(nanos int64) {
 	if d == nil {
 		return
@@ -228,6 +232,8 @@ func (d *Clock) SetSteadyTime(nanos int64) {
 }
 
 // AdvanceWall moves the wall source forward by delta with saturation.
+// Negative results clamp to zero; backward motion clamps instead of
+// rejecting because the signature cannot report an error.
 func (d *Clock) AdvanceWall(delta int64) {
 	if d == nil {
 		return
@@ -235,12 +241,12 @@ func (d *Clock) AdvanceWall(delta int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.wallNanos = addSaturating(d.wallNanos, delta)
-	if d.wallNanos < 0 {
-		d.wallNanos = 0
-	}
+	d.wallNanos = max(d.wallNanos, 0)
 }
 
 // AdvanceSteady moves the steady source forward by delta with saturation.
+// Negative results clamp to zero; backward motion clamps instead of
+// rejecting because the signature cannot report an error.
 func (d *Clock) AdvanceSteady(delta int64) {
 	if d == nil {
 		return
@@ -248,12 +254,11 @@ func (d *Clock) AdvanceSteady(delta int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.steadyNanos = addSaturating(d.steadyNanos, delta)
-	if d.steadyNanos < 0 {
-		d.steadyNanos = 0
-	}
+	d.steadyNanos = max(d.steadyNanos, 0)
 }
 
 // SetSimTime records one sim tick and notifies callbacks in order.
+// Negative ticks clamp to zero.
 func (d *Clock) SetSimTime(nanos int64) Jump {
 	if d == nil {
 		return Jump{}
@@ -276,7 +281,8 @@ func (d *Clock) SetSimTime(nanos int64) Jump {
 	return jump
 }
 
-// SetDomain switches the active domain with jump notification.
+// SetDomain switches the active domain with jump notification. It rejects
+// invalid domains loudly.
 func (d *Clock) SetDomain(domain Domain) (Jump, error) {
 	if d == nil {
 		return Jump{}, errors.New("sdk: set domain on nil clock") //nolint:wrapcheck // new error, nothing to wrap
@@ -334,7 +340,7 @@ func (d *Clock) snapshotCallbacksLocked() []JumpCallback {
 	for id := range d.callbacks {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := make([]JumpCallback, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, d.callbacks[id])
@@ -379,7 +385,8 @@ func (d *Clock) UnregisterJumpCallback(id uint64) {
 	delete(d.callbacks, id)
 }
 
-// CheckPeerAgreement enforces sim agreement with one peer domain.
+// CheckPeerAgreement enforces sim agreement with one peer domain. It
+// rejects invalid local or peer domains loudly before comparing.
 func (d *Clock) CheckPeerAgreement(peer Domain) error {
 	if d == nil {
 		return errors.New("sdk: peer agreement on nil clock") //nolint:wrapcheck // new error, nothing to wrap
@@ -387,6 +394,12 @@ func (d *Clock) CheckPeerAgreement(peer Domain) error {
 	d.mu.Lock()
 	local := d.domain
 	d.mu.Unlock()
+	if !isValidDomain(local) {
+		return fmt.Errorf("sdk: clock: invalid local domain %d", int(local))
+	}
+	if !isValidDomain(peer) {
+		return fmt.Errorf("sdk: clock: invalid peer domain %d", int(peer))
+	}
 	if local == peer {
 		return nil
 	}
@@ -421,7 +434,8 @@ type FakeClock struct {
 	advances uint64
 }
 
-// NewFakeClock returns a running fake at startNanos.
+// NewFakeClock returns a running fake at startNanos. Negative starts
+// clamp to zero.
 func NewFakeClock(startNanos int64) *FakeClock {
 	if startNanos < 0 {
 		startNanos = 0
@@ -444,7 +458,8 @@ func (f *FakeClock) NowFunc() func() int64 {
 	return f.Now
 }
 
-// Set teleports fake time without processing triggers.
+// Set teleports fake time without processing triggers. Negative ticks
+// clamp to zero.
 func (f *FakeClock) Set(nanos int64) {
 	if f == nil {
 		return

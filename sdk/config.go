@@ -6,14 +6,22 @@ package sdk
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // configWatchBuffer sizes each watcher channel. Broadcast never blocks: a
 // full channel evicts its oldest event before the new one is queued.
+// Evictions and drops count loudly in BroadcastDrops.
 const configWatchBuffer = 16
+
+// configHistoryLimit bounds retained history to the last entries.
+// Overflow drops the oldest entries and counts each drop in HistoryDrops.
+const configHistoryLimit = 10000
 
 // ParamType names the kind of a configuration value.
 type ParamType int
@@ -92,6 +100,8 @@ func (v Value) Equal(o Value) bool {
 		return false
 	}
 	switch v.Type {
+	case ParamTypeNotSet:
+		return true
 	case ParamTypeBool:
 		return v.Bool == o.Bool
 	case ParamTypeInteger:
@@ -128,9 +138,36 @@ type Descriptor struct {
 	DoubleMax float64
 }
 
+// isValidParamType reports whether t is a concrete descriptor or value type.
+func isValidParamType(t ParamType) bool {
+	switch t {
+	case ParamTypeNotSet,
+		ParamTypeBool,
+		ParamTypeInteger,
+		ParamTypeDouble,
+		ParamTypeString:
+		return true
+	default:
+		return false
+	}
+}
+
 // validateValue checks type and range without touching read-only state.
+// A NotSet value validates only against a NotSet descriptor. Invalid enum
+// members fail loudly. NaN fails an enabled double range explicitly.
+//
+//nolint:gocognit,cyclop // validation sequences enum, NotSet, type, and range checks in one pass, splitting would obscure intent
 func (d Descriptor) validateValue(v Value) error {
+	if !isValidParamType(v.Type) {
+		return fmt.Errorf("sdk: config: value type %d is invalid", int(v.Type))
+	}
+	if !isValidParamType(d.Type) {
+		return fmt.Errorf("sdk: config: descriptor type %d is invalid", int(d.Type))
+	}
 	if v.Type == ParamTypeNotSet {
+		if d.Type == ParamTypeNotSet {
+			return nil
+		}
 		return errors.New("sdk: config: value type not_set is not concrete") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if d.Type != ParamTypeNotSet && v.Type != d.Type {
@@ -142,6 +179,9 @@ func (d Descriptor) validateValue(v Value) error {
 		}
 	}
 	if v.Type == ParamTypeDouble && d.HasDoubleRange {
+		if math.IsNaN(v.Double) {
+			return fmt.Errorf("sdk: config: double NaN is not in range [%v, %v]", d.DoubleMin, d.DoubleMax)
+		}
 		if v.Double < d.DoubleMin || v.Double > d.DoubleMax {
 			return fmt.Errorf("sdk: config: double %v out of range [%v, %v]", v.Double, d.DoubleMin, d.DoubleMax)
 		}
@@ -199,7 +239,7 @@ func ValidateName(name string) error {
 	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "..") {
 		return fmt.Errorf("sdk: config: parameter name %q has empty segment", name)
 	}
-	for _, segment := range strings.Split(name, ".") {
+	for segment := range strings.SplitSeq(name, ".") {
 		err := validateNameSegment(segment)
 		if err != nil {
 			return fmt.Errorf("sdk: config: parameter name %q: %w", name, err)
@@ -213,7 +253,7 @@ func validateNameSegment(segment string) error {
 	if segment == "" {
 		return errors.New("sdk: config: empty name segment") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	for i := 0; i < len(segment); i++ {
+	for i := range len(segment) {
 		c := segment[i]
 		ok := c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9')
 		if !ok {
@@ -289,6 +329,10 @@ type storeEntry struct {
 // Store is a versioned parameter store with schema, validation, atomic
 // batches, watches, and history. Build it with NewStore and share by
 // pointer; do not copy after first use.
+// History is bounded to the last configHistoryLimit entries; overflow drops
+// the oldest and counts loudly in HistoryDrops. Broadcast never holds the
+// write lock while sending; each watcher is checked plus sent under a read
+// lock with eviction counted in BroadcastDrops.
 //
 // REVIEW: remap tables and undeclared-set flags are deferred; Declare
 // pins names, Set rejects unknown names, and ApplyStartup auto-declares
@@ -302,14 +346,114 @@ type Store struct {
 	version uint64
 	// history records every delta oldest first.
 	history []HistoryEntry
+	// historyDrop counts history bound drops.
+	historyDrop uint64
 	// watchers holds active subscriptions.
 	watchers map[uint64]chan Event
 	// nextWatch numbers watcher ids.
 	nextWatch uint64
-	// validators runs in order during validation.
+	// validators runs in order outside the write lock with optimistic generation.
 	validators map[string][]ValidatorFunc
 	// hooks runs after commit in order.
 	hooks map[string][]ApplyHookFunc
+	// drops counts broadcast evictions plus drops loudly.
+	drops atomic.Uint64
+}
+
+// BroadcastDrops returns the monotonic count of watcher broadcast evictions
+// plus drops.
+func (s *Store) BroadcastDrops() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.drops.Load()
+}
+
+// HistoryDrops returns the monotonic count of history entries dropped by the
+// configHistoryLimit bound.
+func (s *Store) HistoryDrops() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.historyDrop
+}
+
+// pendingValidator pairs one validator with its snapshot inputs.
+type pendingValidator struct {
+	// name is the parameter under validation.
+	name string
+	// oldValue is the snapshot before the batch.
+	oldValue Value
+	// newValue is the snapshot after the batch.
+	newValue Value
+	// fn validates the transition.
+	fn ValidatorFunc
+}
+
+// runPendingValidators runs collected validators outside the write lock.
+func runPendingValidators(pending []pendingValidator) error {
+	for _, p := range pending {
+		err := p.fn(p.oldValue, p.newValue)
+		if err != nil {
+			return fmt.Errorf("sdk: set %q rejected by validator: %w", p.name, err)
+		}
+	}
+	return nil
+}
+
+// Dump returns a copy of every stored value for canonical dump output.
+// Values format stays compatible (v1 values only).
+func (s *Store) Dump() map[string]Value {
+	if s == nil {
+		return map[string]Value{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]Value, len(s.params))
+	for k, e := range s.params {
+		out[k] = e.value
+	}
+	return out
+}
+
+// DumpEntry pairs one stored value with its descriptor for round trips.
+type DumpEntry struct {
+	// Value is the stored parameter value.
+	Value Value
+	// Descriptor is the stored parameter descriptor.
+	Descriptor Descriptor
+}
+
+// DumpDescriptors returns a copy of every stored descriptor for dump round
+// trips.
+func (s *Store) DumpDescriptors() map[string]Descriptor {
+	if s == nil {
+		return map[string]Descriptor{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]Descriptor, len(s.params))
+	for k, e := range s.params {
+		out[k] = e.desc
+	}
+	return out
+}
+
+// DumpAll returns values plus descriptors so a dump round trip preserves
+// read-only flags, ranges, and descriptions.
+func (s *Store) DumpAll() map[string]DumpEntry {
+	if s == nil {
+		return map[string]DumpEntry{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]DumpEntry, len(s.params))
+	for k, e := range s.params {
+		out[k] = DumpEntry{Value: e.value, Descriptor: e.desc}
+	}
+	return out
 }
 
 // NewStore returns an empty store.
@@ -323,6 +467,7 @@ func NewStore() *Store {
 }
 
 // Declare adds a parameter with its descriptor. Re-declaring fails.
+// A NotSet value validates only against a NotSet descriptor.
 func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 	if s == nil {
 		return errors.New("sdk: declare on nil store") //nolint:wrapcheck // new error, nothing to wrap
@@ -336,7 +481,7 @@ func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 		s.mu.Unlock()
 		return fmt.Errorf("sdk: declare %q: already declared", name)
 	}
-	if desc.Type == ParamTypeNotSet {
+	if desc.Type == ParamTypeNotSet && value.Type != ParamTypeNotSet {
 		desc.Type = value.Type
 	}
 	err = desc.validateValue(value)
@@ -351,9 +496,9 @@ func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 	s.history = append(s.history, HistoryEntry{
 		Version: event.Version, Name: name, NewValue: value, HadOld: false, Source: "declare",
 	})
-	channels := s.watcherChannelsLocked()
+	s.trimHistoryLocked()
 	s.mu.Unlock()
-	s.broadcast(channels, event)
+	s.broadcast(event)
 	return nil
 }
 
@@ -457,7 +602,9 @@ func (s *Store) HistorySince(since uint64) []HistoryEntry {
 
 // Watch subscribes to future events. The returned version is the current
 // store version; HistorySince replays anything missed. The channel is
-// buffered and never blocks the store.
+// buffered and never blocks the store: a full channel evicts its oldest
+// event and counts loudly in BroadcastDrops. Consumers must tolerate
+// non-monotonic event order across concurrent batches.
 func (s *Store) Watch() (uint64, <-chan Event, func()) {
 	if s == nil {
 		ch := make(chan Event)
@@ -481,7 +628,11 @@ func (s *Store) Watch() (uint64, <-chan Event, func()) {
 	return s.version, ch, cancel
 }
 
-// AddValidator registers an on-set validator for one parameter.
+// AddValidator registers an on-set validator for one parameter. Validators
+// run outside the write lock against a read snapshot with optimistic
+// generation; the first error aborts before the version moves. A concurrent
+// mutation aborts loudly. Validators must still avoid deep reentrancy: they
+// must not call back into the store.
 func (s *Store) AddValidator(name string, fn ValidatorFunc) error {
 	if s == nil {
 		return errors.New("sdk: add validator on nil store") //nolint:wrapcheck // new error, nothing to wrap
@@ -549,15 +700,9 @@ func (s *Store) ApplyStartup(files, cli, code map[string]Value) (Event, error) {
 		return Event{}, errors.New("sdk: apply startup on nil store") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	merged := make(map[string]Value)
-	for k, v := range files {
-		merged[k] = v
-	}
-	for k, v := range cli {
-		merged[k] = v
-	}
-	for k, v := range code {
-		merged[k] = v
-	}
+	maps.Copy(merged, files)
+	maps.Copy(merged, cli)
+	maps.Copy(merged, code)
 	if len(merged) == 0 {
 		s.mu.RLock()
 		version := s.version
@@ -573,6 +718,7 @@ func (s *Store) ApplyStartup(files, cli, code map[string]Value) (Event, error) {
 
 // SetWithSource writes every entry or none with the given source label in
 // one versioned event. Unknown names auto-declare only when allowed.
+// Validators run outside the write lock with optimistic generation.
 func (s *Store) SetWithSource(updates map[string]Value, source string, autoDeclare bool) (Event, error) {
 	if s == nil {
 		return Event{}, errors.New("sdk: set with source on nil store") //nolint:wrapcheck // new error, nothing to wrap
@@ -581,10 +727,21 @@ func (s *Store) SetWithSource(updates map[string]Value, source string, autoDecla
 		return Event{}, errors.New("sdk: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	s.mu.Lock()
-	event, hooks, err := s.prepareBatchLocked(updates, source, autoDeclare)
+	event, hooks, pending, err := s.prepareBatchLocked(updates, source, autoDeclare)
 	if err != nil {
 		s.mu.Unlock()
 		return Event{}, err
+	}
+	gen := s.version
+	s.mu.Unlock()
+	err = runPendingValidators(pending)
+	if err != nil {
+		return Event{}, err
+	}
+	s.mu.Lock()
+	if s.version != gen {
+		s.mu.Unlock()
+		return Event{}, fmt.Errorf("sdk: config: %s: concurrent mutation aborted batch", source)
 	}
 	if len(event.Changes) == 0 {
 		version := s.version
@@ -592,15 +749,18 @@ func (s *Store) SetWithSource(updates map[string]Value, source string, autoDecla
 		return Event{Version: version, Source: source, Changes: []Change{}}, nil
 	}
 	s.commitPreparedLocked(event)
-	channels := s.watcherChannelsLocked()
 	s.mu.Unlock()
-	s.broadcast(channels, event)
+	s.broadcast(event)
 	s.runHooks(hooks)
 	return event, nil
 }
 
-// prepareBatchLocked validates every update without mutating state.
-func (s *Store) prepareBatchLocked(updates map[string]Value, source string, autoDeclare bool) (Event, []hookCall, error) {
+// prepareBatchLocked validates every update without mutating state and
+// collects validators to run outside the write lock with optimistic
+// generation.
+//
+//nolint:gocognit // batch validation sequences sort, type, read-only, and validator collection in one pass, splitting would obscure intent
+func (s *Store) prepareBatchLocked(updates map[string]Value, source string, autoDeclare bool) (Event, []hookCall, []pendingValidator, error) {
 	ordered := make([]string, 0, len(updates))
 	for name := range updates {
 		ordered = append(ordered, name)
@@ -609,19 +769,20 @@ func (s *Store) prepareBatchLocked(updates map[string]Value, source string, auto
 	next := s.version + 1
 	var changes []Change
 	var hooks []hookCall
+	var pending []pendingValidator
 	for _, name := range ordered {
 		newValue := updates[name]
 		err := ValidateName(name)
 		if err != nil {
-			return Event{}, nil, err
-		}
-		if newValue.Type == ParamTypeNotSet {
-			return Event{}, nil, fmt.Errorf("sdk: set %q: value type not_set is not concrete", name)
+			return Event{}, nil, nil, err
 		}
 		entry, ok := s.params[name]
 		if !ok {
+			if newValue.Type == ParamTypeNotSet {
+				return Event{}, nil, nil, fmt.Errorf("sdk: set %q: value type not_set is not concrete", name)
+			}
 			if !autoDeclare {
-				return Event{}, nil, fmt.Errorf("sdk: set %q: not declared", name)
+				return Event{}, nil, nil, fmt.Errorf("sdk: set %q: not declared", name)
 			}
 			changes = append(changes, Change{Name: name, NewValue: newValue, HadOld: false})
 			for _, fn := range s.hooks[name] {
@@ -630,18 +791,15 @@ func (s *Store) prepareBatchLocked(updates map[string]Value, source string, auto
 			continue
 		}
 		if entry.desc.ReadOnly {
-			return Event{}, nil, fmt.Errorf("sdk: set %q: parameter is read only", name)
+			return Event{}, nil, nil, fmt.Errorf("sdk: set %q: parameter is read only", name)
 		}
 		err = entry.desc.validateValue(newValue)
 		if err != nil {
-			return Event{}, nil, fmt.Errorf("sdk: set %q: %w", name, err)
+			return Event{}, nil, nil, fmt.Errorf("sdk: set %q: %w", name, err)
 		}
 		old := entry.value
 		for _, fn := range s.validators[name] {
-			err = fn(old, newValue)
-			if err != nil {
-				return Event{}, nil, fmt.Errorf("sdk: set %q rejected by validator: %w", name, err)
-			}
+			pending = append(pending, pendingValidator{name: name, oldValue: old, newValue: newValue, fn: fn})
 		}
 		changes = append(changes, Change{Name: name, OldValue: old, NewValue: newValue, HadOld: true})
 		for _, fn := range s.hooks[name] {
@@ -649,11 +807,12 @@ func (s *Store) prepareBatchLocked(updates map[string]Value, source string, auto
 		}
 	}
 	event := Event{Version: next, Source: source, Changes: changes}
-	return event, hooks, nil
+	return event, hooks, pending, nil
 }
 
 // commitPreparedLocked applies a validated event: one version bump, one
-// history entry per change, and value swaps.
+// history entry per change, and value swaps. History is trimmed to the last
+// configHistoryLimit entries with oldest drops counted loudly.
 func (s *Store) commitPreparedLocked(event Event) {
 	s.version = event.Version
 	for _, c := range event.Changes {
@@ -672,33 +831,127 @@ func (s *Store) commitPreparedLocked(event Event) {
 			Source:   event.Source,
 		})
 	}
+	s.trimHistoryLocked()
 }
 
-// watcherChannelsLocked snapshots watcher channels. The caller holds the lock.
-func (s *Store) watcherChannelsLocked() []chan Event {
-	out := make([]chan Event, 0, len(s.watchers))
-	for _, w := range s.watchers {
-		out = append(out, w)
+// trimHistoryLocked drops oldest history beyond configHistoryLimit and counts
+// loudly. The caller holds the write lock.
+func (s *Store) trimHistoryLocked() {
+	if len(s.history) <= configHistoryLimit {
+		return
 	}
-	return out
+	overflow := len(s.history) - configHistoryLimit
+	for i := range overflow {
+		s.history[i] = HistoryEntry{}
+	}
+	s.history = append([]HistoryEntry(nil), s.history[overflow:]...)
+	s.historyDrop += uint64(overflow) //nolint:gosec // overflow is a non-negative length difference fitting uint64
 }
 
-// broadcast delivers the event to every channel without blocking.
-func (s *Store) broadcast(channels []chan Event, event Event) {
-	for _, ch := range channels {
+// broadcast delivers the event to every watcher without holding the write
+// lock. Each watcher is checked plus sent under a read lock with a
+// per-watcher nonblocking send; a full channel evicts its oldest event and
+// counts loudly in BroadcastDrops. Never sends on a closed channel because
+// cancel deletes plus closes under the write lock, which waits for the read
+// lock.
+func (s *Store) broadcast(event Event) {
+	s.mu.RLock()
+	ids := make([]uint64, 0, len(s.watchers))
+	for id := range s.watchers {
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+	for _, id := range ids {
+		s.mu.RLock()
+		ch, ok := s.watchers[id]
+		if !ok {
+			s.mu.RUnlock()
+			continue
+		}
 		select {
 		case ch <- event:
+			s.mu.RUnlock()
 		default:
 			select {
 			case <-ch:
+				s.drops.Add(1)
 			default:
 			}
 			select {
 			case ch <- event:
+				s.mu.RUnlock()
 			default:
+				s.drops.Add(1)
+				s.mu.RUnlock()
 			}
 		}
 	}
+}
+
+// LoadDump restores values plus descriptors atomically with the given source.
+// New names declare with the supplied descriptors after validation; existing
+// names keep their descriptors and validate against them. Validators run
+// outside the write lock with optimistic generation.
+//
+//nolint:gocognit,cyclop // load sequences validation, optimistic prepare, commit, and descriptor pinning in one flow, splitting would obscure intent
+func (s *Store) LoadDump(dump map[string]DumpEntry, source string) (Event, error) {
+	if s == nil {
+		return Event{}, errors.New("sdk: load dump on nil store") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if source == "" {
+		return Event{}, errors.New("sdk: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	values := make(map[string]Value, len(dump))
+	for name, entry := range dump {
+		err := ValidateName(name)
+		if err != nil {
+			return Event{}, err
+		}
+		if _, ok := s.params[name]; !ok {
+			err = entry.Descriptor.validateValue(entry.Value)
+			if err != nil {
+				return Event{}, fmt.Errorf("sdk: load dump %q: %w", name, err)
+			}
+		}
+		values[name] = entry.Value
+	}
+	s.mu.Lock()
+	event, hooks, pending, err := s.prepareBatchLocked(values, source, true)
+	if err != nil {
+		s.mu.Unlock()
+		return Event{}, err
+	}
+	gen := s.version
+	s.mu.Unlock()
+	err = runPendingValidators(pending)
+	if err != nil {
+		return Event{}, err
+	}
+	s.mu.Lock()
+	if s.version != gen {
+		s.mu.Unlock()
+		return Event{}, fmt.Errorf("sdk: config: %s: concurrent mutation aborted batch", source)
+	}
+	if len(event.Changes) == 0 {
+		version := s.version
+		s.mu.Unlock()
+		return Event{Version: version, Source: source, Changes: []Change{}}, nil
+	}
+	s.commitPreparedLocked(event)
+	for _, c := range event.Changes {
+		if c.HadOld {
+			continue
+		}
+		if entry, ok := dump[c.Name]; ok {
+			if stored, exists := s.params[c.Name]; exists {
+				stored.desc = entry.Descriptor
+			}
+		}
+	}
+	s.mu.Unlock()
+	s.broadcast(event)
+	s.runHooks(hooks)
+	return event, nil
 }
 
 // runHooks executes apply hooks after commit in batch order.

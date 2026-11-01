@@ -11,6 +11,9 @@ import (
 	"sync/atomic"
 )
 
+// ErrLoanReturned reports use after return or a second return on a loaned message.
+var ErrLoanReturned = errors.New("sdk: loan already returned")
+
 // Reliability names the delivery retry behavior of a QoS profile.
 type Reliability int
 
@@ -486,12 +489,25 @@ func CanLoanOffer(opts LoanOptions) (bool, string) {
 
 // PublishWithLoan sends one sample with a loan preference.
 //
-// It copies the payload once at ingress exactly like Publish. A future
-// in-process transport may loan eligible samples; until then the copy
-// fallback keeps delivery identical and CanLoanOffer reports the outcome
-// honestly. It returns the context error when ctx already ended, or an
-// error when the node or publisher is closed.
-func (p *Publisher) PublishWithLoan(ctx context.Context, payload []byte, _ LoanOptions) error {
+// When the policy opts into loans it checks CanLoanOffer first and fails
+// loudly with the ineligibility reason instead of silently copying, so a
+// caller that asked for a loan never mistakes a copy for a loan. LoanNever
+// always copies exactly like Publish. An eligible loan still copies once at
+// ingress today because the in-memory bus has no shared-memory transport; a
+// future in-process transport may loan eligible samples. It returns the
+// context error when ctx already ended, or an error when the node or
+// publisher is closed.
+func (p *Publisher) PublishWithLoan(ctx context.Context, payload []byte, opts LoanOptions) error {
+	if opts.Policy != LoanNever {
+		ok, reason := CanLoanOffer(opts)
+		if !ok {
+			topic := ""
+			if p != nil {
+				topic = p.topic
+			}
+			return fmt.Errorf("sdk: publish with loan on %q refused: %s", topic, reason)
+		}
+	}
 	return p.Publish(ctx, payload)
 }
 
@@ -508,17 +524,47 @@ type LoanedMessage struct {
 	payload []byte
 	// valid is consumed by Return.
 	valid bool
+	// topic is the ROS topic the sample arrived on.
+	topic string
+	// typeName is the ROS IDL type of the sample.
+	typeName string
+}
+
+// Topic returns the ROS topic the sample arrived on.
+func (m *LoanedMessage) Topic() string {
+	if m == nil {
+		return ""
+	}
+	return m.topic
+}
+
+// TypeName returns the ROS IDL type of the sample.
+func (m *LoanedMessage) TypeName() string {
+	if m == nil {
+		return ""
+	}
+	return m.typeName
+}
+
+// Valid reports whether the handle still owns its bytes.
+func (m *LoanedMessage) Valid() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.valid
 }
 
 // Bytes exposes the sample bytes. It fails after Return.
 func (m *LoanedMessage) Bytes() ([]byte, error) {
 	if m == nil {
-		return nil, errors.New("sdk: loaned bytes on nil message") //nolint:wrapcheck // new error, nothing to wrap
+		return nil, fmt.Errorf("sdk: loaned bytes on nil message: %w", ErrLoanReturned)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.valid {
-		return nil, errors.New("sdk: loaned bytes after return") //nolint:wrapcheck // new error, nothing to wrap
+		return nil, fmt.Errorf("sdk: loaned bytes after return: %w", ErrLoanReturned)
 	}
 	return m.payload, nil
 }
@@ -526,12 +572,12 @@ func (m *LoanedMessage) Bytes() ([]byte, error) {
 // Return releases the handle exactly once.
 func (m *LoanedMessage) Return() error {
 	if m == nil {
-		return errors.New("sdk: loaned return on nil message") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: loaned return on nil message: %w", ErrLoanReturned)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.valid {
-		return errors.New("sdk: loaned double return") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: loaned double return: %w", ErrLoanReturned)
 	}
 	m.valid = false
 	m.payload = nil
@@ -541,14 +587,31 @@ func (m *LoanedMessage) Return() error {
 // NextLoaned waits for one sample or context end and returns a handle
 // with explicit return.
 //
-// It copies once like Next and reports the fallback honestly through
-// CanLoanOffer: pass LoanIfEligible with InProcess and Eligible set and a
-// future transport may loan, while today the bytes are an owned copy.
-// The caller must call Return exactly once.
-func (s *Subscription) NextLoaned(ctx context.Context, _ LoanOptions) (*LoanedMessage, error) {
+// When the policy opts into loans it checks CanLoanOffer first and fails
+// loudly with the ineligibility reason instead of silently copying. An
+// eligible loan still copies once like Next today because the in-memory bus
+// has no shared-memory transport; a future transport may back the handle
+// with a true loan. The caller must call Return exactly once.
+func (s *Subscription) NextLoaned(ctx context.Context, opts LoanOptions) (*LoanedMessage, error) {
+	if opts.Policy != LoanNever {
+		ok, reason := CanLoanOffer(opts)
+		if !ok {
+			topic := ""
+			if s != nil {
+				topic = s.topic
+			}
+			return nil, fmt.Errorf("sdk: subscription next loaned on %q refused: %s", topic, reason)
+		}
+	}
 	msg, err := s.Next(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &LoanedMessage{payload: msg, valid: true}, nil
+	topic := ""
+	typeName := ""
+	if s != nil {
+		topic = s.topic
+		typeName = s.typeName
+	}
+	return &LoanedMessage{payload: msg, valid: true, topic: topic, typeName: typeName}, nil
 }

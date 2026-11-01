@@ -116,9 +116,14 @@ func topicDomainFlags(fs *flag.FlagSet) (*string, *uint) {
 //
 // Flag sets print help to their configured output, which is stderr for
 // usage errors. Pre-scanning lets -h help go to stdout with exit 0 while
-// parse failures still go to stderr with exit 2.
+// parse failures still go to stderr with exit 2. Scanning stops at the
+// -- terminator so payload values equal to --help pass through; leading
+// flags still trigger help.
 func isHelpRequest(args []string) bool {
 	for _, a := range args {
+		if a == "--" {
+			return false
+		}
 		if a == "-h" || a == "-help" || a == "--help" {
 			return true
 		}
@@ -240,6 +245,10 @@ func resolvePubText(flagText string, args []string) (string, error) {
 	}
 
 	if len(args) == 1 {
+		if args[0] == "" {
+			return "", errors.New("weld: pub message must not be empty") //nolint:wrapcheck // new error, nothing to wrap
+		}
+
 		return args[0], nil
 	}
 
@@ -275,8 +284,6 @@ func withEchoTimeout(ctx context.Context, timeout time.Duration) (context.Contex
 
 // echoSubscriber announces an SEDP reader on backends that support it.
 type echoSubscriber interface {
-	// Subscribe declares a local reader for topic with the given type.
-	Subscribe(ctx context.Context, topic, typeName, typeHash string) error
 	// SubscribeWithDurability declares a local reader with explicit durability.
 	SubscribeWithDurability(ctx context.Context, topic, typeName, typeHash string, volatile bool) error
 }
@@ -431,7 +438,7 @@ func runPub(ctx context.Context, topic, text string, domain uint32, stdout io.Wr
 		return fmt.Errorf("weld: open backend for topic %q: %w", topic, err)
 	}
 
-	payload, err := encodeStringPayload(text)
+	payload, err := encodeStringPayload(topic, text)
 	if err != nil {
 		cerr := backend.Close()
 		if cerr != nil {
@@ -569,61 +576,86 @@ func isSkippableSample(err error) bool {
 		errors.Is(err, dds.ErrInvalidFrame)
 }
 
+// handleEchoTakeError maps take errors to loop action.
+//
+// It returns done true when the loop should exit, with err carrying the
+// terminal error or nil for clean exit. Done false means continue.
+func handleEchoTakeError(ctx context.Context, tracker *lossTracker, err error) (bool, error) {
+	if errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled) {
+			tracker.summary()
+			return true, fmt.Errorf("weld: echo canceled: %w", context.Canceled)
+		}
+		tracker.summary()
+		return true, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		tracker.summary()
+		return true, nil
+	}
+	if isSkippableSample(err) {
+		tracker.countDrop()
+		return false, nil
+	}
+	return true, fmt.Errorf("weld: take bytes: %w", err)
+}
+
+// handleEchoSample filters, decodes, and prints one sample.
+//
+// It returns nil to continue the loop after drops or successful prints,
+// and a terminal error for decode or print failures.
+func handleEchoSample(tracker *lossTracker, topic string, msg transports.IncomingMessage, stdout io.Writer) error {
+	if msg.TopicName != topic {
+		tracker.countDrop()
+		return nil
+	}
+	if msg.TypeName != "" && msg.TypeName != stringTypeName {
+		tracker.countDrop()
+		return nil
+	}
+	text, err := decodeStringPayload(msg.Payload)
+	if err != nil {
+		if msg.TypeName != "" && msg.TypeName != stringTypeName {
+			tracker.countDrop()
+			return nil
+		}
+		return fmt.Errorf("weld: decode message on %q: %w", msg.TopicName, err)
+	}
+	_, err = fmt.Fprintln(stdout, text)
+	if err != nil {
+		return fmt.Errorf("weld: print message: %w", err)
+	}
+	return nil
+}
+
 // echoLoop takes messages on topic until ctx ends and prints decoded text.
 //
 // Messages on other topics are skipped and counted as drops so parallel
 // shards sharing one domain do not cross-talk. Messages with a mismatched
 // type name are also skipped as drops, including decode failures, so a
-// foreign type on the subscribed topic never fails the run.
+// foreign type on the subscribed topic never fails the run. A cancelled
+// context exits 1 like topic and doctor; a deadline timeout exits cleanly.
 func echoLoop(ctx context.Context, backend transports.Backend, topic string, stdout, stderr io.Writer) error {
 	tracker := newLossTracker(backend, stderr)
 
 	for {
 		msg, err := backend.TakeBytes(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				tracker.summary()
-
+			done, terr := handleEchoTakeError(ctx, tracker, err)
+			if terr != nil {
+				return terr
+			}
+			if done {
 				return nil
 			}
-
-			if isSkippableSample(err) {
-				tracker.countDrop()
-
-				continue
-			}
-
-			return fmt.Errorf("weld: take bytes: %w", err)
+			continue
 		}
 
 		tracker.poll()
 
-		if msg.TopicName != topic {
-			tracker.countDrop()
-
-			continue
-		}
-
-		if msg.TypeName != "" && msg.TypeName != stringTypeName {
-			tracker.countDrop()
-
-			continue
-		}
-
-		text, err := decodeStringPayload(msg.Payload)
+		err = handleEchoSample(tracker, topic, msg, stdout)
 		if err != nil {
-			if msg.TypeName != "" && msg.TypeName != stringTypeName {
-				tracker.countDrop()
-
-				continue
-			}
-
-			return fmt.Errorf("weld: decode message on %q: %w", msg.TopicName, err)
-		}
-
-		_, err = fmt.Fprintln(stdout, text)
-		if err != nil {
-			return fmt.Errorf("weld: print message: %w", err)
+			return err
 		}
 	}
 }
@@ -650,7 +682,7 @@ func openBackend(ctx context.Context, domain uint32, participant string) (transp
 
 	err = backend.JoinDiscovery(ctx, info)
 	if err != nil {
-		cerr := backend.Close()
+		cerr := backend.Close() //nolint:contextcheck // backend Close is cleanup without caller ctx, goodbye uses bounded Background
 		if cerr != nil {
 			return nil, fmt.Errorf("join discovery on domain %d as %q: %w", domain, participant, errors.Join(err, cerr))
 		}
@@ -665,19 +697,19 @@ func openBackend(ctx context.Context, domain uint32, participant string) (transp
 func checkEndpoint(topic, name string, kind core.EndpointKind) error {
 	_, err := core.CreateEndpoint(topic, name, kind, core.BestAvailableQoS(), nil, false)
 	if err != nil {
-		return fmt.Errorf("weld: create endpoint: %w", err)
+		return fmt.Errorf("weld: create endpoint topic %q participant %q kind %q: %w", topic, name, kind.String(), err)
 	}
 
 	return nil
 }
 
 // encodeStringPayload encodes text as XCDR1 std_msgs/String bytes.
-func encodeStringPayload(text string) ([]byte, error) {
+func encodeStringPayload(topic, text string) ([]byte, error) {
 	enc := types.NewEncoder(true)
 
 	err := enc.WriteString(text)
 	if err != nil {
-		return nil, fmt.Errorf("encode string: %w", err)
+		return nil, fmt.Errorf("weld: encode string payload topic %q len %d: %w", topic, len(text), err)
 	}
 
 	return enc.Bytes(), nil

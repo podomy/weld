@@ -42,6 +42,8 @@ type Node struct {
 	pubs []*Publisher
 	// servers tracks service servers for teardown.
 	servers []*ServiceServer
+	// clients tracks service clients for teardown.
+	clients []*ServiceClient
 }
 
 // NewNode returns a node with its own config store and wall clock.
@@ -155,12 +157,26 @@ func (n *Node) trackServer(srv *ServiceServer) {
 	n.servers = append(n.servers, srv)
 }
 
+// trackClient records one service client for teardown. A nil node drops it.
+func (n *Node) trackClient(client *ServiceClient) {
+	if n == nil || client == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return
+	}
+	n.clients = append(n.clients, client)
+}
+
 // Close releases node resources and is idempotent.
 //
 // Close marks the node closed, closes Done, then closes tracked
-// publishers and subscriptions and unregisters tracked servers. Later
-// Publish and Call fail loudly instead of flowing. A second call
-// returns nil.
+// publishers, subscriptions, servers, and clients. Later Publish and Call
+// fail loudly instead of flowing. Tracked slices are cleared so a second
+// Close observes no stale entries. The first teardown error is returned;
+// a second call returns nil.
 func (n *Node) Close() error {
 	if n == nil {
 		return errors.New("sdk: close nil node") //nolint:wrapcheck // new error, nothing to wrap
@@ -172,21 +188,44 @@ func (n *Node) Close() error {
 	}
 	n.closed = true
 	close(n.done)
-	pubs := make([]*Publisher, len(n.pubs))
-	copy(pubs, n.pubs)
-	subs := make([]*Subscription, len(n.subs))
-	copy(subs, n.subs)
-	servers := make([]*ServiceServer, len(n.servers))
-	copy(servers, n.servers)
+	closers := n.takeClosersLocked()
 	n.mu.Unlock()
-	for _, pub := range pubs {
-		_ = pub.Close() //nolint:errcheck // teardown is best effort, Close stays nil
+	return runClosers(closers)
+}
+
+// takeClosersLocked collects teardown closures and clears tracked slices.
+//
+// The caller must hold n.mu. Clearing here keeps a second Close from
+// observing stale entries.
+func (n *Node) takeClosersLocked() []func() error {
+	closers := make([]func() error, 0, len(n.pubs)+len(n.subs)+len(n.servers)+len(n.clients))
+	for _, pub := range n.pubs {
+		closers = append(closers, pub.Close)
 	}
-	for _, sub := range subs {
-		_ = sub.Close() //nolint:errcheck // teardown is best effort, Close stays nil
+	for _, sub := range n.subs {
+		closers = append(closers, sub.Close)
 	}
-	for _, srv := range servers {
-		_ = srv.Close() //nolint:errcheck // teardown is best effort, Close stays nil
+	for _, srv := range n.servers {
+		closers = append(closers, srv.Close)
 	}
-	return nil
+	for _, client := range n.clients {
+		closers = append(closers, client.Close)
+	}
+	n.pubs = nil
+	n.subs = nil
+	n.servers = nil
+	n.clients = nil
+	return closers
+}
+
+// runClosers runs teardown closures and returns the first error.
+func runClosers(closers []func() error) error {
+	var firstErr error
+	for _, closeFn := range closers {
+		err := closeFn()
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

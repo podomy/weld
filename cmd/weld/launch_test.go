@@ -132,11 +132,12 @@ func TestRunLaunchUsage(t *testing.T) {
 	cancelled, stop := context.WithCancel(context.Background())
 	stop()
 	var cancelledOut bytes.Buffer
-	code = runLaunchCommand(cancelled, []string{"--node", "x"}, &cancelledOut, &stderr)
-	if code != 0 {
-		t.Fatalf("cancelled code = %d, want clean 0", code)
+	var cancelledErr bytes.Buffer
+	code = runLaunchCommand(cancelled, []string{"--node", "x"}, &cancelledOut, &cancelledErr)
+	if code != 1 {
+		t.Fatalf("cancelled code = %d, want 1", code)
 	}
 	if cancelledOut.Len() != 0 {
-		t.Fatalf("cancelled must print nothing, have %q", cancelledOut.String())
+		t.Fatalf("cancelled must print nothing to stdout, have %q", cancelledOut.String())
 	}
 }

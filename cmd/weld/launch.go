@@ -31,76 +31,93 @@ func (s *stringSliceFlag) Set(v string) error {
 	return nil
 }
 
-// runLaunchCommand resolves launch arguments and prints node config.
-//
-// Left of --ros-args carries launch flags (--node, --namespace, --sdf,
-// --autostart, --allow-undeclared, repeatable --params-file and --rewrite
-// as k:=v). Right of --ros-args forwards with launch.ForwardArgs where CLI
-// argv appends to node options with last wins. Files plus CLI resolve with
-// FQN over wildcard, rewrites apply per namespace, SDF appends with sim
-// time forced on, and the canonical dump shares form with ros2 param dump.
-// A cancelled context terminates cleanly with code 0 and no output. This
-// differs from params which reports cancel with code 1; the 0 here is
-// pinned by TestRunLaunchUsage and stays so launch cancel stays silent.
-func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	err := ctx.Err()
-	if err != nil {
-		return 0
-	}
-	if isHelpRequest(args) {
-		printLaunchUsage(stdout)
-		return 0
-	}
-	left, right := splitRosArgs(args)
+// prepareLaunchForwarded parses flags and forwards args, resolving the FQN.
+func prepareLaunchForwarded(left, right []string, stderr io.Writer) (launch.NodeOptions, launchFlagConfig, string, int, bool) {
 	cfg, cfgErr := parseLaunchFlags(left)
 	if cfgErr != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(cfgErr)) //nolint:errcheck // final error output is best effort
-		return 2
+		return launch.NodeOptions{}, launchFlagConfig{}, "", 2, false
 	}
 	base, err := launch.NewNodeOptions(cfg.node, cfg.namespace, cfg.node == "")
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 2
+		return launch.NodeOptions{}, launchFlagConfig{}, "", 2, false
 	}
-	base.AllowUndeclared = cfg.allowUndeclared
 	base.ParamsFiles = append([]string{}, cfg.paramsFiles...)
 	forwarded, err := launch.ForwardArgs(base, right)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 2
+		return launch.NodeOptions{}, launchFlagConfig{}, "", 2, false
 	}
 	if strings.TrimSpace(forwarded.NodeName) == "" {
 		_, _ = fmt.Fprintln(stderr, "weld: launch needs --node or -r __node:=name") //nolint:errcheck // final error output is best effort
-		return 2
+		return launch.NodeOptions{}, launchFlagConfig{}, "", 2, false
 	}
 	fqn, err := launch.ResolveNodeFQN(forwarded.NodeName, forwarded.Namespace)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 2
+		return launch.NodeOptions{}, launchFlagConfig{}, "", 2, false
 	}
+	return forwarded, cfg, fqn, 0, true
+}
+
+// buildLaunchFinal resolves params, rewrites, and appends SDF.
+func buildLaunchFinal(forwarded launch.NodeOptions, cfg launchFlagConfig, stderr io.Writer) (map[string]core.ParamValue, string, int, bool) {
 	rewrites, err := parseRewriteFlags(cfg.rewrites)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 2
+		return nil, "", 2, false
 	}
 	resolved, err := resolveLaunchParams(forwarded)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 1
+		return nil, "", 1, false
 	}
 	final, err := launch.RewriteParamsForNamespace(resolved, forwarded.Namespace, rewrites, cfg.autostart)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return 2
+		return nil, "", 2, false
 	}
 	sdfPath := strings.TrimSpace(cfg.sdf)
 	if sdfPath != "" {
 		validated, err := launch.AppendSDFParams(forwarded, sdfPath)
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-			return 2
+			return nil, "", 2, false
 		}
 		final[launch.SimTimeParam] = validated.Params[launch.SimTimeParam]
+	}
+	return final, sdfPath, 0, true
+}
+
+// runLaunchCommand resolves launch arguments and prints node config.
+//
+// Left of --ros-args carries launch flags (--node, --namespace, --sdf,
+// --autostart, repeatable --params-file and --rewrite as k:=v). Right of
+// --ros-args forwards with launch.ForwardArgs where CLI argv appends to
+// node options with last wins. Files plus CLI resolve with FQN over
+// wildcard, rewrites apply per namespace, SDF appends with sim time forced
+// on, and the canonical dump shares form with ros2 param dump.
+// A cancelled context terminates with code 1 like params; the 1 here is
+// pinned by TestRunLaunchUsage so launch cancel stays loud.
+func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	err := ctx.Err()
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 1
+	}
+	if isHelpRequest(args) {
+		printLaunchUsage(stdout)
+		return 0
+	}
+	left, right := splitRosArgs(args)
+	forwarded, cfg, fqn, code, ok := prepareLaunchForwarded(left, right, stderr)
+	if !ok {
+		return code
+	}
+	final, sdfPath, code, ok := buildLaunchFinal(forwarded, cfg, stderr)
+	if !ok {
+		return code
 	}
 	dump, err := launch.CanonicalDump(fqn, final)
 	if err != nil {
@@ -109,7 +126,8 @@ func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	err = ctx.Err()
 	if err != nil {
-		return 0
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 1
 	}
 	printLaunchResult(stdout, fqn, forwarded.Remaps, dump, sdfPath)
 	return 0
@@ -117,13 +135,12 @@ func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 
 // launchFlagConfig holds parsed left side launch flags.
 type launchFlagConfig struct {
-	node            string
-	namespace       string
-	sdf             string
-	autostart       bool
-	allowUndeclared bool
-	paramsFiles     []string
-	rewrites        []string
+	node        string
+	namespace   string
+	sdf         string
+	autostart   bool
+	paramsFiles []string
+	rewrites    []string
 }
 
 // parseLaunchFlags parses flags left of --ros-args.
@@ -136,7 +153,6 @@ func parseLaunchFlags(left []string) (launchFlagConfig, error) {
 	fs.StringVar(&cfg.namespace, "namespace", "", "node namespace, absolute resolution, default /")
 	fs.StringVar(&cfg.sdf, "sdf", "", "SDF file appended as node args with sim time forced on")
 	fs.BoolVar(&cfg.autostart, "autostart", false, "force autostart true through namespace rewrites")
-	fs.BoolVar(&cfg.allowUndeclared, "allow-undeclared", false, "allow Set to auto declare unknown names")
 	fs.Var(&files, "params-file", "params YAML file, repeatable")
 	fs.Var(&rewrites, "rewrite", "param rewrite k:=v, repeatable")
 	err := fs.Parse(left)
@@ -183,13 +199,13 @@ func parseRewriteFlags(flags []string) (map[string]string, error) {
 func resolveLaunchParams(opts launch.NodeOptions) (map[string]core.ParamValue, error) {
 	fqn, err := launch.ResolveNodeFQN(opts.NodeName, opts.Namespace)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("weld: resolve node %q: %w", opts.NodeName, err)
 	}
 	var sections []map[string]map[string]core.ParamValue
 	for _, path := range opts.ParamsFiles {
 		loaded, err := launch.LoadParamsFile(path)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("weld: load params file %q: %w", path, err)
 		}
 		sections = append(sections, loaded)
 	}
@@ -223,5 +239,5 @@ func printLaunchResult(stdout io.Writer, fqn string, remaps []launch.RemapRule, 
 
 // printLaunchUsage writes launch help.
 func printLaunchUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, "Usage: weld launch --node NAME [--namespace /ns] [--params-file f.yaml] [--sdf robot.sdf] [--rewrite k:=v] [--autostart] [--allow-undeclared] [--ros-args -r __node:=n -r __ns:=/ns -r from:=to -p k:=v --params-file g.yaml --]\n") //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(w, "Usage: weld launch --node NAME [--namespace /ns] [--params-file f.yaml] [--sdf robot.sdf] [--rewrite k:=v] [--autostart] [--ros-args -r __node:=n -r __ns:=/ns -r from:=to -p k:=v --params-file g.yaml --]\n") //nolint:errcheck // help output failure is not actionable
 }

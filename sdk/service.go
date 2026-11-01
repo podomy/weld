@@ -26,7 +26,12 @@ var (
 	ErrServiceServerGone = errors.New("sdk: service server gone")
 	// ErrServiceClientGone reports a call on a closed client or node.
 	ErrServiceClientGone = errors.New("sdk: service client gone")
+	// ErrServiceInflightExceeded reports a call refused by the max-inflight cap.
+	ErrServiceInflightExceeded = errors.New("sdk: service inflight exceeded")
 )
+
+// maxServiceInflight caps concurrent plus abandoned per-client call goroutines.
+const maxServiceInflight = 64
 
 // ServiceHandler serves one request and returns one reply.
 //
@@ -99,10 +104,12 @@ type ServiceClient struct {
 	service string
 	// seq numbers calls for error context only.
 	seq atomic.Uint64
-	// mu guards closed.
+	// mu guards closed plus inflight.
 	mu sync.Mutex
 	// closed marks teardown; Close is idempotent.
 	closed bool
+	// inflight counts concurrent plus abandoned handler goroutines.
+	inflight int
 }
 
 // Service returns the called service name.
@@ -124,16 +131,6 @@ func (c *ServiceClient) Close() error {
 	return nil
 }
 
-// isClosed reports whether Close ran.
-func (c *ServiceClient) isClosed() bool {
-	if c == nil {
-		return true
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closed
-}
-
 // serviceResult carries one handler outcome across the goroutine boundary.
 type serviceResult struct {
 	// reply holds the handler bytes on success.
@@ -147,7 +144,11 @@ type serviceResult struct {
 // It copies the request at ingress, applies the default timeout when ctx
 // carries no deadline, and errors exactly one call when the server is
 // gone or the context ends. Gone servers and canceled contexts never
-// affect other calls.
+// affect other calls. Concurrent plus abandoned handler goroutines are
+// bounded by maxServiceInflight per client; excess calls fail loudly with
+// ErrServiceInflightExceeded instead of spawning without bound. Abandoned
+// calls still count until their handler finishes, so a slow server cannot
+// accumulate unbounded goroutines through timeouts.
 func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	if c == nil {
 		return nil, errors.New("sdk: call on nil service client") //nolint:wrapcheck // new error, nothing to wrap
@@ -159,22 +160,32 @@ func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, err)
 	}
-	if c.isClosed() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrServiceClientGone)
 	}
+	if c.inflight >= maxServiceInflight {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("sdk: service call on %q inflight %d at cap %d: %w", c.service, c.inflight, maxServiceInflight, ErrServiceInflightExceeded)
+	}
+	c.inflight++
+	c.mu.Unlock()
 	if c.node.IsClosed() {
+		c.finishCall()
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrServiceClientGone)
 	}
 	eff, cancel := withServiceTimeout(ctx)
 	defer cancel()
 	handler, ok := c.node.bus.lookupService(c.service)
 	if !ok {
+		c.finishCall()
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrNoSuchService)
 	}
 	seq := c.seq.Add(1)
 	owned := copyBytes(req)
 	resCh := make(chan serviceResult, 1)
-	go runServiceHandler(eff, handler, owned, resCh)
+	go c.runBoundedServiceHandler(eff, handler, owned, resCh)
 	select {
 	case <-eff.Done():
 		ctxErr := eff.Err()
@@ -188,6 +199,25 @@ func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 		}
 		return res.reply, nil
 	}
+}
+
+// finishCall releases one inflight slot.
+func (c *ServiceClient) finishCall() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inflight > 0 {
+		c.inflight--
+	}
+}
+
+// runBoundedServiceHandler invokes one handler, reports one result, then
+// releases the inflight slot so abandoned calls still bound goroutines.
+func (c *ServiceClient) runBoundedServiceHandler(ctx context.Context, handler ServiceHandler, req []byte, resCh chan<- serviceResult) {
+	defer c.finishCall()
+	runServiceHandler(ctx, handler, req, resCh)
 }
 
 // withServiceTimeout applies the default timeout when ctx has none.
@@ -252,5 +282,11 @@ func (n *Node) NewServiceClient(service string) (*ServiceClient, error) {
 	if n.IsClosed() {
 		return nil, fmt.Errorf("sdk: new service client on %q: node closed", service)
 	}
-	return &ServiceClient{node: n, service: service}, nil
+	client := &ServiceClient{node: n, service: service}
+	n.trackClient(client)
+	if n.IsClosed() {
+		_ = client.Close() //nolint:errcheck // teardown is best effort, node closed error below carries the failure
+		return nil, fmt.Errorf("sdk: new service client on %q: node closed", service)
+	}
+	return client, nil
 }

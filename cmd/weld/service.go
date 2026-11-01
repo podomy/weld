@@ -81,7 +81,7 @@ func runServiceCallCommand(ctx context.Context, args []string, stdout, stderr io
 	serviceFlag := fs.String("service", "", "ROS service name such as /add_two_ints")
 	domainFlag := fs.Uint("domain", uint(defaultDomainID()), "DDS domain id, default from ROS_DOMAIN_ID")
 	requestFlag := fs.String("request", "", "service request data")
-	deadlineFlag := fs.Duration("deadline", defaultServiceDeadline, "per-call timeout")
+	deadlineFlag := fs.Duration("deadline", defaultServiceDeadline, "per-call deadline")
 
 	err := fs.Parse(args)
 	if err != nil {
@@ -148,17 +148,21 @@ func resolveServiceCallArgs(flagService, flagRequest string, args []string) (str
 	}
 
 	if len(rest) == 0 {
-		return service, "", nil
+		return "", "", errors.New("weld: service call needs --request or one positional request") //nolint:wrapcheck // new error, nothing to wrap
 	}
 
 	if len(rest) == 1 {
+		if rest[0] == "" {
+			return "", "", errors.New("weld: service call request must not be empty") //nolint:wrapcheck // new error, nothing to wrap
+		}
+
 		return service, rest[0], nil
 	}
 
 	return "", "", errors.New("weld: service call takes one request, have too many args") //nolint:wrapcheck // new error, nothing to wrap
 }
 
-// validateServiceDeadline rejects non positive per-call timeouts.
+// validateServiceDeadline rejects non positive per-call deadlines.
 func validateServiceDeadline(deadline time.Duration) error {
 	if deadline <= 0 {
 		return errors.New("weld: service deadline must be positive") //nolint:wrapcheck // new error, nothing to wrap
@@ -171,12 +175,12 @@ func validateServiceDeadline(deadline time.Duration) error {
 func checkServiceEndpoints(service string) error {
 	_, _, err := core.ResolveServiceQoS(service, core.BestAvailableQoS())
 	if err != nil {
-		return fmt.Errorf("weld: create service endpoint: %w", err)
+		return fmt.Errorf("weld: create service %q endpoint: %w", service, err)
 	}
 
 	_, err = dds.NewServiceEndpoints(service, serviceIDLBase, false)
 	if err != nil {
-		return fmt.Errorf("weld: map service endpoints: %w", err)
+		return fmt.Errorf("weld: map service %q endpoints: %w", service, err)
 	}
 
 	return nil
@@ -249,7 +253,7 @@ func subscribeServiceReply(ctx context.Context, backend transports.Backend, serv
 
 	err := sub.Subscribe(ctx, service, serviceResponseIDL, "")
 	if err != nil {
-		return fmt.Errorf("weld: subscribe %q: %w", service, err)
+		return fmt.Errorf("weld: subscribe service %q reply: %w", service, err)
 	}
 
 	return nil
@@ -258,6 +262,52 @@ func subscribeServiceReply(ctx context.Context, backend transports.Backend, serv
 // publishServiceRequest retries PublishBytes on ErrNoRoute until deadline or ctx ends.
 func publishServiceRequest(ctx context.Context, backend transports.Backend, out transports.OutgoingMessage, deadline time.Duration) error {
 	return publishWithRouteRetry(ctx, backend, out, deadline)
+}
+
+// publishServiceChecked publishes one request, mapping no-route loudly.
+func publishServiceChecked(callCtx context.Context, backend transports.Backend, out transports.OutgoingMessage, client *core.ServiceClient, service string, guid [8]byte, seq uint64, deadline time.Duration) error {
+	err := publishServiceRequest(callCtx, backend, out, deadline)
+	if err != nil {
+		if errors.Is(err, dds.ErrNoRoute) {
+			_ = client.FailServerGone(service, guid, seq) //nolint:errcheck // gone count is best effort, loud error below carries the failure
+			return fmt.Errorf("weld: service %q: no server: %w", service, err)
+		}
+		return fmt.Errorf("weld: service %q: publish request: %w", service, err)
+	}
+	return nil
+}
+
+// checkServiceTakeError maps take errors to continue or terminal error.
+func checkServiceTakeError(callCtx context.Context, service string, deadline time.Duration, err error) error {
+	if errors.Is(callCtx.Err(), context.Canceled) {
+		return fmt.Errorf("weld: service %q: canceled: %w", service, context.Canceled)
+	}
+	if callCtx.Err() != nil {
+		return fmt.Errorf("weld: service %q: deadline %v exceeded: %w", service, deadline, context.DeadlineExceeded)
+	}
+	if isSkippableSample(err) {
+		return nil
+	}
+	return fmt.Errorf("weld: service %q: take reply: %w", service, err)
+}
+
+// processServiceReply filters, decodes, and completes one reply.
+func processServiceReply(client *core.ServiceClient, service string, guid [8]byte, seq uint64, msg transports.IncomingMessage) (string, bool, error) {
+	if msg.TopicName != "" && msg.TopicName != service {
+		return "", false, nil
+	}
+	resp, matched, err := decodeServiceReply(msg.Payload, guid, seq)
+	if err != nil {
+		return "", true, fmt.Errorf("weld: service %q: %w", service, err)
+	}
+	if !matched {
+		return "", false, nil
+	}
+	err = client.CompleteCall(service, guid, seq)
+	if err != nil {
+		return "", true, fmt.Errorf("weld: service %q: complete call: %w", service, err)
+	}
+	return resp, true, nil
 }
 
 // serviceCallWithBackend publishes one request and waits for the matching reply.
@@ -290,54 +340,28 @@ func serviceCallWithBackend(ctx context.Context, backend transports.Backend, ser
 		Payload:   wire,
 	}
 
-	err = publishServiceRequest(callCtx, backend, out, deadline)
+	err = publishServiceChecked(callCtx, backend, out, client, service, guid, seq, deadline)
 	if err != nil {
-		if errors.Is(err, dds.ErrNoRoute) {
-			_ = client.FailServerGone(service, guid, seq) //nolint:errcheck // gone count is best effort, loud error below carries the failure
-
-			return "", fmt.Errorf("weld: service %q: no server: %w", service, err)
-		}
-
-		return "", fmt.Errorf("weld: service %q: publish request: %w", service, err)
+		return "", err
 	}
 
 	for {
 		msg, err := backend.TakeBytes(callCtx)
 		if err != nil {
-			if errors.Is(callCtx.Err(), context.Canceled) {
-				return "", fmt.Errorf("weld: service %q: canceled: %w", service, context.Canceled)
+			terr := checkServiceTakeError(callCtx, service, deadline, err)
+			if terr != nil {
+				return "", terr
 			}
-
-			if callCtx.Err() != nil {
-				return "", fmt.Errorf("weld: service %q: deadline %v exceeded: %w", service, deadline, context.DeadlineExceeded)
-			}
-
-			if isSkippableSample(err) {
-				continue
-			}
-
-			return "", fmt.Errorf("weld: service %q: take reply: %w", service, err)
-		}
-
-		if msg.TopicName != "" && msg.TopicName != service {
 			continue
 		}
 
-		resp, matched, err := decodeServiceReply(msg.Payload, guid, seq)
+		resp, done, err := processServiceReply(client, service, guid, seq, msg)
 		if err != nil {
-			return "", fmt.Errorf("weld: service %q: %w", service, err)
+			return "", err
 		}
-
-		if !matched {
-			continue
+		if done {
+			return resp, nil
 		}
-
-		err = client.CompleteCall(service, guid, seq)
-		if err != nil {
-			return "", fmt.Errorf("weld: service %q: complete call: %w", service, err)
-		}
-
-		return resp, nil
 	}
 }
 

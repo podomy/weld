@@ -26,14 +26,14 @@ const (
 	topicDiscoveryWait = 500 * time.Millisecond
 )
 
-// TopicTypeHashPolicy marks type hash mismatches in loud CLI output.
+// topicTypeHashPolicy marks type hash mismatches in loud CLI output.
 //
 // Core PolicyKind covers QoS only, so type mismatches use this extra kind
 // to keep topic plus endpoint pair plus policy kind in one line.
-const TopicTypeHashPolicy core.PolicyKind = "type_hash"
+const topicTypeHashPolicy core.PolicyKind = "type_hash"
 
-// TopicEndpoint is one endpoint in a graph snapshot for list and info.
-type TopicEndpoint struct {
+// topicEndpoint is one endpoint in a graph snapshot for list and info.
+type topicEndpoint struct {
 	// GID identifies the endpoint, from SEDP GUID string form.
 	GID string
 	// Topic is the ROS name such as /chatter.
@@ -50,20 +50,20 @@ type TopicEndpoint struct {
 	HasQoS bool
 }
 
-// GraphSnapshot is a point in time copy of discovered endpoints.
+// graphSnapshot is a point in time copy of discovered endpoints.
 //
 // It is the CLI view of the graph index: endpoints are copied so later
 // discovery never mutates a printed list. Generation counts remote
 // mutations when known, else zero.
-type GraphSnapshot struct {
+type graphSnapshot struct {
 	// Generation versions the snapshot for stale detection.
 	Generation uint64
 	// Endpoints holds one record per discovered endpoint.
-	Endpoints []TopicEndpoint
+	Endpoints []topicEndpoint
 }
 
-// TopicSummary groups one topic with counts plus types plus hashes.
-type TopicSummary struct {
+// topicSummary groups one topic with counts plus types plus hashes.
+type topicSummary struct {
 	// Name is the ROS topic name.
 	Name string
 	// Types holds distinct IDL names sorted.
@@ -75,16 +75,16 @@ type TopicSummary struct {
 	// SubCount counts subscriptions on the topic.
 	SubCount int
 	// Endpoints holds the topic endpoints sorted by GID.
-	Endpoints []TopicEndpoint
+	Endpoints []topicEndpoint
 }
 
-// EndpointFromSEDP converts one SEDP endpoint to a snapshot record.
+// endpointFromSEDP converts one SEDP endpoint to a snapshot record.
 //
 // QoS bytes stay opaque passthrough in v1, so HasQoS is false and QoS
 // mismatch checks skip the record. Type mismatches still flow from Type
 // and TypeHash.
-func EndpointFromSEDP(ep dds.SEDPEndpoint) TopicEndpoint {
-	return TopicEndpoint{
+func endpointFromSEDP(ep dds.SEDPEndpoint) topicEndpoint {
+	return topicEndpoint{
 		GID:      ep.ID.String(),
 		Topic:    ep.ROSTopic,
 		Type:     ep.TypeIDL,
@@ -94,12 +94,12 @@ func EndpointFromSEDP(ep dds.SEDPEndpoint) TopicEndpoint {
 	}
 }
 
-// NewTopicEndpointWithQoS returns a snapshot record with a core profile.
+// newTopicEndpointWithQoS returns a snapshot record with a core profile.
 //
 // Tests and future translators use it to attach a resolved profile so
-// QoS matching flows through core.Indicate whether the record carries QoS.
-func NewTopicEndpointWithQoS(gid, topic, typ, hash string, isReader bool, qos core.QoSProfile) TopicEndpoint {
-	return TopicEndpoint{
+// QoS matching flows through core. Indicate whether the record carries QoS.
+func newTopicEndpointWithQoS(gid, topic, typ, hash string, isReader bool, qos core.QoSProfile) topicEndpoint {
+	return topicEndpoint{
 		GID:      gid,
 		Topic:    topic,
 		Type:     typ,
@@ -110,12 +110,12 @@ func NewTopicEndpointWithQoS(gid, topic, typ, hash string, isReader bool, qos co
 	}
 }
 
-// BuildGraphSnapshot copies endpoints into a snapshot with generation.
-func BuildGraphSnapshot(endpoints []TopicEndpoint, generation uint64) GraphSnapshot {
-	out := make([]TopicEndpoint, len(endpoints))
+// buildGraphSnapshot copies endpoints into a snapshot with generation.
+func buildGraphSnapshot(endpoints []topicEndpoint, generation uint64) graphSnapshot {
+	out := make([]topicEndpoint, len(endpoints))
 	copy(out, endpoints)
 
-	return GraphSnapshot{Generation: generation, Endpoints: out}
+	return graphSnapshot{Generation: generation, Endpoints: out}
 }
 
 // isHiddenTopic reports whether topic is hidden from default list output.
@@ -124,7 +124,7 @@ func BuildGraphSnapshot(endpoints []TopicEndpoint, generation uint64) GraphSnaps
 // underscore, matching the ros2 hidden convention. The leading empty
 // segment from the leading slash never counts.
 func isHiddenTopic(topic string) bool {
-	for _, part := range strings.Split(topic, "/") {
+	for part := range strings.SplitSeq(topic, "/") {
 		if part == "" {
 			continue
 		}
@@ -159,14 +159,14 @@ func distinctStrings(in []string) []string {
 	return out
 }
 
-// SummarizeTopics groups a snapshot by topic with counts plus hashes.
+// summarizeTopics groups a snapshot by topic with counts plus hashes.
 //
 // Hidden topics are skipped unless includeHidden is true. Summaries sort
 // by name and endpoints sort by GID so output is deterministic. Types and
 // hashes collect distinct non empty values to disambiguate same name use
 // with different types.
-func SummarizeTopics(snap GraphSnapshot, includeHidden bool) []TopicSummary {
-	byTopic := make(map[string][]TopicEndpoint)
+func summarizeTopics(snap graphSnapshot, includeHidden bool) []topicSummary {
+	byTopic := make(map[string][]topicEndpoint)
 
 	for _, ep := range snap.Endpoints {
 		if ep.Topic == "" {
@@ -180,10 +180,10 @@ func SummarizeTopics(snap GraphSnapshot, includeHidden bool) []TopicSummary {
 		byTopic[ep.Topic] = append(byTopic[ep.Topic], ep)
 	}
 
-	out := make([]TopicSummary, 0, len(byTopic))
+	out := make([]topicSummary, 0, len(byTopic))
 
 	for name, eps := range byTopic {
-		slices.SortFunc(eps, func(a, b TopicEndpoint) int {
+		slices.SortFunc(eps, func(a, b topicEndpoint) int {
 			return strings.Compare(a.GID, b.GID)
 		})
 
@@ -203,7 +203,7 @@ func SummarizeTopics(snap GraphSnapshot, includeHidden bool) []TopicSummary {
 			}
 		}
 
-		out = append(out, TopicSummary{
+		out = append(out, topicSummary{
 			Name:       name,
 			Types:      distinctStrings(types),
 			TypeHashes: distinctStrings(hashes),
@@ -213,7 +213,7 @@ func SummarizeTopics(snap GraphSnapshot, includeHidden bool) []TopicSummary {
 		})
 	}
 
-	slices.SortFunc(out, func(a, b TopicSummary) int {
+	slices.SortFunc(out, func(a, b topicSummary) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 
@@ -229,11 +229,11 @@ func pluralize(n int, singular, plural string) string {
 	return fmt.Sprintf("%d %s", n, plural)
 }
 
-// FormatTopicList renders summaries as list lines with counts plus hashes.
+// formatTopicList renders summaries as list lines with counts plus hashes.
 //
 // Each line holds topic plus publisher and subscriber counts plus distinct
 // types plus distinct hashes. Empty summaries render as empty string.
-func FormatTopicList(summaries []TopicSummary) string {
+func formatTopicList(summaries []topicSummary) string {
 	if len(summaries) == 0 {
 		return ""
 	}
@@ -251,7 +251,7 @@ func FormatTopicList(summaries []TopicSummary) string {
 			hashes = strings.Join(s.TypeHashes, ", ")
 		}
 
-		_, _ = fmt.Fprintf(&b, "%s (%s, %s) %s %s\n",
+		_, _ = fmt.Fprintf(&b, "%s (%s, %s) %s %s\n", //nolint:errcheck // strings.Builder writes never fail
 			s.Name,
 			pluralize(s.PubCount, "publisher", "publishers"),
 			pluralize(s.SubCount, "subscriber", "subscribers"),
@@ -263,33 +263,33 @@ func FormatTopicList(summaries []TopicSummary) string {
 	return b.String()
 }
 
-// FormatTopicInfo renders one topic with endpoint info plus type hashes.
+// formatTopicInfo renders one topic with endpoint info plus type hashes.
 //
 // The report holds types, hashes, counts, per endpoint GID plus type plus
 // hash plus QoS, and loud mismatch lines with topic plus endpoint pair
 // plus policy kind. Empty mismatches render as an explicit none line.
-func FormatTopicInfo(summary TopicSummary, mismatches []core.MismatchEvent) string {
+func formatTopicInfo(summary topicSummary, mismatches []core.MismatchEvent) string {
 	var b strings.Builder
 
-	_, _ = fmt.Fprintf(&b, "Topic: %s\n", summary.Name)
+	_, _ = fmt.Fprintf(&b, "Topic: %s\n", summary.Name) //nolint:errcheck // strings.Builder writes never fail
 
 	types := "(none)"
 	if len(summary.Types) != 0 {
 		types = strings.Join(summary.Types, ", ")
 	}
 
-	_, _ = fmt.Fprintf(&b, "Types: %s\n", types)
+	_, _ = fmt.Fprintf(&b, "Types: %s\n", types) //nolint:errcheck // strings.Builder writes never fail
 
 	hashes := "(none)"
 	if len(summary.TypeHashes) != 0 {
 		hashes = strings.Join(summary.TypeHashes, ", ")
 	}
 
-	_, _ = fmt.Fprintf(&b, "Type hashes: %s\n", hashes)
-	_, _ = fmt.Fprintf(&b, "Publishers: %d\n", summary.PubCount)
-	_, _ = fmt.Fprintf(&b, "Subscribers: %d\n", summary.SubCount)
+	_, _ = fmt.Fprintf(&b, "Type hashes: %s\n", hashes)           //nolint:errcheck // strings.Builder writes never fail
+	_, _ = fmt.Fprintf(&b, "Publishers: %d\n", summary.PubCount)  //nolint:errcheck // strings.Builder writes never fail
+	_, _ = fmt.Fprintf(&b, "Subscribers: %d\n", summary.SubCount) //nolint:errcheck // strings.Builder writes never fail
 
-	_, _ = fmt.Fprintln(&b, "Endpoints:")
+	_, _ = fmt.Fprintln(&b, "Endpoints:") //nolint:errcheck // strings.Builder writes never fail
 	for _, ep := range summary.Endpoints {
 		role := "publisher"
 		if ep.IsReader {
@@ -312,42 +312,42 @@ func FormatTopicInfo(summary TopicSummary, mismatches []core.MismatchEvent) stri
 			typ = "(none)"
 		}
 
-		_, _ = fmt.Fprintf(&b, "  - gid=%s role=%s type=%s hash=%s %s\n", ep.GID, role, typ, hash, qos)
+		_, _ = fmt.Fprintf(&b, "  - gid=%s role=%s type=%s hash=%s %s\n", ep.GID, role, typ, hash, qos) //nolint:errcheck // strings.Builder writes never fail
 	}
 
 	if len(mismatches) == 0 {
-		_, _ = fmt.Fprintln(&b, "Mismatches: none")
+		_, _ = fmt.Fprintln(&b, "Mismatches: none") //nolint:errcheck // strings.Builder writes never fail
 
 		return b.String()
 	}
 
-	_, _ = fmt.Fprintf(&b, "Mismatches (%d):\n", len(mismatches))
+	_, _ = fmt.Fprintf(&b, "Mismatches (%d):\n", len(mismatches)) //nolint:errcheck // strings.Builder writes never fail
 
 	for _, m := range mismatches {
-		_, _ = fmt.Fprintf(&b, "  - %s\n", FormatMismatch(m))
+		_, _ = fmt.Fprintf(&b, "  - %s\n", formatMismatch(m)) //nolint:errcheck // strings.Builder writes never fail
 	}
 
 	return b.String()
 }
 
-// FormatMismatch renders one mismatch loudly with topic plus pair plus kind.
+// formatMismatch renders one mismatch loudly with topic plus pair plus kind.
 //
 // The weld prefix keeps CLI mismatch lines greppable across logs, metrics,
 // and CLI. The core LogLine already carries topic, publisher, subscriber,
 // and policy kind.
-func FormatMismatch(event core.MismatchEvent) string {
+func formatMismatch(event core.MismatchEvent) string {
 	return "weld: " + event.LogLine()
 }
 
-// DetectQoSMismatches checks each publisher versus subscriber pair with core.
+// detectQoSMismatches checks each publisher versus subscriber pair with core.
 //
 // Pairs without QoS on both sides are skipped. Compatible pairs yield no
 // events. Incompatible pairs yield one event per policy kind through
 // core.CompatibilityEvents, each loud with topic plus endpoint pair plus
 // policy kind.
-func DetectQoSMismatches(topic string, endpoints []TopicEndpoint) []core.MismatchEvent {
-	var pubs []TopicEndpoint
-	var subs []TopicEndpoint
+func detectQoSMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
+	var pubs []topicEndpoint
+	var subs []topicEndpoint
 
 	for _, ep := range endpoints {
 		if ep.IsReader {
@@ -357,10 +357,10 @@ func DetectQoSMismatches(topic string, endpoints []TopicEndpoint) []core.Mismatc
 		}
 	}
 
-	slices.SortFunc(pubs, func(a, b TopicEndpoint) int {
+	slices.SortFunc(pubs, func(a, b topicEndpoint) int {
 		return strings.Compare(a.GID, b.GID)
 	})
-	slices.SortFunc(subs, func(a, b TopicEndpoint) int {
+	slices.SortFunc(subs, func(a, b topicEndpoint) int {
 		return strings.Compare(a.GID, b.GID)
 	})
 
@@ -384,14 +384,14 @@ func DetectQoSMismatches(topic string, endpoints []TopicEndpoint) []core.Mismatc
 	return out
 }
 
-// DetectTypeMismatches reports publisher versus subscriber type differences.
+// detectTypeMismatches reports publisher versus subscriber type differences.
 //
 // Each pair with differing Type or TypeHash yields one error event with
-// TopicTypeHashPolicy kind so output keeps topic plus endpoint pair plus
+// topicTypeHashPolicy kind so output keeps topic plus endpoint pair plus
 // policy kind. Pairs with equal type and hash flow silently.
-func DetectTypeMismatches(topic string, endpoints []TopicEndpoint) []core.MismatchEvent {
-	var pubs []TopicEndpoint
-	var subs []TopicEndpoint
+func detectTypeMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
+	var pubs []topicEndpoint
+	var subs []topicEndpoint
 
 	for _, ep := range endpoints {
 		if ep.IsReader {
@@ -401,10 +401,10 @@ func DetectTypeMismatches(topic string, endpoints []TopicEndpoint) []core.Mismat
 		}
 	}
 
-	slices.SortFunc(pubs, func(a, b TopicEndpoint) int {
+	slices.SortFunc(pubs, func(a, b topicEndpoint) int {
 		return strings.Compare(a.GID, b.GID)
 	})
-	slices.SortFunc(subs, func(a, b TopicEndpoint) int {
+	slices.SortFunc(subs, func(a, b topicEndpoint) int {
 		return strings.Compare(a.GID, b.GID)
 	})
 
@@ -420,7 +420,7 @@ func DetectTypeMismatches(topic string, endpoints []TopicEndpoint) []core.Mismat
 				Topic:      topic,
 				Publisher:  pub.GID,
 				Subscriber: sub.GID,
-				Policy:     TopicTypeHashPolicy,
+				Policy:     topicTypeHashPolicy,
 				Offered:    pub.TypeHash,
 				Requested:  sub.TypeHash,
 				Severity:   core.SeverityError,
@@ -432,9 +432,9 @@ func DetectTypeMismatches(topic string, endpoints []TopicEndpoint) []core.Mismat
 	return out
 }
 
-// DetectMismatches combines type plus QoS mismatches sorted deterministically.
-func DetectMismatches(topic string, endpoints []TopicEndpoint) []core.MismatchEvent {
-	out := append(DetectTypeMismatches(topic, endpoints), DetectQoSMismatches(topic, endpoints)...)
+// detectMismatches combines type plus QoS mismatches sorted deterministically.
+func detectMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
+	out := append(detectTypeMismatches(topic, endpoints), detectQoSMismatches(topic, endpoints)...)
 
 	slices.SortFunc(out, func(a, b core.MismatchEvent) int {
 		if c := strings.Compare(a.Publisher, b.Publisher); c != 0 {
@@ -453,16 +453,20 @@ func DetectMismatches(topic string, endpoints []TopicEndpoint) []core.MismatchEv
 
 // resolveInfoTopic picks the info topic from flag or positional arg.
 //
-// An explicit --topic wins when it differs from default. Otherwise one
+// An explicit --topic wins even when equal to default. Otherwise one
 // positional supplies the topic when the flag was left at default. The
 // shared --topic flag defaults to /chatter like echo and pub, so no
 // positional with default flag reports the default topic.
-func resolveInfoTopic(flagText string, args []string) (string, error) {
+func resolveInfoTopic(flagText string, flagExplicit bool, args []string) (string, error) {
 	if len(args) > 1 {
 		return "", fmt.Errorf("weld: topic info takes one topic, have %d args", len(args))
 	}
 
-	if flagText != "" && flagText != defaultTopic {
+	if flagExplicit {
+		if flagText == "" {
+			return "", errors.New("weld: topic info needs --topic or one positional topic") //nolint:wrapcheck // new error, nothing to wrap
+		}
+
 		return flagText, nil
 	}
 
@@ -474,13 +478,13 @@ func resolveInfoTopic(flagText string, args []string) (string, error) {
 		return flagText, nil
 	}
 
-	return "", fmt.Errorf("weld: topic info needs --topic or one positional topic")
+	return "", errors.New("weld: topic info needs --topic or one positional topic") //nolint:wrapcheck // new error, nothing to wrap
 }
 
 // topicSnapshotter is implemented by backends that expose a graph snapshot.
 type topicSnapshotter interface {
 	// SnapshotGraph returns a copy of the current graph snapshot.
-	SnapshotGraph() GraphSnapshot
+	SnapshotGraph() graphSnapshot
 }
 
 // sedpLocalViewer exposes local SEDP endpoints for snapshot building.
@@ -515,17 +519,17 @@ var topicDiscoveryWaitVar = topicDiscoveryWait
 // from LocalEndpoints plus RemoteEndpoints when both exist, else returns
 // an empty snapshot. The empty case keeps CLI usable before the backend
 // exposes graph state and still exercises list plus info formatting.
-func fetchTopicSnapshot(backend transports.Backend) (GraphSnapshot, error) {
+func fetchTopicSnapshot(backend transports.Backend) (graphSnapshot, error) {
 	if backend == nil {
-		return GraphSnapshot{}, fmt.Errorf("weld: topic snapshot needs a backend")
+		return graphSnapshot{}, errors.New("weld: topic snapshot needs a backend") //nolint:wrapcheck // new error, nothing to wrap
 	}
 
 	if snapper, ok := backend.(topicSnapshotter); ok {
 		snap := snapper.SnapshotGraph()
-		out := make([]TopicEndpoint, len(snap.Endpoints))
+		out := make([]topicEndpoint, len(snap.Endpoints))
 		copy(out, snap.Endpoints)
 
-		return GraphSnapshot{Generation: snap.Generation, Endpoints: out}, nil
+		return graphSnapshot{Generation: snap.Generation, Endpoints: out}, nil
 	}
 
 	localViewer, hasLocal := backend.(sedpLocalViewer)
@@ -535,13 +539,13 @@ func fetchTopicSnapshot(backend transports.Backend) (GraphSnapshot, error) {
 		locals := localViewer.LocalEndpoints()
 		remotes := remoteViewer.RemoteEndpoints()
 
-		merged := make([]TopicEndpoint, 0, len(locals)+len(remotes))
+		merged := make([]topicEndpoint, 0, len(locals)+len(remotes))
 		for _, ep := range locals {
-			merged = append(merged, EndpointFromSEDP(ep))
+			merged = append(merged, endpointFromSEDP(ep))
 		}
 
 		for _, ep := range remotes {
-			merged = append(merged, EndpointFromSEDP(ep))
+			merged = append(merged, endpointFromSEDP(ep))
 		}
 
 		var gen uint64
@@ -549,10 +553,10 @@ func fetchTopicSnapshot(backend transports.Backend) (GraphSnapshot, error) {
 			gen = genViewer.DiscoveryGeneration()
 		}
 
-		return GraphSnapshot{Generation: gen, Endpoints: merged}, nil
+		return graphSnapshot{Generation: gen, Endpoints: merged}, nil
 	}
 
-	return GraphSnapshot{}, nil
+	return graphSnapshot{}, nil
 }
 
 // waitForTopicDiscovery pauses for SPDP and SEDP to settle or ctx to end.
@@ -581,21 +585,21 @@ func waitForTopicDiscovery(ctx context.Context) error {
 // openAndSnapshotTopic opens the backend, joins discovery, waits, and snapshots.
 //
 // It closes the backend before returning so list and info share one path.
-func openAndSnapshotTopic(ctx context.Context, domain uint32) (GraphSnapshot, error) {
+func openAndSnapshotTopic(ctx context.Context, domain uint32) (graphSnapshot, error) {
 	backend, err := openTopicBackendFunc(ctx, domain, topicParticipant)
 	if err != nil {
-		return GraphSnapshot{}, fmt.Errorf("weld: open backend: %w", err)
+		return graphSnapshot{}, fmt.Errorf("weld: open backend: %w", err)
 	}
 
-	snap, ferr := func() (GraphSnapshot, error) {
+	snap, ferr := func() (graphSnapshot, error) {
 		err := waitForTopicDiscovery(ctx)
 		if err != nil {
-			return GraphSnapshot{}, err
+			return graphSnapshot{}, err
 		}
 
 		snap, err := fetchTopicSnapshot(backend)
 		if err != nil {
-			return GraphSnapshot{}, fmt.Errorf("weld: snapshot graph on domain %d: %w", domain, err)
+			return graphSnapshot{}, fmt.Errorf("weld: snapshot graph on domain %d: %w", domain, err)
 		}
 
 		return snap, nil
@@ -603,35 +607,35 @@ func openAndSnapshotTopic(ctx context.Context, domain uint32) (GraphSnapshot, er
 
 	cerr := backend.Close()
 	if ferr != nil && cerr != nil {
-		return GraphSnapshot{}, fmt.Errorf("weld: topic snapshot on domain %d: %w", domain, errors.Join(ferr, cerr))
+		return graphSnapshot{}, fmt.Errorf("weld: topic snapshot on domain %d: %w", domain, errors.Join(ferr, cerr))
 	}
 
 	if cerr != nil {
-		return GraphSnapshot{}, fmt.Errorf("weld: close topic backend: %w", cerr)
+		return graphSnapshot{}, fmt.Errorf("weld: close topic backend: %w", cerr)
 	}
 
 	if ferr != nil {
-		return GraphSnapshot{}, ferr
+		return graphSnapshot{}, ferr
 	}
 
 	return snap, nil
 }
 
 // findTopicSummary returns the summary for topic or false when absent.
-func findTopicSummary(summaries []TopicSummary, topic string) (TopicSummary, bool) {
+func findTopicSummary(summaries []topicSummary, topic string) (topicSummary, bool) {
 	for _, s := range summaries {
 		if s.Name == topic {
 			return s, true
 		}
 	}
 
-	return TopicSummary{}, false
+	return topicSummary{}, false
 }
 
 // printTopicMismatches emits loud mismatch lines to stderr.
 func printTopicMismatches(stderr io.Writer, mismatches []core.MismatchEvent) {
 	for _, m := range mismatches {
-		_, _ = fmt.Fprintln(stderr, FormatMismatch(m)) //nolint:errcheck // final error output is best effort
+		_, _ = fmt.Fprintln(stderr, formatMismatch(m)) //nolint:errcheck // final error output is best effort
 	}
 }
 
@@ -698,12 +702,20 @@ func runTopicListCommand(ctx context.Context, args []string, stdout, stderr io.W
 		return handleRunError(err, stderr)
 	}
 
-	summaries := SummarizeTopics(snap, *includeHidden)
+	summaries := summarizeTopics(snap, *includeHidden)
 
-	_, _ = fmt.Fprint(stdout, FormatTopicList(summaries)) //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(stdout, formatTopicList(summaries)) //nolint:errcheck // help output failure is not actionable
+
+	mismatchCount := 0
 
 	for _, s := range summaries {
-		printTopicMismatches(stderr, DetectMismatches(s.Name, s.Endpoints))
+		mismatches := detectMismatches(s.Name, s.Endpoints)
+		printTopicMismatches(stderr, mismatches)
+		mismatchCount += len(mismatches)
+	}
+
+	if mismatchCount != 0 {
+		return 1
 	}
 
 	return 0
@@ -727,7 +739,14 @@ func runTopicInfoCommand(ctx context.Context, args []string, stdout, stderr io.W
 		return 2
 	}
 
-	topic, err := resolveInfoTopic(*topicFlag, fs.Args())
+	topicExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "topic" {
+			topicExplicit = true
+		}
+	})
+
+	topic, err := resolveInfoTopic(*topicFlag, topicExplicit, fs.Args())
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
 
@@ -753,7 +772,7 @@ func runTopicInfoCommand(ctx context.Context, args []string, stdout, stderr io.W
 		return handleRunError(err, stderr)
 	}
 
-	summaries := SummarizeTopics(snap, true)
+	summaries := summarizeTopics(snap, true)
 
 	summary, ok := findTopicSummary(summaries, topic)
 	if !ok {
@@ -762,10 +781,14 @@ func runTopicInfoCommand(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 
-	mismatches := DetectMismatches(summary.Name, summary.Endpoints)
+	mismatches := detectMismatches(summary.Name, summary.Endpoints)
 
-	_, _ = fmt.Fprint(stdout, FormatTopicInfo(summary, mismatches)) //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(stdout, formatTopicInfo(summary, mismatches)) //nolint:errcheck // help output failure is not actionable
 	printTopicMismatches(stderr, mismatches)
+
+	if len(mismatches) != 0 {
+		return 1
+	}
 
 	return 0
 }

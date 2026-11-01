@@ -61,19 +61,29 @@ func TestWithEchoTimeoutZero(t *testing.T) {
 	}
 }
 
-// TestWithEchoTimeoutNegative checks negative means run until interrupt.
+// TestWithEchoTimeoutNegative checks the flag layer rejects negative timeout.
 //
-// The CLI still rejects negative values with exit 2; the helper treats
-// them like zero so only the flag layer decides validity.
+// The CLI rejects negative values with exit 2 before dialing; the helper
+// alone would treat them like zero, so this test invokes the real flag
+// path via runEchoCommand instead of asserting helper behavior.
 func TestWithEchoTimeoutNegative(t *testing.T) {
 	ctx := context.Background()
 
-	got, cancel := withEchoTimeout(ctx, -5*time.Second)
-	defer cancel()
+	var stdout bytes.Buffer
 
-	_, ok := got.Deadline()
-	if ok {
-		t.Fatal("negative timeout must not set a deadline")
+	var stderr bytes.Buffer
+
+	code := runEchoCommand(ctx, []string{"--topic", "/chatter", "--domain", "42", "--timeout", "-5s"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("negative timeout exit = %d, want 2", code)
+	}
+
+	if !strings.Contains(stderr.String(), "must not be negative") {
+		t.Fatalf("negative timeout stderr = %q, want must not be negative", stderr.String())
+	}
+
+	if stdout.Len() != 0 {
+		t.Fatalf("negative timeout stdout = %q, want silence", stdout.String())
 	}
 }
 
@@ -271,6 +281,28 @@ func TestLossTrackerThrottle(t *testing.T) {
 	}
 }
 
+// checkEchoDurabilityCase checks one durability mapping case.
+func checkEchoDurabilityCase(t *testing.T, input string, wantVolatile, wantErr bool) {
+	t.Helper()
+
+	got, err := resolveEchoDurability(input)
+	if wantErr {
+		if err == nil {
+			t.Fatalf("resolveEchoDurability(%q) must fail", input)
+		}
+		if !strings.HasPrefix(err.Error(), "weld:") {
+			t.Fatalf("resolveEchoDurability(%q) error = %q, want weld: prefix", input, err.Error())
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("resolveEchoDurability(%q): %v", input, err)
+	}
+	if got != wantVolatile {
+		t.Fatalf("resolveEchoDurability(%q) = %v, want %v", input, got, wantVolatile)
+	}
+}
+
 // TestResolveEchoDurability checks volatile mapping and bad value rejection.
 func TestResolveEchoDurability(t *testing.T) {
 	cases := []struct {
@@ -288,26 +320,7 @@ func TestResolveEchoDurability(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveEchoDurability(tc.input)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("resolveEchoDurability(%q) must fail", tc.input)
-				}
-
-				if !strings.HasPrefix(err.Error(), "weld:") {
-					t.Fatalf("resolveEchoDurability(%q) error = %q, want weld: prefix", tc.input, err.Error())
-				}
-
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("resolveEchoDurability(%q): %v", tc.input, err)
-			}
-
-			if got != tc.wantVolatile {
-				t.Fatalf("resolveEchoDurability(%q) = %v, want %v", tc.input, got, tc.wantVolatile)
-			}
+			checkEchoDurabilityCase(t, tc.input, tc.wantVolatile, tc.wantErr)
 		})
 	}
 }

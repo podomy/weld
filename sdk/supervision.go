@@ -157,16 +157,16 @@ func (g *SerialGroup) Attach(e SerialEntity) error {
 		return errors.New("sdk: serial group attach on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if e.Name == "" {
-		return errors.New("sdk: serial group attach with empty entity name") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q attach with empty entity name", g.name)
 	}
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		return errors.New("sdk: serial group attach on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q attach on closed group", g.name)
 	}
 	if findSerialIndex(g.entries, e.Name) >= 0 {
 		g.mu.Unlock()
-		return fmt.Errorf("sdk: serial group attach duplicate entity %q", e.Name)
+		return fmt.Errorf("sdk: serial group %q attach duplicate entity %q", g.name, e.Name)
 	}
 	configured := g.configured
 	active := g.active
@@ -174,22 +174,22 @@ func (g *SerialGroup) Attach(e SerialEntity) error {
 	if configured {
 		err := callSerialCallback(e.Configure)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group attach %q configure: %w", e.Name, err)
+			return fmt.Errorf("sdk: serial group %q attach %q configure: %w", g.name, e.Name, err)
 		}
 	}
 	if active {
 		err := callSerialCallback(e.Activate)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group attach %q activate: %w", e.Name, err)
+			return fmt.Errorf("sdk: serial group %q attach %q activate: %w", g.name, e.Name, err)
 		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
-		return errors.New("sdk: serial group attach on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q attach on closed group", g.name)
 	}
 	if findSerialIndex(g.entries, e.Name) >= 0 {
-		return fmt.Errorf("sdk: serial group attach duplicate entity %q", e.Name)
+		return fmt.Errorf("sdk: serial group %q attach duplicate entity %q", g.name, e.Name)
 	}
 	g.entries = append(g.entries, &serialEntry{entity: e, seq: g.nextSeq})
 	g.nextSeq++
@@ -202,13 +202,13 @@ func (g *SerialGroup) Detach(name string) error {
 		return errors.New("sdk: serial group detach on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if name == "" {
-		return errors.New("sdk: serial group detach with empty entity name") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q detach with empty entity name", g.name)
 	}
 	g.mu.Lock()
 	idx := findSerialIndex(g.entries, name)
 	if idx < 0 {
 		g.mu.Unlock()
-		return fmt.Errorf("sdk: serial group detach unknown entity %q", name)
+		return fmt.Errorf("sdk: serial group %q detach unknown entity %q", g.name, name)
 	}
 	active := g.active
 	entity := g.entries[idx].entity
@@ -216,14 +216,14 @@ func (g *SerialGroup) Detach(name string) error {
 	if active {
 		err := callSerialCallback(entity.Deactivate)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group detach %q deactivate: %w", name, err)
+			return fmt.Errorf("sdk: serial group %q detach %q deactivate: %w", g.name, name, err)
 		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	idx = findSerialIndex(g.entries, name)
 	if idx < 0 {
-		return fmt.Errorf("sdk: serial group detach unknown entity %q", name)
+		return fmt.Errorf("sdk: serial group %q detach unknown entity %q", g.name, name)
 	}
 	copy(g.entries[idx:], g.entries[idx+1:])
 	g.entries[len(g.entries)-1] = nil
@@ -239,7 +239,7 @@ func (g *SerialGroup) Configure() error {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		return errors.New("sdk: serial group configure on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q configure on closed group", g.name)
 	}
 	if g.configured {
 		g.mu.Unlock()
@@ -250,13 +250,13 @@ func (g *SerialGroup) Configure() error {
 	for i := range entities {
 		err := callSerialCallback(entities[i].Configure)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group configure entity %q: %w", entities[i].Name, err)
+			return fmt.Errorf("sdk: serial group %q configure entity %q: %w", g.name, entities[i].Name, err)
 		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
-		return errors.New("sdk: serial group configure on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q configure on closed group", g.name)
 	}
 	g.configured = true
 	return nil
@@ -270,7 +270,7 @@ func (g *SerialGroup) Activate() error {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
-		return errors.New("sdk: serial group activate on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q activate on closed group", g.name)
 	}
 	if g.active {
 		g.mu.Unlock()
@@ -278,20 +278,20 @@ func (g *SerialGroup) Activate() error {
 	}
 	if !g.configured {
 		g.mu.Unlock()
-		return errors.New("sdk: serial group activate before configure") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q activate before configure", g.name)
 	}
 	entities := copySerialEntities(g.entries)
 	g.mu.Unlock()
 	for i := range entities {
 		err := callSerialCallback(entities[i].Activate)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group activate entity %q: %w", entities[i].Name, err)
+			return fmt.Errorf("sdk: serial group %q activate entity %q: %w", g.name, entities[i].Name, err)
 		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
-		return errors.New("sdk: serial group activate on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q activate on closed group", g.name)
 	}
 	g.active = true
 	return nil
@@ -309,10 +309,10 @@ func (g *SerialGroup) Deactivate() error {
 	}
 	entities := copySerialEntities(g.entries)
 	g.mu.Unlock()
-	for i := len(entities) - 1; i >= 0; i-- {
-		err := callSerialCallback(entities[i].Deactivate)
+	for _, entity := range slices.Backward(entities) {
+		err := callSerialCallback(entity.Deactivate)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group deactivate entity %q: %w", entities[i].Name, err)
+			return fmt.Errorf("sdk: serial group %q deactivate entity %q: %w", g.name, entity.Name, err)
 		}
 	}
 	g.mu.Lock()
@@ -333,14 +333,14 @@ func (g *SerialGroup) Cleanup() error {
 	}
 	if g.active {
 		g.mu.Unlock()
-		return errors.New("sdk: serial group cleanup while active; deactivate first") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q cleanup while active; deactivate first", g.name)
 	}
 	entities := copySerialEntities(g.entries)
 	g.mu.Unlock()
-	for i := len(entities) - 1; i >= 0; i-- {
-		err := callSerialCallback(entities[i].Cleanup)
+	for _, entity := range slices.Backward(entities) {
+		err := callSerialCallback(entity.Cleanup)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group cleanup entity %q: %w", entities[i].Name, err)
+			return fmt.Errorf("sdk: serial group %q cleanup entity %q: %w", g.name, entity.Name, err)
 		}
 	}
 	g.mu.Lock()
@@ -357,10 +357,10 @@ func (g *SerialGroup) Shutdown() error {
 	g.mu.Lock()
 	entities := copySerialEntities(g.entries)
 	g.mu.Unlock()
-	for i := len(entities) - 1; i >= 0; i-- {
-		err := callSerialCallback(entities[i].Shutdown)
+	for _, entity := range slices.Backward(entities) {
+		err := callSerialCallback(entity.Shutdown)
 		if err != nil {
-			return fmt.Errorf("sdk: serial group shutdown entity %q: %w", entities[i].Name, err)
+			return fmt.Errorf("sdk: serial group %q shutdown entity %q: %w", g.name, entity.Name, err)
 		}
 	}
 	g.mu.Lock()
@@ -412,11 +412,11 @@ func (g *SerialGroup) RecordHeartbeat(entity string, nowNanos int64) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
-		return errors.New("sdk: serial group heartbeat on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return fmt.Errorf("sdk: serial group %q heartbeat on closed group", g.name)
 	}
 	idx := findSerialIndex(g.entries, entity)
 	if idx < 0 {
-		return fmt.Errorf("sdk: serial group heartbeat unknown entity %q", entity)
+		return fmt.Errorf("sdk: serial group %q heartbeat unknown entity %q", g.name, entity)
 	}
 	g.entries[idx].lastHeartbeatNanos = nowNanos
 	g.entries[idx].hasHeartbeat = true
@@ -432,7 +432,7 @@ func (g *SerialGroup) BondAlive(entity string, nowNanos int64) (bool, error) {
 	defer g.mu.Unlock()
 	idx := findSerialIndex(g.entries, entity)
 	if idx < 0 {
-		return false, fmt.Errorf("sdk: serial group bond check unknown entity %q", entity)
+		return false, fmt.Errorf("sdk: serial group %q bond check unknown entity %q", g.name, entity)
 	}
 	entry := g.entries[idx]
 	return bondAliveAt(entry.hasHeartbeat, entry.lastHeartbeatNanos, nowNanos, SerialBondTimeoutNanos), nil
@@ -611,12 +611,12 @@ func (g *PooledGroup) Submit(task func()) (bool, error) {
 		return false, errors.New("sdk: pooled group submit on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if task == nil {
-		return false, errors.New("sdk: pooled group submit with nil task") //nolint:wrapcheck // new error, nothing to wrap
+		return false, fmt.Errorf("sdk: pooled group workers %d depth %d submit with nil task", g.workers, g.depth)
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
-		return false, errors.New("sdk: pooled group submit on closed group") //nolint:wrapcheck // new error, nothing to wrap
+		return false, fmt.Errorf("sdk: pooled group workers %d depth %d submit on closed group", g.workers, g.depth)
 	}
 	evicted := false
 	if len(g.queue) >= g.depth {
@@ -631,7 +631,11 @@ func (g *PooledGroup) Submit(task func()) (bool, error) {
 	return evicted, nil
 }
 
-// Close discards pending tasks and joins workers cleanly.
+// Close discards pending tasks and joins workers cleanly. Concurrent
+// Close calls all join workers; a second Close waits instead of returning
+// early. Close must not be called from a pool worker; self-close deadlocks
+// by design because the calling worker waits for itself. The caller owns
+// this contract.
 func (g *PooledGroup) Close() error {
 	if g == nil {
 		return errors.New("sdk: pooled group close on nil group") //nolint:wrapcheck // new error, nothing to wrap
@@ -639,6 +643,7 @@ func (g *PooledGroup) Close() error {
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
+		g.wg.Wait()
 		return nil
 	}
 	g.closed = true

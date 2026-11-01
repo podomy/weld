@@ -18,10 +18,8 @@ import (
 type fakeTopicBackend struct {
 	joined   bool
 	closed   bool
-	snapshot GraphSnapshot
+	snapshot graphSnapshot
 	hasSnap  bool
-	locals   []dds.SEDPEndpoint
-	remotes  []dds.SEDPEndpoint
 }
 
 // PublishBytes accepts one message without sending.
@@ -54,15 +52,15 @@ func (f *fakeTopicBackend) Close() error {
 }
 
 // SnapshotGraph returns the injected snapshot copy.
-func (f *fakeTopicBackend) SnapshotGraph() GraphSnapshot {
+func (f *fakeTopicBackend) SnapshotGraph() graphSnapshot {
 	if !f.hasSnap {
-		return GraphSnapshot{}
+		return graphSnapshot{}
 	}
 
-	out := make([]TopicEndpoint, len(f.snapshot.Endpoints))
+	out := make([]topicEndpoint, len(f.snapshot.Endpoints))
 	copy(out, f.snapshot.Endpoints)
 
-	return GraphSnapshot{Generation: f.snapshot.Generation, Endpoints: out}
+	return graphSnapshot{Generation: f.snapshot.Generation, Endpoints: out}
 }
 
 // sedpOnlyBackend exposes only SEDP viewers for snapshot building.
@@ -156,11 +154,11 @@ func TestIsHiddenTopic(t *testing.T) {
 
 // TestBuildGraphSnapshotCopies checks snapshot copies input.
 func TestBuildGraphSnapshotCopies(t *testing.T) {
-	eps := []TopicEndpoint{
+	eps := []topicEndpoint{
 		{GID: "a", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1"},
 	}
 
-	snap := BuildGraphSnapshot(eps, 7)
+	snap := buildGraphSnapshot(eps, 7)
 	if snap.Generation != 7 {
 		t.Fatalf("generation = %d, want 7", snap.Generation)
 	}
@@ -177,14 +175,14 @@ func TestBuildGraphSnapshotCopies(t *testing.T) {
 
 // TestSummarizeTopicsCounts checks grouping plus counts plus hashes.
 func TestSummarizeTopicsCounts(t *testing.T) {
-	snap := BuildGraphSnapshot([]TopicEndpoint{
+	snap := buildGraphSnapshot([]topicEndpoint{
 		{GID: "pub1", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1"},
 		{GID: "pub2", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1"},
 		{GID: "sub1", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1", IsReader: true},
 		{GID: "pub3", Topic: "/other", Type: "std_msgs__msg__String", TypeHash: "h2"},
 	}, 0)
 
-	got := SummarizeTopics(snap, false)
+	got := summarizeTopics(snap, false)
 	if len(got) != 2 {
 		t.Fatalf("summaries = %d, want 2", len(got))
 	}
@@ -208,17 +206,17 @@ func TestSummarizeTopicsCounts(t *testing.T) {
 
 // TestSummarizeTopicsHiddenFiltering checks hidden topics filter.
 func TestSummarizeTopicsHiddenFiltering(t *testing.T) {
-	snap := BuildGraphSnapshot([]TopicEndpoint{
+	snap := buildGraphSnapshot([]topicEndpoint{
 		{GID: "a", Topic: "/chatter", Type: "t", TypeHash: "h"},
 		{GID: "b", Topic: "/_hidden", Type: "t", TypeHash: "h"},
 	}, 0)
 
-	filtered := SummarizeTopics(snap, false)
+	filtered := summarizeTopics(snap, false)
 	if len(filtered) != 1 || filtered[0].Name != "/chatter" {
 		t.Fatalf("filtered = %v, want only /chatter", filtered)
 	}
 
-	shown := SummarizeTopics(snap, true)
+	shown := summarizeTopics(snap, true)
 	if len(shown) != 2 {
 		t.Fatalf("include hidden = %d, want 2", len(shown))
 	}
@@ -226,12 +224,12 @@ func TestSummarizeTopicsHiddenFiltering(t *testing.T) {
 
 // TestSummarizeTopicsSameNameDisambiguation checks multi type topics.
 func TestSummarizeTopicsSameNameDisambiguation(t *testing.T) {
-	snap := BuildGraphSnapshot([]TopicEndpoint{
+	snap := buildGraphSnapshot([]topicEndpoint{
 		{GID: "a", Topic: "/same", Type: "a__msg__A", TypeHash: "h1"},
 		{GID: "b", Topic: "/same", Type: "b__msg__B", TypeHash: "h2", IsReader: true},
 	}, 0)
 
-	got := SummarizeTopics(snap, false)
+	got := summarizeTopics(snap, false)
 	if len(got) != 1 {
 		t.Fatalf("summaries = %d, want 1", len(got))
 	}
@@ -262,7 +260,7 @@ func TestEndpointFromSEDP(t *testing.T) {
 		t.Fatalf("declare writer: %v", err)
 	}
 
-	got := EndpointFromSEDP(ep)
+	got := endpointFromSEDP(ep)
 	if got.Topic != "/chatter" {
 		t.Fatalf("topic = %q, want /chatter", got.Topic)
 	}
@@ -290,12 +288,12 @@ func TestEndpointFromSEDP(t *testing.T) {
 
 // TestDetectTypeMismatches checks differing hashes report loudly.
 func TestDetectTypeMismatches(t *testing.T) {
-	eps := []TopicEndpoint{
-		NewTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestQoS()),
-		NewTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h2", true, topicTestQoS()),
+	eps := []topicEndpoint{
+		newTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestQoS()),
+		newTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h2", true, topicTestQoS()),
 	}
 
-	got := DetectTypeMismatches("/chatter", eps)
+	got := detectTypeMismatches("/chatter", eps)
 	if len(got) != 1 {
 		t.Fatalf("type mismatches = %d, want 1", len(got))
 	}
@@ -305,28 +303,28 @@ func TestDetectTypeMismatches(t *testing.T) {
 		t.Fatalf("mismatch identity = %+v, want topic plus pair", m)
 	}
 
-	if m.Policy != TopicTypeHashPolicy {
-		t.Fatalf("policy = %q, want %q", m.Policy, TopicTypeHashPolicy)
+	if m.Policy != topicTypeHashPolicy {
+		t.Fatalf("policy = %q, want %q", m.Policy, topicTypeHashPolicy)
 	}
 
-	same := []TopicEndpoint{
-		NewTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestQoS()),
-		NewTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
+	same := []topicEndpoint{
+		newTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestQoS()),
+		newTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
 	}
 
-	if got := DetectTypeMismatches("/chatter", same); len(got) != 0 {
+	if got := detectTypeMismatches("/chatter", same); len(got) != 0 {
 		t.Fatalf("same hash mismatches = %d, want 0", len(got))
 	}
 }
 
 // TestDetectQoSMismatches checks best effort versus reliable reports policy.
 func TestDetectQoSMismatches(t *testing.T) {
-	eps := []TopicEndpoint{
-		NewTopicEndpointWithQoS("pub", "/chatter", "t", "h", false, topicTestBestEffort()),
-		NewTopicEndpointWithQoS("sub", "/chatter", "t", "h", true, topicTestQoS()),
+	eps := []topicEndpoint{
+		newTopicEndpointWithQoS("pub", "/chatter", "t", "h", false, topicTestBestEffort()),
+		newTopicEndpointWithQoS("sub", "/chatter", "t", "h", true, topicTestQoS()),
 	}
 
-	got := DetectQoSMismatches("/chatter", eps)
+	got := detectQoSMismatches("/chatter", eps)
 	if len(got) == 0 {
 		t.Fatalf("qos mismatch missing for best effort versus reliable")
 	}
@@ -342,25 +340,25 @@ func TestDetectQoSMismatches(t *testing.T) {
 		t.Fatalf("reliability mismatch with topic plus pair missing: %+v", got)
 	}
 
-	compatible := []TopicEndpoint{
-		NewTopicEndpointWithQoS("pub", "/chatter", "t", "h", false, topicTestQoS()),
-		NewTopicEndpointWithQoS("sub", "/chatter", "t", "h", true, topicTestQoS()),
+	compatible := []topicEndpoint{
+		newTopicEndpointWithQoS("pub", "/chatter", "t", "h", false, topicTestQoS()),
+		newTopicEndpointWithQoS("sub", "/chatter", "t", "h", true, topicTestQoS()),
 	}
 
-	if got := DetectQoSMismatches("/chatter", compatible); len(got) != 0 {
+	if got := detectQoSMismatches("/chatter", compatible); len(got) != 0 {
 		t.Fatalf("compatible mismatches = %d, want 0", len(got))
 	}
 }
 
 // TestDetectMismatchesSorted checks deterministic order.
 func TestDetectMismatchesSorted(t *testing.T) {
-	eps := []TopicEndpoint{
-		NewTopicEndpointWithQoS("pub-b", "/chatter", "t", "h1", false, topicTestBestEffort()),
-		NewTopicEndpointWithQoS("pub-a", "/chatter", "t", "h2", false, topicTestBestEffort()),
-		NewTopicEndpointWithQoS("sub", "/chatter", "t", "h3", true, topicTestQoS()),
+	eps := []topicEndpoint{
+		newTopicEndpointWithQoS("pub-b", "/chatter", "t", "h1", false, topicTestBestEffort()),
+		newTopicEndpointWithQoS("pub-a", "/chatter", "t", "h2", false, topicTestBestEffort()),
+		newTopicEndpointWithQoS("sub", "/chatter", "t", "h3", true, topicTestQoS()),
 	}
 
-	got := DetectMismatches("/chatter", eps)
+	got := detectMismatches("/chatter", eps)
 	if len(got) == 0 {
 		t.Fatalf("mismatches missing")
 	}
@@ -376,11 +374,11 @@ func TestDetectMismatchesSorted(t *testing.T) {
 
 // TestFormatTopicList checks counts plus types plus hashes appear.
 func TestFormatTopicList(t *testing.T) {
-	summaries := []TopicSummary{
+	summaries := []topicSummary{
 		{Name: "/chatter", Types: []string{"std_msgs__msg__String"}, TypeHashes: []string{"h1"}, PubCount: 2, SubCount: 1},
 	}
 
-	out := FormatTopicList(summaries)
+	out := formatTopicList(summaries)
 	if !strings.Contains(out, "/chatter") {
 		t.Fatalf("list misses topic:\n%s", out)
 	}
@@ -393,27 +391,27 @@ func TestFormatTopicList(t *testing.T) {
 		t.Fatalf("list misses type or hash:\n%s", out)
 	}
 
-	if out := FormatTopicList(nil); out != "" {
+	if out := formatTopicList(nil); out != "" {
 		t.Fatalf("empty list = %q, want empty", out)
 	}
 }
 
 // TestFormatTopicInfo checks endpoint info plus loud mismatches.
 func TestFormatTopicInfo(t *testing.T) {
-	summary := TopicSummary{
+	summary := topicSummary{
 		Name:       "/chatter",
 		Types:      []string{"std_msgs__msg__String"},
 		TypeHashes: []string{"h1"},
 		PubCount:   1,
 		SubCount:   1,
-		Endpoints: []TopicEndpoint{
-			NewTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestBestEffort()),
-			NewTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
+		Endpoints: []topicEndpoint{
+			newTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestBestEffort()),
+			newTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
 		},
 	}
 
-	mismatches := DetectMismatches(summary.Name, summary.Endpoints)
-	out := FormatTopicInfo(summary, mismatches)
+	mismatches := detectMismatches(summary.Name, summary.Endpoints)
+	out := formatTopicInfo(summary, mismatches)
 
 	for _, want := range []string{"/chatter", "gid=pub", "gid=sub", "h1", "reliability", "Mismatches"} {
 		if !strings.Contains(out, want) {
@@ -429,7 +427,7 @@ func TestFormatTopicInfo(t *testing.T) {
 		t.Fatalf("info mismatch misses policy kind:\n%s", out)
 	}
 
-	none := FormatTopicInfo(summary, nil)
+	none := formatTopicInfo(summary, nil)
 	if !strings.Contains(none, "Mismatches: none") {
 		t.Fatalf("no mismatch info misses none line:\n%s", none)
 	}
@@ -448,7 +446,7 @@ func TestFormatMismatch(t *testing.T) {
 		Detail:     "offered best_effort cannot satisfy requested reliable",
 	}
 
-	got := FormatMismatch(event)
+	got := formatMismatch(event)
 	if !strings.HasPrefix(got, "weld:") {
 		t.Fatalf("mismatch = %q, want weld prefix", got)
 	}
@@ -461,51 +459,39 @@ func TestFormatMismatch(t *testing.T) {
 }
 
 // TestResolveInfoTopic checks flag versus positional selection.
+// checkInfoTopicSuccess checks one successful topic resolution.
+func checkInfoTopicSuccess(t *testing.T, flagText string, explicit bool, args []string, want, label string) {
+	t.Helper()
+
+	got, err := resolveInfoTopic(flagText, explicit, args)
+	if err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+	if got != want {
+		t.Fatalf("%s = %q, want %q", label, got, want)
+	}
+}
+
+// checkInfoTopicFailure checks one failing topic resolution keeps weld prefix.
+func checkInfoTopicFailure(t *testing.T, flagText string, explicit bool, args []string, label string) {
+	t.Helper()
+
+	_, err := resolveInfoTopic(flagText, explicit, args)
+	if err == nil {
+		t.Fatalf("%s accepted", label)
+	}
+	if !strings.HasPrefix(err.Error(), "weld:") {
+		t.Fatalf("%s error = %q, want weld prefix", label, err.Error())
+	}
+}
+
 func TestResolveInfoTopic(t *testing.T) {
-	got, err := resolveInfoTopic("/explicit", nil)
-	if err != nil {
-		t.Fatalf("flag topic: %v", err)
-	}
-
-	if got != "/explicit" {
-		t.Fatalf("flag topic = %q, want /explicit", got)
-	}
-
-	got, err = resolveInfoTopic(defaultTopic, []string{"/pos"})
-	if err != nil {
-		t.Fatalf("positional topic: %v", err)
-	}
-
-	if got != "/pos" {
-		t.Fatalf("positional = %q, want /pos", got)
-	}
-
-	got, err = resolveInfoTopic(defaultTopic, nil)
-	if err != nil {
-		t.Fatalf("default topic: %v", err)
-	}
-
-	if got != defaultTopic {
-		t.Fatalf("default = %q, want %q", got, defaultTopic)
-	}
-
-	_, err = resolveInfoTopic("", nil)
-	if err == nil {
-		t.Fatalf("missing topic accepted")
-	}
-
-	if !strings.HasPrefix(err.Error(), "weld:") {
-		t.Fatalf("missing error = %q, want weld prefix", err.Error())
-	}
-
-	_, err = resolveInfoTopic("/a", []string{"/b", "/c"})
-	if err == nil {
-		t.Fatalf("two args accepted")
-	}
-
-	if !strings.HasPrefix(err.Error(), "weld:") {
-		t.Fatalf("two args error = %q, want weld prefix", err.Error())
-	}
+	checkInfoTopicSuccess(t, "/explicit", true, nil, "/explicit", "flag topic")
+	checkInfoTopicSuccess(t, defaultTopic, false, []string{"/pos"}, "/pos", "positional")
+	checkInfoTopicSuccess(t, defaultTopic, true, []string{"/pos"}, defaultTopic, "explicit default topic")
+	checkInfoTopicSuccess(t, defaultTopic, false, nil, defaultTopic, "default topic")
+	checkInfoTopicFailure(t, "", false, nil, "missing topic")
+	checkInfoTopicFailure(t, "/a", true, []string{"/b", "/c"}, "two args")
 }
 
 // TestFetchTopicSnapshotEmpty checks backend without graph yields empty.
@@ -562,9 +548,9 @@ func (f *fakeTopicBackendNoGraph) Close() error {
 func TestFetchTopicSnapshotWithSnapshotter(t *testing.T) {
 	fb := &fakeTopicBackend{
 		hasSnap: true,
-		snapshot: GraphSnapshot{
+		snapshot: graphSnapshot{
 			Generation: 9,
-			Endpoints: []TopicEndpoint{
+			Endpoints: []topicEndpoint{
 				{GID: "a", Topic: "/chatter", Type: "t", TypeHash: "h"},
 			},
 		},
@@ -642,7 +628,7 @@ func stubTopicBackend(t *testing.T, backend transports.Backend) {
 func TestRunTopicListCommand(t *testing.T) {
 	fb := &fakeTopicBackend{
 		hasSnap: true,
-		snapshot: GraphSnapshot{Endpoints: []TopicEndpoint{
+		snapshot: graphSnapshot{Endpoints: []topicEndpoint{
 			{GID: "pub", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1"},
 			{GID: "sub", Topic: "/chatter", Type: "std_msgs__msg__String", TypeHash: "h1", IsReader: true},
 		}},
@@ -690,9 +676,9 @@ func TestRunTopicListCommand(t *testing.T) {
 func TestRunTopicInfoCommand(t *testing.T) {
 	fb := &fakeTopicBackend{
 		hasSnap: true,
-		snapshot: GraphSnapshot{Endpoints: []TopicEndpoint{
-			NewTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestBestEffort()),
-			NewTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
+		snapshot: graphSnapshot{Endpoints: []topicEndpoint{
+			newTopicEndpointWithQoS("pub", "/chatter", "std_msgs__msg__String", "h1", false, topicTestBestEffort()),
+			newTopicEndpointWithQoS("sub", "/chatter", "std_msgs__msg__String", "h1", true, topicTestQoS()),
 		}},
 	}
 	stubTopicBackend(t, fb)
@@ -701,8 +687,8 @@ func TestRunTopicInfoCommand(t *testing.T) {
 	var stderr bytes.Buffer
 
 	code := runTopicInfoCommand(context.Background(), []string{"--topic", "/chatter", "--domain", "42"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("info code = %d, want 0\nstderr:\n%s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("info code = %d, want 1 for mismatch\nstderr:\n%s", code, stderr.String())
 	}
 
 	if !strings.Contains(stdout.String(), "Topic: /chatter") {

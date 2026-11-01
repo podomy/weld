@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +32,7 @@ func (f *fakeEchoBackend) PublishBytes(_ context.Context, _ transports.OutgoingM
 func (f *fakeEchoBackend) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
 	err := ctx.Err()
 	if err != nil {
-		return transports.IncomingMessage{}, err
+		return transports.IncomingMessage{}, fmt.Errorf("fake echo take: %w", err)
 	}
 
 	if len(f.msgs) == 0 {
@@ -68,7 +69,7 @@ func (f *fakeEchoBackend) LostCount() uint64 {
 func echoValidPayload(t *testing.T, text string) []byte {
 	t.Helper()
 
-	payload, err := encodeStringPayload(text)
+	payload, err := encodeStringPayload("/chatter", text)
 	if err != nil {
 		t.Fatalf("encode string: %v", err)
 	}
@@ -248,7 +249,7 @@ func (f *fakeEchoDiscoveryBackend) PublishBytes(_ context.Context, _ transports.
 func (f *fakeEchoDiscoveryBackend) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
 	err := ctx.Err()
 	if err != nil {
-		return transports.IncomingMessage{}, err
+		return transports.IncomingMessage{}, fmt.Errorf("fake echo discovery take: %w", err)
 	}
 
 	return transports.IncomingMessage{}, context.Canceled

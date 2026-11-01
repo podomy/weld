@@ -391,8 +391,13 @@ func takeStereoSamples(t *testing.T, takeCtx context.Context, backend *dds.Backe
 // sample with NewDecoder. A missing payload skips with the interop gap
 // note, while backend errors still fail. It stops the talker and closes
 // the backend before returning.
+//
+//nolint:cyclop // live stereo gate sequences talker, echo, and allowlist verdict in one run
 func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	logPath := filepath.Join(t.TempDir(), "talker-"+live+"-stereo-disparity.log")
 	logFile, err := os.Create(logPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -417,7 +422,9 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), stereoDisparityCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopTalker)
 	helpers.Sleep(ctx, stereoDisparityTalkerNap)
@@ -462,7 +469,10 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 	}
 	closeBackend()
 	stopTalker()
-	t.Skipf("weld take did not see stereo disparity payload hash %s (known interop gap), local codec ok", typeHash)
+	t.Logf("weld take did not see stereo disparity payload hash %s (known interop gap), local codec ok", typeHash)
+	reason := "weld take misses stereo disparity user DATA but local codec ok, known interop gap forward stereo"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // publishStereoDisparityUntilEcho publishes until ros2 topic echo sees want.
@@ -479,8 +489,13 @@ func publishStereoDisparityUntilEcho(ctx context.Context, t *testing.T, backend 
 // ID or the poll wait ends. A missing payload skips with the interop gap
 // note, while pub failures still fail. It stops the echo and closes the
 // backend before returning.
+//
+//nolint:cyclop // live stereo gate sequences talker, echo, and allowlist verdict in one run
 func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	echoPath := filepath.Join(t.TempDir(), "rosecho-"+live+"-stereo-disparity.log")
 	echoFile, err := os.Create(echoPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -504,7 +519,9 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), stereoDisparityCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, stereoDisparityEchoNap)
@@ -553,7 +570,10 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 	}
 	closeBackend()
 	stopEcho()
-	t.Skipf("ros2 topic echo did not see stereo disparity payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
+	t.Logf("ros2 topic echo did not see stereo disparity payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
+	reason := "ros echo misses stereo disparity user DATA but pub ok, known interop gap reverse stereo"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // TestROSTypeStereoDisparity checks DisparityImage small forward plus reverse.

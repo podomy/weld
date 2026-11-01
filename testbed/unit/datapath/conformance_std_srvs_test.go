@@ -8,8 +8,8 @@
 // travel on rq request and rr reply DDS topics, not on the rt topic path,
 // so they are out of topic-gate scope. The test below asserts
 // internal/types Encoder and Decoder round trips for the Trigger, Empty,
-// and SetBool shapes recorded in the corpus, and skips with reason when a
-// shape is not defined there.
+// and SetBool shapes recorded in the in-repo corpus, and fails loudly when a
+// shape is missing or wrong there.
 //
 //nolint:dupl // live gate decoders repeat similar wire checks across types
 package unit_datapath
@@ -34,26 +34,26 @@ func stdSrvsTestGUID() [8]byte {
 // stdSrvsTestSeq is the fixed service sequence number for tests.
 const stdSrvsTestSeq = uint64(7)
 
-// stdSrvsCheckCorpus returns the corpus entry for pkg and name or skips.
+// stdSrvsCheckCorpus returns the corpus entry for pkg and name or fails loudly.
 func stdSrvsCheckCorpus(t *testing.T, pkg, name string) types.CorpusEntry {
 	t.Helper()
 	entry, ok := types.Lookup(pkg, name)
 	if !ok {
-		t.Skipf("corpus misses %s/%s, no shape to pin", pkg, name)
+		t.Fatalf("in-repo corpus misses %s/%s, no shape to pin", pkg, name)
 	}
 	if entry.Kind != types.KindService {
-		t.Skipf("corpus %s/%s kind %q is not service, no service shape to pin", pkg, name, entry.Kind)
+		t.Fatalf("corpus %s/%s kind %q is not service, no service shape to pin", pkg, name, entry.Kind)
 	}
 	return entry
 }
 
-// stdSrvsRequireSummary skips when Summary misses a required fragment.
+// stdSrvsRequireSummary fails loudly when Summary misses a required fragment.
 func stdSrvsRequireSummary(t *testing.T, entry types.CorpusEntry, fragments ...string) {
 	t.Helper()
 	summary := strings.ToLower(entry.Summary)
 	for _, fragment := range fragments {
 		if !strings.Contains(summary, strings.ToLower(fragment)) {
-			t.Skipf("corpus %s/%s Summary %q misses %q, shape not defined", entry.Package, entry.Name, entry.Summary, fragment)
+			t.Fatalf("in-repo corpus %s/%s Summary %q misses %q, shape not defined", entry.Package, entry.Name, entry.Summary, fragment)
 		}
 	}
 }

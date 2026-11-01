@@ -153,7 +153,9 @@ func keyedLiveStartTalker(t *testing.T, ctx context.Context, domain int, live, t
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), keyedLiveCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stop)
 	return stop
@@ -294,7 +296,9 @@ func TestKeyedLiveReversePeerVisible(t *testing.T) {
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), keyedLiveCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, keyedLiveEchoNap)

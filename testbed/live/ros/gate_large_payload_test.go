@@ -328,7 +328,9 @@ func startLargeEcho(t *testing.T, ctx context.Context, domain uint32, topic, log
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), largePayloadClean)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 }
 
@@ -917,7 +919,9 @@ func startLargePC2Echo(t *testing.T, ctx context.Context, domain uint32, topic, 
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), largePayloadClean)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 }
 

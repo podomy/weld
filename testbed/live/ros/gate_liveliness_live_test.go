@@ -127,7 +127,14 @@ func enforceDrainQueue(t *testing.T, ctx context.Context, backend *dds.Backend, 
 		msg, err := backend.TakeBytes(drainCtx)
 		drainCancel()
 		if err != nil {
-			break
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				break
+			}
+			if isExpectedTakeError(err) {
+				drained++
+				continue
+			}
+			t.Fatalf("enforce drain take failed on %q: %v", topic, err)
 		}
 		_ = msg
 		drained++
@@ -182,7 +189,7 @@ func TestROSLivelinessEnforcementStaleExpiry(t *testing.T) {
 	talker := startLiveTalker(t, ctx, enforceGateDomain, topic, payload, "2")
 	helpers.WaitForTopicDiscovery(ctx, backend, topic)
 	enforceTakeOneLiveSample(t, ctx, backend, topic, runID, &tracker)
-	stopLiveTalker(t, ctx, talker, enforceGateDomain, payload)
+	stopLiveTalker(t, ctx, talker, payload)
 	// Drain after the kill so no buffered sample survives into the
 	// post-expiry take: the talker is dead, nothing new can arrive, and
 	// the tracker still anchors on the live sample for stale/expiry.
@@ -240,7 +247,9 @@ func TestROSLivelinessEnforcementDeadlineMiss(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(deadlineDomain), payload)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, payload); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	misses := 0
 	alerts := 0
@@ -288,7 +297,7 @@ func TestROSLivelinessEnforcementDeadlineMiss(t *testing.T) {
 	if _, ok := deadlineTracker.Check(now); ok {
 		alerts++
 	}
-	stopLiveTalker(t, ctx, talker, deadlineDomain, payload)
+	stopLiveTalker(t, ctx, talker, payload)
 	if seen == 0 {
 		t.Fatalf("slow publisher on %q delivered nothing in %v", topic, enforceGateTakeTimeout)
 	}

@@ -485,6 +485,9 @@ func startRestByteMultiArrayEcho(t *testing.T, ctx context.Context, domain int, 
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
 		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if !helpers.WaitForContainerProcGone(cleanupCtx, helpers.Container, topic, helpers.PeerStopTimeout) {
+			t.Errorf("stop peer proc survived kill on domain %v pattern %q", domain, topic)
+		}
 	})
 }
 

@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package unit_cli holds pure Go CLI checks with no peer and no network.
+//
+// CLI flag and exit path conformance lives in cmd/weld/main_test.go (real
+// product functions in package main) plus testbed/live/cli/gate_cli_test.go
+// (real built binary with peer). This file keeps only same-module
+// product-path coverage by calling the product directly (core endpoints,
+// transports domain IDs, dds publishers and SEDP, types codecs) and does
+// not import cmd/weld: cmd/weld is a separate module with GOWORK=off (see
+// cmd/weld/go.mod), so unit_cli cannot import its flag helpers and must
+// not exec a binary from hermetic unit tests. Local cli* helpers below
+// are test doubles for pure-Go shape checks only, not product flag paths.
 package unit_cli
 
 import (
@@ -558,16 +568,14 @@ func TestCLIInvalidDomainExit2(t *testing.T) {
 	t.Setenv(transports.DomainEnvVar, "")
 }
 
-// TestCLITimeoutNegativeAndZero checks negative fails and zero runs until interrupt.
+// TestCLITimeoutNegativeAndZero checks zero runs until interrupt.
+//
+// Negative timeout rejection lives in cmd/weld/main_test.go
+// TestWithEchoTimeoutNegative via the real runEchoCommand flag path
+// plus live gates; this package cannot import cmd/weld (separate module
+// with GOWORK=off, see cmd/weld/go.mod), so it does not reassert the
+// negative flag path here and does not exec a binary from unit tests.
 func TestCLITimeoutNegativeAndZero(t *testing.T) {
-	negTimeout := -1 * time.Second
-	if negTimeout >= 0 {
-		t.Fatalf("negative timeout setup is not negative")
-	}
-	negErr := errors.New("weld: echo timeout -1s must not be negative")
-	if !strings.Contains(negErr.Error(), "must not be negative") {
-		t.Fatalf("negative timeout misses reason: %v", negErr)
-	}
 	ctx := context.Background()
 	got, cancel := cliWithEchoTimeout(ctx, 0)
 	_, ok := got.Deadline()
@@ -584,12 +592,6 @@ func TestCLITimeoutNegativeAndZero(t *testing.T) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 || remaining > time.Minute {
 		t.Fatalf("deadline remaining %v out of range", remaining)
-	}
-	negCtx, negCancel := cliWithEchoTimeout(ctx, negTimeout)
-	defer negCancel()
-	_, hasDeadline := negCtx.Deadline()
-	if hasDeadline {
-		t.Fatalf("negative timeout must not set a deadline in helper")
 	}
 }
 

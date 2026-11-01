@@ -363,8 +363,8 @@ func TestGateCLIPubWaitsForRoute(t *testing.T) {
 		t.Fatalf("route cancel elapsed %v too long, want fast interrupt", intElapsed)
 	}
 	combined := intOut.String() + "\n" + intErr.String()
-	if strings.Contains(combined, "weld:") || !strings.Contains(combined, "context") {
-		t.Logf("route cancel output without weld prefix, still honors interrupt:\n%s", combined)
+	if !strings.Contains(combined, "weld:") || !strings.Contains(combined, "context") {
+		t.Fatalf("route cancel output misses weld prefix or context, want both:\n%s", combined)
 	}
 }
 
@@ -428,6 +428,9 @@ func TestGateCLIWeldToWeldRoundTrip(t *testing.T) {
 // late match still lands.
 func TestGateCLIForwardRosTalkerSeenByWeldEcho(t *testing.T) {
 	domain := helpers.MustAllocateDomain(t)
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domainStr := strconv.Itoa(domain)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -456,7 +459,9 @@ func TestGateCLIForwardRosTalkerSeenByWeldEcho(t *testing.T) {
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.WaitForSEDPRemote(t, ctx, probe, topic, "ROS talker writer", helpers.SEDPRemoteTimeout)
 	helpers.Sleep(ctx, cliForwardSleep)
@@ -487,7 +492,10 @@ func TestGateCLIForwardRosTalkerSeenByWeldEcho(t *testing.T) {
 		t.Fatalf("weld echo backend error:\n%s", combined)
 	}
 	if !strings.Contains(echoRes.stdout, live) {
-		t.Skipf("weld echo did not receive ROS live %q (known user DATA gap), echo ok without payload\nstdout:\n%s\nstderr:\n%s", payload, echoRes.stdout, echoRes.stderr)
+		t.Logf("weld echo did not receive ROS live %q (known user DATA gap), echo ok without payload\nstdout:\n%s\nstderr:\n%s", payload, echoRes.stdout, echoRes.stderr)
+		reason := "weld echo misses ROS user DATA but echo ok, known user DATA gap forward cli"
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }
 
@@ -496,6 +504,9 @@ func TestGateCLIForwardRosTalkerSeenByWeldEcho(t *testing.T) {
 //nolint:gocognit,cyclop // reverse test asserts publish plus file poll across two peers in one run
 func TestGateCLIReverseWeldPubSeenByRosEcho(t *testing.T) {
 	domain := helpers.MustAllocateDomain(t)
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domainStr := strconv.Itoa(domain)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -529,7 +540,9 @@ func TestGateCLIReverseWeldPubSeenByRosEcho(t *testing.T) {
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, cliReverseSleep)
 	if ctx.Err() != nil {
@@ -567,6 +580,9 @@ func TestGateCLIReverseWeldPubSeenByRosEcho(t *testing.T) {
 		if readErr != nil {
 			t.Fatalf("read ros echo log: %v", readErr)
 		}
-		t.Skipf("ros echo did not see live %q (known user DATA gap), pub ok\noutput:\n%s", payload, string(fileData))
+		t.Logf("ros echo did not see live %q (known user DATA gap), pub ok\noutput:\n%s", payload, string(fileData))
+		reason := "ros echo misses weld user DATA but pub ok, known user DATA gap reverse cli"
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }

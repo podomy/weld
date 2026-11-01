@@ -207,9 +207,24 @@ func takeShapeSamples(t *testing.T, takeCtx context.Context, backend *dds.Backen
 // with static fallback, then takes via the Weld backend and decodes each
 // sample with NewDecoder. A missing payload skips with the interop gap
 // note, while backend errors still fail. It stops the talker and closes
+// stopShapePeer stops one shape peer and verifies the container process
+// is gone so later labels run on a quiet domain.
+func stopShapePeer(t *testing.T, ctx context.Context, cmd *exec.Cmd, topic string) {
+	t.Helper()
+	helpers.StopCmd(cmd)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), shapeCleanWait)
+	defer cleanupCancel()
+	if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+		t.Errorf("stop peer proc: %v", err)
+	}
+}
+
 // the backend before returning so later labels run on a quiet domain.
 func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	logPath := filepath.Join(t.TempDir(), "talker-"+live+"-shape.log")
 	logFile, err := os.Create(logPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -231,10 +246,7 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 		t.Fatalf("start ROS talker shape: %v", err)
 	}
 	stopTalker := func() {
-		helpers.StopCmd(talker)
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), shapeCleanWait)
-		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		stopShapePeer(t, ctx, talker, topic)
 	}
 	t.Cleanup(stopTalker)
 	helpers.Sleep(ctx, shapeTalkerNap)
@@ -279,7 +291,10 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	closeBackend()
 	stopTalker()
-	t.Skipf("weld take did not see shape payload hash %s (known interop gap), local codec ok", typeHash)
+	t.Logf("weld take did not see shape payload hash %s (known interop gap), local codec ok", typeHash)
+	reason := "weld take misses shape user DATA but local codec ok, known interop gap forward shape"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // publishShapeUntilEcho publishes until ros2 topic echo sees want.
@@ -299,6 +314,9 @@ func publishShapeUntilEcho(ctx context.Context, t *testing.T, backend *dds.Backe
 // quiet domain.
 func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	echoPath := filepath.Join(t.TempDir(), "rosecho-"+live+"-shape.log")
 	echoFile, err := os.Create(echoPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -319,10 +337,7 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 		t.Fatalf("start ros2 topic echo shape: %v", err)
 	}
 	stopEcho := func() {
-		helpers.StopCmd(echoCmd)
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), shapeCleanWait)
-		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		stopShapePeer(t, ctx, echoCmd, topic)
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, shapeEchoNap)
@@ -371,7 +386,10 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	closeBackend()
 	stopEcho()
-	t.Skipf("ros2 topic echo did not see shape payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
+	t.Logf("ros2 topic echo did not see shape payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
+	reason := "ros echo misses shape user DATA but pub ok, known interop gap reverse shape"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // TestROSTypeShapeSolidPrimitive checks SolidPrimitive forward plus reverse.

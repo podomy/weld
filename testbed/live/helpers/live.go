@@ -488,13 +488,45 @@ func peerPidReady(path string) bool {
 // kill -0 for the pidfile PID until the proc exits or PeerStopTimeout
 // expires. The kill -0 probe sends no signal and only tests PID presence
 // with the same kill binary StopPeerProc already uses. Missing or empty
-// pidfiles return at once. It is best effort cleanup and never fails the
-// test: a surviving proc is left for the scoped pkill already sent.
+// pidfiles return at once. After the wait it rechecks the pidfile: a
+// late pidfile write can appear after the first kill missed, so a present
+// PID triggers one second kill plus scoped pkill. It is best effort
+// cleanup and never fails the test: a surviving proc is left for the
+// scoped pkill already sent.
 func StopPeerProcAndWait(ctx context.Context, container string, domain int, hostPidPath, pkillPattern string) {
 	stopCtx, cancel := context.WithTimeout(ctx, PeerStopTimeout)
 	defer cancel()
 	StopPeerProc(stopCtx, container, domain, hostPidPath, pkillPattern)
 	waitForPidExit(stopCtx, container, domain, hostPidPath)
+	recheckPeerProcMiss(stopCtx, container, domain, hostPidPath, pkillPattern)
+}
+
+// recheckPeerProcMiss retries kill plus pkill when a late pidfile appears.
+//
+// The first StopPeerProc can miss when the container sh script writes the
+// pidfile after the read. After the wait this re-reads the pidfile and,
+// when a PID is present and still live, issues one second pidfile kill
+// plus scoped pkill. Missing or exited procs are a no-op.
+func recheckPeerProcMiss(ctx context.Context, container string, domain int, hostPidPath, pkillPattern string) {
+	if hostPidPath == "" {
+		return
+	}
+	pid, err := readPeerPid(hostPidPath)
+	if err != nil {
+		return
+	}
+	if pid == "" {
+		return
+	}
+	if peerPidGone(ctx, container, domain, pid) {
+		return
+	}
+	killArgs := DockerArgs(container, domain, "kill", pid)
+	killCmd := exec.CommandContext(ctx, "docker", killArgs...) //nolint:gosec // live harness invokes docker with fixed args from test tables
+	_ = killCmd.Run()                                          //nolint:errcheck // best-effort cleanup, missing proc is not an error
+	if pkillPattern != "" {
+		KillContainerProc(ctx, container, domain, pkillPattern)
+	}
 }
 
 // waitForPidExit polls kill -0 until the pidfile PID exits or ctx ends.

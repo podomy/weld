@@ -289,7 +289,9 @@ func relRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), relCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, relForwardNap)
 	if ctx.Err() != nil {
@@ -350,7 +352,9 @@ func relRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), relCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, relReverseNap)
 	if ctx.Err() != nil {
@@ -381,6 +385,8 @@ func relRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 // This proves the best_effort pair flows without weld in the path, which
 // the weld facade cannot prove because the facade always offers reliable.
 // A miss here fails because a compatible pair must flow.
+//
+//nolint:gocognit,cyclop // live ros-to-ros gate sequences talker, echo, and silence verdict in one run
 func relRunRosToRos(t *testing.T, ctx context.Context, domain int, c relLiveCase) {
 	t.Helper()
 	live := helpers.LiveID("rel-" + c.name)
@@ -410,7 +416,9 @@ func relRunRosToRos(t *testing.T, ctx context.Context, domain int, c relLiveCase
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), relCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, relReverseNap)
 	if ctx.Err() != nil {
@@ -441,7 +449,9 @@ func relRunRosToRos(t *testing.T, ctx context.Context, domain int, c relLiveCase
 		helpers.StopCmd(pubCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), relCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	found := helpers.WaitForFileContains(ctx, echoPath, live, relPollWait)
 	if !found {
@@ -517,7 +527,7 @@ func TestROSQoSReliabilityCore(t *testing.T) {
 // returned cancel.
 func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
 	t.Helper()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), relTestTimeout)
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	relRequireFlag(t, ctx, domain)
@@ -525,7 +535,7 @@ func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
 	// The outer domain covered only the reliability probe. Free it now so
 	// parallel workers reuse the 32-domain pool instead of pinning two
 	// domains per worker for the whole test.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
 	return ctx, cancel, bin
 }
 

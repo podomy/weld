@@ -314,7 +314,9 @@ func qosDHRunForward(t *testing.T, ctx context.Context, bin string, domain int, 
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosDHCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosDHForwardNap)
 	err = ctx.Err()
@@ -379,7 +381,9 @@ func qosDHRunReverse(t *testing.T, ctx context.Context, bin string, domain int, 
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosDHCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosDHReverseNap)
 	err = ctx.Err()
@@ -494,7 +498,7 @@ func TestROSQoSDurabilityHistoryCore(t *testing.T) {
 // lacks the keep_all value.
 func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosDHTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -503,7 +507,7 @@ func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
 	for _, c := range qosDHCompatibleCases() {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
@@ -522,7 +526,7 @@ func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 // skip with reason when the peer help lacks the keep_all value.
 func TestROSQoSDurabilityHistoryIncompatibleLoud(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosDHTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -531,7 +535,7 @@ func TestROSQoSDurabilityHistoryIncompatibleLoud(t *testing.T) {
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
 	for _, c := range qosDHIncompatibleCases() {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)

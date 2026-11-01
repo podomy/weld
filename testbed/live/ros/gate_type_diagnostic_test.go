@@ -49,7 +49,7 @@ type diagGapEntry struct {
 var diagGapAllowlist = map[string]diagGapEntry{
 	"diag-status": {
 		Hash:    diagHashStatus,
-		Reason:  "peer CycloneDDS omits DiagnosticStatus sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits DiagnosticStatus sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
 }
@@ -62,13 +62,7 @@ var diagGapAllowlist = map[string]diagGapEntry{
 func diagFailOrAllow(t *testing.T, label, hash, detail string) {
 	t.Helper()
 	entry, ok := diagGapAllowlist[label]
-	if ok && entry.Hash == hash && time.Now().Before(entry.Expires) && helpers.IsValidRIHSHash(entry.Hash) {
-		t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	if ok && !time.Now().Before(entry.Expires) {
-		t.Fatalf("expired allowlist %s hash %s reason %s expired %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	t.Fatalf("live missing %s hash %s with local codec ok, no peer reason and no allowlist: %s", label, hash, detail)
+	gapFailOrAllow(t, label, hash, detail, entry.Hash, entry.Reason, entry.Expires, ok)
 }
 
 // runDiagStrictForward checks Weld take sees a ROS talker with strict gaps.
@@ -106,7 +100,9 @@ func runDiagStrictForward(t *testing.T, ctx context.Context, domain int, tc type
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopTalker)
 	helpers.Sleep(ctx, typeMatrixTalkerNap)
@@ -207,6 +203,8 @@ func diagPublishUntilEcho(ctx context.Context, t *testing.T, backend *dds.Backen
 // hash probing, and the Weld backend. It mirrors runMatrixReverse for domain and argv but fails when echo is
 // missing with local codec ok unless the label is explicitly allowlisted
 // with hash plus reason plus expiry.
+//
+//nolint:cyclop // live reverse gate sequences echo, probe, and allowlist verdict in one run
 func runDiagStrictReverse(t *testing.T, ctx context.Context, domain int, tc typeMatrixCase, live, topic string) {
 	t.Helper()
 	echoPath := filepath.Join(t.TempDir(), "rosecho-"+live+"-"+tc.Label+".log")
@@ -232,7 +230,9 @@ func runDiagStrictReverse(t *testing.T, ctx context.Context, domain int, tc type
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, typeMatrixEchoNap)

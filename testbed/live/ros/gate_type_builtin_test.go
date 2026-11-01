@@ -55,14 +55,30 @@ type builtinGapEntry struct {
 var builtinGapAllowlist = map[string]builtinGapEntry{
 	"builtin-time-zero": {
 		Hash:    builtinTimeHash,
-		Reason:  "peer CycloneDDS omits zero Time sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits zero Time sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
 	"builtin-time-max": {
 		Hash:    builtinTimeHash,
-		Reason:  "peer CycloneDDS omits TimeMax sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits TimeMax sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
+}
+
+// gapFailOrAllow skips only for an explicit allowlist gap, else fails.
+//
+// It checks the looked-up entry with matching hash and unexpired date. On
+// match it skips with hash plus reason plus expiry. Otherwise it fails
+// because local codec ok but live missing has no peer reason.
+func gapFailOrAllow(t *testing.T, label, hash, detail, entryHash, entryReason string, expires time.Time, ok bool) {
+	t.Helper()
+	if ok && entryHash == hash && time.Now().Before(expires) && helpers.IsValidRIHSHash(entryHash) {
+		t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: %s", label, entryHash, entryReason, expires.Format("2006-01-02"), detail)
+	}
+	if ok && !time.Now().Before(expires) {
+		t.Fatalf("expired allowlist %s hash %s reason %s expired %s: %s", label, entryHash, entryReason, expires.Format("2006-01-02"), detail)
+	}
+	t.Fatalf("live missing %s hash %s with local codec ok, no peer reason and no allowlist: %s", label, hash, detail)
 }
 
 // builtinFailOrAllow skips only for explicit allowlist gaps, else fails.
@@ -73,13 +89,7 @@ var builtinGapAllowlist = map[string]builtinGapEntry{
 func builtinFailOrAllow(t *testing.T, label, hash, detail string) {
 	t.Helper()
 	entry, ok := builtinGapAllowlist[label]
-	if ok && entry.Hash == hash && time.Now().Before(entry.Expires) && helpers.IsValidRIHSHash(entry.Hash) {
-		t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	if ok && !time.Now().Before(entry.Expires) {
-		t.Fatalf("expired allowlist %s hash %s reason %s expired %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	t.Fatalf("live missing %s hash %s with local codec ok, no peer reason and no allowlist: %s", label, hash, detail)
+	gapFailOrAllow(t, label, hash, detail, entry.Hash, entry.Reason, entry.Expires, ok)
 }
 
 // runBuiltinStrictForward checks Weld take sees a ROS talker with strict gaps.
@@ -117,7 +127,9 @@ func runBuiltinStrictForward(t *testing.T, ctx context.Context, domain int, tc t
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopTalker)
 	helpers.Sleep(ctx, typeMatrixTalkerNap)
@@ -218,6 +230,8 @@ func builtinPublishUntilEcho(ctx context.Context, t *testing.T, backend *dds.Bac
 // hash probing, and the Weld backend. It mirrors runMatrixReverse for domain and argv but fails when echo is
 // missing with local codec ok unless the label is explicitly allowlisted
 // with hash plus reason plus expiry.
+//
+//nolint:cyclop // live reverse gate sequences echo, probe, and allowlist verdict in one run
 func runBuiltinStrictReverse(t *testing.T, ctx context.Context, domain int, tc typeMatrixCase, live, topic string) {
 	t.Helper()
 	echoPath := filepath.Join(t.TempDir(), "rosecho-"+live+"-"+tc.Label+".log")
@@ -243,7 +257,9 @@ func runBuiltinStrictReverse(t *testing.T, ctx context.Context, domain int, tc t
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, typeMatrixEchoNap)

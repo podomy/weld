@@ -519,7 +519,7 @@ var (
 // callers reuse the same path. The binary lives under os.MkdirTemp, not
 // t.TempDir, because each test TempDir is removed at that test cleanup
 // while later tests still need the binary. Concurrent exec of the finished
-// path is safe because the file is immutable after the once build.
+// path is safe because the file is immutable after the once build. The temp dir is one per test binary process and is intentionally left for the OS to reclaim; no cleanup removes it while later tests still run.
 func BuildWeld(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	root := RepoRoot(t)
@@ -678,6 +678,31 @@ func StopCmd(cmd *exec.Cmd) {
 	}
 	_ = cmd.Process.Kill() //nolint:errcheck // best-effort test cleanup, kill failure is not fatal
 	_ = cmd.Wait()         //nolint:errcheck // best-effort test cleanup, wait failure is not fatal
+}
+
+// KillAndWaitContainerProc kills container procs matching pattern and
+// verifies they are gone, all in one docker exec.
+//
+// Splitting kill and verify across exec calls races docker latency under
+// load: the kill may land late while per-call timeouts expire, producing
+// false survived verdicts. One server-side script avoids that: pkill,
+// then a bounded poll, then SIGKILL escalation, then a final check. The
+// pattern travels in the WPAT env var so neither the local docker argv
+// nor the container shell ever contains the literal pattern as its own
+// command line. It returns nil only when no matching proc remains.
+// A missing proc is success, not an error.
+func KillAndWaitContainerProc(ctx context.Context, container, pattern string) error {
+	const script = `pkill -f "$WPAT"; for i in $(seq 1 12); do pgrep -f "$WPAT" >/dev/null || exit 0; sleep 0.5; done; pkill -9 -f "$WPAT"; for i in $(seq 1 4); do pgrep -f "$WPAT" >/dev/null || exit 0; sleep 0.5; done; exit 1`
+	args := []string{"exec", "-e", "WPAT=" + pattern, container, "sh", "-c", script}
+	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness kills only test-owned peer procs
+	if out, err := cmd.CombinedOutput(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return fmt.Errorf("helpers: container proc survived kill pattern %q: %w", pattern, err)
+		}
+		return fmt.Errorf("helpers: container kill verify inconclusive pattern %q output %q: %w", pattern, string(out), err)
+	}
+	return nil
 }
 
 // KillContainerProc best-effort kills container procs matching pattern.

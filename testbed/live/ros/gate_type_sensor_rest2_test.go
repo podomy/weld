@@ -477,17 +477,21 @@ func startSensorRest2PC2Echo(t *testing.T, ctx context.Context, domain uint32, t
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), largePayloadClean)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 }
 
 // sensorRest2LargeAllowEntry pins one temporary payload miss exception.
 //
 // An entry allows a skip only for an exact RosType plus exact RIHS01 Hash
-// while time is before Expiry. The list stays empty so every miss fails.
+// while time is before Expiry. Reason names the peer interop cause. The
+// list stays empty so every miss fails.
 type sensorRest2LargeAllowEntry struct {
 	RosType string
 	Hash    string
+	Reason  string
 	Expiry  time.Time
 }
 
@@ -496,15 +500,17 @@ var sensorRest2LargeAllowlist []sensorRest2LargeAllowEntry
 
 // sensorRest2LargeAllowlisted reports whether a miss may skip.
 //
-// It requires exact type plus exact hash plus unexpired time. Empty list
-// means false so callers fail.
-func sensorRest2LargeAllowlisted(rosType, hash string, now time.Time) bool {
+// It requires exact type plus exact hash plus unexpired time plus a
+// non-empty reason. Empty list means false so callers fail. It returns
+// the matching entry so callers log entry expiry and reason instead of
+// hardcoded dates.
+func sensorRest2LargeAllowlisted(rosType, hash string, now time.Time) (sensorRest2LargeAllowEntry, bool) {
 	for _, e := range sensorRest2LargeAllowlist {
-		if e.RosType == rosType && e.Hash == hash && now.Before(e.Expiry) {
-			return true
+		if e.RosType == rosType && e.Hash == hash && e.Reason != "" && now.Before(e.Expiry) {
+			return e, true
 		}
 	}
-	return false
+	return sensorRest2LargeAllowEntry{}, false
 }
 
 // publishSensorRest2PC2UntilEcho publishes until ros2 echo holds the live ID.
@@ -607,8 +613,8 @@ func TestROSTypeSensorPointCloud2Large(t *testing.T) {
 		if rerr != nil {
 			t.Fatalf("ros echo did not see rest2 large pc2 %q: %v", runID, rerr)
 		}
-		if sensorRest2LargeAllowlisted(sensorRest2PC2RosType, sensorRestHashPointCloud2, time.Now()) {
-			t.Skipf("allowlisted live gap %s hash %s expires %s: ros echo did not see rest2 large pc2 %q", "sensor-pc2-large", sensorRestHashPointCloud2, time.Date(2027, time.March, 31, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), runID)
+		if entry, ok := sensorRest2LargeAllowlisted(sensorRest2PC2RosType, sensorRestHashPointCloud2, time.Now()); ok {
+			t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: ros echo did not see rest2 large pc2 %q", "sensor-pc2-large", entry.Hash, entry.Reason, entry.Expiry.Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest2 large pc2 %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

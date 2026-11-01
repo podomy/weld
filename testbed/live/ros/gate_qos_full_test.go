@@ -579,7 +579,9 @@ func qosFullRunForward(t *testing.T, ctx context.Context, bin string, domain int
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosFullCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosFullForwardNap)
 	err = ctx.Err()
@@ -603,6 +605,7 @@ func qosFullRunForward(t *testing.T, ctx context.Context, bin string, domain int
 		}
 		return
 	}
+	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "qos-full")
 	if strings.Contains(stdout, live) {
 		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow", c.name, payload)
 	}
@@ -644,7 +647,9 @@ func qosFullRunReverse(t *testing.T, ctx context.Context, bin string, domain int
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosFullCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosFullReverseNap)
 	err = ctx.Err()
@@ -770,7 +775,7 @@ func TestROSQoSFullCore(t *testing.T) {
 // or when the flags are unsupported.
 func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosFullTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -779,7 +784,8 @@ func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
+	var selected []qosFullCase
 	for _, c := range qosFullLiveCases() {
 		facade := core.FacadeAdvertisedQoS()
 		_, _, _, _, report, err := qosFullBuildReport(c, facade)
@@ -789,6 +795,12 @@ func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 		if !report.Compatible {
 			continue
 		}
+		selected = append(selected, c)
+	}
+	if len(selected) == 0 {
+		t.Fatalf("qos full compatible selected 0 cases, want >0")
+	}
+	for _, c := range selected {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			qosFullRunLiveCase(t, ctx, bin, subdomain, c, relVals, durVals, histVals)
@@ -807,7 +819,7 @@ func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 // cleanly when no peer is present or when the QoS flags are unsupported.
 func TestROSQoSFullIncompatibleLoud(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosFullTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -816,7 +828,8 @@ func TestROSQoSFullIncompatibleLoud(t *testing.T) {
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
+	var selected []qosFullCase
 	for _, c := range qosFullLiveCases() {
 		facade := core.FacadeAdvertisedQoS()
 		_, _, _, _, report, err := qosFullBuildReport(c, facade)
@@ -826,6 +839,12 @@ func TestROSQoSFullIncompatibleLoud(t *testing.T) {
 		if report.Compatible {
 			continue
 		}
+		selected = append(selected, c)
+	}
+	if len(selected) == 0 {
+		t.Fatalf("qos full incompatible selected 0 cases, want >0")
+	}
+	for _, c := range selected {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			subCtx, subCancel := context.WithTimeout(ctx, qosFullMismatchWait+2*qosFullEchoWait)

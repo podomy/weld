@@ -58,17 +58,17 @@ type diagRest2GapEntry struct {
 var diagRest2GapAllowlist = map[string]diagRest2GapEntry{
 	"diag-rest2-keyvalue": {
 		Hash:    diagHashKeyValue,
-		Reason:  "peer CycloneDDS omits KeyValue presence sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits KeyValue presence sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
 	"diag-rest2-status": {
 		Hash:    diagHashStatus,
-		Reason:  "peer CycloneDDS omits Status presence sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits Status presence sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
 	"diag-rest2-array": {
 		Hash:    diagExtraHashArray,
-		Reason:  "peer CycloneDDS omits Array presence sample on domain 42 with local codec ok",
+		Reason:  "peer CycloneDDS omits Array presence sample on pooled domain with local codec ok",
 		Expires: time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC),
 	},
 }
@@ -81,13 +81,7 @@ var diagRest2GapAllowlist = map[string]diagRest2GapEntry{
 func diagRest2FailOrAllow(t *testing.T, label, hash, detail string) {
 	t.Helper()
 	entry, ok := diagRest2GapAllowlist[label]
-	if ok && entry.Hash == hash && time.Now().Before(entry.Expires) && helpers.IsValidRIHSHash(entry.Hash) {
-		t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	if ok && !time.Now().Before(entry.Expires) {
-		t.Fatalf("expired allowlist %s hash %s reason %s expired %s: %s", label, entry.Hash, entry.Reason, entry.Expires.Format("2006-01-02"), detail)
-	}
-	t.Fatalf("live missing %s hash %s with local codec ok, no peer reason and no allowlist: %s", label, hash, detail)
+	gapFailOrAllow(t, label, hash, detail, entry.Hash, entry.Reason, entry.Expires, ok)
 }
 
 // diagRest2LocalOk proves the local XCDR codec round trips for one presence label.

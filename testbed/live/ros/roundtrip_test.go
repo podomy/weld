@@ -57,7 +57,7 @@ var rosPayloadGapAllowlist = []rosPayloadGap{
 	{
 		distro:    "jazzy",
 		direction: "reverse",
-		reason:    "ros2 topic echo stays healthy but weld pub user DATA does not arrive on domain 42",
+		reason:    "ros2 topic echo stays healthy but weld pub user DATA does not arrive on pooled domain",
 		expires:   time.Date(2027, time.March, 31, 0, 0, 0, 0, time.UTC),
 	},
 }

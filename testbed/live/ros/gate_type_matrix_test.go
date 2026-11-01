@@ -544,6 +544,9 @@ func wantMatrixFluidPressure(live string) string {
 // domain.
 func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatrixCase, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	logPath := filepath.Join(t.TempDir(), "talker-"+live+"-"+tc.Label+".log")
 	logFile, err := os.Create(logPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -568,7 +571,9 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopTalker)
 	helpers.Sleep(ctx, typeMatrixTalkerNap)
@@ -630,7 +635,10 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	closeBackend()
 	stopTalker()
-	t.Skipf("weld take did not see %s payload hash %s (known interop gap), local codec ok", tc.Label, typeHash)
+	t.Logf("weld take did not see %s payload hash %s (known interop gap), local codec ok", tc.Label, typeHash)
+	reason := "weld take misses " + tc.Label + " user DATA but local codec ok, known interop gap forward matrix"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // runMatrixReverse checks ros2 topic echo sees a Weld pub for one type.
@@ -648,6 +656,9 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 // labels run on a quiet domain.
 func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatrixCase, live, topic string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	echoPath := filepath.Join(t.TempDir(), "rosecho-"+live+"-"+tc.Label+".log")
 	echoFile, err := os.Create(echoPath) //nolint:gosec // test writes controlled temp path
 	if err != nil {
@@ -671,7 +682,9 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), typeMatrixCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	}
 	t.Cleanup(stopEcho)
 	helpers.Sleep(ctx, typeMatrixEchoNap)
@@ -720,7 +733,10 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	closeBackend()
 	stopEcho()
-	t.Skipf("ros2 topic echo did not see %s payload %q hash %s (known interop gap), pub ok\necho output:\n%s", tc.Label, want, typeHash, string(data))
+	t.Logf("ros2 topic echo did not see %s payload %q hash %s (known interop gap), pub ok\necho output:\n%s", tc.Label, want, typeHash, string(data))
+	reason := "ros echo misses " + tc.Label + " user DATA but pub ok, known interop gap reverse matrix"
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
 // publishMatrixUntilEcho publishes until ros2 topic echo sees want.

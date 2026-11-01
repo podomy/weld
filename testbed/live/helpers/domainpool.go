@@ -4,11 +4,15 @@
 package helpers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -73,6 +77,10 @@ import (
 //   - No reuse while live: a domain stays marked used and its flock held
 //     until its test releases it through t.Cleanup, so sequential reuse
 //     is safe but concurrent overlap is impossible.
+//   - Ownership tokens: each lease mints a nonzero token stored with the
+//     domain. ReleaseDomainLease frees only on token match, so an early
+//     manual release plus a later stale t.Cleanup cannot free another
+//     test domain that reused the number.
 const (
 	// ParallelDomainMin is the first pooled exclusive domain.
 	ParallelDomainMin = 70
@@ -88,12 +96,22 @@ var errDomainHeld = errors.New("helpers: domain held by another process")
 // parallelPoolUsed tracks pooled domains currently held by live tests.
 var parallelPoolUsed = map[int]bool{}
 
+// parallelPoolTokens holds the ownership token per held pooled domain.
+// Each AllocateDomainLease mints a fresh nonzero token; ReleaseDomainLease
+// releases only when the caller token matches the current holder, so a
+// stale t.Cleanup after an early manual release cannot free another test
+// domain that reused the number.
+var parallelPoolTokens = map[int]uint64{}
+
+// parallelPoolNextToken mints ownership tokens. Zero means no holder.
+var parallelPoolNextToken uint64 = 1
+
 // parallelPoolLocks holds the open lock file per allocated domain. Each
-// file stays open with its exclusive flock until ReleaseDomain, so the
+// file stays open with its exclusive flock until ReleaseDomainLease, so the
 // kernel releases the domain even when the test binary crashes.
 var parallelPoolLocks = map[int]*os.File{}
 
-// parallelPoolMu guards parallelPoolUsed and parallelPoolLocks for concurrent use.
+// parallelPoolMu guards parallelPoolUsed, parallelPoolTokens, and parallelPoolLocks for concurrent use.
 var parallelPoolMu sync.Mutex
 
 // domainLockDir returns the fixed directory holding per-domain lock files.
@@ -162,20 +180,33 @@ func releaseDomainLock(domain int) {
 	_ = fh.Close()                                   //nolint:errcheck // best-effort cleanup, closing releases the flock
 }
 
-// AllocateDomain returns one exclusive pooled domain.
+// AllocateDomainLease returns one exclusive pooled domain plus an ownership token.
 //
 // It scans from ParallelDomainMin and marks the first free domain used.
 // A domain counts as free only when it is absent from the in-process
 // used set and its cross-process lock file flocks on the first try, so
 // two concurrent go test binaries never hold the same domain.
 // Contention moves on to the next candidate. Exhaustion returns an
-// error; the caller must not proceed without a domain. Use
-// MustAllocateDomain in tests for t.Fatalf handling plus automatic
-// release. Direct callers that use AllocateDomain must call
-// ReleaseDomain when the domain is no longer needed. Allocation purges
-// stale ros2 daemons for the domain so every test starts clean even
-// after killed runs left participants behind.
-func AllocateDomain() (int, error) {
+// error; the caller must not proceed without a domain. The token is a
+// nonzero owner ID; ReleaseDomainLease frees only on token match so a
+// stale cleanup after an early manual release cannot free a reused
+// domain. Allocation purges stale ros2 daemons for the domain so every
+// test starts clean even after killed runs left participants behind.
+func AllocateDomainLease() (int, uint64, error) {
+	domain, token, err := claimPooledDomain()
+	if err != nil {
+		return 0, 0, err
+	}
+	purgeStaleRosDaemon(domain)
+	return domain, token, nil
+}
+
+// claimPooledDomain marks the first free pooled domain under the pool lock.
+//
+// It returns the domain plus ownership token with the lock released; the
+// caller purges residue after return so slow docker exec never serializes
+// other allocators behind the pool mutex.
+func claimPooledDomain() (int, uint64, error) {
 	parallelPoolMu.Lock()
 	defer parallelPoolMu.Unlock()
 	for domain := ParallelDomainMin; domain <= ParallelDomainMax; domain++ {
@@ -184,68 +215,233 @@ func AllocateDomain() (int, error) {
 		}
 		err := ValidateDomain(domain)
 		if err != nil {
-			return 0, fmt.Errorf("helpers: allocate domain %d invalid: %w", domain, err)
+			return 0, 0, fmt.Errorf("helpers: allocate domain %d invalid: %w", domain, err)
 		}
 		fh, err := acquireDomainLock(domain)
 		if err != nil {
 			if errors.Is(err, errDomainHeld) {
 				continue
 			}
-			return 0, err
+			return 0, 0, err
+		}
+		token := parallelPoolNextToken
+		if token == 0 {
+			token = 1
+		}
+		parallelPoolNextToken = token + 1
+		if parallelPoolNextToken == 0 {
+			parallelPoolNextToken = 1
 		}
 		parallelPoolUsed[domain] = true
+		parallelPoolTokens[domain] = token
 		parallelPoolLocks[domain] = fh
-		purgeStaleRosDaemon(domain)
-		return domain, nil
+		return domain, token, nil
 	}
-	return 0, fmt.Errorf("helpers: domain pool %d through %d exhausted", ParallelDomainMin, ParallelDomainMax)
+	return 0, 0, fmt.Errorf("helpers: domain pool %d through %d exhausted", ParallelDomainMin, ParallelDomainMax)
 }
 
-// purgeStaleRosDaemon stops ros2 CLI daemon procs for one domain best effort.
+// AllocateDomain returns one exclusive pooled domain.
+//
+// It wraps AllocateDomainLease and discards the ownership token. Prefer
+// AllocateDomainLease plus ReleaseDomainLease for manual early releases;
+// the token form keeps a stale t.Cleanup from freeing a reused domain.
+// Direct callers that use AllocateDomain must call ReleaseDomain when the
+// domain is no longer needed.
+func AllocateDomain() (int, error) {
+	domain, _, err := AllocateDomainLease()
+	if err != nil {
+		return 0, err
+	}
+	return domain, nil
+}
+
+// fleetContainers lists every fleet peer that can host DDS participants.
+//
+// Pooled allocations are exclusive per domain, but ros2 CLI daemons and
+// leaked peer procs linger per container. Purging only the Jazzy peer
+// leaves humble and rolling residue visible on the shared multicast
+// groups, so isolation purges must cover the whole fleet.
+func fleetContainers() []string {
+	seen := map[string]bool{Container: true}
+	out := []string{Container}
+	for _, peer := range DistroPeers() {
+		if peer.Container == "" || seen[peer.Container] {
+			continue
+		}
+		seen[peer.Container] = true
+		out = append(out, peer.Container)
+	}
+	return out
+}
+
+// containerProcGone reports whether no process matches the pkill pattern
+// in one container. pgrep runs directly (no shell wrapper) so the probe
+// command itself can never match the pattern. Exec failures report
+// not-gone so callers retry instead of assuming a clean container.
+func containerProcGone(ctx context.Context, container, pattern string) bool {
+	args := DockerArgs(container, 0, "pgrep", "-f", pattern)
+	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness invokes docker with fixed test args
+	out, err := cmd.Output()
+	if len(bytes.TrimSpace(out)) != 0 {
+		return false
+	}
+	if err == nil {
+		return true
+	}
+	// pgrep exits 1 on no match, which still means gone. Any other error
+	// (docker unreachable, container gone) reports not-gone so the caller
+	// retries instead of assuming a clean container.
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
+}
+
+// WaitForContainerProcGone polls until no process matches the pkill pattern
+// in one container or the bound expires. It returns true when the container
+// is clean. Callers that require death fail loudly on false instead of
+// racing teardown against a lingering peer.
+func WaitForContainerProcGone(ctx context.Context, container, pattern string, bound time.Duration) bool {
+	deadline := time.Now().Add(bound)
+	for {
+		if containerProcGone(ctx, container, pattern) {
+			return true
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return containerProcGone(context.WithoutCancel(ctx), container, pattern)
+		}
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+// stalePeerAgeSeconds bounds legitimate peer lifetime for the purge.
+//
+// Test talkers and echoes live seconds to about a minute; the longest
+// suites hold peers under two minutes. Anything older than fifteen
+// minutes is residue from a killed run, never a live test, so the purge
+// may reap it without risking parallel or sequential suites.
+const stalePeerAgeSeconds = "900"
+
+// purgeStaleRosDaemon stops ros2 CLI daemon procs for one domain on every
+// fleet peer and reaps ancient topic peers fleet-wide, verifying daemons.
 //
 // Daemons linger after killed runs and join discovery on reused domains,
 // breaking isolation assertions and slot probes. Live daemons cannot
 // exist yet at allocate time because no test on this domain runs before
-// its allocator returns, so the purge only removes residue. It targets
-// the Jazzy fleet peer that serves pooled allocations; distro peers
-// need explicit kills at their call sites. Failures are ignored.
+// its allocator returns, so the purge only removes residue. Ancient
+// topic procs (older than stalePeerAgeSeconds) are crash residue too:
+// no live test holds a peer that long, and parallel suites hold other
+// domains, so reaping them cannot signal a live test. Survivors fail
+// loudly instead of handing out a dirty domain. Failures are ignored
+// only when docker itself is unreachable in every attempt; a surviving
+// daemon is loud.
 
 //nolint:contextcheck,nolintlint // cleanup contexts intentionally outlive test cancellation, the purge runs at allocate time with a bounded Background timeout
 func purgeStaleRosDaemon(domain int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	KillRosDaemon(ctx, Container, domain)
+	pattern := "daemonize.*ros-domain-id " + strconv.Itoa(domain) + " "
+	for _, container := range fleetContainers() {
+		KillRosDaemon(ctx, container, domain)
+		if !WaitForContainerProcGone(ctx, container, pattern, 10*time.Second) {
+			log.Printf("helpers: purge domain %d daemon survives on %s pattern %q", domain, container, pattern)
+		}
+		reapStaleTopicPeers(ctx, container)
+	}
+}
+
+// reapStaleTopicPeers kills ros2 topic procs older than the stale bound.
+//
+// Crash residue accumulates across suites in one fleet and poisons later
+// isolation assertions. The age bound keeps the reap clear of live tests:
+// parallel suites hold other domains and no live peer approaches the bound.
+// One extended pattern covers both verbs so the reap costs one exec.
+func reapStaleTopicPeers(ctx context.Context, container string) {
+	args := DockerArgs(container, 0, "pkill", "--older", stalePeerAgeSeconds, "-f", "topic (pub|echo)")
+	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness kills only stale test peers
+	_ = cmd.Run()                                      //nolint:errcheck // best effort; absence of stale peers is not an error
+}
+
+// ReleaseDomainLease frees a pooled domain only on token match for later sequential reuse.
+//
+// It drops the in-process mark and releases the cross-process flock when
+// the caller token matches the current holder, so the domain becomes
+// available to later tests in this binary and in concurrent binaries. It
+// is idempotent: a token mismatch, a free domain, or an out of pool
+// domain is a no-op, so a stale t.Cleanup after an early manual release
+// cannot free another test domain that reused the number.
+func ReleaseDomainLease(domain int, token uint64) {
+	parallelPoolMu.Lock()
+	defer parallelPoolMu.Unlock()
+	if token == 0 {
+		return
+	}
+	current, ok := parallelPoolTokens[domain]
+	if !ok || current != token {
+		return
+	}
+	releaseDomainLock(domain)
+	delete(parallelPoolUsed, domain)
+	delete(parallelPoolTokens, domain)
 }
 
 // ReleaseDomain frees a pooled domain for later sequential reuse.
 //
-// It drops the in-process mark and releases the cross-process flock, so
-// the domain becomes available to later tests in this binary and in
-// concurrent binaries. It is idempotent: releasing a free or out of
-// pool domain is a no-op. MustAllocateDomain registers this through
-// t.Cleanup, so most tests never call it directly. Direct AllocateDomain
-// callers must call it when the test no longer needs exclusivity.
+// Legacy form without ownership checking: it drops the in-process mark
+// and releases the cross-process flock unconditionally. Prefer
+// ReleaseDomainLease with the AllocateDomainLease token; the token form
+// keeps a stale cleanup from freeing a reused domain. MustAllocateDomain
+// no longer uses this; it registers the token form in t.Cleanup.
 func ReleaseDomain(domain int) {
 	parallelPoolMu.Lock()
 	defer parallelPoolMu.Unlock()
 	releaseDomainLock(domain)
 	delete(parallelPoolUsed, domain)
+	delete(parallelPoolTokens, domain)
 }
 
-// MustAllocateDomain returns one exclusive pooled domain or fails the test.
+// MustAllocateDomainLease returns one exclusive pooled domain plus token or fails the test.
 //
-// It wraps AllocateDomain with t.Fatalf on exhaustion and registers
-// ReleaseDomain in t.Cleanup so sequential tests reuse domains while
-// concurrent workers hold distinct ones. It never touches process
-// state, so it is safe to call before or after t.Parallel.
-func MustAllocateDomain(t *testing.T) int {
+// It wraps AllocateDomainLease with t.Fatalf on exhaustion and registers
+// ReleaseDomainLease in t.Cleanup so sequential tests reuse domains while
+// concurrent workers hold distinct ones. Use the returned token for an
+// early manual ReleaseDomainLease; the later Cleanup with the same token
+// is then a safe no-op, and a reused domain with a new token is never
+// freed by the stale Cleanup. It never touches process state, so it is
+// safe to call before or after t.Parallel.
+func MustAllocateDomainLease(t *testing.T) (int, uint64) {
 	t.Helper()
-	domain, err := AllocateDomain()
+	domain, token, err := AllocateDomainLease()
 	if err != nil {
 		t.Fatalf("allocate domain: %v", err)
 	}
 	t.Cleanup(func() {
-		ReleaseDomain(domain)
+		ReleaseDomainLease(domain, token)
+	})
+	return domain, token
+}
+
+// MustAllocateDomain returns one exclusive pooled domain or fails the test.
+//
+// It wraps AllocateDomainLease with t.Fatalf on exhaustion and registers
+// ReleaseDomainLease in t.Cleanup so sequential tests reuse domains while
+// concurrent workers hold distinct ones. The token stays in the Cleanup
+// closure, so a manual early release must use MustAllocateDomainLease to
+// get its token; otherwise the automatic Cleanup still owns the domain.
+// It never touches process state, so it is safe to call before or after
+// t.Parallel.
+func MustAllocateDomain(t *testing.T) int {
+	t.Helper()
+	domain, token, err := AllocateDomainLease()
+	if err != nil {
+		t.Fatalf("allocate domain: %v", err)
+	}
+	t.Cleanup(func() {
+		ReleaseDomainLease(domain, token)
 	})
 	return domain
 }

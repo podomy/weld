@@ -32,6 +32,9 @@ import (
 //nolint:gocognit // forward gate asserts build, talker, echo, and payload in one run
 func TestGate2ForwardEchoSeesTalker(t *testing.T) {
 	domain := helpers.MustAllocateDomain(t)
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -83,7 +86,10 @@ func TestGate2ForwardEchoSeesTalker(t *testing.T) {
 		t.Fatalf("weld echo backend error:\n%s", combined)
 	}
 	if !strings.Contains(stdout, id) {
-		t.Skipf("weld echo did not receive live payload %q (known user DATA gap), echo ok without payload\nstdout:\n%s\nstderr:\n%s", payload, stdout, stderr)
+		t.Logf("weld echo did not receive live payload %q (known user DATA gap), echo ok without payload\nstdout:\n%s\nstderr:\n%s", payload, stdout, stderr)
+		reason := "weld echo misses user DATA but echo ok, known user DATA gap forward"
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }
 
@@ -101,6 +107,9 @@ func TestGate2ForwardEchoSeesTalker(t *testing.T) {
 // t.Parallel workers.
 func TestGate2ReverseEchoSeesPub(t *testing.T) {
 	domain := helpers.MustAllocateDomain(t)
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -134,6 +143,9 @@ func TestGate2ReverseEchoSeesPub(t *testing.T) {
 		if rerr != nil {
 			t.Fatalf("ros2 topic echo did not see live payload %q: %v", payload, rerr)
 		}
-		t.Skipf("ros2 topic echo did not see live payload %q (known user DATA gap), pub ok\necho output:\n%s", payload, string(data))
+		t.Logf("ros2 topic echo did not see live payload %q (known user DATA gap), pub ok\necho output:\n%s", payload, string(data))
+		reason := "ros echo misses user DATA but pub ok, known user DATA gap reverse"
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }

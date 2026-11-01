@@ -219,6 +219,26 @@ func qosArgv(c qosCase) []string {
 }
 
 // qosRunForward runs ROS pub with QoS flags and checks weld echo output.
+// requireTalkerAliveForSilence proves the ROS talker is running and visible
+// on SEDP before judging silence as refusal. A dead or undiscovered talker
+// would also stay silent, so the check fails loudly instead of passing a
+// vacuous incompatibility gate.
+func requireTalkerAliveForSilence(t *testing.T, ctx context.Context, domain int, topic, live, caseName string, talker *exec.Cmd, label string) {
+	t.Helper()
+	if talker.Process == nil {
+		t.Fatalf("case %s: ROS talker missing process, cannot judge silence as refusal", caseName)
+	}
+	if talker.ProcessState != nil && talker.ProcessState.Exited() {
+		t.Fatalf("case %s: ROS talker exited, cannot judge silence as refusal", caseName)
+	}
+	probe := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), label+"-probe-"+live, "qos-probe") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	probeErr := probe.Subscribe(ctx, topic, helpers.ForwardStringIDL, helpers.ForwardStringHash)
+	if probeErr != nil {
+		t.Fatalf("case %s: probe subscribe for SEDP visibility: %v", caseName, probeErr)
+	}
+	helpers.WaitForSEDPRemote(t, ctx, probe, topic, "ROS talker writer", helpers.SEDPRemoteTimeout)
+}
+
 func qosRunForward(t *testing.T, ctx context.Context, bin string, domain int, c qosCase) {
 	t.Helper()
 	live := helpers.LiveID("qos-" + c.name)
@@ -250,7 +270,9 @@ func qosRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosForwardNap)
 	if ctx.Err() != nil {
@@ -273,6 +295,7 @@ func qosRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 		}
 		return
 	}
+	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "qos")
 	if strings.Contains(stdout, live) {
 		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow", c.name, payload)
 	}
@@ -310,7 +333,9 @@ func qosRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), qosCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, qosReverseNap)
 	if ctx.Err() != nil {
@@ -438,7 +463,7 @@ func TestROSQoSMatrixCore(t *testing.T) {
 // ok echo output fails.
 func TestROSQoSCompatibleDelivers(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -448,13 +473,17 @@ func TestROSQoSCompatibleDelivers(t *testing.T) {
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test. Matrix subtests then
 	// run the four-flag live direction on fresh exclusive domains.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
 	// Matrix compatible cases span six entries: three forward reliable
 	// transient local with varying history and depth, plus three reverse
 	// with volatile and mixed reliability. Each needs a fresh domain so
 	// parallel workers never share discovery.
 	t.Logf("qos matrix runs four-flag compatible cases on fresh domains")
-	for _, c := range qosCompatibleCases() {
+	selected := qosCompatibleCases()
+	if len(selected) == 0 {
+		t.Fatalf("qos matrix compatible selected 0 cases, want >0")
+	}
+	for _, c := range selected {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			qosRunCase(t, ctx, bin, subdomain, c)
@@ -471,7 +500,7 @@ func TestROSQoSCompatibleDelivers(t *testing.T) {
 // present or when the QoS flags are unsupported.
 func TestROSQoSIncompatibleLoud(t *testing.T) {
 	t.Parallel()
-	domain := helpers.MustAllocateDomain(t)
+	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosTestTimeout)
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -481,12 +510,16 @@ func TestROSQoSIncompatibleLoud(t *testing.T) {
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test. Matrix mismatch subtests
 	// then check the loud reliability error on fresh exclusive domains.
-	helpers.ReleaseDomain(domain)
+	helpers.ReleaseDomainLease(domain, token)
 	// Matrix incompatible cases pin three forward best-effort offers against
 	// the facade reliable request with varying durability, history, and
 	// depth. Each needs a fresh domain so parallel workers stay isolated.
 	t.Logf("qos matrix runs four-flag mismatch cases on fresh domains")
-	for _, c := range qosIncompatibleCases() {
+	selected := qosIncompatibleCases()
+	if len(selected) == 0 {
+		t.Fatalf("qos matrix incompatible selected 0 cases, want >0")
+	}
+	for _, c := range selected {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			subCtx, subCancel := context.WithTimeout(ctx, qosMismatchWait+2*qosEchoWait)

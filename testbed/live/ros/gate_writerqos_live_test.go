@@ -171,7 +171,7 @@ func wqSetup(t *testing.T) (context.Context, context.CancelFunc, string, int) {
 }
 
 // wqRunRosPub starts a ROS talker with explicit QoS flags and a per-run payload.
-func wqRunRosPub(t *testing.T, ctx context.Context, domain int, pubRel, pubDur, payloadPrefix string) (string, string) {
+func wqRunRosPub(t *testing.T, ctx context.Context, domain int, pubRel, pubDur, payloadPrefix string) (string, string, string, *exec.Cmd) {
 	t.Helper()
 
 	live := helpers.LiveID("wq-" + payloadPrefix)
@@ -209,10 +209,12 @@ func wqRunRosPub(t *testing.T, ctx context.Context, domain int, pubRel, pubDur, 
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), wqCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, live)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, live); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 
-	return topic, payload
+	return topic, payload, live, talker
 }
 
 // wqRunRosEcho starts a ROS echo reader with explicit QoS flags into a log file.
@@ -250,7 +252,9 @@ func wqRunRosEcho(t *testing.T, ctx context.Context, domain int, topic, echoRel,
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), wqCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 
 	return echoPath
@@ -341,7 +345,7 @@ func TestWriterQoSLiveVolatileServiceEquivalent(t *testing.T) {
 	report := dds.CheckWireCompatibility(wireOffered, wqForwardOffered(t, topic, "ros-pub", "weld-echo", requested))
 	wqCheckWireCompatible(t, "volatile-service-equivalent", report)
 
-	liveTopic, payload := wqRunRosPub(t, ctx, domain, "reliable", "volatile", "volatile")
+	liveTopic, payload, _, _ := wqRunRosPub(t, ctx, domain, "reliable", "volatile", "volatile")
 	helpers.Sleep(ctx, wqForwardNap)
 
 	if ctx.Err() != nil {
@@ -389,7 +393,7 @@ func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
 	subCtx, subCancel := context.WithTimeout(ctx, wqMismatchWait+2*wqEchoWait)
 	defer subCancel()
 
-	liveTopic, payload := wqRunRosPub(t, subCtx, domain, "best_effort", "transient_local", "mismatch")
+	liveTopic, payload, live, talker := wqRunRosPub(t, subCtx, domain, "best_effort", "transient_local", "mismatch")
 	helpers.Sleep(subCtx, wqForwardNap)
 
 	if subCtx.Err() != nil {
@@ -404,6 +408,18 @@ func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
 	combined := stdout + "\n" + stderr
 	helpers.AssertNoBackendError(t, "reliable-requester-vs-best-effort-offer", combined)
 
+	if talker.Process == nil {
+		t.Fatalf("ROS talker missing process, cannot judge silence as refusal")
+	}
+	if talker.ProcessState != nil && talker.ProcessState.Exited() {
+		t.Fatalf("ROS talker exited, cannot judge silence as refusal")
+	}
+	probe := helpers.MustOpenLiveBackend(t, subCtx, uint32(domain), "wq-probe-"+live, "wq-probe") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	probeErr := probe.Subscribe(subCtx, liveTopic, helpers.ForwardStringIDL, helpers.ForwardStringHash)
+	if probeErr != nil {
+		t.Fatalf("probe subscribe for SEDP visibility: %v", probeErr)
+	}
+	helpers.WaitForSEDPRemote(t, subCtx, probe, liveTopic, "ROS talker writer", helpers.SEDPRemoteTimeout)
 	if strings.Contains(stdout, payload) {
 		t.Fatalf("incompatible pair delivered payload %q, want no flow (gate reports incompatible with reliability named)", payload)
 	}

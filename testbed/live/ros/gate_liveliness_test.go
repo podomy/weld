@@ -76,18 +76,27 @@ func startLiveTalker(t *testing.T, ctx context.Context, domain uint32, topic, pa
 		helpers.StopCmd(talker)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), payload)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, payload); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	return talker
 }
 
 // stopLiveTalker stops a talker started by startLiveTalker and kills survivors.
-func stopLiveTalker(t *testing.T, ctx context.Context, talker *exec.Cmd, domain uint32, payload string) {
+//
+// It verifies the container process is actually gone before returning: a
+// lingering publisher would keep feeding the domain after the kill and
+// break post-kill assertions (drained queues, expired liveliness) with
+// samples that look ancient but are freshly published.
+func stopLiveTalker(t *testing.T, ctx context.Context, talker *exec.Cmd, payload string) {
 	t.Helper()
 	helpers.StopCmd(talker)
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cleanupCancel()
-	helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), payload)
+	if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, payload); err != nil {
+		t.Fatalf("stop live talker: %v", err)
+	}
 	helpers.Sleep(ctx, rosLiveSettle)
 }
 
@@ -116,7 +125,9 @@ func startLiveEcho(t *testing.T, ctx context.Context, domain uint32, topic, logP
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, int(domain), topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	return echoCmd, echoFile
 }
@@ -173,11 +184,11 @@ func checkLateForward(t *testing.T, ctx context.Context, backend *dds.Backend, f
 	for {
 		cerr = ctx.Err()
 		if cerr != nil {
-			stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
+			stopLiveTalker(t, ctx, talker, forwardPayload)
 			t.Fatalf("context ended waiting for late talker: %v", cerr)
 		}
 		if skips >= 100 {
-			stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
+			stopLiveTalker(t, ctx, talker, forwardPayload)
 			t.Fatalf("weld take on %q saw 100 consecutive skips without run %q, last reason %q: systematic wrong-topic delivery", forwardTopic, runID, lastReason)
 		}
 		msg, terr := backend.TakeBytes(takeCtx)
@@ -187,7 +198,7 @@ func checkLateForward(t *testing.T, ctx context.Context, backend *dds.Backend, f
 				if tcerr != nil {
 					terr = tcerr
 				}
-				stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
+				stopLiveTalker(t, ctx, talker, forwardPayload)
 				t.Fatalf("weld take timed out waiting for late talker %q after %d skips: %v", forwardPayload, skips, terr)
 			}
 			if errors.Is(terr, dds.ErrStaleSequence) || errors.Is(terr, dds.ErrTruncated) || errors.Is(terr, dds.ErrInvalidFrame) {
@@ -223,7 +234,7 @@ func checkLateForward(t *testing.T, ctx context.Context, backend *dds.Backend, f
 		t.Logf("late forward ok on %q skips %d", forwardTopic, skips)
 		break
 	}
-	stopLiveTalker(t, ctx, talker, rosLiveLateDomain, forwardPayload)
+	stopLiveTalker(t, ctx, talker, forwardPayload)
 }
 
 // checkLateReverse proves ros2 echo sees Weld pubs started before echo.

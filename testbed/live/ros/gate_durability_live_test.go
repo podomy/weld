@@ -207,6 +207,8 @@ func durPublishBacklog(t *testing.T, ctx context.Context, backend *dds.Backend, 
 // lost backlog and fails loudly; duplicates are transport-correct
 // at-least-once repair and do not fail. It skips only for no peer or a
 // missing std_msgs type.
+//
+//nolint:gocognit // live backlog gate sequences publish, settle, echo, and presence verdict in one run
 func TestDurabilityLateCycloneEchoSeesWeldBacklog(t *testing.T) {
 	t.Parallel()
 
@@ -275,7 +277,9 @@ func TestDurabilityLateCycloneEchoSeesWeldBacklog(t *testing.T) {
 		helpers.StopCmd(echoCmd)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), durBacklogCleanWait)
 		defer cleanupCancel()
-		helpers.KillContainerProc(cleanupCtx, helpers.Container, domain, topic)
+		if err := helpers.KillAndWaitContainerProc(cleanupCtx, helpers.Container, topic); err != nil {
+			t.Errorf("stop peer proc: %v", err)
+		}
 	})
 	helpers.Sleep(ctx, helpers.EchoSettle)
 	if ctx.Err() != nil {

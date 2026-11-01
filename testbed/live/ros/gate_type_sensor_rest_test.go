@@ -2545,10 +2545,12 @@ func TestROSTypeSensorPointCloud2(t *testing.T) {
 // sensorRestLargeAllowEntry pins one temporary payload miss exception.
 //
 // An entry allows a skip only for an exact RosType plus exact RIHS01 Hash
-// while time is before Expiry. The list stays empty so every miss fails.
+// while time is before Expiry. Reason names the peer interop cause. The
+// list stays empty so every miss fails.
 type sensorRestLargeAllowEntry struct {
 	RosType string
 	Hash    string
+	Reason  string
 	Expiry  time.Time
 }
 
@@ -2557,15 +2559,17 @@ var sensorRestLargeAllowlist []sensorRestLargeAllowEntry
 
 // sensorRestLargeAllowlisted reports whether a miss may skip.
 //
-// It requires exact type plus exact hash plus unexpired time. Empty list
-// means false so callers fail.
-func sensorRestLargeAllowlisted(rosType, hash string, now time.Time) bool {
+// It requires exact type plus exact hash plus unexpired time plus a
+// non-empty reason. Empty list means false so callers fail. It returns
+// the matching entry so callers log entry expiry and reason instead of
+// hardcoded dates.
+func sensorRestLargeAllowlisted(rosType, hash string, now time.Time) (sensorRestLargeAllowEntry, bool) {
 	for _, e := range sensorRestLargeAllowlist {
-		if e.RosType == rosType && e.Hash == hash && now.Before(e.Expiry) {
-			return true
+		if e.RosType == rosType && e.Hash == hash && e.Reason != "" && now.Before(e.Expiry) {
+			return e, true
 		}
 	}
-	return false
+	return sensorRestLargeAllowEntry{}, false
 }
 
 // publishSensorRestLargeStrict publishes until ros2 echo holds the live ID.
@@ -2639,8 +2643,8 @@ func TestROSTypeSensorImageLarge(t *testing.T) {
 		if rerr != nil {
 			t.Fatalf("ros echo did not see rest large image %q: %v", runID, rerr)
 		}
-		if sensorRestLargeAllowlisted(largePayloadRosType, sensorRest2HashImage, time.Now()) {
-			t.Skipf("allowlisted live gap %s hash %s expires %s: ros echo did not see rest large image %q", "sensor-image-large", sensorRest2HashImage, time.Date(2027, time.March, 31, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), runID)
+		if entry, ok := sensorRestLargeAllowlisted(largePayloadRosType, sensorRest2HashImage, time.Now()); ok {
+			t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: ros echo did not see rest large image %q", "sensor-image-large", entry.Hash, entry.Reason, entry.Expiry.Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest large image %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

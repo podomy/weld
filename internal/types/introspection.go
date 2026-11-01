@@ -8,6 +8,7 @@ package types
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 )
@@ -416,7 +417,10 @@ func (m *MessageMember) validateNestedReference() error {
 }
 
 // validateNestedTarget requires a table or a reference for nested members.
+// It holds nestedPatchMu to match the EnsureNestedPatched write path.
 func (m *MessageMember) validateNestedTarget() error {
+	nestedPatchMu.Lock()
+	defer nestedPatchMu.Unlock()
 	if m.Members == nil && (m.NestedNamespace == "" || m.NestedName == "") {
 		return fmt.Errorf("types: member %q nested needs members or namespace plus name", m.Name)
 	}
@@ -424,7 +428,10 @@ func (m *MessageMember) validateNestedTarget() error {
 }
 
 // validateNonNestedTarget rejects nested tables and references on plain members.
+// It holds nestedPatchMu to match the EnsureNestedPatched write path.
 func (m *MessageMember) validateNonNestedTarget() error {
+	nestedPatchMu.Lock()
+	defer nestedPatchMu.Unlock()
 	if m.Members != nil {
 		return fmt.Errorf("types: member %q non-message carries nested table", m.Name)
 	}
@@ -737,8 +744,11 @@ func RegisterMessageMembers(m *MessageMembers) error {
 // callers are read-only and must not mutate through them. Lazy patching
 // uses the direct registry pointer internally (see nestedMembersLocked)
 // so patch identity is preserved while direct Lookup callers stay
-// isolated.
+// isolated. It holds nestedPatchMu then the registry read lock to match
+// the EnsureNestedPatched write path.
 func LookupMessageMembers(namespace, name string) (*MessageMembers, error) {
+	nestedPatchMu.Lock()
+	defer nestedPatchMu.Unlock()
 	introspectionMu.RLock()
 	defer introspectionMu.RUnlock()
 	m, ok := messageRegistry[registryKey(namespace, name)]
@@ -876,12 +886,16 @@ func selfContainedMember(member *MessageMember, visited, inStack map[string]bool
 }
 
 // selfContainedNested resolves and checks one nested member table.
+// The caller holds nestedPatchMu; resolution uses the registry directly
+// instead of the cloning Lookup so the single guard never re-locks.
 func selfContainedNested(member *MessageMember, visited, inStack map[string]bool) (bool, error) {
 	nested := member.Members
 	if nested == nil && member.NestedNamespace != "" {
-		resolved, err := LookupMessageMembers(member.NestedNamespace, member.NestedName)
-		if err != nil {
-			return false, fmt.Errorf("types: self contained lookup %s: %w", member.Name, err)
+		introspectionMu.RLock()
+		resolved, ok := messageRegistry[registryKey(member.NestedNamespace, member.NestedName)]
+		introspectionMu.RUnlock()
+		if !ok {
+			return false, fmt.Errorf("types: self contained lookup %s: message %s/%s not registered", member.Name, member.NestedNamespace, member.NestedName)
 		}
 		nested = resolved
 	}
@@ -919,6 +933,7 @@ func IsMemcpySafe(m *MessageMembers) (bool, error) {
 }
 
 // structField returns the reflect value of a named struct field.
+// It rejects unexported fields loudly instead of risking reflect panics.
 func structField(base any, field string) (reflect.Value, error) {
 	v := reflect.ValueOf(base)
 	if v.Kind() != reflect.Pointer || v.IsNil() {
@@ -931,6 +946,9 @@ func structField(base any, field string) (reflect.Value, error) {
 	f := elem.FieldByName(field)
 	if !f.IsValid() {
 		return reflect.Value{}, fmt.Errorf("types: field %q not found", field)
+	}
+	if !f.CanInterface() {
+		return reflect.Value{}, fmt.Errorf("types: field %q is unexported", field)
 	}
 	return f, nil
 }
@@ -1067,12 +1085,16 @@ func NewMessageMembers(namespace, name string, sizeOf uint, members []MessageMem
 }
 
 // checkWrapperShape validates a Data plus Size plus Capacity wrapper once.
+// It rejects unexported Data loudly instead of risking reflect panics.
 func checkWrapperShape(parent reflect.Value, field string) error {
 	dataField := parent.FieldByName("Data")
 	sizeField := parent.FieldByName("Size")
 	capField := parent.FieldByName("Capacity")
 	if !dataField.IsValid() || !sizeField.IsValid() || !capField.IsValid() {
 		return fmt.Errorf("types: field %q wrapper misses Data Size Capacity", field)
+	}
+	if !dataField.CanInterface() {
+		return fmt.Errorf("types: field %q wrapper data is unexported", field)
 	}
 	if dataField.Kind() != reflect.Slice && dataField.Kind() != reflect.Array {
 		return fmt.Errorf("types: field %q data is not slice or array", field)
@@ -1086,6 +1108,7 @@ func checkWrapperShape(parent reflect.Value, field string) error {
 // arrayDataSlice resolves the element slice for array accessors.
 // It supports direct slice or array fields and Sequence struct wrappers
 // with Data plus Size plus Capacity triples.
+// It rejects unexported wrapper Data loudly instead of risking panics.
 func arrayDataSlice(base any, field string) (reflect.Value, reflect.Value, bool, error) {
 	f, err := structField(base, field)
 	if err != nil {
@@ -1096,20 +1119,29 @@ func arrayDataSlice(base any, field string) (reflect.Value, reflect.Value, bool,
 		return f, reflect.Value{}, false, nil
 	}
 	if kind == reflect.Struct {
-		data := f.FieldByName("Data")
-		if !data.IsValid() {
-			return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q is not an array", field)
-		}
-		if data.Kind() != reflect.Slice && data.Kind() != reflect.Array {
-			return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q is not an array", field)
-		}
-		err = checkWrapperShape(f, field)
-		if err != nil {
-			return reflect.Value{}, reflect.Value{}, false, err
-		}
-		return data, f, true, nil
+		return arrayDataSliceStruct(f, field)
 	}
 	return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q is not an array", field)
+}
+
+// arrayDataSliceStruct resolves Data from a Sequence struct wrapper.
+// It rejects unexported Data loudly instead of risking reflect panics.
+func arrayDataSliceStruct(f reflect.Value, field string) (reflect.Value, reflect.Value, bool, error) {
+	data := f.FieldByName("Data")
+	if !data.IsValid() {
+		return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q is not an array", field)
+	}
+	if !data.CanInterface() {
+		return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q data is unexported", field)
+	}
+	if data.Kind() != reflect.Slice && data.Kind() != reflect.Array {
+		return reflect.Value{}, reflect.Value{}, false, fmt.Errorf("types: field %q is not an array", field)
+	}
+	err := checkWrapperShape(f, field)
+	if err != nil {
+		return reflect.Value{}, reflect.Value{}, false, err
+	}
+	return data, f, true, nil
 }
 
 // syncSequenceTriple refreshes Size and Capacity from the Data slice.
@@ -1132,18 +1164,37 @@ func syncSequenceTriple(parent reflect.Value) error {
 	return nil
 }
 
+// checkArrayIndex validates a uint index against MaxInt and length.
+// It returns an error for overflow or out of range instead of panicking
+// on int conversion or reflect Index.
+func checkArrayIndex(index uint, length int) error {
+	if uint64(index) > uint64(math.MaxInt) {
+		return fmt.Errorf("types: index %d overflows int", index)
+	}
+	if int(index) >= length {
+		return fmt.Errorf("types: index %d out of range %d", index, length)
+	}
+	return nil
+}
+
 // getElem resolves one array element for the get accessors.
 // It shares the bounds check between arrayGetConstFunc and arrayGetFunc
 // so the two paths cannot drift apart.
+// It rejects unexported elements loudly instead of risking Interface panics.
 func getElem(base any, field string, index uint, what string) (any, error) {
 	f, _, _, err := arrayDataSlice(base, field)
 	if err != nil {
 		return nil, fmt.Errorf("types: %s field %q: %w", what, field, err)
 	}
-	if int(index) >= f.Len() {
-		return nil, fmt.Errorf("types: index %d out of range %d", index, f.Len())
+	err = checkArrayIndex(index, f.Len())
+	if err != nil {
+		return nil, err
 	}
-	return f.Index(int(index)).Interface(), nil
+	elem := f.Index(int(index))
+	if !elem.CanInterface() {
+		return nil, fmt.Errorf("types: %s field %q element is unexported", what, field)
+	}
+	return elem.Interface(), nil
 }
 
 // arraySizeFunc returns a SizeFunc reading slice or array length by field name.
@@ -1180,20 +1231,25 @@ func arrayGetFunc(field string) GetFunc {
 }
 
 // arrayFetchFunc returns a FetchFunc copying one element into out.
+// It rejects overflow indexes and unexported sources loudly.
 func arrayFetchFunc(field string) FetchFunc {
 	return func(base any, index uint, out any) error {
 		f, _, _, err := arrayDataSlice(base, field)
 		if err != nil {
 			return fmt.Errorf("types: fetch field %q: %w", field, err)
 		}
-		if int(index) >= f.Len() {
-			return fmt.Errorf("types: index %d out of range %d", index, f.Len())
+		err = checkArrayIndex(index, f.Len())
+		if err != nil {
+			return err
 		}
 		ov := reflect.ValueOf(out)
 		if ov.Kind() != reflect.Pointer || ov.IsNil() {
 			return errors.New("types: fetch out must be a non nil pointer")
 		}
 		src := f.Index(int(index))
+		if !src.CanInterface() {
+			return fmt.Errorf("types: fetch field %q element is unexported", field)
+		}
 		dst := ov.Elem()
 		if !src.Type().AssignableTo(dst.Type()) {
 			return fmt.Errorf("types: cannot fetch %s into %s", src.Type().String(), dst.Type().String())
@@ -1206,19 +1262,24 @@ func arrayFetchFunc(field string) FetchFunc {
 // arrayAssignFunc returns an AssignFunc copying val into one element.
 // Only AssignableTo values are accepted; implicit numeric conversion is
 // rejected so callers convert explicitly and truncation stays visible.
+// It rejects overflow indexes and unsettable destinations loudly.
 func arrayAssignFunc(field string) AssignFunc {
 	return func(base any, index uint, val any) error {
 		f, _, _, err := arrayDataSlice(base, field)
 		if err != nil {
 			return fmt.Errorf("types: assign field %q: %w", field, err)
 		}
-		if int(index) >= f.Len() {
-			return fmt.Errorf("types: index %d out of range %d", index, f.Len())
+		err = checkArrayIndex(index, f.Len())
+		if err != nil {
+			return err
 		}
 		vv := reflect.ValueOf(val)
 		dst := f.Index(int(index))
 		if !vv.IsValid() {
 			return errors.New("types: assign value is invalid")
+		}
+		if !dst.CanSet() {
+			return fmt.Errorf("types: assign field %q element cannot be set", field)
 		}
 		if !vv.Type().AssignableTo(dst.Type()) {
 			return fmt.Errorf("types: cannot assign %s to %s", vv.Type().String(), dst.Type().String())

@@ -243,16 +243,20 @@ func effectiveServiceTimeout(timeout Duration) Duration {
 // computeServiceDeadline returns the absolute expiry in the now domain.
 //
 // Infinite never expires and maps to max int64. Other totals add through
-// tfAddSaturating so a negative injected startNanos cannot overflow the
-// MaxInt64 minus start check to MaxUint64 and so a fake clock near the top
-// still terminates cleanly.
+// tfAddSaturating. A saturated finite sum must not masquerade as infinite:
+// it clamps to max int64 minus one so isServiceExpired treats it as
+// already-expired and a fake clock near the top still terminates cleanly.
 func computeServiceDeadline(startNanos int64, timeout Duration) int64 {
 	eff := effectiveServiceTimeout(timeout)
 	if eff.IsInfinite() {
 		return math.MaxInt64
 	}
 	total := eff.TotalNanoseconds()
-	return tfAddSaturating(startNanos, total)
+	deadline := tfAddSaturating(startNanos, total)
+	if deadline == math.MaxInt64 {
+		return math.MaxInt64 - 1
+	}
+	return deadline
 }
 
 // isServiceExpired reports whether now reached a finite deadline.
@@ -293,8 +297,6 @@ func normalizeServiceNow(now func() int64) func() int64 {
 
 // servicePendingCall is one outbound client call awaiting a reply.
 type servicePendingCall struct {
-	key           ServiceCallKey
-	startNanos    int64
 	deadlineNanos int64
 	done          <-chan struct{}
 }
@@ -333,6 +335,7 @@ func NewServiceClient(now func() int64, enabled bool, hook ServiceTraceHook) *Se
 }
 
 // SetIntrospection replaces the introspection gate and hook.
+// Staged API for introspection control; retained despite no in-repo callers.
 // When enabled is false no hook fires. A nil hook drops events.
 func (c *ServiceClient) SetIntrospection(enabled bool, hook ServiceTraceHook) {
 	if c == nil {
@@ -394,7 +397,7 @@ func (c *ServiceClient) BeginCall(ctx context.Context, service string, client [8
 		c.mu.Unlock()
 		return fmt.Errorf("core: begin service call on %q seq %d: %w", service, seq, ErrServiceDuplicate)
 	}
-	c.pending[key] = servicePendingCall{key: key, startNanos: start, deadlineNanos: deadline, done: ctx.Done()}
+	c.pending[key] = servicePendingCall{deadlineNanos: deadline, done: ctx.Done()}
 	enabled := c.traceEnabled
 	hook := c.traceHook
 	c.mu.Unlock()
@@ -600,9 +603,8 @@ func (r ServiceRequest) Key() ServiceCallKey {
 
 // serviceQueuedRequest is one queued or active server request.
 type serviceQueuedRequest struct {
-	req   ServiceRequest
-	done  <-chan struct{}
-	start int64
+	req  ServiceRequest
+	done <-chan struct{}
 }
 
 // ServiceServer tracks inbound service requests with atomic take plus dispatch.
@@ -644,6 +646,7 @@ func NewServiceServer(now func() int64, enabled bool, hook ServiceTraceHook) *Se
 }
 
 // SetIntrospection replaces the introspection gate and hook.
+// Staged API for introspection control; retained despite no in-repo callers.
 // When enabled is false no hook fires. A nil hook drops events.
 func (s *ServiceServer) SetIntrospection(enabled bool, hook ServiceTraceHook) {
 	if s == nil {
@@ -664,6 +667,8 @@ func (s *ServiceServer) emitServerTrace(trace ServiceTrace, enabled bool, hook S
 }
 
 // EnqueueRequest records one inbound request and captures its timeout at start.
+// The clock is copied before taking the lock mirroring BeginCall so a slow
+// clock never blocks the tracker.
 //
 // It validates the service name, rejects a nil context, returns the context
 // error when already done, rejects malformed timeouts, and rejects a
@@ -698,12 +703,22 @@ func (s *ServiceServer) EnqueueRequest(ctx context.Context, service string, clie
 		s.mu.Unlock()
 		return fmt.Errorf("core: enqueue service request on %q seq %d: %w", service, seq, ErrServiceDuplicate)
 	}
-	start := s.now()
+	nowFn := s.now
+	s.mu.Unlock()
+	start := nowFn()
 	deadline := computeServiceDeadline(start, timeout)
+	s.mu.Lock()
+	if _, dup := s.queuedIndex[key]; dup {
+		s.mu.Unlock()
+		return fmt.Errorf("core: enqueue service request on %q seq %d: %w", service, seq, ErrServiceDuplicate)
+	}
+	if _, dup := s.active[key]; dup {
+		s.mu.Unlock()
+		return fmt.Errorf("core: enqueue service request on %q seq %d: %w", service, seq, ErrServiceDuplicate)
+	}
 	s.queued = append(s.queued, serviceQueuedRequest{
-		req:   ServiceRequest{Service: service, Client: client, Sequence: seq, DeadlineNanos: deadline},
-		done:  ctx.Done(),
-		start: start,
+		req:  ServiceRequest{Service: service, Client: client, Sequence: seq, DeadlineNanos: deadline},
+		done: ctx.Done(),
 	})
 	if s.queuedIndex == nil {
 		s.queuedIndex = make(map[ServiceCallKey]struct{})

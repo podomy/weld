@@ -76,8 +76,9 @@ func (t *DeadlineTracker) MarkSeen(nowNanos int64) {
 // stay quiet until MarkSeen or a backward rebase clears the flag, so one
 // bad spell yields one alert and then clears within one good period. A
 // quiet Check inside the window also clears the flag so a clock rewind to
-// the window recovers even when the target equals the last sample time.
-// Unspecified deadlines never alert. Infinite deadlines in practice never
+// the window recovers even when the target equals the last sample time. A
+// best available sentinel never alerts, mirroring MissedAt. Unspecified
+// deadlines never alert. Infinite deadlines in practice never
 // alert because elapsed time stays below max int64. Negative deadlines are
 // malformed and rejected by Validate; Check treats them as unspecified and
 // never alerts so malformed input stays quiet here instead of firing false
@@ -92,6 +93,9 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 		return DeadlineAlert{}, false
 	}
 	if t.deadline.Seconds < 0 {
+		return DeadlineAlert{}, false
+	}
+	if IsBestAvailableDuration(t.deadline) {
 		return DeadlineAlert{}, false
 	}
 	if t.deadline.IsInfinite() {

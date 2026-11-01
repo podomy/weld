@@ -7,16 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // configWatchBuffer sizes each watcher channel. Broadcast never blocks:
 // a full channel evicts its oldest event before the new one is queued,
 // and the evicted range stays recoverable through HistorySince.
+// Evictions and drops increment BroadcastDrops loudly so overflow is never silent.
 const configWatchBuffer = 16
+
+// configHistoryLimit bounds retained history to the last entries.
+// Overflow drops the oldest entries and counts each drop in HistoryDrops
+// so long runs stay bounded while remaining observable.
+const configHistoryLimit = 10000
 
 // ParamType names the kind of a parameter value.
 type ParamType int
@@ -281,24 +289,79 @@ type ParamDescriptor struct {
 	DoubleMax float64
 }
 
+// isValidParamType reports whether t is a concrete descriptor or value type.
+func isValidParamType(t ParamType) bool {
+	switch t {
+	case ParamTypeNotSet,
+		ParamTypeBool,
+		ParamTypeInteger,
+		ParamTypeDouble,
+		ParamTypeString,
+		ParamTypeByteArray,
+		ParamTypeBoolArray,
+		ParamTypeIntegerArray,
+		ParamTypeDoubleArray,
+		ParamTypeStringArray:
+		return true
+	default:
+		return false
+	}
+}
+
 // validateValue checks type and range without touching read-only state.
 // Read-only is enforced by the store, which knows whether the entry is new.
+// A NotSet value validates only against a NotSet descriptor, so legal stored
+// NotSet state passes its own schema validation. Invalid enum members fail
+// loudly. NaN fails an enabled double range explicitly because comparisons
+// never match NaN.
 func (d ParamDescriptor) validateValue(v ParamValue) error {
+	if !isValidParamType(v.Type) {
+		return fmt.Errorf("core: config: value type %d is invalid", int(v.Type))
+	}
+	if !isValidParamType(d.Type) {
+		return fmt.Errorf("core: config: descriptor type %d is invalid", int(d.Type))
+	}
 	if v.Type == ParamTypeNotSet {
+		if d.Type == ParamTypeNotSet {
+			return nil
+		}
 		return errors.New("core: config: value type not_set is not concrete") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if d.Type != ParamTypeNotSet && v.Type != d.Type {
 		return fmt.Errorf("core: config: type mismatch: have %s, want %s", v.Type, d.Type)
 	}
-	if v.Type == ParamTypeInteger && d.HasIntegerRange {
-		if v.Integer < d.IntegerMin || v.Integer > d.IntegerMax {
-			return fmt.Errorf("core: config: integer %d out of range [%d, %d]", v.Integer, d.IntegerMin, d.IntegerMax)
-		}
+	if err := d.checkIntegerRange(v); err != nil {
+		return err
 	}
-	if v.Type == ParamTypeDouble && d.HasDoubleRange {
-		if v.Double < d.DoubleMin || v.Double > d.DoubleMax {
-			return fmt.Errorf("core: config: double %v out of range [%v, %v]", v.Double, d.DoubleMin, d.DoubleMax)
-		}
+	if err := d.checkDoubleRange(v); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkIntegerRange enforces an enabled integer range on one value.
+func (d ParamDescriptor) checkIntegerRange(v ParamValue) error {
+	if v.Type != ParamTypeInteger || !d.HasIntegerRange {
+		return nil
+	}
+	if v.Integer < d.IntegerMin || v.Integer > d.IntegerMax {
+		return fmt.Errorf("core: config: integer %d out of range [%d, %d]", v.Integer, d.IntegerMin, d.IntegerMax)
+	}
+	return nil
+}
+
+// checkDoubleRange enforces an enabled double range on one value.
+//
+// NaN fails explicitly because comparisons never match NaN.
+func (d ParamDescriptor) checkDoubleRange(v ParamValue) error {
+	if v.Type != ParamTypeDouble || !d.HasDoubleRange {
+		return nil
+	}
+	if math.IsNaN(v.Double) {
+		return fmt.Errorf("core: config: double NaN is not in range [%v, %v]", d.DoubleMin, d.DoubleMax)
+	}
+	if v.Double < d.DoubleMin || v.Double > d.DoubleMax {
+		return fmt.Errorf("core: config: double %v out of range [%v, %v]", v.Double, d.DoubleMin, d.DoubleMax)
 	}
 	return nil
 }
@@ -467,34 +530,86 @@ func normalizeNodeKey(key string) string {
 // CollapseParamFiles merges wildcard and node-specific file sections. The
 // wildcard section ("*" or "/*") applies first; the nodeFQN section
 // overwrites per key so fully qualified names beat wildcards. Keys are
-// normalized with normalizeNodeKey before comparison.
+// normalized with normalizeNodeKey before comparison. Duplicate section keys
+// that normalize to the same entry fail loudly naming both originals when
+// their contents differ; identical duplicates resolve deterministically in
+// sorted key order.
 func CollapseParamFiles(files map[string]map[string]ParamValue, nodeFQN string) map[string]ParamValue {
+	out, err := CollapseParamFilesChecked(files, nodeFQN)
+	if err != nil {
+		panic(err.Error())
+	}
+	return out
+}
+
+// collapseSectionsForNode selects the wildcard and node-specific sections
+// for one node from normalized file sections.
+func collapseSectionsForNode(sections map[string]map[string]ParamValue, want string) (wildcard, specific map[string]ParamValue) {
+	if sec, ok := sections["*"]; ok {
+		wildcard = sec
+	}
+	if want != "*" {
+		if sec, ok := sections[want]; ok {
+			specific = sec
+		}
+	}
+	return wildcard, specific
+}
+
+// CollapseParamFilesChecked merges file sections and reports duplicate
+// normalized section keys loudly instead of overwriting nondeterministically.
+func CollapseParamFilesChecked(files map[string]map[string]ParamValue, nodeFQN string) (map[string]ParamValue, error) {
 	out := make(map[string]ParamValue)
 	if files == nil {
-		return out
+		return out, nil
 	}
 	want := normalizeNodeKey(nodeFQN)
-	var wildcard map[string]ParamValue
-	var specific map[string]ParamValue
-	for key, section := range files {
+	keys := make([]string, 0, len(files))
+	for key := range files {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	origins := make(map[string]string)
+	sections := make(map[string]map[string]ParamValue)
+	for _, key := range keys {
 		norm := normalizeNodeKey(key)
-		if norm == "*" {
-			if wildcard == nil {
-				wildcard = section
+		if norm != "*" && (want == "*" || norm != want) {
+			continue
+		}
+		if first, ok := origins[norm]; ok {
+			if !paramSectionsEqual(sections[norm], files[key]) {
+				return nil, fmt.Errorf("core: config: collapse collision %q and %q both normalize to %q", first, key, norm)
 			}
 			continue
 		}
-		if want != "*" && norm == want {
-			specific = section
-		}
+		origins[norm] = key
+		sections[norm] = files[key]
 	}
+	wildcard, specific := collapseSectionsForNode(sections, want)
 	for k, v := range wildcard {
 		out[k] = cloneParamValue(v)
 	}
 	for k, v := range specific {
 		out[k] = cloneParamValue(v)
 	}
-	return out
+	return out, nil
+}
+
+// paramSectionsEqual reports whether two file sections carry equal values.
+func paramSectionsEqual(a, b map[string]ParamValue) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if !va.Equal(vb) {
+			return false
+		}
+	}
+	return true
 }
 
 // ParamValueFromAny converts a decoded YAML-like scalar or uniform array to
@@ -704,6 +819,9 @@ func flattenInto(nested map[string]any, prefix string, out map[string]ParamValue
 		if err != nil {
 			return err
 		}
+		if _, exists := out[full]; exists {
+			return fmt.Errorf("core: config: flatten collision %q from %q collides with existing entry", full, k)
+		}
 		out[full] = v
 	}
 	return nil
@@ -907,19 +1025,49 @@ type configWatcher struct {
 // ConfigStore is a versioned parameter store with schema, validation,
 // atomic batches, watches, and history. The zero value is unusable; build
 // with NewConfigStore. Do not copy after first use.
+// History is bounded to the last configHistoryLimit entries; overflow drops
+// the oldest entries and counts each drop in HistoryDrops so long runs stay
+// bounded while remaining observable. Watch broadcast never holds the write
+// lock while sending; each watcher is checked plus sent under a read lock
+// with eviction counted in BroadcastDrops.
 type ConfigStore struct {
-	noCopy     noCopy
-	mu         sync.RWMutex
-	params     map[string]*configEntry
-	version    uint64
-	history    []ConfigHistoryEntry
-	watchers   map[uint64]*configWatcher
-	nextWatch  uint64
-	validators map[string][]ConfigValidator
-	hooks      map[string][]ConfigApplyHook
-	global     []RemapRule
-	local      []RemapRule
-	allowNew   bool
+	noCopy      noCopy
+	mu          sync.RWMutex
+	params      map[string]*configEntry
+	version     uint64
+	history     []ConfigHistoryEntry
+	historyDrop uint64
+	watchers    map[uint64]*configWatcher
+	nextWatch   uint64
+	validators  map[string][]ConfigValidator
+	hooks       map[string][]ConfigApplyHook
+	global      []RemapRule
+	local       []RemapRule
+	allowNew    bool
+	drops       atomic.Uint64
+}
+
+// BroadcastDrops returns the monotonic count of watcher broadcast evictions
+// plus drops. A full channel evicts its oldest event; the evicted range stays
+// recoverable through HistorySince.
+func (s *ConfigStore) BroadcastDrops() uint64 {
+	return s.drops.Load()
+}
+
+// HistoryDrops returns the monotonic count of history entries dropped by the
+// configHistoryLimit bound. Overflow drops the oldest entries.
+func (s *ConfigStore) HistoryDrops() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.historyDrop
+}
+
+// pendingValidator pairs one validator with its snapshot inputs.
+type pendingValidator struct {
+	name string
+	old  ParamValue
+	new  ParamValue
+	fn   ConfigValidator
 }
 
 // NewConfigStore returns an empty store with fixed remap tables. Rules are
@@ -970,55 +1118,106 @@ func (s *ConfigStore) Remapped(name string) string {
 // Declare adds a parameter with its descriptor. The name is remapped first.
 // Re-declaring fails. The value must validate against the descriptor unless
 // both are NotSet. One declare is one versioned event.
+// Validators for the declare run outside the write lock against a read
+// snapshot with optimistic generation; a concurrent mutation aborts loudly.
+// Validators must still avoid deep reentrancy.
+// declareNotSetFastPath inserts a NotSet value plus NotSet descriptor
+// directly. It reports handled when the fast path applied; otherwise the
+// caller falls through to the validated declare path.
+func (s *ConfigStore) declareNotSetFastPath(name string, value ParamValue, desc ParamDescriptor) (string, bool, error) {
+	s.mu.Lock()
+	final := s.remappedLocked(name)
+	err := ValidateParamName(final)
+	if err != nil {
+		s.mu.Unlock()
+		return "", false, err
+	}
+	if _, ok := s.params[final]; ok {
+		s.mu.Unlock()
+		return "", false, fmt.Errorf("core: config: declare %q: already declared", final)
+	}
+	if value.Type != ParamTypeNotSet || desc.Type != ParamTypeNotSet {
+		s.mu.Unlock()
+		return final, false, nil
+	}
+	event := ConfigEvent{Version: s.version + 1, Source: "declare"}
+	event.Changes = []ConfigChange{{Name: final, NewValue: cloneParamValue(value), HadOld: false}}
+	s.params[final] = &configEntry{value: cloneParamValue(value), desc: desc}
+	s.version = event.Version
+	s.history = append(s.history, ConfigHistoryEntry{
+		Version: event.Version, Name: final, NewValue: cloneParamValue(value), HadOld: false, Source: "declare",
+	})
+	s.trimHistoryLocked()
+	s.mu.Unlock()
+	s.broadcast(event)
+	return final, true, nil
+}
+
 func (s *ConfigStore) Declare(name string, value ParamValue, desc ParamDescriptor) error {
 	err := ValidateParamName(name)
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	final := s.remappedLocked(name)
-	err = ValidateParamName(final)
-	if err != nil {
-		s.mu.Unlock()
+	_, handled, err := s.declareNotSetFastPath(name, value, desc)
+	if err != nil || handled {
 		return err
 	}
-	if _, ok := s.params[final]; ok {
-		s.mu.Unlock()
-		return fmt.Errorf("core: config: declare %q: already declared", final)
-	}
-	if value.Type == ParamTypeNotSet && desc.Type == ParamTypeNotSet {
-		event := ConfigEvent{Version: s.version + 1, Source: "declare"}
-		event.Changes = []ConfigChange{{Name: final, NewValue: cloneParamValue(value), HadOld: false}}
-		s.params[final] = &configEntry{value: cloneParamValue(value), desc: desc}
-		s.version = event.Version
-		s.history = append(s.history, ConfigHistoryEntry{
-			Version: event.Version, Name: final, NewValue: cloneParamValue(value), HadOld: false, Source: "declare",
-		})
-		channels := s.watcherChannelsLocked()
-		s.mu.Unlock()
-		s.broadcast(channels, event)
-		return nil
+	// Remap tables are fixed at creation, so resolving outside the lock is
+	// safe; the retry loop below re-checks existence under the lock.
+	final := ApplyRemap(name, s.global, s.local)
+	err = ValidateParamName(final)
+	if err != nil {
+		return err
 	}
 	err = desc.validateValue(value)
 	if err != nil {
-		s.mu.Unlock()
 		return fmt.Errorf("core: config: declare %q: %w", final, err)
 	}
 	if desc.Type == ParamTypeNotSet {
 		desc.Type = value.Type
 	}
 	descs := map[string]ParamDescriptor{final: desc}
-	event, hooks, err := s.prepareBatchLocked(map[string]ParamValue{name: value}, descs, "declare", true)
-	if err != nil {
+	return s.commitDeclareBatch(name, final, value, descs)
+}
+
+// commitDeclareBatch commits one validated declare, retrying on concurrent
+// mutation. It re-checks absence on every attempt so a racing declare fails
+// loudly instead of overwriting. name is the pre-remap input name; final is
+// its remapped form.
+func (s *ConfigStore) commitDeclareBatch(name, final string, value ParamValue, descs map[string]ParamDescriptor) error {
+	for range configCommitRetries {
+		s.mu.Lock()
+		if _, ok := s.params[final]; ok {
+			s.mu.Unlock()
+			return fmt.Errorf("core: config: declare %q: already declared", final)
+		}
+		event, hooks, pending, err := s.prepareBatchLocked(map[string]ParamValue{name: value}, descs, "declare", true)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		gen := s.version
 		s.mu.Unlock()
-		return err
+		err = runPendingValidators(pending)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if _, ok := s.params[final]; ok {
+			s.mu.Unlock()
+			return fmt.Errorf("core: config: declare %q: already declared", final)
+		}
+		if s.version != gen {
+			s.mu.Unlock()
+			continue
+		}
+		s.commitPreparedLocked(event, descs)
+		s.mu.Unlock()
+		s.broadcast(event)
+		s.runHooks(hooks, event)
+		return nil
 	}
-	s.commitPreparedLocked(event, descs)
-	channels := s.watcherChannelsLocked()
-	s.mu.Unlock()
-	s.broadcast(channels, event)
-	s.runHooks(hooks, event)
-	return nil
+	return fmt.Errorf("core: config: declare %q: batch aborted after %d concurrent mutations", final, configCommitRetries)
 }
 
 // Get returns a copy of one parameter. The name is remapped first.
@@ -1129,7 +1328,10 @@ func cloneEvent(e ConfigEvent) ConfigEvent {
 // Watch subscribes to future events. The returned version is the current
 // store version; HistorySince replays anything missed. The channel is
 // buffered and never blocks the store: a full channel evicts its oldest
-// event. Call cancel to unsubscribe; cancel closes the channel.
+// event and counts the eviction in BroadcastDrops. Call cancel to unsubscribe;
+// cancel closes the channel. Consumers must tolerate non-monotonic event
+// order across concurrent batches: broadcast checks plus sends per watcher
+// under a read lock without holding the write lock.
 func (s *ConfigStore) Watch() (uint64, <-chan ConfigEvent, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1149,8 +1351,11 @@ func (s *ConfigStore) Watch() (uint64, <-chan ConfigEvent, func()) {
 }
 
 // AddValidator registers an on-set validator for one parameter. Validators
-// run in registration order during the validation phase; the first error
-// aborts the batch before apply hooks run and before the version moves.
+// run in registration order outside the write lock against a read snapshot
+// with optimistic generation; the first error aborts the batch before apply
+// hooks run and before the version moves. A concurrent mutation between
+// validation and commit aborts loudly. Validators must still avoid deep
+// reentrancy: they must not call back into the store.
 func (s *ConfigStore) AddValidator(name string, fn ConfigValidator) error {
 	err := ValidateParamName(name)
 	if err != nil {
@@ -1200,49 +1405,39 @@ func (s *ConfigStore) SetAtomically(updates map[string]ParamValue) (ConfigEvent,
 
 // SetWithSource writes every entry or none with the given source label in
 // one versioned event. Unknown names auto-declare only when the store
-// allows undeclared parameters.
+// allows undeclared parameters. Validators run outside the write lock
+// against a read snapshot; a concurrent mutation aborts loudly.
 func (s *ConfigStore) SetWithSource(updates map[string]ParamValue, source string) (ConfigEvent, error) {
 	if source == "" {
 		return ConfigEvent{}, errors.New("core: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	s.mu.Lock()
-	event, hooks, err := s.prepareBatchLocked(updates, nil, source, s.allowNew)
+	// allowNew is set once at construction and never mutates, so reading it
+	// without the lock is safe.
+	event, hooks, err := s.commitBatchWithValidators(updates, nil, source, s.allowNew)
 	if err != nil {
-		s.mu.Unlock()
 		return ConfigEvent{}, err
 	}
 	if len(event.Changes) == 0 {
-		version := s.version
-		s.mu.Unlock()
-		return ConfigEvent{Version: version, Source: source, Changes: []ConfigChange{}}, nil
+		return event, nil
 	}
-	s.commitPreparedLocked(event, nil)
-	channels := s.watcherChannelsLocked()
-	s.mu.Unlock()
-	s.broadcast(channels, event)
+	s.broadcast(event)
 	s.runHooks(hooks, event)
 	return event, nil
 }
 
 // ApplyOverrides writes CLI-style overrides in one versioned event with
 // source "override". Missing names always auto-declare here, matching node
-// options where overrides declare from the command line.
+// options where overrides declare from the command line. Validators run
+// outside the write lock with optimistic generation.
 func (s *ConfigStore) ApplyOverrides(overrides map[string]ParamValue) (ConfigEvent, error) {
-	s.mu.Lock()
-	event, hooks, err := s.prepareBatchLocked(overrides, nil, "override", true)
+	event, hooks, err := s.commitBatchWithValidators(overrides, nil, "override", true)
 	if err != nil {
-		s.mu.Unlock()
 		return ConfigEvent{}, err
 	}
 	if len(event.Changes) == 0 {
-		version := s.version
-		s.mu.Unlock()
-		return ConfigEvent{Version: version, Source: "override", Changes: []ConfigChange{}}, nil
+		return event, nil
 	}
-	s.commitPreparedLocked(event, nil)
-	channels := s.watcherChannelsLocked()
-	s.mu.Unlock()
-	s.broadcast(channels, event)
+	s.broadcast(event)
 	s.runHooks(hooks, event)
 	return event, nil
 }
@@ -1250,7 +1445,8 @@ func (s *ConfigStore) ApplyOverrides(overrides map[string]ParamValue) (ConfigEve
 // ApplyStartup merges files, CLI, and code with fixed precedence
 // files < CLI < code in one versioned event with source "startup".
 // Missing names auto-declare from overrides regardless of the store flag.
-// An empty merge emits no version bump and an empty event.
+// An empty merge emits no version bump and an empty event. Validators run
+// outside the write lock with optimistic generation.
 func (s *ConfigStore) ApplyStartup(files, cli, code map[string]ParamValue) (ConfigEvent, error) {
 	merged := make(map[string]ParamValue)
 	maps.Copy(merged, files)
@@ -1262,22 +1458,22 @@ func (s *ConfigStore) ApplyStartup(files, cli, code map[string]ParamValue) (Conf
 		s.mu.RUnlock()
 		return ConfigEvent{Version: version, Source: "startup", Changes: []ConfigChange{}}, nil
 	}
-	s.mu.Lock()
-	event, hooks, err := s.prepareBatchLocked(merged, nil, "startup", true)
+	event, hooks, err := s.commitBatchWithValidators(merged, nil, "startup", true)
 	if err != nil {
-		s.mu.Unlock()
 		return ConfigEvent{}, err
 	}
-	s.commitPreparedLocked(event, nil)
-	channels := s.watcherChannelsLocked()
-	s.mu.Unlock()
-	s.broadcast(channels, event)
+	if len(event.Changes) == 0 {
+		return event, nil
+	}
+	s.broadcast(event)
 	s.runHooks(hooks, event)
 	return event, nil
 }
 
 // Dump returns a copy of every stored value for canonical dump output.
 // The map is freshly allocated so caller mutation cannot alias the store.
+// Values format stays compatible; use DumpDescriptors plus LoadDump to round
+// trip descriptors. Dump version is v1 values only.
 func (s *ConfigStore) Dump() map[string]ParamValue {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1286,6 +1482,68 @@ func (s *ConfigStore) Dump() map[string]ParamValue {
 		out[k] = cloneParamValue(e.value)
 	}
 	return out
+}
+
+// ConfigDumpEntry pairs one stored value with its descriptor for round trips.
+type ConfigDumpEntry struct {
+	// Value is the stored parameter value.
+	Value ParamValue
+	// Descriptor is the stored parameter descriptor.
+	Descriptor ParamDescriptor
+}
+
+// DumpDescriptors returns a copy of every stored descriptor for dump round
+// trips. The map is freshly allocated so caller mutation cannot alias the store.
+func (s *ConfigStore) DumpDescriptors() map[string]ParamDescriptor {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]ParamDescriptor, len(s.params))
+	for k, e := range s.params {
+		out[k] = e.desc
+	}
+	return out
+}
+
+// DumpAll returns values plus descriptors so a dump round trip preserves
+// read-only flags, ranges, and descriptions. The map is freshly allocated.
+func (s *ConfigStore) DumpAll() map[string]ConfigDumpEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]ConfigDumpEntry, len(s.params))
+	for k, e := range s.params {
+		out[k] = ConfigDumpEntry{Value: cloneParamValue(e.value), Descriptor: e.desc}
+	}
+	return out
+}
+
+// LoadDump restores values plus descriptors atomically with source "load".
+// Missing names declare with the supplied descriptors; existing names set
+// through validation. Validators run outside the write lock with optimistic
+// generation like other batches.
+func (s *ConfigStore) LoadDump(dump map[string]ConfigDumpEntry, source string) (ConfigEvent, error) {
+	if source == "" {
+		return ConfigEvent{}, errors.New("core: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	values := make(map[string]ParamValue, len(dump))
+	descs := make(map[string]ParamDescriptor, len(dump))
+	for name, entry := range dump {
+		err := ValidateParamName(name)
+		if err != nil {
+			return ConfigEvent{}, err
+		}
+		values[name] = entry.Value
+		descs[name] = entry.Descriptor
+	}
+	event, hooks, err := s.commitBatchWithValidators(values, descs, source, true)
+	if err != nil {
+		return ConfigEvent{}, err
+	}
+	if len(event.Changes) == 0 {
+		return event, nil
+	}
+	s.broadcast(event)
+	s.runHooks(hooks, event)
+	return event, nil
 }
 
 // ValidateSchema checks the store snapshot against the schema: every schema
@@ -1308,31 +1566,112 @@ type hookCall struct {
 	new ParamValue
 }
 
-// prepareBatchLocked validates every update without mutating state and
-// builds the event plus hook list. Remapping, sorting, type checks,
-// read-only checks, and validators all run here; commit happens separately
-// so a late failure can never leave a partial batch. The caller holds the
-// write lock.
+// runPendingValidators runs collected validators outside the write lock.
+// Validators receive snapshot copies; they must still avoid deep reentrancy.
+func runPendingValidators(pending []pendingValidator) error {
+	for _, p := range pending {
+		err := p.fn(cloneParamValue(p.old), cloneParamValue(p.new))
+		if err != nil {
+			return fmt.Errorf("core: config: set %q rejected by validator: %w", p.name, err)
+		}
+	}
+	return nil
+}
+
+// configCommitRetries bounds optimistic-concurrency retries for one batch.
 //
-//nolint:gocognit // batch validation sequences remap, sort, type, read-only, and validator checks in one pass, splitting would obscure intent
+// Concurrent batches re-prepare against the fresh store, so distinct-key
+// writes converge instead of aborting each other. Sustained contention past
+// the bound fails loudly instead of spinning.
+const configCommitRetries = 64
+
+// commitBatchWithValidators prepares, validates outside the write lock, and
+// commits one batch, retrying when a concurrent mutation lands mid-batch.
+// Validators run on snapshots per attempt. A validator rejection fails
+// immediately; only concurrent-mutation races retry. Empty batches commit
+// nothing and return the current version.
+func (s *ConfigStore) commitBatchWithValidators(updates map[string]ParamValue, descs map[string]ParamDescriptor, source string, autoDeclare bool) (ConfigEvent, []hookCall, error) {
+	var aborted error
+	for range configCommitRetries {
+		s.mu.Lock()
+		event, hooks, pending, err := s.prepareBatchLocked(updates, descs, source, autoDeclare)
+		if err != nil {
+			s.mu.Unlock()
+			return ConfigEvent{}, nil, err
+		}
+		gen := s.version
+		s.mu.Unlock()
+		err = runPendingValidators(pending)
+		if err != nil {
+			return ConfigEvent{}, nil, err
+		}
+		s.mu.Lock()
+		if s.version != gen {
+			s.mu.Unlock()
+			aborted = fmt.Errorf("core: config: %s: concurrent mutation", source)
+			continue
+		}
+		if len(event.Changes) == 0 {
+			version := s.version
+			s.mu.Unlock()
+			return ConfigEvent{Version: version, Source: source, Changes: []ConfigChange{}}, nil, nil
+		}
+		s.commitPreparedLocked(event, descs)
+		s.mu.Unlock()
+		return event, hooks, nil
+	}
+	return ConfigEvent{}, nil, fmt.Errorf("core: config: %s: batch aborted after %d concurrent mutations: %w", source, configCommitRetries, aborted)
+}
+
+// prepareBatchLocked validates every update without mutating state and
+// builds the event plus hook list plus pending validators. Remapping sorts
+// deterministically and fails loudly naming both originals when two inputs
+// collide on one final name. Type checks and read-only checks run here;
+// validators are collected here and run outside the write lock by the caller
+// with optimistic generation, so a late failure can never leave a partial
+// batch. The caller holds the write lock.
+//
+// remapBatchLocked validates and remaps batch names deterministically.
+//
+// It sorts inputs, validates each raw and final name, and fails loudly
+// naming both originals when two inputs collide on one final name.
+func (s *ConfigStore) remapBatchLocked(updates map[string]ParamValue) (map[string]ParamValue, error) {
+	names := make([]string, 0, len(updates))
+	for name := range updates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	remapped := make(map[string]ParamValue, len(updates))
+	origins := make(map[string]string, len(updates))
+	for _, name := range names {
+		v := updates[name]
+		err := ValidateParamName(name)
+		if err != nil {
+			return nil, err
+		}
+		final := s.remappedLocked(name)
+		err = ValidateParamName(final)
+		if err != nil {
+			return nil, err
+		}
+		if first, ok := origins[final]; ok {
+			return nil, fmt.Errorf("core: config: remap collision %q and %q both map to %q", first, name, final)
+		}
+		origins[final] = name
+		remapped[final] = v
+	}
+	return remapped, nil
+}
+
 func (s *ConfigStore) prepareBatchLocked(
 	updates map[string]ParamValue,
 	descs map[string]ParamDescriptor,
 	source string,
 	autoDeclare bool,
-) (ConfigEvent, []hookCall, error) {
-	remapped := make(map[string]ParamValue, len(updates))
-	for name, v := range updates {
-		err := ValidateParamName(name)
-		if err != nil {
-			return ConfigEvent{}, nil, err
-		}
-		final := s.remappedLocked(name)
-		err = ValidateParamName(final)
-		if err != nil {
-			return ConfigEvent{}, nil, err
-		}
-		remapped[final] = v
+) (ConfigEvent, []hookCall, []pendingValidator, error) {
+	remapped, err := s.remapBatchLocked(updates)
+	if err != nil {
+		return ConfigEvent{}, nil, nil, err
 	}
 	ordered := make([]string, 0, len(remapped))
 	for name := range remapped {
@@ -1342,16 +1681,14 @@ func (s *ConfigStore) prepareBatchLocked(
 	next := s.version + 1
 	var changes []ConfigChange
 	var hooks []hookCall
+	var pending []pendingValidator
 	for _, name := range ordered {
 		newValue := cloneParamValue(remapped[name])
-		if newValue.Type == ParamTypeNotSet {
-			return ConfigEvent{}, nil, fmt.Errorf("core: config: set %q: value type not_set is not concrete", name)
-		}
 		entry, ok := s.params[name]
 		if !ok {
 			err := s.validateNewLocked(name, newValue, descs, autoDeclare)
 			if err != nil {
-				return ConfigEvent{}, nil, err
+				return ConfigEvent{}, nil, nil, err
 			}
 			changes = append(changes, ConfigChange{Name: name, NewValue: newValue, HadOld: false})
 			for _, fn := range s.hooks[name] {
@@ -1359,23 +1696,25 @@ func (s *ConfigStore) prepareBatchLocked(
 			}
 			continue
 		}
-		err := s.validateExistingLocked(name, entry, newValue)
+		hookVals, pend, err := s.validateExistingNoValidatorsLocked(name, entry, newValue)
 		if err != nil {
-			return ConfigEvent{}, nil, err
+			return ConfigEvent{}, nil, nil, err
 		}
+		pending = append(pending, pend...)
 		old := cloneParamValue(entry.value)
 		changes = append(changes, ConfigChange{Name: name, OldValue: old, NewValue: newValue, HadOld: true})
-		for _, fn := range s.hooks[name] {
+		for _, fn := range hookVals {
 			hooks = append(hooks, hookCall{fn: fn, old: cloneParamValue(old), new: cloneParamValue(newValue)})
 		}
 	}
 	event := ConfigEvent{Version: next, Source: source, Changes: changes}
-	return event, hooks, nil
+	return event, hooks, pending, nil
 }
 
 // validateNewLocked checks a write to an undeclared name. Auto-declare
-// accepts any concrete value; otherwise the write fails. A declare-time
-// descriptor, when supplied, must still validate.
+// accepts any concrete value; NotSet needs a NotSet descriptor to validate.
+// Otherwise the write fails. A declare-time descriptor, when supplied, must
+// still validate.
 func (s *ConfigStore) validateNewLocked(
 	name string,
 	newValue ParamValue,
@@ -1389,37 +1728,40 @@ func (s *ConfigStore) validateNewLocked(
 		}
 		return nil
 	}
+	if newValue.Type == ParamTypeNotSet {
+		return fmt.Errorf("core: config: set %q: value type not_set is not concrete", name)
+	}
 	if !autoDeclare {
 		return fmt.Errorf("core: config: set %q: not declared and undeclared parameters are not allowed", name)
 	}
 	return nil
 }
 
-// validateExistingLocked checks type, range, read-only, and validators for
-// a write to a declared name.
-func (s *ConfigStore) validateExistingLocked(name string, entry *configEntry, newValue ParamValue) error {
+// validateExistingNoValidatorsLocked checks type and read-only for a write
+// to a declared name and collects validators to run outside the write lock.
+// The caller holds the write lock; validators run later against snapshots.
+func (s *ConfigStore) validateExistingNoValidatorsLocked(name string, entry *configEntry, newValue ParamValue) ([]ConfigApplyHook, []pendingValidator, error) {
 	if entry.desc.ReadOnly {
-		return fmt.Errorf("core: config: set %q: parameter is read only", name)
+		return nil, nil, fmt.Errorf("core: config: set %q: parameter is read only", name)
 	}
 	err := entry.desc.validateValue(newValue)
 	if err != nil {
-		return fmt.Errorf("core: config: set %q: %w", name, err)
+		return nil, nil, fmt.Errorf("core: config: set %q: %w", name, err)
 	}
-	old := entry.value
+	old := cloneParamValue(entry.value)
+	var pending []pendingValidator
 	for _, fn := range s.validators[name] {
-		err = fn(cloneParamValue(old), cloneParamValue(newValue))
-		if err != nil {
-			return fmt.Errorf("core: config: set %q rejected by validator: %w", name, err)
-		}
+		pending = append(pending, pendingValidator{name: name, old: old, new: cloneParamValue(newValue), fn: fn})
 	}
-	return nil
+	return s.hooks[name], pending, nil
 }
 
 // commitPreparedLocked applies a validated event: one version bump, one
 // history entry per change sharing that version, and stored value swaps.
 // Declared descriptors in descs pin new entries; auto-declared entries
 // infer an unconstrained descriptor from the value. The caller holds the
-// write lock and has already validated.
+// write lock and has already validated. History is trimmed to the last
+// configHistoryLimit entries with oldest drops counted loudly.
 func (s *ConfigStore) commitPreparedLocked(event ConfigEvent, descs map[string]ParamDescriptor) {
 	s.version = event.Version
 	for _, c := range event.Changes {
@@ -1445,33 +1787,61 @@ func (s *ConfigStore) commitPreparedLocked(event ConfigEvent, descs map[string]P
 			Source:   event.Source,
 		})
 	}
+	s.trimHistoryLocked()
 }
 
-// watcherChannelsLocked snapshots watcher channels. The caller holds the lock.
-func (s *ConfigStore) watcherChannelsLocked() []chan ConfigEvent {
-	out := make([]chan ConfigEvent, 0, len(s.watchers))
-	for _, w := range s.watchers {
-		out = append(out, w.ch)
+// trimHistoryLocked drops oldest history beyond configHistoryLimit and counts
+// loudly. The caller holds the write lock.
+func (s *ConfigStore) trimHistoryLocked() {
+	if len(s.history) <= configHistoryLimit {
+		return
 	}
-	return out
+	overflow := len(s.history) - configHistoryLimit
+	for i := range overflow {
+		s.history[i] = ConfigHistoryEntry{}
+	}
+	s.history = append([]ConfigHistoryEntry(nil), s.history[overflow:]...)
+	s.historyDrop += uint64(overflow) //nolint:gosec // overflow is a non-negative length difference fitting uint64
 }
 
-// broadcast delivers the event to every channel without blocking. A full
-// channel evicts its oldest event first; the evicted range stays available
-// through HistorySince.
-func (s *ConfigStore) broadcast(channels []chan ConfigEvent, event ConfigEvent) {
-	for _, ch := range channels {
+// broadcast delivers the event to every watcher without holding the write
+// lock. Each watcher is checked plus sent under a read lock with a
+// per-watcher nonblocking send; a full channel evicts its oldest event and
+// counts loudly in BroadcastDrops, and a second full send drops loudly.
+// The evicted range stays available through HistorySince. Never sends on a
+// closed channel because cancel deletes plus closes under the write lock,
+// which waits for the read lock.
+func (s *ConfigStore) broadcast(event ConfigEvent) {
+	s.mu.RLock()
+	ids := make([]uint64, 0, len(s.watchers))
+	for id := range s.watchers {
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+	for _, id := range ids {
+		s.mu.RLock()
+		w, ok := s.watchers[id]
+		if !ok {
+			s.mu.RUnlock()
+			continue
+		}
+		ch := w.ch
 		deliver := cloneEvent(event)
 		select {
 		case ch <- deliver:
+			s.mu.RUnlock()
 		default:
 			select {
 			case <-ch:
+				s.drops.Add(1)
 			default:
 			}
 			select {
 			case ch <- deliver:
+				s.mu.RUnlock()
 			default:
+				s.drops.Add(1)
+				s.mu.RUnlock()
 			}
 		}
 	}

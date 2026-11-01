@@ -63,34 +63,71 @@ func ParticipantFromCore(gid core.GID, info core.ParticipantInfo) ParticipantInf
 	}
 }
 
+// indexFromCoreMaxAttempts bounds generation-checked retries.
+const indexFromCoreMaxAttempts = 5
+
 // IndexFromCore builds a view index from the core write path index.
+//
+// Core map getters copy under separate locks, so a torn snapshot is
+// possible when discovery mutates concurrently. This reads the generation,
+// copies all tables, then re-reads the generation; mismatched generations
+// retry bounded times and fail loudly when never consistent instead of
+// installing a torn snapshot and overwriting the generation.
 func IndexFromCore(g *core.Graph) (*Index, error) {
 	if g == nil {
 		return nil, errors.New("graph: core graph is nil") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	for range indexFromCoreMaxAttempts {
+		genBefore := g.Generation()
+		writers := g.Writers()
+		readers := g.Readers()
+		services := g.Services()
+		participants := g.Participants()
+		genAfter := g.Generation()
+		if genBefore != genAfter {
+			continue
+		}
+		idx, err := buildIndexFromCopies(writers, readers, services, participants, genBefore)
+		if err != nil {
+			return nil, err
+		}
+		return idx, nil
+	}
+	return nil, fmt.Errorf("graph: index from core never consistent after %d attempts", indexFromCoreMaxAttempts)
+}
+
+// buildIndexFromCopies converts generation-checked core copies into a view index.
+// It fails loudly on invalid records instead of installing partial state.
+func buildIndexFromCopies(
+	writers map[core.GID]core.EntityInfo,
+	readers map[core.GID]core.EntityInfo,
+	services map[core.GID]core.ServiceInfo,
+	participants map[core.GID]core.ParticipantInfo,
+	gen uint64,
+) (*Index, error) {
 	idx := NewIndex()
-	for gid, info := range g.Writers() {
+	for gid, info := range writers {
 		converted := EntityFromCore(gid, info)
 		err := idx.UpsertWriter(converted)
 		if err != nil {
 			return nil, fmt.Errorf("graph: convert writer %s: %w", gid.String(), err)
 		}
 	}
-	for gid, info := range g.Readers() {
+	for gid, info := range readers {
 		converted := EntityFromCore(gid, info)
 		err := idx.UpsertReader(converted)
 		if err != nil {
 			return nil, fmt.Errorf("graph: convert reader %s: %w", gid.String(), err)
 		}
 	}
-	for gid, info := range g.Services() {
+	for gid, info := range services {
 		converted := ServiceFromCore(gid, info)
 		err := idx.UpsertService(converted)
 		if err != nil {
 			return nil, fmt.Errorf("graph: convert service %s: %w", gid.String(), err)
 		}
 	}
-	for gid, info := range g.Participants() {
+	for gid, info := range participants {
 		converted := ParticipantFromCore(gid, info)
 		err := idx.UpsertParticipant(converted)
 		if err != nil {
@@ -98,7 +135,7 @@ func IndexFromCore(g *core.Graph) (*Index, error) {
 		}
 	}
 	idx.mu.Lock()
-	idx.generation = g.Generation()
+	idx.generation = gen
 	idx.mu.Unlock()
 	return idx, nil
 }

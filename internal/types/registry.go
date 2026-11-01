@@ -9,10 +9,12 @@ import (
 	"sync"
 )
 
-// fullKey identifies one stored description by name plus hash string.
+// fullKey identifies one stored description by name plus versioned hash.
+// The hash is the full TypeHash so version is significant: a v2 digest
+// never matches a v1 entry even when digests collide, matching Equal.
 type fullKey struct {
 	name string
-	hash string
+	hash TypeHash
 }
 
 // Registry stores individuals plus sources plus full descriptions by name and hash.
@@ -215,6 +217,8 @@ func normalizeFull(desc TypeDescription, sources []TypeSource) (TypeDescription,
 }
 
 // checkClosureComplete verifies every nested name appears in the closed set.
+// It also rejects referenced-but-unreachable types: the closure must equal
+// the reachable set from the root, not merely a superset.
 func checkClosureComplete(sorted TypeDescription) error {
 	present := make(map[string]bool, len(sorted.Referenced)+1)
 	present[sorted.Description.TypeName] = true
@@ -235,7 +239,54 @@ func checkClosureComplete(sorted TypeDescription) error {
 			}
 		}
 	}
+	err := checkClosureReachable(sorted, present)
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+// checkClosureReachable rejects referenced types unreachable from the root.
+// It walks nested names from the root over the closed set; every referenced
+// entry must be visited or the closure carries unreachable types loudly.
+func checkClosureReachable(sorted TypeDescription, present map[string]bool) error {
+	lookup := make(map[string]IndividualTypeDescription, len(present))
+	lookup[sorted.Description.TypeName] = sorted.Description
+	for i := range sorted.Referenced {
+		lookup[sorted.Referenced[i].TypeName] = sorted.Referenced[i]
+	}
+	reachable := map[string]bool{sorted.Description.TypeName: true}
+	queue := []string{sorted.Description.TypeName}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		cur, ok := lookup[name]
+		if !ok {
+			continue
+		}
+		queue = visitReachableFields(cur, present, reachable, queue)
+	}
+	for i := range sorted.Referenced {
+		name := sorted.Referenced[i].TypeName
+		if !reachable[name] {
+			return fmt.Errorf("types: closure %q contains unreachable referenced %q", sorted.Description.TypeName, name)
+		}
+	}
+	return nil
+}
+
+// visitReachableFields enqueues unvisited nested names from one individual.
+// It keeps checkClosureReachable short by isolating the field loop.
+func visitReachableFields(cur IndividualTypeDescription, present, reachable map[string]bool, queue []string) []string {
+	for i := range cur.Fields {
+		nested := cur.Fields[i].Type.NestedTypeName
+		if nested == "" || reachable[nested] || !present[nested] {
+			continue
+		}
+		reachable[nested] = true
+		queue = append(queue, nested)
+	}
+	return queue
 }
 
 // storeFull stores one normalized description plus sources with conflict checks.
@@ -260,7 +311,7 @@ func (r *Registry) storeFull(sorted TypeDescription, h TypeHash, sources []TypeS
 	for i := range sources {
 		r.sources[sources[i].TypeName] = sources[i]
 	}
-	key := fullKey{name: sorted.Description.TypeName, hash: h.String()}
+	key := fullKey{name: sorted.Description.TypeName, hash: h}
 	r.fullByNameHash[key] = sorted
 	return nil
 }
@@ -283,10 +334,11 @@ func (r *Registry) RegisterFull(desc TypeDescription, sources []TypeSource) (Typ
 }
 
 // LookupFull returns one stored description by type name plus hash.
+// The lookup is version-sensitive like Equal: version and digest must match.
 func (r *Registry) LookupFull(name string, hash TypeHash) (TypeDescription, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	key := fullKey{name: name, hash: hash.String()}
+	key := fullKey{name: name, hash: hash}
 	d, ok := r.fullByNameHash[key]
 	if !ok {
 		return TypeDescription{}, false

@@ -202,12 +202,31 @@ func (e *ClockMismatchError) Error() string {
 }
 
 // ValidateGoalClock rejects a goal whose domain disagrees with the server.
+// Invalid domains on either side fail loudly instead of passing when equal.
 //
 // Any disagreement errors, so a wall stamped receding horizon goal against
 // sim time surfaces here instead of freezing silently. Matching domains
 // pass. The returned error is a ClockMismatchError carrying stamp and
 // both domains.
 func ValidateGoalClock(server, goalID string, stampNanos int64, goalDomain, serverDomain ClockDomain) error {
+	if !isValidClockDomain(goalDomain) {
+		return &ClockMismatchError{
+			Server:       server,
+			GoalID:       goalID,
+			StampNanos:   stampNanos,
+			GoalDomain:   goalDomain,
+			ServerDomain: serverDomain,
+		}
+	}
+	if !isValidClockDomain(serverDomain) {
+		return &ClockMismatchError{
+			Server:       server,
+			GoalID:       goalID,
+			StampNanos:   stampNanos,
+			GoalDomain:   goalDomain,
+			ServerDomain: serverDomain,
+		}
+	}
 	if goalDomain == serverDomain {
 		return nil
 	}
@@ -223,9 +242,6 @@ func ValidateGoalClock(server, goalID string, stampNanos int64, goalDomain, serv
 // actionGoal is one in flight goal in the active or pending slot.
 type actionGoal struct {
 	id                string
-	stampNanos        int64
-	stampDomain       ClockDomain
-	acceptedNanos     int64
 	status            GoalStatus
 	feedback          []FeedbackSample
 	lost              uint64
@@ -265,7 +281,6 @@ type ActionServer struct {
 	pendingGoal        *actionGoal
 	results            map[string]*actionResult
 	emptyTakes         uint64
-	lastActivateNanos  int64
 }
 
 // NewActionServer returns an inactive server with the given clock domain
@@ -320,13 +335,12 @@ func (s *ActionServer) IsActive() bool {
 
 // Activate marks the server active so it admits goals.
 //
-// It is idempotent. The stamp orders activation against fake clock tests
-// and carries no expiry.
-func (s *ActionServer) Activate(nowNanos int64) {
+// It is idempotent. The nowNanos orders activation against fake clock tests
+// and carries no expiry; it is not stored.
+func (s *ActionServer) Activate(_ int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.active = true
-	s.lastActivateNanos = nowNanos
 }
 
 // Deactivate terminal results in flight goals and rejects new work.
@@ -386,11 +400,8 @@ func (s *ActionServer) AcceptGoal(goalID string, stampNanos int64, goalDomain Cl
 		return fmt.Errorf("core: action %q: %w", s.name, err)
 	}
 	fresh := &actionGoal{
-		id:            goalID,
-		stampNanos:    stampNanos,
-		stampDomain:   goalDomain,
-		acceptedNanos: nowNanos,
-		status:        GoalAccepted,
+		id:     goalID,
+		status: GoalAccepted,
 	}
 	if s.activeGoal == nil {
 		fresh.status = GoalExecuting

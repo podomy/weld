@@ -110,6 +110,8 @@ type SerialGroup struct {
 	active      bool
 	destroyed   bool
 	done        chan struct{}
+	started     chan struct{}
+	spinStarted bool
 	wg          sync.WaitGroup
 	preshutdown []func()
 }
@@ -121,7 +123,7 @@ func NewSerialGroup(name string) (*SerialGroup, error) {
 	if name == "" {
 		return nil, errors.New("core: serial group name is empty") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	return &SerialGroup{name: name, done: make(chan struct{})}, nil
+	return &SerialGroup{name: name, done: make(chan struct{}), started: make(chan struct{})}, nil
 }
 
 // Name returns the group name. A nil group reports empty.
@@ -181,7 +183,8 @@ func (g *SerialGroup) IsActive() bool {
 }
 
 // IsDestroyed reports whether Destroy ran. A nil group reports destroyed so
-// callers skip work.
+// callers skip work. Staged API for teardown gating; retained because Spin
+// probes it on every iteration.
 func (g *SerialGroup) IsDestroyed() bool {
 	if g == nil {
 		return true
@@ -500,22 +503,43 @@ func (g *SerialGroup) SpinOnce() bool {
 //
 // Spin is the detached thread entry point: run it with go Spin(stop) where
 // ROS uses a detached executor. A nil stop means run until Destroy. Idle
-// spins yield instead of blocking so Destroy and stop stay responsive. Do not
-// call Destroy from inside a Take callback; call it from the goroutine that
-// owns teardown while Spin runs elsewhere.
+// spins yield instead of blocking so Destroy and stop stay responsive. The
+// started channel closes on entry after the worker is counted so Destroy can
+// wait for started then Wait without racing Add. Do not call Destroy from
+// inside a Take callback; call it from the goroutine that owns teardown
+// while Spin runs elsewhere.
+// spinShouldStop reports whether the spinner must exit on done or stop.
+func (g *SerialGroup) spinShouldStop(stop <-chan struct{}) bool {
+	select {
+	case <-g.done:
+		return true
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
 func (g *SerialGroup) Spin(stop <-chan struct{}) {
 	if g == nil {
 		return
 	}
+	g.mu.Lock()
+	if g.destroyed {
+		g.mu.Unlock()
+		return
+	}
 	g.wg.Add(1)
+	shouldClose := !g.spinStarted
+	g.spinStarted = true
+	g.mu.Unlock()
+	if shouldClose {
+		close(g.started)
+	}
 	defer g.wg.Done()
 	for {
-		select {
-		case <-g.done:
+		if g.spinShouldStop(stop) {
 			return
-		case <-stop:
-			return
-		default:
 		}
 		if g.IsDestroyed() {
 			return
@@ -523,22 +547,19 @@ func (g *SerialGroup) Spin(stop <-chan struct{}) {
 		if g.SpinOnce() {
 			continue
 		}
-		select {
-		case <-g.done:
+		if g.spinShouldStop(stop) {
 			return
-		case <-stop:
-			return
-		default:
-			runtime.Gosched()
 		}
+		runtime.Gosched()
 	}
 }
 
 // Destroy stops delivery, skips pending callbacks, and joins spinners.
 //
 // Destroy is idempotent and safe for concurrent use with Spin and SpinOnce.
+// It clears active plus configured so IsActive is false after destroy.
 // After Destroy, SpinOnce reports false without calling Take. A nil group is
-// a no op.
+// a no op. Destroy waits for started when Spin ran, then joins workers.
 func (g *SerialGroup) Destroy() {
 	if g == nil {
 		return
@@ -546,10 +567,16 @@ func (g *SerialGroup) Destroy() {
 	g.mu.Lock()
 	if !g.destroyed {
 		g.destroyed = true
+		g.active = false
+		g.configured = false
 		close(g.done)
 	}
+	started := g.spinStarted
 	g.mu.Unlock()
-	g.wg.Wait()
+	if started {
+		<-g.started
+		g.wg.Wait()
+	}
 }
 
 // RecordHeartbeat records one bond heartbeat for an entity at nowNanos.
@@ -748,7 +775,9 @@ func (c *SerialChannel[T]) Closed() bool {
 
 // TryPublish enqueues v without blocking and reports whether an oldest sample
 // was evicted. A full channel drops the oldest, counts one lost, and stores
-// v. A nil or closed channel drops v and reports no eviction.
+// v. A nil or closed channel drops v and reports no eviction. A zero value
+// channel with non-positive capacity drops v safely without an index panic;
+// build channels with NewSerialChannel.
 func (c *SerialChannel[T]) TryPublish(v T) bool {
 	if c == nil {
 		return false
@@ -756,6 +785,9 @@ func (c *SerialChannel[T]) TryPublish(v T) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
+		return false
+	}
+	if c.capacity <= 0 {
 		return false
 	}
 	if len(c.buf) >= c.capacity {

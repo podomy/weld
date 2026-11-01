@@ -503,21 +503,6 @@ func (d *Domain) Generation() uint64 {
 	return d.generation.Load()
 }
 
-// JumpsForward counts fired forward jumps, including activations that moved forward.
-func (d *Domain) JumpsForward() uint64 {
-	return d.forwardCount.Load()
-}
-
-// JumpsBackward counts fired backward jumps, including activations that moved backward.
-func (d *Domain) JumpsBackward() uint64 {
-	return d.backwardCount.Load()
-}
-
-// JumpsTotal counts all fired jump events.
-func (d *Domain) JumpsTotal() uint64 {
-	return d.forwardCount.Load() + d.backwardCount.Load()
-}
-
 // JumpForwardThreshold returns the configured forward jump threshold in nanoseconds.
 func (d *Domain) JumpForwardThreshold() int64 {
 	return d.forwardThreshold
@@ -1095,11 +1080,6 @@ func (t *Timer) GuardCount() uint64 {
 // unready, canceled, closed, or zero period.
 func (t *Timer) Backlog() uint64 {
 	return t.backlogAt(t.domain.readKind(t.kind))
-}
-
-// BacklogAt returns owed firings at an explicit now without reading the clock.
-func (t *Timer) BacklogAt(now int64) uint64 {
-	return t.backlogAt(now)
 }
 
 // backlogAt computes owed firings behind now.

@@ -170,6 +170,8 @@ type ClockState struct {
 }
 
 // NewClockState returns a state with explicit wall plus steady fallbacks.
+// An invalid domain fails loudly with a panic because the domain selects the
+// active source and silent fallback to wall would hide misconfiguration.
 //
 // The domain selects the active source: sim reads sim ticks when valid,
 // steady reads the steady source, wall reads the wall source. When the
@@ -177,7 +179,7 @@ type ClockState struct {
 // UsingFallback reports true: the fallback is explicit, never silent.
 func NewClockState(domain ClockDomain, wallNanos, steadyNanos int64) *ClockState {
 	if !isValidClockDomain(domain) {
-		domain = ClockWall
+		panic("core: new clock state: invalid clock domain")
 	}
 	if wallNanos < 0 {
 		wallNanos = 0
@@ -495,22 +497,29 @@ func (d *ClockState) CheckGoal(server, goalID string, stampNanos int64, goalDoma
 	return nil
 }
 
-// RebaseDeadlinesOnJump rebases deadline trackers after a backward jump.
+// RebaseDeadlinesOnJump rebases deadline trackers after a backward jump and
+// returns any alerts that fire during the rebase.
 //
 // DeadlineTracker.Check already rebases on backward time by resetting to
 // now, so this helper drives each tracker with the jump target when the
 // jump is backward or carries an activation change. Forward jumps leave
-// trackers untouched. Nil trackers are skipped.
-func RebaseDeadlinesOnJump(jump ClockJump, trackers ...*DeadlineTracker) {
+// trackers untouched. Nil trackers are skipped. Alerts are propagated to the
+// caller instead of discarded so monitoring stays loud.
+func RebaseDeadlinesOnJump(jump ClockJump, trackers ...*DeadlineTracker) []DeadlineAlert {
 	if !jump.Backward && !jump.ActivationChanged {
-		return
+		return nil
 	}
+	var out []DeadlineAlert
 	for _, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
-		tracker.Check(jump.ToNanos)
+		alert, ok := tracker.Check(jump.ToNanos)
+		if ok {
+			out = append(out, alert)
+		}
 	}
+	return out
 }
 
 // ShouldPublishClock reports whether a /clock tick is due.

@@ -433,7 +433,10 @@ func TestRegistryUnsortedRegisterFull(t *testing.T) {
 	unsorted := TypeDescription{
 		Description: IndividualTypeDescription{
 			TypeName: "pkg/msg/A",
-			Fields:   []Field{{Name: "v", Type: FieldType{TypeID: FieldTypeInt32}}},
+			Fields: []Field{
+				{Name: "b", Type: FieldType{TypeID: FieldTypeNestedType, NestedTypeName: "pkg/msg/B"}},
+				{Name: "c", Type: FieldType{TypeID: FieldTypeNestedType, NestedTypeName: "pkg/msg/C"}},
+			},
 		},
 		Referenced: []IndividualTypeDescription{mkref("pkg/msg/C"), mkref("pkg/msg/B")},
 	}

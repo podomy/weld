@@ -421,6 +421,9 @@ func checkFieldTypeValidID(t *testing.T, id FieldTypeID) {
 	if id == FieldTypeNestedType || id == 49 || id == 97 || id == 145 {
 		ft.NestedTypeName = "pkg/msg/X"
 	}
+	if base := id.Base(); base == FieldTypeFixedString || base == FieldTypeFixedWString || base == FieldTypeBoundedString || base == FieldTypeBoundedWString {
+		ft.StringCapacity = 4
+	}
 	if ft.TypeID.IsArray() || ft.TypeID.IsBoundedSequence() {
 		ft.Capacity = 4
 	}

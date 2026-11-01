@@ -507,15 +507,15 @@ func (idx *Index) Snapshot() Snapshot {
 }
 
 // validateEntity checks one entity record.
+// Topic names must be canonical ROS form like core: leading slash, no empty
+// segments, no trailing slash, and no whitespace.
 func validateEntity(info EntityInfo) error {
 	if info.GID.IsZero() {
 		return errors.New("graph: entity GID is zero") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	if info.TopicName == "" {
-		return errors.New("graph: entity topic name is empty") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	if info.TopicName[0] != '/' {
-		return fmt.Errorf("graph: entity topic %q must start with slash", info.TopicName)
+	err := validateROSTopicName(info.TopicName)
+	if err != nil {
+		return fmt.Errorf("graph: entity topic: %w", err)
 	}
 	if info.TopicType == "" {
 		return fmt.Errorf("graph: entity topic %q misses type", info.TopicName)
@@ -524,18 +524,45 @@ func validateEntity(info EntityInfo) error {
 }
 
 // validateService checks one service record.
+// Service names must be canonical ROS form like core.
 func validateService(info ServiceInfo) error {
 	if info.GID.IsZero() {
 		return errors.New("graph: service GID is zero") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	if info.ServiceName == "" {
-		return errors.New("graph: service name is empty") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	if info.ServiceName[0] != '/' {
-		return fmt.Errorf("graph: service %q must start with slash", info.ServiceName)
+	err := validateROSTopicName(info.ServiceName)
+	if err != nil {
+		return fmt.Errorf("graph: service: %w", err)
 	}
 	if info.ServiceType == "" {
 		return fmt.Errorf("graph: service %q misses type", info.ServiceName)
+	}
+	return nil
+}
+
+// validateROSTopicName rejects names that are not canonical ROS form.
+// It mirrors core validation: leading slash, no empty segments, no trailing
+// slash except root, and no whitespace.
+func validateROSTopicName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("graph: topic name is empty") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		return fmt.Errorf("graph: topic name %q must start with slash", name)
+	}
+	if strings.Contains(trimmed, "//") {
+		return fmt.Errorf("graph: topic name %q has an empty segment", name)
+	}
+	if strings.HasSuffix(trimmed, "/") && trimmed != "/" {
+		return fmt.Errorf("graph: topic name %q has a trailing slash", name)
+	}
+	if strings.ContainsAny(trimmed, " \t\n\r") {
+		return fmt.Errorf("graph: topic name %q has whitespace", name)
+	}
+	for seg := range strings.SplitSeq(strings.Trim(trimmed, "/"), "/") {
+		if seg == "" && trimmed != "/" {
+			return fmt.Errorf("graph: topic name %q has an empty segment", name)
+		}
 	}
 	return nil
 }
@@ -684,8 +711,10 @@ func (s Snapshot) SubscriptionCounts() map[string]int {
 //
 // Unknown participant GIDs use the unknown sentinels. Participants with no
 // node entities are bare DDS applications and use the bare DDS sentinels.
-// When a participant owns several nodes, the first node in entity order
-// answers, so repeated queries stay deterministic.
+// Each endpoint is attributed to its own participant node: a participant
+// with exactly one node answers with that node. A participant with several
+// nodes is ambiguous without per-endpoint node identity, so it answers with
+// the unknown sentinels instead of silently picking the first node.
 func (s Snapshot) resolveNode(participant GID) (string, string) {
 	info, ok := s.participants[participant]
 	if !ok {
@@ -693,6 +722,9 @@ func (s Snapshot) resolveNode(participant GID) (string, string) {
 	}
 	if len(info.Nodes) == 0 {
 		return BareDDSAppName, BareDDSAppNamespace
+	}
+	if len(info.Nodes) > 1 {
+		return UnknownNodeName, UnknownNodeNamespace
 	}
 	return info.Nodes[0].Name, info.Nodes[0].Namespace
 }

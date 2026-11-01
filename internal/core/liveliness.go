@@ -4,6 +4,7 @@
 package core
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -93,12 +94,22 @@ func (o GateOutcome) String() string {
 // GateDelivery decides deliver versus hold versus drop for one sample.
 //
 // It is pure: it reads only the writer stage plus the deadline miss flag
-// and never touches clocks or counters. Priority is expired, then stale,
-// then deadline miss, then deliver. Expired always drops with a distinct
-// stale reason naming lease duration so a dead writer never serves ancient
-// samples silently. Stale always holds naming lease duration. Deadline
-// misses drop naming deadline. Fresh and alive delivers.
+// and never touches clocks or counters. Priority is invalid state, then
+// expired, then stale, then deadline miss, then deliver. Out-of-range
+// writer states fail closed with a loud drop naming the invalid stage so a
+// corrupt or future stage never serves ancient samples silently. Expired
+// always drops with a distinct stale reason naming lease duration so a dead
+// writer never serves ancient samples silently. Stale always holds naming
+// lease duration. Deadline misses drop naming deadline. Fresh and alive
+// delivers.
 func GateDelivery(writer LivelinessState, deadlineMissed bool) GateOutcome {
+	if writer != LivelinessAlive && writer != LivelinessStale && writer != LivelinessExpired {
+		return GateOutcome{
+			Decision: GateDrop,
+			Reason:   fmt.Sprintf("drop sample: invalid liveliness state %d", int(writer)),
+			Policy:   PolicyLeaseDuration,
+		}
+	}
 	if writer == LivelinessExpired {
 		return GateOutcome{
 			Decision: GateDrop,
@@ -128,14 +139,14 @@ func GateDelivery(writer LivelinessState, deadlineMissed bool) GateOutcome {
 // Deliver yields no event. Hold and Drop yield one event carrying topic
 // plus endpoint pair plus outcome policy for logs, metrics, and CLI.
 // Offered and Requested carry the already rendered values for the policy.
-func NewGateMismatchEvent(topic, endpoint string, outcome GateOutcome, offered, requested string) (MismatchEvent, bool) {
+func NewGateMismatchEvent(topic, publisher, subscriber string, outcome GateOutcome, offered, requested string) (MismatchEvent, bool) {
 	if outcome.Decision == GateDeliver {
 		return MismatchEvent{}, false
 	}
 	return MismatchEvent{
 		Topic:      topic,
-		Publisher:  endpoint,
-		Subscriber: endpoint,
+		Publisher:  publisher,
+		Subscriber: subscriber,
 		Policy:     outcome.Policy,
 		Offered:    offered,
 		Requested:  requested,
@@ -291,6 +302,18 @@ func (t *LivelinessTracker) Kind() LivelinessPolicy {
 // Lease returns the enforced lease duration.
 func (t *LivelinessTracker) Lease() Duration {
 	return t.lease
+}
+
+// Reconfigure updates the tracked kind and lease on reconfiguration.
+//
+// It preserves the last assert tick, latched stage, and generation so a
+// config refresh never hides an in-flight outage. The next StateAt folds
+// the new lease. Safe for concurrent use.
+func (t *LivelinessTracker) Reconfigure(kind LivelinessPolicy, lease Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.kind = kind
+	t.lease = lease
 }
 
 // LastAssertNanos returns the last assert tick.

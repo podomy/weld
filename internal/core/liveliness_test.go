@@ -233,14 +233,14 @@ func checkLivelinessGating(t *testing.T) {
 	if both.Decision != GateDrop || !strings.Contains(both.Reason, "stale") {
 		t.Fatalf("expired plus deadline must drop stale, got %+v", both)
 	}
-	event, ok := NewGateMismatchEvent("/scan", "talker", dropped, "4s", "4s")
+	event, ok := NewGateMismatchEvent("/scan", "talker", "listener", dropped, "4s", "4s")
 	if !ok {
 		t.Fatal("drop must yield a loud event")
 	}
 	if event.Policy != PolicyLeaseDuration {
 		t.Fatalf("gate event policy = %q, want lease_duration", event.Policy)
 	}
-	if _, ok := NewGateMismatchEvent("/scan", "talker", deliver, "", ""); ok {
+	if _, ok := NewGateMismatchEvent("/scan", "talker", "listener", deliver, "", ""); ok {
 		t.Fatal("deliver must yield no event")
 	}
 }

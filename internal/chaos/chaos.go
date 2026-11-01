@@ -130,16 +130,6 @@ func (l BurstyLink) CycleNanos() int64 {
 	return l.goodNanos + l.badNanos
 }
 
-// GoodDwell returns the good state dwell in nanoseconds.
-func (l BurstyLink) GoodDwell() int64 {
-	return l.goodNanos
-}
-
-// BadDwell returns the bad state dwell in nanoseconds.
-func (l BurstyLink) BadDwell() int64 {
-	return l.badNanos
-}
-
 // BadAt reports whether nowNanos falls in the bad state.
 func (l BurstyLink) BadAt(nowNanos int64) bool {
 	cycle := l.CycleNanos()

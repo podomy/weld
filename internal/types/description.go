@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 )
 
 // MaxTypeNameLength caps every type name at 255 bytes.
@@ -232,9 +233,12 @@ func ValidateTypeName(name string) error {
 // Array and bounded sequence kinds must carry Capacity greater than 0.
 // Unbounded sequence kinds must carry Capacity 0. Only string bases
 // FieldTypeString to FieldTypeBoundedWString may carry StringCapacity;
-// all other bases must carry StringCapacity 0. Nested kinds with base
-// FieldTypeNestedType (identifiers 1, 49, 97, 145) require a nested type
-// name; all other kinds forbid one.
+// all other bases must carry StringCapacity 0. Bounded and fixed string
+// bases FieldTypeFixedString to FieldTypeBoundedWString must carry
+// StringCapacity greater than 0; plain String and WString may carry zero
+// for unbounded or nonzero for the bounded representation. Nested kinds
+// with base FieldTypeNestedType (identifiers 1, 49, 97, 145) require a
+// nested type name; all other kinds forbid one.
 func (t FieldType) Validate() error {
 	if err := t.validateID(); err != nil {
 		return err
@@ -289,11 +293,23 @@ func (t FieldType) validateNonNestedName() error {
 }
 
 // validateStringCapacity rejects string capacity on non string kinds.
+// Bounded and fixed string bases must carry StringCapacity greater than 0.
+// Plain String and WString allow zero or nonzero: zero means unbounded and
+// nonzero carries the bounded representation used by existing fixtures.
 func (t FieldType) validateStringCapacity() error {
-	if t.TypeID.IsString() || t.StringCapacity == 0 {
+	if !t.TypeID.IsString() {
+		if t.StringCapacity != 0 {
+			return fmt.Errorf("types: non string type id %d carries string capacity %d", uint8(t.TypeID), t.StringCapacity)
+		}
 		return nil
 	}
-	return fmt.Errorf("types: non string type id %d carries string capacity %d", uint8(t.TypeID), t.StringCapacity)
+	base := t.TypeID.Base()
+	if base == FieldTypeFixedString || base == FieldTypeFixedWString || base == FieldTypeBoundedString || base == FieldTypeBoundedWString {
+		if t.StringCapacity == 0 {
+			return fmt.Errorf("types: bounded or fixed string type id %d misses string capacity", uint8(t.TypeID))
+		}
+	}
+	return nil
 }
 
 // validateCapacity checks capacity against array, sequence, and scalar rules.
@@ -318,9 +334,14 @@ func (t FieldType) validateCapacity() error {
 }
 
 // Validate checks the field name and its nested type.
+// It rejects invalid UTF-8 in field names so distinct malformed names
+// cannot collide after U+FFFD substitution in canonical JSON.
 func (f Field) Validate() error {
 	if f.Name == "" {
 		return errors.New("types: empty field name") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if !utf8.ValidString(f.Name) {
+		return fmt.Errorf("types: field name %q is not valid UTF-8", f.Name)
 	}
 	err := f.Type.Validate()
 	if err != nil {

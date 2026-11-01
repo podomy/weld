@@ -14,7 +14,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
+	"sync"
 
 	"github.com/podomy/weld/internal/types"
 )
@@ -60,8 +62,10 @@ const (
 // Metrics counts dropped inputs for bag parsing.
 //
 // Drops increments for truncated, empty, and malformed buffers. The struct
-// is plain data owned by the caller. There is no global state.
+// is safe for concurrent use via RecordDrop and Count; direct field access
+// bypasses the mutex and must use the methods instead. There is no global state.
 type Metrics struct {
+	mu sync.Mutex
 	// Drops counts inputs dropped instead of parsed.
 	Drops uint64
 }
@@ -71,6 +75,8 @@ func (m *Metrics) RecordDrop() {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Drops++
 }
 
@@ -79,6 +85,8 @@ func (m *Metrics) Count() uint64 {
 	if m == nil {
 		return 0
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.Drops
 }
 
@@ -289,8 +297,10 @@ type Info struct {
 // Topics are indexed by name and by id. Messages keep raw XCDR1 bytes
 // verbatim. Iteration through Topics, OrderedMessages, Info, and Marshal
 // is deterministic: topics sort by name and messages sort by receive
-// timestamp then topic then sequence.
+// timestamp then topic then sequence. The mutex guards topics, ids,
+// messages, and drops for concurrent use; Storage is immutable after New.
 type Bag struct {
+	mu       sync.RWMutex
 	storage  string
 	topics   map[string]Topic
 	ids      map[uint32]string
@@ -318,6 +328,8 @@ func (b *Bag) Storage() string {
 	if b == nil {
 		return ""
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return b.storage
 }
 
@@ -326,41 +338,51 @@ func (b *Bag) Drops() uint64 {
 	if b == nil {
 		return 0
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return b.drops
-}
-
-// recordDrop adds one drop to the bag counter.
-func (b *Bag) recordDrop() {
-	if b == nil {
-		return
-	}
-	b.drops++
 }
 
 // AddTopic records one topic record.
 //
 // A zero ID is assigned as one plus the current maximum so callers that
-// add topics in sorted name order get deterministic IDs. A nonzero ID must
-// be unique across topics. Names must be unique. The QoS vector is copied.
+// add topics in sorted name order get deterministic IDs. Auto-assigned IDs
+// start at 1 and never hand out 0; overflow at MaxUint32 fails loudly.
+// A nonzero ID must be unique across topics, including wire ID 0 which is
+// a valid stored ID when inserted via the parse path. Names must be unique.
+// The QoS vector is copied. Topic count above maxTopics fails loudly.
 func (b *Bag) AddTopic(t Topic) error {
 	if b == nil {
 		return errors.New("bags: nil bag") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	err := t.Validate()
 	if err != nil {
-		b.recordDrop()
+		b.mu.Lock()
+		b.drops++
+		b.mu.Unlock()
 		return fmt.Errorf("bags: add topic %q: %w", t.Name, err)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.topics) >= maxTopics {
+		b.drops++
+		return fmt.Errorf("bags: topic count %d above cap %d", len(b.topics)+1, maxTopics)
+	}
 	if _, ok := b.topics[t.Name]; ok {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: duplicate topic %q", t.Name)
 	}
 	id := t.ID
 	if id == 0 {
-		id = b.nextTopicID()
+		next, err := b.nextTopicIDLocked()
+		if err != nil {
+			b.drops++
+			return err
+		}
+		id = next
 	}
 	if _, ok := b.ids[id]; ok {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: duplicate topic id %d", id)
 	}
 	cp := Topic{
@@ -381,15 +403,63 @@ func (b *Bag) AddTopic(t Topic) error {
 	return nil
 }
 
-// nextTopicID returns one plus the current maximum id, or 1 when empty.
-func (b *Bag) nextTopicID() uint32 {
+// nextTopicIDLocked returns one plus the current maximum id, or 1 when empty.
+// The caller must hold the write lock. It guards MaxUint32 so auto-assign
+// never wraps to 0.
+func (b *Bag) nextTopicIDLocked() (uint32, error) {
 	var top uint32
 	for id := range b.ids {
 		if id > top {
 			top = id
 		}
 	}
-	return top + 1
+	if top == math.MaxUint32 {
+		return 0, fmt.Errorf("bags: topic id space exhausted at %d", top)
+	}
+	return top + 1, nil
+}
+
+// insertParsedTopic stores one wire topic preserving ID 0.
+// Unlike AddTopic it never auto-assigns: wire ID 0 is a valid ID.
+// The caller must hold no lock; this locks internally.
+func (b *Bag) insertParsedTopic(t Topic) error {
+	err := t.Validate()
+	if err != nil {
+		b.mu.Lock()
+		b.drops++
+		b.mu.Unlock()
+		return fmt.Errorf("bags: add topic %q: %w", t.Name, err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.topics) >= maxTopics {
+		b.drops++
+		return fmt.Errorf("bags: topic count %d above cap %d", len(b.topics)+1, maxTopics)
+	}
+	if _, ok := b.topics[t.Name]; ok {
+		b.drops++
+		return fmt.Errorf("bags: duplicate topic %q", t.Name)
+	}
+	if _, ok := b.ids[t.ID]; ok {
+		b.drops++
+		return fmt.Errorf("bags: duplicate topic id %d", t.ID)
+	}
+	cp := Topic{
+		ID:       t.ID,
+		Name:     t.Name,
+		Type:     t.Type,
+		Format:   t.Format,
+		TypeHash: t.TypeHash,
+	}
+	if t.OfferedQoS != nil {
+		cp.OfferedQoS = make([]string, len(t.OfferedQoS))
+		copy(cp.OfferedQoS, t.OfferedQoS)
+	} else {
+		cp.OfferedQoS = []string{}
+	}
+	b.topics[t.Name] = cp
+	b.ids[t.ID] = t.Name
+	return nil
 }
 
 // Append records one message after envelope plus schema checks.
@@ -399,28 +469,37 @@ func (b *Bag) nextTopicID() uint32 {
 // non nil and the topic type is known to the registry, the type hash is
 // verified when present and the payload fields are decoded against the
 // registry schema with trailing garbage rejected. Unknown types stay first
-// class: they pass with envelope checks only.
+// class: they pass with envelope checks only. Message count above
+// maxMessages fails loudly with a drop.
 func (b *Bag) Append(m Message, reg *types.Registry) error {
 	if b == nil {
 		return errors.New("bags: nil bag") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	err := m.Validate()
 	if err != nil {
-		b.recordDrop()
+		b.mu.Lock()
+		b.drops++
+		b.mu.Unlock()
 		return fmt.Errorf("bags: append: %w", err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.messages) >= maxMessages {
+		b.drops++
+		return fmt.Errorf("bags: message count %d above cap %d", len(b.messages)+1, maxMessages)
 	}
 	topic, ok := b.topics[m.Topic]
 	if !ok {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: append: unknown topic %q", m.Topic)
 	}
 	if m.Format != topic.Format {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: append on %q format %q mismatches topic format %q", m.Topic, m.Format, topic.Format)
 	}
 	err = checkSchema(m, topic, reg)
 	if err != nil {
-		b.recordDrop()
+		b.drops++
 		return err
 	}
 	cp := Message{
@@ -472,6 +551,14 @@ func (b *Bag) Topics() []Topic {
 	if b == nil {
 		return nil
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.topicsLocked()
+}
+
+// topicsLocked returns sorted topic records.
+// The caller must hold the read lock or write lock.
+func (b *Bag) topicsLocked() []Topic {
 	out := make([]Topic, 0, len(b.topics))
 	for _, topic := range b.topics {
 		if topic.OfferedQoS != nil {
@@ -496,6 +583,24 @@ func (b *Bag) OrderedMessages() []Message {
 	if b == nil {
 		return nil
 	}
+	b.mu.RLock()
+	out := make([]Message, len(b.messages))
+	for i := range b.messages {
+		out[i] = b.messages[i]
+		if len(b.messages[i].Data) > 0 {
+			cp := make([]byte, len(b.messages[i].Data))
+			copy(cp, b.messages[i].Data)
+			out[i].Data = cp
+		}
+	}
+	b.mu.RUnlock()
+	sortMessages(out)
+	return out
+}
+
+// orderedMessagesLocked returns replay-ordered message copies.
+// The caller must hold the read lock or write lock.
+func (b *Bag) orderedMessagesLocked() []Message {
 	out := make([]Message, len(b.messages))
 	for i := range b.messages {
 		out[i] = b.messages[i]
@@ -530,7 +635,9 @@ func (b *Bag) Info() Info {
 	if b == nil {
 		return Info{}
 	}
-	topics := b.Topics()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	topics := b.topicsLocked()
 	counts := make(map[string]int, len(topics))
 	for i := range b.messages {
 		counts[b.messages[i].Topic]++
@@ -588,26 +695,29 @@ func (b *Bag) Verify(reg *types.Registry) error {
 	if b == nil {
 		return errors.New("bags: nil bag") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	err := b.verifyTopics(reg)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	err := b.verifyTopicsLocked(reg)
 	if err != nil {
 		return err
 	}
-	err = b.verifyMessages(reg)
+	err = b.verifyMessagesLocked(reg)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-// verifyTopics checks topic records plus known hashes.
-func (b *Bag) verifyTopics(reg *types.Registry) error {
-	for _, topic := range b.Topics() {
+// verifyTopicsLocked checks topic records plus known hashes.
+// The caller must hold the write lock.
+func (b *Bag) verifyTopicsLocked(reg *types.Registry) error {
+	for _, topic := range b.topicsLocked() {
 		err := topic.Validate()
 		if err != nil {
-			b.recordDrop()
+			b.drops++
 			return fmt.Errorf("bags: verify topic %q: %w", topic.Name, err)
 		}
-		err = b.verifyTopicHash(topic, reg)
+		err = b.verifyTopicHashLocked(topic, reg)
 		if err != nil {
 			return err
 		}
@@ -615,8 +725,9 @@ func (b *Bag) verifyTopics(reg *types.Registry) error {
 	return nil
 }
 
-// verifyTopicHash checks one topic hash when the registry knows the type.
-func (b *Bag) verifyTopicHash(topic Topic, reg *types.Registry) error {
+// verifyTopicHashLocked checks one topic hash when the registry knows the type.
+// The caller must hold the write lock.
+func (b *Bag) verifyTopicHashLocked(topic Topic, reg *types.Registry) error {
 	if reg == nil {
 		return nil
 	}
@@ -629,32 +740,33 @@ func (b *Bag) verifyTopicHash(topic Topic, reg *types.Registry) error {
 	}
 	h, err := types.ParseTypeHash(topic.TypeHash)
 	if err != nil {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: verify topic %q: %w", topic.Name, err)
 	}
 	_, err = reg.LookupWithHash(topic.Type, h)
 	if err != nil {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: verify topic %q: %w", topic.Name, err)
 	}
 	return nil
 }
 
-// verifyMessages checks message envelopes plus known payloads.
-func (b *Bag) verifyMessages(reg *types.Registry) error {
+// verifyMessagesLocked checks message envelopes plus known payloads.
+// The caller must hold the write lock.
+func (b *Bag) verifyMessagesLocked(reg *types.Registry) error {
 	for i := range b.messages {
 		msg := b.messages[i]
 		err := msg.Validate()
 		if err != nil {
-			b.recordDrop()
+			b.drops++
 			return fmt.Errorf("bags: verify message %d: %w", i, err)
 		}
 		topic, ok := b.topics[msg.Topic]
 		if !ok {
-			b.recordDrop()
+			b.drops++
 			return fmt.Errorf("bags: verify message %d: unknown topic %q", i, msg.Topic)
 		}
-		err = b.verifyMessagePayload(msg, topic, reg)
+		err = b.verifyMessagePayloadLocked(msg, topic, reg)
 		if err != nil {
 			return err
 		}
@@ -662,8 +774,9 @@ func (b *Bag) verifyMessages(reg *types.Registry) error {
 	return nil
 }
 
-// verifyMessagePayload decodes one payload when the registry knows the type.
-func (b *Bag) verifyMessagePayload(msg Message, topic Topic, reg *types.Registry) error {
+// verifyMessagePayloadLocked decodes one payload when the registry knows the type.
+// The caller must hold the write lock.
+func (b *Bag) verifyMessagePayloadLocked(msg Message, topic Topic, reg *types.Registry) error {
 	if reg == nil {
 		return nil
 	}
@@ -676,7 +789,7 @@ func (b *Bag) verifyMessagePayload(msg Message, topic Topic, reg *types.Registry
 	}
 	err := validatePayload(msg.Data, topic.Type, reg)
 	if err != nil {
-		b.recordDrop()
+		b.drops++
 		return fmt.Errorf("bags: verify message on %q: %w", msg.Topic, err)
 	}
 	return nil
@@ -1083,23 +1196,32 @@ func decodeWStringScalar(dec *types.Decoder, field types.Field) error {
 //
 // Topics sort by name and messages sort by receive timestamp then topic
 // then sequence. Raw XCDR1 bytes are copied verbatim so a parse plus
-// marshal round trip is byte identical.
+// marshal round trip is byte identical. Topic and message counts are
+// bounds-checked against parse caps before casting to u32.
 func (b *Bag) Marshal() ([]byte, error) {
 	if b == nil {
 		return nil, errors.New("bags: nil bag") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	if b.storage != StorageSQLite3 && b.storage != StorageMCAP {
 		return nil, fmt.Errorf("bags: unknown storage id %q", b.storage)
 	}
-	topics := b.Topics()
+	topics := b.topicsLocked()
 	err := validateMarshalTopics(topics)
 	if err != nil {
 		return nil, err
 	}
-	msgs := b.OrderedMessages()
-	err = b.validateMarshalMessages(msgs)
+	msgs := b.orderedMessagesLocked()
+	err = b.validateMarshalMessagesLocked(msgs)
 	if err != nil {
 		return nil, err
+	}
+	if len(topics) > maxTopics {
+		return nil, fmt.Errorf("bags: marshal topic count %d above cap %d", len(topics), maxTopics)
+	}
+	if len(msgs) > maxMessages {
+		return nil, fmt.Errorf("bags: marshal message count %d above cap %d", len(msgs), maxMessages)
 	}
 	out := make([]byte, 0, 64)
 	out = append(out, magic0, magic1, magic2, magic3)
@@ -1108,11 +1230,11 @@ func (b *Bag) Marshal() ([]byte, error) {
 	binary.LittleEndian.PutUint16(tmp[2:4], 0)
 	out = append(out, tmp[0:4]...)
 	out = appendString(out, b.storage)
-	out = appendU32(out, uint32(len(topics))) //nolint:gosec // G115: length checked against maxTopics below
+	out = appendU32(out, uint32(len(topics))) //nolint:gosec // G115: length checked against maxTopics just above
 	for i := range topics {
 		out = appendTopic(out, topics[i])
 	}
-	out = appendU32(out, uint32(len(msgs))) //nolint:gosec // G115: length checked against maxMessages below
+	out = appendU32(out, uint32(len(msgs))) //nolint:gosec // G115: length checked against maxMessages just above
 	for i := range msgs {
 		out = appendMessage(out, msgs[i])
 	}
@@ -1130,8 +1252,9 @@ func validateMarshalTopics(topics []Topic) error {
 	return nil
 }
 
-// validateMarshalMessages checks messages for marshal.
-func (b *Bag) validateMarshalMessages(msgs []Message) error {
+// validateMarshalMessagesLocked checks messages for marshal.
+// The caller must hold the read lock or write lock.
+func (b *Bag) validateMarshalMessagesLocked(msgs []Message) error {
 	for i := range msgs {
 		err := msgs[i].Validate()
 		if err != nil {
@@ -1313,6 +1436,7 @@ func parseTopics(data []byte, off *int, bag *Bag, m *Metrics) error {
 }
 
 // parseOneTopic reads plus validates plus stores one topic record.
+// Wire ID 0 is preserved as a valid ID via insertParsedTopic.
 func parseOneTopic(data []byte, off *int, bag *Bag, m *Metrics) error {
 	id, err := readU32(data, off, m)
 	if err != nil {
@@ -1346,7 +1470,7 @@ func parseOneTopic(data []byte, off *int, bag *Bag, m *Metrics) error {
 		OfferedQoS: qos,
 		TypeHash:   hash,
 	}
-	err = bag.AddTopic(topic)
+	err = bag.insertParsedTopic(topic)
 	if err != nil {
 		m.RecordDrop()
 		return err

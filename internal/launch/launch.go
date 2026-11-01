@@ -33,9 +33,6 @@ import (
 	"github.com/podomy/weld/internal/core"
 )
 
-// WildcardNode is the ROS wildcard node pattern matching every node.
-const WildcardNode = "/**"
-
 // SimTimeParam is the parameter forced true when simulation time is used.
 const SimTimeParam = "use_sim_time"
 

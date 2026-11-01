@@ -700,20 +700,34 @@ func tfPathIsStaticOnly(statics map[tfKey]TransformStamped, path []tfEdge) bool 
 	return true
 }
 
-// tfPathLatest returns the newest stamp along a path for zero time stamps.
+// tfPathLatest returns the minimum newest stamp along a path for zero time
+// stamps. The minimum edge latest bounds the path because every edge must
+// have data; this aligns with tfExtrapolationBounds which takes the minimum
+// latest across dynamic edges for multi-edge paths. Static edges ignore time
+// and are skipped when any dynamic edge exists; a static-only path returns
+// the minimum static stamp.
 func tfPathLatest(dynamics map[tfKey][]TransformStamped, statics map[tfKey]TransformStamped, path []tfEdge) int64 {
 	var latest int64
+	found := false
+	consider := func(stamp int64) {
+		if !found || stamp < latest {
+			latest, found = stamp, true
+		}
+	}
 	for _, edge := range path {
-		if stored, ok := statics[edge.key]; ok {
-			if stored.StampNanos > latest {
-				latest = stored.StampNanos
-			}
+		if _, ok := statics[edge.key]; ok {
 			continue
 		}
 		if best, ok := tfNewestSample(dynamics[edge.key]); ok {
-			if best.StampNanos > latest {
-				latest = best.StampNanos
-			}
+			consider(best.StampNanos)
+		}
+	}
+	if found {
+		return latest
+	}
+	for _, edge := range path {
+		if stored, ok := statics[edge.key]; ok {
+			consider(stored.StampNanos)
 		}
 	}
 	return latest
@@ -781,7 +795,8 @@ func tfExtrapolationBounds(dynamics map[tfKey][]TransformStamped, statics map[tf
 	return target, source, earliest, latest, false, false
 }
 
-// Inverse returns the reverse rigid transform.
+// Inverse returns the reverse rigid transform. Staged API for reverse
+// traversal; retained because tfComposePath uses it for backward edges.
 func (t Transform) Inverse() Transform {
 	inv := conjugateQuaternion(normalizeQuaternion(t.Rotation))
 	neg := Vector3{X: -t.Translation.X, Y: -t.Translation.Y, Z: -t.Translation.Z}

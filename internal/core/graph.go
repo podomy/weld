@@ -179,7 +179,10 @@ func NewGraph() *Graph {
 //
 // A nil hook clears the previous hook. The hook runs outside the index
 // lock so it must not call back into the index while holding assumptions
-// about atomicity. SetOnChange itself locks the mutex.
+// about atomicity. Consumers must tolerate non-monotonic generation order:
+// hooks fire outside the lock so concurrent mutations may reorder, and
+// ReplayRetained replays the current generation without incrementing, so the
+// same generation can fire twice. SetOnChange itself locks the mutex.
 func (g *Graph) SetOnChange(fn func(uint64)) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -198,8 +201,12 @@ func (g *Graph) Generation() uint64 {
 }
 
 // addGraphRecord validates info, inserts it under lock when absent, bumps
-// the generation, and fires the hook outside the lock.
+// the generation, and fires the hook outside the lock. A zero GID fails
+// loudly because the zero value means unset.
 func addGraphRecord[V any](g *Graph, m map[GID]V, gid GID, info V, validate func(V) error, op string) error {
+	if gid.IsZero() {
+		return fmt.Errorf("core: %s with zero gid", op)
+	}
 	err := validate(info)
 	if err != nil {
 		return fmt.Errorf("core: %s %s: %w", op, gid.String(), err)
@@ -226,8 +233,12 @@ func (g *Graph) AddWriter(gid GID, info EntityInfo) error {
 }
 
 // upsertGraphRecord validates info, replaces it under lock unless identical,
-// bumps the generation, and fires the hook outside the lock.
+// bumps the generation, and fires the hook outside the lock. A zero GID fails
+// loudly because the zero value means unset.
 func upsertGraphRecord[V any](g *Graph, m map[GID]V, gid GID, info V, validate func(V) error, equal func(V, V) bool, op string) error {
+	if gid.IsZero() {
+		return fmt.Errorf("core: %s with zero gid", op)
+	}
 	err := validate(info)
 	if err != nil {
 		return fmt.Errorf("core: %s %s: %w", op, gid.String(), err)
@@ -423,8 +434,11 @@ func (g *Graph) AddParticipant(gid GID, info ParticipantInfo) error {
 // fire. A stale node sequence below the stored sequence is ignored with
 // no increment, so a late duplicate never overwrites newer state.
 // Changed or new content increments the generation and fires the
-// hook outside the lock.
+// hook outside the lock. A zero GID fails loudly.
 func (g *Graph) UpsertParticipant(gid GID, info ParticipantInfo) error {
+	if gid.IsZero() {
+		return errors.New("core: upsert participant with zero gid") //nolint:wrapcheck // new error, nothing to wrap
+	}
 	err := validateParticipantInfo(info)
 	if err != nil {
 		return fmt.Errorf("core: upsert participant %s: %w", gid.String(), err)
@@ -714,8 +728,13 @@ func validateParticipantInfo(info ParticipantInfo) error {
 	return nil
 }
 
-// validateROSTopicName rejects names that are not demangled ROS form.
+// validateROSTopicName rejects names that are not demangled ROS form. Names
+// with surrounding whitespace are non-canonical and fail loudly instead of
+// being trimmed and stored.
 func validateROSTopicName(name string) error {
+	if name != strings.TrimSpace(name) {
+		return fmt.Errorf("core: topic name %q must be canonical with no surrounding whitespace", name)
+	}
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return errors.New("core: topic name is empty") //nolint:wrapcheck // new error, nothing to wrap
@@ -931,7 +950,8 @@ func (g *Graph) SweepExpired(nowNanos int64) int {
 	return len(expired)
 }
 
-// ParticipantExpiry returns the lease expiry for one participant.
+// ParticipantExpiry returns the lease expiry for one participant. Staged API
+// for liveliness observability; retained despite no in-repo callers.
 //
 // It reports false when the participant has no liveliness record, which
 // includes locally added participants without an alive report. Every
@@ -946,7 +966,8 @@ func (g *Graph) ParticipantExpiry(gid GID) (int64, bool) {
 	return live.expiryNanos, true
 }
 
-// ParticipantSequence returns the last accepted discovery sequence.
+// ParticipantSequence returns the last accepted discovery sequence. Staged API
+// for liveliness observability; retained despite no in-repo callers.
 //
 // It reports false when no liveliness record exists. Local adds without
 // an alive report have no discovery sequence.

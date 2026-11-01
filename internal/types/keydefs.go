@@ -5,12 +5,12 @@ package types
 
 // Synthetic keyed descriptors for keyed topic testing.
 //
-// Standard ROS message types are normally unkeyed: no corpus type carries
-// IsKey annotations, and the keyed wire path must produce normally empty
-// key extraction for them. The descriptors below are synthetic test-only
-// shapes that exercise the keyed path in unit and live gates. They are
-// not ROS standard types, they never enter the global registry, and each
-// constructor returns fresh pointers so tests never share mutable tables.
+// These are test helpers compiled into the non-test package so the
+// cross-package keyed_test in internal/transports/dds can use them: Go
+// test files cannot be imported across packages, so the helpers live here
+// instead of a _test file by design. They are not ROS standard types, they
+// never enter the global registry, and each constructor returns fresh
+// pointers so tests never share mutable tables.
 //
 // Shapes:
 //   - Keyed flat: weld_test/msg/Keyed with uint32 seq plus string label

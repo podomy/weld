@@ -288,11 +288,14 @@ func (b StringBound) Merge(field DescriptionField) StringBound {
 }
 
 // CheckStringLength enforces all bound sources at serialize time.
+// Bounds count runes like the CDR wire bounds, not bytes, so multi-byte
+// UTF-8 never over-rejects.
 func CheckStringLength(s string, bound StringBound) error {
 	upper, ok := bound.EffectiveUpperBound()
 	if ok {
-		if uint(len(s)) > upper {
-			return fmt.Errorf("types: string len %d above bound %d", len(s), upper)
+		n := countRunes(s)
+		if uint(n) > upper {
+			return fmt.Errorf("types: string len %d above bound %d", n, upper)
 		}
 	}
 	return nil
@@ -377,6 +380,7 @@ type DescriptionField struct {
 }
 
 // CheckAgainstDescription enforces description capacities at serialize time.
+// StrLen counts runes like the CDR wire bounds, not bytes.
 func CheckAgainstDescription(field DescriptionField, strLen, seqLen uint, isString bool) error {
 	if isString {
 		if field.StringCapacity != 0 && strLen > field.StringCapacity {

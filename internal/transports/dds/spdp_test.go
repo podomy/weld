@@ -2358,3 +2358,91 @@ func TestSPDPInfoDstUnicastMismatch(t *testing.T) {
 		t.Fatalf("len = %d, want 1 after unenforced multicast install", table.Len())
 	}
 }
+
+// TestSPDPInfoDstUnicastBodyShapes pins zero-length skip and short reject.
+//
+// A zero-length INFO_DST is a legal RTPS no-op and processes normally; a
+// short non-empty body is malformed and drops loudly; an all-zero 12 byte
+// prefix is unknown and processes normally.
+func TestSPDPInfoDstUnicastBodyShapes(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0x1D)
+	var local GUIDPrefix
+	for i := range local {
+		local[i] = 0x2C + byte(i)
+	}
+
+	alive := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+
+	header, subs, err := rtps.DecodeMessage(alive, nil)
+	if err != nil {
+		t.Fatalf("decode alive: %v", err)
+	}
+
+	withBody := func(body []byte) []byte {
+		t.Helper()
+		dst := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: rtps.FlagLittleEndian, Body: body}
+		msg, err := rtps.EncodeMessage(header, append([]rtps.RawSubmessage{dst}, subs...))
+		if err != nil {
+			t.Fatalf("encode INFO_DST: %v", err)
+		}
+		return msg
+	}
+
+	if err := checkSPDPInfoDstUnicast(withBody(nil), local); err != nil {
+		t.Fatalf("zero-length INFO_DST = %v, want nil", err)
+	}
+
+	if err := checkSPDPInfoDstUnicast(withBody(make([]byte, 12)), local); err != nil {
+		t.Fatalf("zero-prefix INFO_DST = %v, want nil", err)
+	}
+
+	err = checkSPDPInfoDstUnicast(withBody([]byte{0x01, 0x02, 0x03, 0x04, 0x05}), local)
+	if !errors.Is(err, ErrInvalidSPDP) {
+		t.Fatalf("short INFO_DST = %v, want ErrInvalidSPDP", err)
+	}
+}
+
+// TestSPDPDisposeTombstoneUniformWindow pins the predictable distrust window.
+//
+// Dispose, explicit remove, and sweep all retain now plus maxSPDPLease so a
+// short remaining lease never shrinks the window. A newer dispose refreshes
+// the deadline instead of keeping the old short one.
+func TestSPDPDisposeTombstoneUniformWindow(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	base := time.Now()
+	guid := testGUID(0xA0)
+
+	first := mustMarshalAlive(t, guid, 0, 5, 10*time.Second)
+	if err := table.HandlePacket(first, base); err != nil {
+		t.Fatalf("handle alive: %v", err)
+	}
+
+	bye := mustMarshalDispose(t, guid, 0, 6)
+	before := time.Now()
+	if err := table.HandlePacket(bye, base.Add(time.Second)); err != nil {
+		t.Fatalf("handle dispose: %v", err)
+	}
+
+	seq, ok := table.TombstoneSeq(guid.Prefix)
+	if !ok || seq != 6 {
+		t.Fatalf("tombstone seq = %d ok=%v, want 6 true", seq, ok)
+	}
+
+	if got := table.Sweep(base.Add(time.Second)); got != 0 {
+		t.Fatalf("sweep reaped live tombstone, want 0")
+	}
+
+	newer := mustMarshalDispose(t, guid, 0, 7)
+	if err := table.HandlePacket(newer, base.Add(2*time.Second)); err != nil {
+		t.Fatalf("handle newer dispose: %v", err)
+	}
+
+	floor := before.Add(maxSPDPLease)
+	if got := table.Sweep(floor.Add(-time.Second)); got != 0 {
+		t.Fatalf("sweep reaped refreshed tombstone early, want 0")
+	}
+}

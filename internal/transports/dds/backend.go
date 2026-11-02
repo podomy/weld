@@ -1483,8 +1483,10 @@ func (b *Backend) ensureRouteMapsForStore() bool {
 
 // isAnnouncementStale reports whether one announcement loses the table gate.
 //
-// It reads the RemoteTable LastSeq without holding the backend lock across
-// the table lock beyond a snapshot.
+// It reads the RemoteTable LastSeq plus the tombstone high-water without
+// holding the backend lock across the table lock beyond a snapshot. A
+// stale alive at or below either never reinstalls routes the table would
+// reject.
 func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 	b.mu.RLock()
 	remotes := b.remotes
@@ -1493,7 +1495,13 @@ func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 		return false
 	}
 	info, ok := remotes.Get(ann.GUID.Prefix)
-	return ok && ann.Sequence <= info.LastSeq
+	if ok && ann.Sequence <= info.LastSeq {
+		return true
+	}
+	if tombSeq, tombed := remotes.TombstoneSeq(ann.GUID.Prefix); tombed && ann.Sequence <= tombSeq {
+		return true
+	}
+	return false
 }
 
 // installAnnouncementRoutes writes one gated announcement to the tables.
@@ -3073,11 +3081,12 @@ func (b *Backend) handleDemuxDatagram(
 // shouldDropUnicastForInfoDst reports whether one unicast datagram names
 // another participant in INFO_DST.
 //
-// It decodes the header and submessages without failing the caller on
-// parse errors: undecodable datagrams return false and flow to dispatch,
-// which counts the decode failure. A 12 byte INFO_DST naming a prefix
-// other than the local prefix reports true. Multicast callers never call
-// this helper.
+// It shares the walk with the SPDP and SEDP unicast helpers through
+// rtps.ClassifyUnicastInfoDst: undecodable datagrams return false and
+// flow to dispatch, which counts the decode failure; absent, zero-length,
+// or all-zero INFO_DST processes normally; a non-zero foreign prefix or
+// a short non-empty body reports true. Multicast callers never call this
+// helper.
 func (b *Backend) shouldDropUnicastForInfoDst(data []byte) bool {
 	b.mu.RLock()
 	local := b.local
@@ -3091,27 +3100,10 @@ func (b *Backend) shouldDropUnicastForInfoDst(data []byte) bool {
 	lg := local.GUID()
 	copy(want[:], lg.Prefix[:])
 
-	header, subs, err := rtps.DecodeMessage(data, nil)
-	if err != nil {
-		return false
-	}
-	_ = header
+	var arr [12]byte
+	copy(arr[:], want[:])
 
-	for _, sub := range subs {
-		if sub.ID != rtps.SubmessageInfoDst {
-			continue
-		}
-		if len(sub.Body) < 12 {
-			continue
-		}
-		var dst GUIDPrefix
-		copy(dst[:], sub.Body[:12])
-		if dst != want {
-			return true
-		}
-	}
-
-	return false
+	return rtps.ClassifyUnicastInfoDst(data, arr) != rtps.InfoDstAbsent
 }
 
 // snapshotDemux returns unicast plus queues under lock.

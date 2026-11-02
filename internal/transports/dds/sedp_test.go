@@ -3447,6 +3447,31 @@ func TestSEDPInfoDstUnicast(t *testing.T) {
 	if !errors.Is(err, ErrSEDPInfoDst) {
 		t.Fatalf("mismatch = %v, want ErrSEDPInfoDst", err)
 	}
+
+	withBody := func(body []byte) []byte {
+		t.Helper()
+		out := make([]byte, 0, sedpRTPSHeaderLen+sedpSubmessageHeaderLen+len(body))
+		out = append(out, sedpRTPSMagic...)
+		out = append(out, sedpRTPSMajor, sedpRTPSMinor, sedpVendorID0, sedpVendorID1)
+		out = append(out, local[:]...)
+		out = append(out, sedpSubmessageInfoDst, sedpFlagLittleEndian)
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(body))) //nolint:gosec // G115: test bodies are tiny
+		out = append(out, body...)
+		return out
+	}
+
+	if err := sedpCheckInfoDstUnicast(withBody(nil), local); err != nil {
+		t.Fatalf("zero-length INFO_DST = %v, want nil", err)
+	}
+
+	if err := sedpCheckInfoDstUnicast(withBody(make([]byte, 12)), local); err != nil {
+		t.Fatalf("zero-prefix INFO_DST = %v, want nil", err)
+	}
+
+	err = sedpCheckInfoDstUnicast(withBody([]byte{0x01, 0x02, 0x03, 0x04, 0x05}), local)
+	if !errors.Is(err, ErrSEDPInfoDst) {
+		t.Fatalf("short INFO_DST = %v, want ErrSEDPInfoDst", err)
+	}
 }
 
 // TestSEDPSubmessageCountCap pins the per-datagram walk bound.

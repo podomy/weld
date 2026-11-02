@@ -1296,52 +1296,32 @@ func sedpHeaderPrefix(data []byte) (SEDPGUIDPrefix, error) {
 
 // sedpCheckInfoDstUnicast enforces INFO_DST on unicast ingress.
 //
-// It walks at most sedpMaxSubmessages submessages and drops loudly with
-// ErrSEDPInfoDst when an INFO_DST names a 12 byte prefix other than local.
-// A short INFO_DST body below 12 bytes is malformed and drops loudly
-// instead of skipping. An all-zero destination means unknown and is
-// treated as absent, not a mismatch: only a non-zero prefix different
-// from local drops. Undecodable datagrams return nil so the caller flows
+// It shares the walk with the SPDP helper and the backend demux through
+// rtps.ClassifyUnicastInfoDst so all three agree: absent or unknown
+// processes normally, mismatch or malformed bodies drop loudly with
+// ErrSEDPInfoDst. Undecodable datagrams return nil so the caller flows
 // to the normal decode path, which counts the failure. Multicast ingress
 // must never call this helper: group sockets carry every sender, so
 // per-sender identity has no meaning there and enforcement would drop
 // valid peers.
 func sedpCheckInfoDstUnicast(data []byte, local SEDPGUIDPrefix) error {
-	verr := sedpValidateRTPSHeader(data)
-	if verr != nil {
-		return nil //nolint:nilerr // header failures flow to the normal decode path which counts them
-	}
-	off := sedpRTPSHeaderLen
-	seen := 0
-	for off < len(data) {
-		seen++
-		if seen > sedpMaxSubmessages {
-			return fmt.Errorf("dds: sedp INFO_DST submessages above %d: %w", sedpMaxSubmessages, ErrSEDPInvalidDATA)
-		}
-		id, body, _, next, serr := sedpSplitSubmessage(data, off)
-		if serr != nil {
-			return nil //nolint:nilerr // split failures flow to the normal decode path which counts them
-		}
-		off = next
-		if id != sedpSubmessageInfoDst {
-			continue
-		}
-		if len(body) < sedpPrefixLen {
-			log.Printf("dds: sedp unicast INFO_DST short %d, dropping", len(body))
+	var want [12]byte
+	copy(want[:], local[:])
 
-			return fmt.Errorf("dds: sedp INFO_DST short body %d: %w", len(body), ErrSEDPInfoDst)
-		}
-		var dst SEDPGUIDPrefix
-		copy(dst[:], body[:sedpPrefixLen])
-		if dst == (SEDPGUIDPrefix{}) {
-			continue
-		}
-		if dst != local {
-			log.Printf("dds: sedp unicast INFO_DST mismatch, dropping")
-			return fmt.Errorf("dds: sedp INFO_DST mismatch: %w", ErrSEDPInfoDst)
-		}
+	switch rtps.ClassifyUnicastInfoDst(data, want) {
+	case rtps.InfoDstAbsent:
+		return nil
+	case rtps.InfoDstMismatch:
+		log.Printf("dds: sedp unicast INFO_DST mismatch, dropping")
+
+		return fmt.Errorf("dds: sedp INFO_DST mismatch: %w", ErrSEDPInfoDst)
+	case rtps.InfoDstMalformed:
+		log.Printf("dds: sedp unicast INFO_DST malformed, dropping")
+
+		return fmt.Errorf("dds: sedp INFO_DST malformed body: %w", ErrSEDPInfoDst)
+	default:
+		return nil
 	}
-	return nil
 }
 
 // sedpHeartbeatNote records one builtin writer heartbeat bound.

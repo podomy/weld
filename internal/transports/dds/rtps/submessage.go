@@ -998,3 +998,60 @@ func DecodeSubmessage(raw RawSubmessage, drops *Counter) (Submessage, error) {
 		return Submessage{ID: raw.ID, Flags: raw.Flags, Raw: raw.Body}, nil
 	}
 }
+
+// InfoDstVerdict classifies unicast INFO_DST addressing for one datagram.
+//
+// Absent means process normally: no INFO_DST, a zero-length INFO_DST
+// (legal RTPS no-op), or an all-zero destination (unknown). Mismatch
+// means a non-zero prefix names another participant: drop. Malformed
+// means a short non-empty body that can be neither: drop loudly.
+// Undecodable datagrams report Absent so the caller flows to the normal
+// decode path, which counts the failure. Multicast ingress must never
+// use this: group sockets carry every sender, so per-sender identity has
+// no meaning there.
+type InfoDstVerdict int
+
+const (
+	// InfoDstAbsent processes the datagram normally.
+	InfoDstAbsent InfoDstVerdict = iota
+	// InfoDstMismatch drops a datagram addressed to another participant.
+	InfoDstMismatch
+	// InfoDstMalformed drops a datagram with an undecodable INFO_DST body.
+	InfoDstMalformed
+)
+
+// ClassifyUnicastInfoDst walks one datagram for INFO_DST submessages.
+//
+// Non-INFO_DST submessages are skipped. Every INFO_DST is judged: later
+// entries do not override an earlier drop verdict.
+func ClassifyUnicastInfoDst(data []byte, local [12]byte) InfoDstVerdict {
+	_, raws, err := DecodeMessage(data, nil)
+	if err != nil {
+		return InfoDstAbsent
+	}
+
+	verdict := InfoDstAbsent
+
+	for _, raw := range raws {
+		if raw.ID != SubmessageInfoDst {
+			continue
+		}
+		if len(raw.Body) == 0 {
+			continue
+		}
+		if len(raw.Body) < 12 {
+			return InfoDstMalformed
+		}
+		var dst [12]byte
+		copy(dst[:], raw.Body[:12])
+		var zero [12]byte
+		if dst == zero {
+			continue
+		}
+		if dst != local {
+			return InfoDstMismatch
+		}
+	}
+
+	return verdict
+}

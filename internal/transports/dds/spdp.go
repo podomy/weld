@@ -1367,7 +1367,9 @@ type RemoteTable struct {
 type spdpTombstone struct {
 	// seq is the high-water sequence for the removed prefix.
 	seq uint64
-	// expiresAt is when Sweep may drop the tombstone.
+	// expiresAt is creation plus maxSPDPLease for every path so the
+	// distrust window stays predictable; Sweep deletes the tombstone
+	// once now reaches it.
 	expiresAt time.Time
 }
 
@@ -1445,6 +1447,23 @@ func notifyChange(changed bool, gen uint64, hook func(uint64)) {
 	hook(gen)
 }
 
+// TombstoneSeq returns the removal high-water for one prefix.
+//
+// The second result reports whether a tombstone exists. The backend route
+// gate uses it so a stale alive at or below the tombstone never reinstalls
+// routes the table would reject.
+func (t *RemoteTable) TombstoneSeq(prefix GUIDPrefix) (uint64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tomb, ok := t.tombstones[prefix]
+	if !ok {
+		return 0, false
+	}
+
+	return tomb.seq, true
+}
+
 // handleDisposeLocked removes one prefix. Caller holds the lock.
 //
 // A dispose at the stored sequence is a routine multicast duplicate and
@@ -1452,11 +1471,12 @@ func notifyChange(changed bool, gen uint64, hook func(uint64)) {
 // on lossy groups. Only a strictly older sequence fails loudly with
 // ErrStaleSPDP, since rollbacks never occur legitimately. Only a newer
 // sequence deletes the entry and its routes. The delete retains a
-// tombstone with the dispose sequence until the removed lease expiry so
-// a stale alive cannot reinstall; Sweep drops the tombstone after expiry
-// so the map stays bounded. A missing entry consults the tombstone with
-// the same duplicate versus stale discipline and never creates a new
-// tombstone, so spoofed disposes cannot grow the map.
+// tombstone with the dispose sequence until now plus maxSPDPLease so the
+// window stays predictable and a stale alive cannot reinstall; Sweep
+// drops the tombstone after expiry so the map stays bounded. A missing
+// entry consults the tombstone with the same duplicate versus stale
+// discipline and never creates a new tombstone, so spoofed disposes
+// cannot grow the map.
 func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(uint64), error) {
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
@@ -1474,6 +1494,7 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(
 			return false, 0, nil, fmt.Errorf("dds: spdp stale dispose seq=%d last=%d: %w", ann.Sequence, tomb.seq, ErrStaleSPDP)
 		}
 		tomb.seq = ann.Sequence
+		tomb.expiresAt = time.Now().Add(maxSPDPLease)
 		t.tombstones[ann.GUID.Prefix] = tomb
 
 		return false, 0, nil, nil
@@ -1490,12 +1511,8 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(
 		return false, 0, nil, fmt.Errorf("dds: spdp stale dispose seq=%d last=%d: %w", ann.Sequence, existing.LastSeq, ErrStaleSPDP)
 	}
 
-	expiry := existing.LeaseExpiry
-	if expiry.IsZero() {
-		expiry = time.Now().Add(maxSPDPLease)
-	}
 	delete(t.entries, ann.GUID.Prefix)
-	t.tombstones[ann.GUID.Prefix] = spdpTombstone{seq: ann.Sequence, expiresAt: expiry}
+	t.tombstones[ann.GUID.Prefix] = spdpTombstone{seq: ann.Sequence, expiresAt: time.Now().Add(maxSPDPLease)}
 	t.generation++
 
 	return true, t.generation, t.onChange, nil
@@ -1622,46 +1639,34 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 
 // checkSPDPInfoDstUnicast enforces INFO_DST on unicast ingress.
 //
-// It decodes the datagram and drops loudly with ErrInvalidSPDP when an
-// INFO_DST submessage names a 12 byte prefix other than local. A short
-// INFO_DST body below 12 bytes is malformed and drops loudly instead of
-// skipping. An all-zero destination means unknown and is treated as
-// absent, not a mismatch: only a non-zero prefix different from local
-// drops. Parse failures return nil so the caller flows to the normal
-// decode path, which counts the failure. Multicast ingress must never
-// call this helper: group sockets carry every sender, so per-sender
-// identity has no meaning there and enforcement would drop valid peers.
+// It shares the walk with the SEDP helper and the backend demux through
+// rtps.ClassifyUnicastInfoDst so all three agree: absent or unknown
+// processes normally, mismatch or malformed bodies drop loudly with
+// ErrInvalidSPDP. Parse failures return nil so the caller flows to the
+// normal decode path, which counts the failure. Multicast ingress must
+// never call this helper: group sockets carry every sender, so
+// per-sender identity has no meaning there and enforcement would drop
+// valid peers.
 func checkSPDPInfoDstUnicast(data []byte, local GUIDPrefix) error {
-	header, subs, derr := rtps.DecodeMessage(data, nil)
-	if derr != nil {
-		return nil //nolint:nilerr // decode failures flow to the normal parse path which counts them
+	var want [12]byte
+	copy(want[:], local[:])
+
+	switch rtps.ClassifyUnicastInfoDst(data, want) {
+	case rtps.InfoDstAbsent:
+		return nil
+	case rtps.InfoDstMismatch:
+		n := spdpParseDrops.Add(1)
+		log.Printf("dds: spdp unicast INFO_DST mismatch, dropping %d", n)
+
+		return fmt.Errorf("dds: spdp INFO_DST mismatch: %w", ErrInvalidSPDP)
+	case rtps.InfoDstMalformed:
+		n := spdpParseDrops.Add(1)
+		log.Printf("dds: spdp unicast INFO_DST malformed, dropping %d", n)
+
+		return fmt.Errorf("dds: spdp INFO_DST malformed body: %w", ErrInvalidSPDP)
+	default:
+		return nil
 	}
-	_ = header
-
-	for _, sub := range subs {
-		if sub.ID != rtps.SubmessageInfoDst {
-			continue
-		}
-		if len(sub.Body) < 12 {
-			n := spdpParseDrops.Add(1)
-			log.Printf("dds: spdp unicast INFO_DST short %d, dropping %d", len(sub.Body), n)
-
-			return fmt.Errorf("dds: spdp INFO_DST short body %d: %w", len(sub.Body), ErrInvalidSPDP)
-		}
-		var dst GUIDPrefix
-		copy(dst[:], sub.Body[:12])
-		if isZeroPrefix(dst) {
-			continue
-		}
-		if dst != local {
-			n := spdpParseDrops.Add(1)
-			log.Printf("dds: spdp unicast INFO_DST %x mismatches local %x, dropping %d", dst, local, n)
-
-			return fmt.Errorf("dds: spdp INFO_DST mismatch: %w", ErrInvalidSPDP)
-		}
-	}
-
-	return nil
 }
 
 // HandlePacketUnicast enforces INFO_DST for unicast ingress then handles the packet.
@@ -1700,12 +1705,8 @@ func (t *RemoteTable) Remove(prefix GUIDPrefix) bool {
 		return false
 	}
 
-	expiry := existing.LeaseExpiry
-	if expiry.IsZero() {
-		expiry = time.Now().Add(maxSPDPLease)
-	}
 	delete(t.entries, prefix)
-	t.tombstones[prefix] = spdpTombstone{seq: existing.LastSeq, expiresAt: expiry}
+	t.tombstones[prefix] = spdpTombstone{seq: existing.LastSeq, expiresAt: time.Now().Add(maxSPDPLease)}
 	t.generation++
 
 	gen := t.generation

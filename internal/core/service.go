@@ -218,15 +218,26 @@ var (
 // validateServiceTimeout rejects malformed timeouts before they start a call.
 //
 // Negative seconds and nanoseconds at or above one second are malformed and
-// must normalize with NewDuration first. Unspecified and infinite pass
-// through: unspecified means use the default at the call site, infinite
-// means no timeout.
+// must normalize with NewDuration first. The best available sentinel is
+// rejected like matcher Validate rejects it: endpoint resolution must
+// replace the marker before a timeout starts, so a surviving sentinel fails
+// loudly instead of flowing as a near-infinite timeout. Unspecified and
+// infinite pass through: unspecified means use the default at the call site,
+// infinite means no timeout. Huge finite values that would saturate to
+// infinite are rejected loudly like matcher Validate; saturation stays as
+// the backstop in computeServiceDeadline.
 func validateServiceTimeout(timeout Duration) error {
 	if timeout.Seconds < 0 {
 		return fmt.Errorf("core: service timeout: negative seconds are malformed: %w", ErrServiceTimeout)
 	}
 	if timeout.Nanoseconds >= 1000000000 {
 		return fmt.Errorf("core: service timeout: nanoseconds >= 1e9 are malformed: %w", ErrServiceTimeout)
+	}
+	if IsBestAvailableDuration(timeout) {
+		return fmt.Errorf("core: service timeout: best available is not resolved: %w", ErrServiceTimeout)
+	}
+	if isSaturatingToInfinite(timeout) {
+		return fmt.Errorf("core: service timeout: huge finite duration saturates to infinite: %w", ErrServiceTimeout)
 	}
 	return nil
 }
@@ -334,19 +345,6 @@ func NewServiceClient(now func() int64, enabled bool, hook ServiceTraceHook) *Se
 	}
 }
 
-// SetIntrospection replaces the introspection gate and hook.
-// Staged API for introspection control; retained despite no in-repo callers.
-// When enabled is false no hook fires. A nil hook drops events.
-func (c *ServiceClient) SetIntrospection(enabled bool, hook ServiceTraceHook) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.traceEnabled = enabled
-	c.traceHook = hook
-}
-
 // emitClientTrace calls the hook outside the lock when gated on.
 func (c *ServiceClient) emitClientTrace(trace ServiceTrace, enabled bool, hook ServiceTraceHook) {
 	if !enabled || hook == nil {
@@ -355,7 +353,9 @@ func (c *ServiceClient) emitClientTrace(trace ServiceTrace, enabled bool, hook S
 	hook(trace)
 }
 
-// BeginCall starts one call and captures its timeout at start.
+// BeginCall starts one call and captures its timeout at start. The clock
+// func is copied before taking the mutex so a slow clock never blocks the
+// tracker, mirroring EnqueueRequest.
 //
 // It validates the service name, rejects a nil context, returns the context
 // error when already done, rejects malformed timeouts, and rejects a
@@ -382,13 +382,13 @@ func (c *ServiceClient) BeginCall(ctx context.Context, service string, client [8
 	if err != nil {
 		return fmt.Errorf("core: begin service call on %q seq %d: %w", service, seq, err)
 	}
+	nowFn := c.now
 	key := ServiceCallKey{Service: service, Client: client, Sequence: seq}
 	c.mu.Lock()
 	if _, dup := c.pending[key]; dup {
 		c.mu.Unlock()
 		return fmt.Errorf("core: begin service call on %q seq %d: %w", service, seq, ErrServiceDuplicate)
 	}
-	nowFn := c.now
 	c.mu.Unlock()
 	start := nowFn()
 	deadline := computeServiceDeadline(start, timeout)
@@ -645,19 +645,6 @@ func NewServiceServer(now func() int64, enabled bool, hook ServiceTraceHook) *Se
 	}
 }
 
-// SetIntrospection replaces the introspection gate and hook.
-// Staged API for introspection control; retained despite no in-repo callers.
-// When enabled is false no hook fires. A nil hook drops events.
-func (s *ServiceServer) SetIntrospection(enabled bool, hook ServiceTraceHook) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.traceEnabled = enabled
-	s.traceHook = hook
-}
-
 // emitServerTrace calls the hook outside the lock when gated on.
 func (s *ServiceServer) emitServerTrace(trace ServiceTrace, enabled bool, hook ServiceTraceHook) {
 	if !enabled || hook == nil {
@@ -693,6 +680,7 @@ func (s *ServiceServer) EnqueueRequest(ctx context.Context, service string, clie
 	if err != nil {
 		return fmt.Errorf("core: enqueue service request on %q seq %d: %w", service, seq, err)
 	}
+	nowFn := s.now
 	key := ServiceCallKey{Service: service, Client: client, Sequence: seq}
 	s.mu.Lock()
 	if _, dup := s.queuedIndex[key]; dup {
@@ -703,7 +691,6 @@ func (s *ServiceServer) EnqueueRequest(ctx context.Context, service string, clie
 		s.mu.Unlock()
 		return fmt.Errorf("core: enqueue service request on %q seq %d: %w", service, seq, ErrServiceDuplicate)
 	}
-	nowFn := s.now
 	s.mu.Unlock()
 	start := nowFn()
 	deadline := computeServiceDeadline(start, timeout)

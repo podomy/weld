@@ -326,13 +326,29 @@ type storeEntry struct {
 	desc Descriptor
 }
 
+// sdkWatcher is one subscription with close-then-drain discipline.
+// Broadcast never sends on a channel the cancel path can close: cancel
+// deletes from the map under the store write lock then closes under the
+// watcher mutex, while broadcast sends only while holding that same watcher
+// mutex with closed false (generation-checked delivery).
+type sdkWatcher struct {
+	// mu guards closed plus ch during send versus close.
+	mu sync.Mutex
+	// ch carries events to the subscriber; closed by cancel.
+	ch chan Event
+	// closed is true after cancel; broadcast skips closed watchers.
+	closed bool
+	// gen pins the Watch id for generation-checked delivery.
+	gen uint64
+}
+
 // Store is a versioned parameter store with schema, validation, atomic
 // batches, watches, and history. Build it with NewStore and share by
 // pointer; do not copy after first use.
 // History is bounded to the last configHistoryLimit entries; overflow drops
 // the oldest and counts loudly in HistoryDrops. Broadcast never holds the
-// write lock while sending; each watcher is checked plus sent under a read
-// lock with eviction counted in BroadcastDrops.
+// write lock while sending; each watcher is checked plus sent under its own
+// watcher mutex with eviction counted in BroadcastDrops.
 //
 // REVIEW: remap tables and undeclared-set flags are deferred; Declare
 // pins names, Set rejects unknown names, and ApplyStartup auto-declares
@@ -349,7 +365,7 @@ type Store struct {
 	// historyDrop counts history bound drops.
 	historyDrop uint64
 	// watchers holds active subscriptions.
-	watchers map[uint64]chan Event
+	watchers map[uint64]*sdkWatcher
 	// nextWatch numbers watcher ids.
 	nextWatch uint64
 	// validators runs in order outside the write lock with optimistic generation.
@@ -460,7 +476,7 @@ func (s *Store) DumpAll() map[string]DumpEntry {
 func NewStore() *Store {
 	return &Store{
 		params:     make(map[string]*storeEntry),
-		watchers:   make(map[uint64]chan Event),
+		watchers:   make(map[uint64]*sdkWatcher),
 		validators: make(map[string][]ValidatorFunc),
 		hooks:      make(map[string][]ApplyHookFunc),
 	}
@@ -468,6 +484,9 @@ func NewStore() *Store {
 
 // Declare adds a parameter with its descriptor. Re-declaring fails.
 // A NotSet value validates only against a NotSet descriptor.
+// Registered validators run on declare like any other write: the old
+// snapshot is the zero value, so a validator rejecting from unset aborts
+// loudly before the version moves. There is no exempt declare path.
 func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 	if s == nil {
 		return errors.New("sdk: declare on nil store") //nolint:wrapcheck // new error, nothing to wrap
@@ -489,8 +508,31 @@ func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 		s.mu.Unlock()
 		return fmt.Errorf("sdk: declare %q: %w", name, err)
 	}
+	var pending []pendingValidator
+	for _, fn := range s.validators[name] {
+		pending = append(pending, pendingValidator{name: name, oldValue: Value{}, newValue: value, fn: fn})
+	}
+	var hooks []hookCall
+	for _, fn := range s.hooks[name] {
+		hooks = append(hooks, hookCall{fn: fn, oldValue: Value{}, newValue: value})
+	}
 	event := Event{Version: s.version + 1, Source: "declare"}
 	event.Changes = []Change{{Name: name, NewValue: value, HadOld: false}}
+	gen := s.version
+	s.mu.Unlock()
+	err = runPendingValidators(pending)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if _, ok := s.params[name]; ok {
+		s.mu.Unlock()
+		return fmt.Errorf("sdk: declare %q: already declared", name)
+	}
+	if s.version != gen {
+		s.mu.Unlock()
+		return errors.New("sdk: config: declare: concurrent mutation aborted batch") //nolint:wrapcheck // new error, nothing to wrap
+	}
 	s.params[name] = &storeEntry{value: value, desc: desc}
 	s.version = event.Version
 	s.history = append(s.history, HistoryEntry{
@@ -499,6 +541,7 @@ func (s *Store) Declare(name string, value Value, desc Descriptor) error {
 	s.trimHistoryLocked()
 	s.mu.Unlock()
 	s.broadcast(event)
+	s.runHooks(hooks)
 	return nil
 }
 
@@ -604,7 +647,10 @@ func (s *Store) HistorySince(since uint64) []HistoryEntry {
 // store version; HistorySince replays anything missed. The channel is
 // buffered and never blocks the store: a full channel evicts its oldest
 // event and counts loudly in BroadcastDrops. Consumers must tolerate
-// non-monotonic event order across concurrent batches.
+// non-monotonic event order across concurrent batches. Cancel deletes under
+// the store write lock then closes under the watcher mutex, while broadcast
+// sends only while holding that same watcher mutex, so no send ever races
+// a close.
 func (s *Store) Watch() (uint64, <-chan Event, func()) {
 	if s == nil {
 		ch := make(chan Event)
@@ -616,13 +662,25 @@ func (s *Store) Watch() (uint64, <-chan Event, func()) {
 	id := s.nextWatch
 	s.nextWatch++
 	ch := make(chan Event, configWatchBuffer)
-	s.watchers[id] = ch
+	s.watchers[id] = &sdkWatcher{ch: ch, gen: id}
 	cancel := func() {
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if w, ok := s.watchers[id]; ok {
-			delete(s.watchers, id)
-			close(w)
+		w, ok := s.watchers[id]
+		if !ok {
+			s.mu.Unlock()
+			return
+		}
+		if w.gen != id {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.watchers, id)
+		s.mu.Unlock()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if !w.closed {
+			w.closed = true
+			close(w.ch)
 		}
 	}
 	return s.version, ch, cancel
@@ -757,9 +815,9 @@ func (s *Store) SetWithSource(updates map[string]Value, source string, autoDecla
 
 // prepareBatchLocked validates every update without mutating state and
 // collects validators to run outside the write lock with optimistic
-// generation.
-//
-//nolint:gocognit // batch validation sequences sort, type, read-only, and validator collection in one pass, splitting would obscure intent
+// generation. Registered validators run on new plus auto-declared parameters
+// like any other write: the old snapshot is the zero value, so there is no
+// exempt new-parameter path.
 func (s *Store) prepareBatchLocked(updates map[string]Value, source string, autoDeclare bool) (Event, []hookCall, []pendingValidator, error) {
 	ordered := make([]string, 0, len(updates))
 	for name := range updates {
@@ -778,36 +836,67 @@ func (s *Store) prepareBatchLocked(updates map[string]Value, source string, auto
 		}
 		entry, ok := s.params[name]
 		if !ok {
-			if newValue.Type == ParamTypeNotSet {
-				return Event{}, nil, nil, fmt.Errorf("sdk: set %q: value type not_set is not concrete", name)
+			c, h, p, err := s.validateNewEntryLocked(name, newValue, autoDeclare)
+			if err != nil {
+				return Event{}, nil, nil, err
 			}
-			if !autoDeclare {
-				return Event{}, nil, nil, fmt.Errorf("sdk: set %q: not declared", name)
-			}
-			changes = append(changes, Change{Name: name, NewValue: newValue, HadOld: false})
-			for _, fn := range s.hooks[name] {
-				hooks = append(hooks, hookCall{fn: fn, oldValue: Value{}, newValue: newValue})
-			}
+			changes = append(changes, c)
+			hooks = append(hooks, h...)
+			pending = append(pending, p...)
 			continue
 		}
-		if entry.desc.ReadOnly {
-			return Event{}, nil, nil, fmt.Errorf("sdk: set %q: parameter is read only", name)
-		}
-		err = entry.desc.validateValue(newValue)
+		c, h, p, err := s.validateExistingEntryLocked(name, entry, newValue)
 		if err != nil {
-			return Event{}, nil, nil, fmt.Errorf("sdk: set %q: %w", name, err)
+			return Event{}, nil, nil, err
 		}
-		old := entry.value
-		for _, fn := range s.validators[name] {
-			pending = append(pending, pendingValidator{name: name, oldValue: old, newValue: newValue, fn: fn})
-		}
-		changes = append(changes, Change{Name: name, OldValue: old, NewValue: newValue, HadOld: true})
-		for _, fn := range s.hooks[name] {
-			hooks = append(hooks, hookCall{fn: fn, oldValue: old, newValue: newValue})
-		}
+		changes = append(changes, c)
+		hooks = append(hooks, h...)
+		pending = append(pending, p...)
 	}
 	event := Event{Version: next, Source: source, Changes: changes}
 	return event, hooks, pending, nil
+}
+
+// validateNewEntryLocked checks a write to an undeclared name and collects
+// validators plus hooks. The caller holds the write lock.
+func (s *Store) validateNewEntryLocked(name string, newValue Value, autoDeclare bool) (Change, []hookCall, []pendingValidator, error) {
+	if newValue.Type == ParamTypeNotSet {
+		return Change{}, nil, nil, fmt.Errorf("sdk: set %q: value type not_set is not concrete", name)
+	}
+	if !autoDeclare {
+		return Change{}, nil, nil, fmt.Errorf("sdk: set %q: not declared", name)
+	}
+	var pending []pendingValidator
+	for _, fn := range s.validators[name] {
+		pending = append(pending, pendingValidator{name: name, oldValue: Value{}, newValue: newValue, fn: fn})
+	}
+	var hooks []hookCall
+	for _, fn := range s.hooks[name] {
+		hooks = append(hooks, hookCall{fn: fn, oldValue: Value{}, newValue: newValue})
+	}
+	return Change{Name: name, NewValue: newValue, HadOld: false}, hooks, pending, nil
+}
+
+// validateExistingEntryLocked checks type plus read-only for a declared name
+// and collects validators plus hooks. The caller holds the write lock.
+func (s *Store) validateExistingEntryLocked(name string, entry *storeEntry, newValue Value) (Change, []hookCall, []pendingValidator, error) {
+	if entry.desc.ReadOnly {
+		return Change{}, nil, nil, fmt.Errorf("sdk: set %q: parameter is read only", name)
+	}
+	err := entry.desc.validateValue(newValue)
+	if err != nil {
+		return Change{}, nil, nil, fmt.Errorf("sdk: set %q: %w", name, err)
+	}
+	old := entry.value
+	var pending []pendingValidator
+	for _, fn := range s.validators[name] {
+		pending = append(pending, pendingValidator{name: name, oldValue: old, newValue: newValue, fn: fn})
+	}
+	var hooks []hookCall
+	for _, fn := range s.hooks[name] {
+		hooks = append(hooks, hookCall{fn: fn, oldValue: old, newValue: newValue})
+	}
+	return Change{Name: name, OldValue: old, NewValue: newValue, HadOld: true}, hooks, pending, nil
 }
 
 // commitPreparedLocked applies a validated event: one version bump, one
@@ -849,28 +938,29 @@ func (s *Store) trimHistoryLocked() {
 }
 
 // broadcast delivers the event to every watcher without holding the write
-// lock. Each watcher is checked plus sent under a read lock with a
+// lock. Each watcher is checked plus sent under its own watcher mutex with a
 // per-watcher nonblocking send; a full channel evicts its oldest event and
 // counts loudly in BroadcastDrops. Never sends on a closed channel because
-// cancel deletes plus closes under the write lock, which waits for the read
-// lock.
+// cancel deletes under the store write lock then closes under the watcher
+// mutex, while broadcast sends only while holding that same watcher mutex
+// with closed false (generation-checked delivery).
 func (s *Store) broadcast(event Event) {
 	s.mu.RLock()
-	ids := make([]uint64, 0, len(s.watchers))
-	for id := range s.watchers {
-		ids = append(ids, id)
+	watchers := make([]*sdkWatcher, 0, len(s.watchers))
+	for _, w := range s.watchers {
+		watchers = append(watchers, w)
 	}
 	s.mu.RUnlock()
-	for _, id := range ids {
-		s.mu.RLock()
-		ch, ok := s.watchers[id]
-		if !ok {
-			s.mu.RUnlock()
+	for _, w := range watchers {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
 			continue
 		}
+		ch := w.ch
 		select {
 		case ch <- event:
-			s.mu.RUnlock()
+			w.mu.Unlock()
 		default:
 			select {
 			case <-ch:
@@ -879,10 +969,10 @@ func (s *Store) broadcast(event Event) {
 			}
 			select {
 			case ch <- event:
-				s.mu.RUnlock()
+				w.mu.Unlock()
 			default:
 				s.drops.Add(1)
-				s.mu.RUnlock()
+				w.mu.Unlock()
 			}
 		}
 	}
@@ -891,7 +981,11 @@ func (s *Store) broadcast(event Event) {
 // LoadDump restores values plus descriptors atomically with the given source.
 // New names declare with the supplied descriptors after validation; existing
 // names keep their descriptors and validate against them. Validators run
-// outside the write lock with optimistic generation.
+// outside the write lock with optimistic generation. Dump descriptors are
+// validated for self-consistency upfront without touching the store, so no
+// racy unlocked params read can occur; existence is resolved under the write
+// lock in prepareBatchLocked and descriptor pinning happens under the write
+// lock after commit.
 //
 //nolint:gocognit,cyclop // load sequences validation, optimistic prepare, commit, and descriptor pinning in one flow, splitting would obscure intent
 func (s *Store) LoadDump(dump map[string]DumpEntry, source string) (Event, error) {
@@ -907,11 +1001,9 @@ func (s *Store) LoadDump(dump map[string]DumpEntry, source string) (Event, error
 		if err != nil {
 			return Event{}, err
 		}
-		if _, ok := s.params[name]; !ok {
-			err = entry.Descriptor.validateValue(entry.Value)
-			if err != nil {
-				return Event{}, fmt.Errorf("sdk: load dump %q: %w", name, err)
-			}
+		err = entry.Descriptor.validateValue(entry.Value)
+		if err != nil {
+			return Event{}, fmt.Errorf("sdk: load dump %q: %w", name, err)
 		}
 		values[name] = entry.Value
 	}

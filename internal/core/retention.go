@@ -45,9 +45,10 @@ func NewHistoryCache[T any](capacity uint64) *HistoryCache[T] {
 	return &HistoryCache[T]{capacity: capacity}
 }
 
-// Push appends v and reports whether an oldest sample was evicted. A zero
-// value cache with zero capacity drops safely without an index panic; build
-// caches with NewHistoryCache.
+// Push appends v and reports whether an oldest sample was evicted. A
+// non-nil cache with zero capacity panics loudly: zero means not set, so
+// call RetentionCapacity first instead of silently dropping. A nil cache
+// drops safely returning false; build non-nil caches with NewHistoryCache.
 //
 // The return is advisory backpressure feedback: true means one sample was
 // dropped and counted in Lost, so the caller must slow the producer instead
@@ -61,7 +62,7 @@ func (c *HistoryCache[T]) Push(v T) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.capacity == 0 {
-		return false
+		panic("core: HistoryCache: capacity 0 means not set; call RetentionCapacity first")
 	}
 	if uint64(len(c.buf)) >= c.capacity {
 		var zero T

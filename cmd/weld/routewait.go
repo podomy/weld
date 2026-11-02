@@ -20,6 +20,10 @@ import (
 // errors return at once. The wait is bounded by timeout or ctx cancel,
 // whichever ends first. A cancelled context reports cancel; a deadline
 // wait that outlasts the timeout preserves no-route loudly.
+//
+// The pub, service, and action verbs share this helper through thin
+// wrappers that diverge only in timeout source, so retry, timeout, and
+// cancel semantics stay identical across verbs.
 func publishWithRouteRetry(ctx context.Context, backend transports.Backend, msg transports.OutgoingMessage, timeout time.Duration) error {
 	start := time.Now()
 

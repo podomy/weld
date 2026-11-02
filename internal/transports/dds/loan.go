@@ -483,9 +483,10 @@ func (r *LoanedReceiver) TakeLoaned(frame []byte, m *types.MessageMembers) (*Loa
 		return nil, fmt.Errorf("dds: loaned take topic %q: %w", decoded.ddsTopic, err)
 	}
 	r.inner.mu.Lock()
-	defer r.inner.mu.Unlock()
 	err = r.inner.trackSequenceLocked(decoded.guid, decoded.seq)
+	r.inner.mu.Unlock()
 	if err != nil {
+		r.inner.countDrop()
 		return nil, fmt.Errorf("dds: loaned take sequence: %w", err)
 	}
 	loan, err := r.pool.Borrow(m, int(decoded.userLen))
@@ -583,6 +584,8 @@ func NewLoanChannel(depth int) (*LoanChannel, error) {
 // sender must not use it after Send returns nil and must drop its alias.
 // The sender handle is invalidated like Return, with buf and full cleared
 // under the handle mutex so a stale alias observes nil, never live data.
+// The handle mutex covers only the snapshot; the channel send runs without
+// holding it so a full buffer blocks without freezing handle observers.
 //
 // Send blocks when the channel buffer is full until Recv drains one
 // slot; there is no non-blocking TrySend because no caller needs one.
@@ -596,8 +599,8 @@ func (c *LoanChannel) Send(loan *Loan) error {
 		return fmt.Errorf("dds: loan channel send nil handle: %w", ErrLoanReturned)
 	}
 	loan.mu.Lock()
-	defer loan.mu.Unlock()
 	if !loan.valid {
+		loan.mu.Unlock()
 		return fmt.Errorf("dds: loan channel send after return: %w", ErrLoanReturned)
 	}
 	loan.valid = false
@@ -609,6 +612,7 @@ func (c *LoanChannel) Send(loan *Loan) error {
 	typeName := loan.TypeName
 	loan.buf = nil
 	loan.full = nil
+	loan.mu.Unlock()
 	carried := &Loan{pool: pool, full: full, buf: payload, pooled: pooled, valid: true, TopicName: topic, TypeName: typeName}
 	c.ch <- carried
 	c.transfers.Add(1)

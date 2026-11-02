@@ -123,6 +123,22 @@ const (
 	sedpRTPSMajorOff = 4
 	// sedpDATAReserved is the zero reserved octet starting a DATA body.
 	sedpDATAReserved byte = 0x00
+	// sedpMaxSubmessages caps one datagram submessage walk for bounded work.
+	//
+	// Sixty four covers batched discovery (one DATA plus one HEARTBEAT per
+	// endpoint) with wide headroom while bounding unauthenticated walks;
+	// over-cap datagrams drop loudly before dispatch.
+	sedpMaxSubmessages = 64
+	// sedpGapNoBoundCap caps a GAP advance with no heartbeat bound known.
+	//
+	// Sixty four is one user repair window: a writer that never announced
+	// a heartbeat bound cannot jump the high more than one window past
+	// the current high, so a crafted GAP cannot teleport tracking.
+	sedpGapNoBoundCap uint64 = 64
+	// sedpSubmessageGap selects GAP submessages.
+	sedpSubmessageGap byte = 0x08
+	// sedpSubmessageInfoDst selects INFO_DST submessages.
+	sedpSubmessageInfoDst byte = 0x0E
 )
 
 // sedpHeartbeatKind gathers RTPS Heartbeat constants for reliable discovery.
@@ -226,6 +242,10 @@ var (
 	ErrSEDPInvalidDATA = errors.New("dds: invalid sedp data")
 	// ErrSEDPUnknownEndpoint reports a GUID with no local endpoint.
 	ErrSEDPUnknownEndpoint = errors.New("dds: unknown sedp endpoint")
+	// ErrSEDPStale reports a replayed DATA sequence at or below the last accepted value.
+	ErrSEDPStale = errors.New("dds: stale sedp sequence")
+	// ErrSEDPInfoDst reports an INFO_DST naming another participant on unicast ingress.
+	ErrSEDPInfoDst = errors.New("dds: sedp INFO_DST mismatch")
 )
 
 // sedpWriterSeq tracks the last DATA sequence per builtin SEDP writer.
@@ -382,8 +402,15 @@ type SEDPIndex struct {
 	onRemove   func(SEDPGUID)
 	// lastSeq tracks the last SEDP DATA sequence per endpoint GUID for
 	// monotonic ingest gating. Stale or reordered samples are rejected
-	// without upserting.
+	// without upserting. Zero never advances this map.
 	lastSeq map[SEDPGUID]uint64
+	// hbLast tracks the last HEARTBEAT LastSequence per builtin writer.
+	hbLast map[sedpWriterKey]uint64
+	// hbCount tracks the last HEARTBEAT Count per builtin writer.
+	hbCount map[sedpWriterKey]int32
+	// writerHigh tracks the highest DATA or GAP sequence per builtin
+	// writer for heartbeat clamp bounds.
+	writerHigh map[sedpWriterKey]uint64
 }
 
 // NewSEDPIndex returns an SEDP index for one participant prefix and domain.
@@ -1188,8 +1215,300 @@ func (idx *SEDPIndex) ListenLoop(ctx context.Context, r SEDPReceiver) error {
 // so an old retransmit cannot clobber newer state. It returns nil when at
 // least one entry installs or when all entries are stale replays,
 // otherwise the first parse or upsert error.
+// sedpHeaderPrefix returns the RTPS header participant prefix.
+func sedpHeaderPrefix(data []byte) (SEDPGUIDPrefix, error) {
+	var prefix SEDPGUIDPrefix
+	err := sedpValidateRTPSHeader(data)
+	if err != nil {
+		return prefix, err
+	}
+	copy(prefix[:], data[8:20])
+	return prefix, nil
+}
+
+// sedpCheckInfoDstUnicast enforces INFO_DST on unicast ingress.
+//
+// It walks at most sedpMaxSubmessages submessages and drops loudly with
+// ErrSEDPInfoDst when an INFO_DST names a 12 byte prefix other than local.
+// Undecodable datagrams return nil so the caller flows to the normal decode
+// path, which counts the failure. Multicast ingress must never call this
+// helper: group sockets carry every sender, so per-sender identity has no
+// meaning there and enforcement would drop valid peers.
+func sedpCheckInfoDstUnicast(data []byte, local SEDPGUIDPrefix) error {
+	verr := sedpValidateRTPSHeader(data)
+	if verr != nil {
+		return nil //nolint:nilerr // header failures flow to the normal decode path which counts them
+	}
+	off := sedpRTPSHeaderLen
+	seen := 0
+	for off < len(data) {
+		seen++
+		if seen > sedpMaxSubmessages {
+			return fmt.Errorf("dds: sedp INFO_DST submessages above %d: %w", sedpMaxSubmessages, ErrSEDPInvalidDATA)
+		}
+		id, body, _, next, serr := sedpSplitSubmessage(data, off)
+		if serr != nil {
+			return nil //nolint:nilerr // split failures flow to the normal decode path which counts them
+		}
+		off = next
+		if id != sedpSubmessageInfoDst {
+			continue
+		}
+		if len(body) < sedpPrefixLen {
+			continue
+		}
+		var dst SEDPGUIDPrefix
+		copy(dst[:], body[:sedpPrefixLen])
+		if dst != local {
+			log.Printf("dds: sedp unicast INFO_DST mismatch, dropping")
+			return fmt.Errorf("dds: sedp INFO_DST mismatch: %w", ErrSEDPInfoDst)
+		}
+	}
+	return nil
+}
+
+// sedpHeartbeatNote records one builtin writer heartbeat bound.
+//
+// It reports false for replays: a nonzero Count at or below the last Count
+// with no new LastSequence draws no further work. Last and Count only move
+// forward. Count==0 heartbeats carry no duplicate suppression, so the first
+// Count==0 per LastSequence updates the bound and repeats with the same
+// LastSequence are replays: single processing per LastSequence without a
+// NACK storm. The standalone index sends no ACKs; suppression here only
+// bounds GAP clamping and reprocessing.
+// sedpHeartbeatReplay reports whether a nonzero count heartbeat is a replay.
+func sedpHeartbeatReplay(count int32, last uint64, lastCount int32, lastLast uint64) bool {
+	return count != 0 && lastCount != 0 && count <= lastCount && last <= lastLast
+}
+
+// sedpNoteZeroHeartbeat records a Count==0 bound, reporting false on repeats.
+func sedpNoteZeroHeartbeat(high map[sedpWriterKey]uint64, key sedpWriterKey, last uint64) bool {
+	if last != 0 && last == high[key] {
+		return false
+	}
+	if last > high[key] {
+		high[key] = last
+	}
+	return true
+}
+
+func (idx *SEDPIndex) sedpHeartbeatNote(key sedpWriterKey, count int32, last uint64) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.hbLast == nil {
+		idx.hbLast = make(map[sedpWriterKey]uint64)
+	}
+	if idx.hbCount == nil {
+		idx.hbCount = make(map[sedpWriterKey]int32)
+	}
+	lastCount := idx.hbCount[key]
+	lastLast := idx.hbLast[key]
+	if sedpHeartbeatReplay(count, last, lastCount, lastLast) {
+		return false
+	}
+	if count == 0 {
+		return sedpNoteZeroHeartbeat(idx.hbLast, key, last)
+	}
+	if last > lastLast {
+		idx.hbLast[key] = last
+	}
+	if count > lastCount {
+		idx.hbCount[key] = count
+	}
+	return true
+}
+
+// sedpApplyGapList advances writerHigh over the full skipped list.
+//
+// Sequences apply in increasing order. When a heartbeat bound is known,
+// each step clamps to last plus one so a crafted GAP cannot jump past
+// announced history. When no bound is known, each step caps at the current
+// high plus sedpGapNoBoundCap (64, one repair window). Zeros are ignored.
+// It self-locks and is safe for concurrent use.
+func (idx *SEDPIndex) sedpApplyGapList(key sedpWriterKey, seqs []uint64) {
+	filtered := make([]uint64, 0, len(seqs))
+	for _, seq := range seqs {
+		if seq == 0 {
+			continue
+		}
+		filtered = append(filtered, seq)
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	slices.Sort(filtered)
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.writerHigh == nil {
+		idx.writerHigh = make(map[sedpWriterKey]uint64)
+	}
+	if idx.hbLast == nil {
+		idx.hbLast = make(map[sedpWriterKey]uint64)
+	}
+	bound, hasBound := idx.hbLast[key]
+	for _, seq := range filtered {
+		seq = sedpClampGapSeq(seq, bound, hasBound, idx.writerHigh[key])
+		if seq > idx.writerHigh[key] {
+			idx.writerHigh[key] = seq
+		}
+	}
+}
+
+// sedpClampGapSeq bounds one GAP sequence.
+//
+// A known heartbeat bound clamps to last plus one so a crafted GAP cannot
+// jump past announced history. Without a bound the advance caps at the
+// current high plus sedpGapNoBoundCap, one repair window.
+func sedpClampGapSeq(seq, bound uint64, hasBound bool, current uint64) uint64 {
+	if hasBound && bound != 0 {
+		return sedpClampGapBounded(seq, bound)
+	}
+	return sedpClampGapUnbounded(seq, current)
+}
+
+// sedpClampGapBounded clamps one GAP sequence to a heartbeat bound plus one.
+func sedpClampGapBounded(seq, bound uint64) uint64 {
+	maxAllowed := bound + 1
+	if maxAllowed == 0 {
+		maxAllowed = ^uint64(0)
+	}
+	if seq > maxAllowed {
+		return maxAllowed
+	}
+	return seq
+}
+
+// sedpClampGapUnbounded caps one GAP sequence without a heartbeat bound.
+func sedpClampGapUnbounded(seq, current uint64) uint64 {
+	limit := current + sedpGapNoBoundCap
+	if limit < current {
+		limit = ^uint64(0)
+	}
+	if seq > limit {
+		return limit
+	}
+	return seq
+}
+
+// noteSedpHeartbeats scans one datagram for builtin SEDP HEARTBEATs.
+//
+// Malformed heartbeat bodies log loudly and skip without failing the
+// datagram, so one poison control submessage never drops valid endpoint
+// DATA in the same datagram. Replays are ignored quietly.
+// sedpHeartbeatWriterOf returns the builtin SEDP writer for a HEARTBEAT body.
+func sedpHeartbeatWriterOf(body []byte) (SEDPEntityID, bool) {
+	var writer SEDPEntityID
+	if len(body) < sedpEntityLen*2 {
+		return writer, false
+	}
+	copy(writer[:], body[sedpHeartbeatWriterOff:sedpHeartbeatWriterOff+sedpEntityLen])
+	isEndpoint, _ := sedpClassifyWriter(writer)
+	return writer, isEndpoint
+}
+
+func (idx *SEDPIndex) noteSedpHeartbeats(data []byte, prefix SEDPGUIDPrefix) {
+	err := sedpValidateRTPSHeader(data)
+	if err != nil {
+		return
+	}
+	off := sedpRTPSHeaderLen
+	seen := 0
+	for off < len(data) {
+		seen++
+		if seen > sedpMaxSubmessages {
+			return
+		}
+		id, body, flags, next, serr := sedpSplitSubmessage(data, off)
+		if serr != nil {
+			return
+		}
+		off = next
+		if id != sedpSubmessageHeartbeat {
+			continue
+		}
+		idx.noteOneHeartbeat(prefix, body, flags)
+	}
+}
+
+// noteOneHeartbeat records one HEARTBEAT submessage body.
+//
+// Short and undecodable bodies log loudly and skip. Replays trace quietly.
+func (idx *SEDPIndex) noteOneHeartbeat(prefix SEDPGUIDPrefix, body []byte, flags byte) {
+	writer, ok := sedpHeartbeatWriterOf(body)
+	if !ok {
+		log.Printf("dds: sedp heartbeat short body, skipping")
+		return
+	}
+	var drops rtps.Counter
+	beat, err := rtps.DecodeHeartbeat(body, flags, &drops)
+	if err != nil {
+		log.Printf("dds: sedp heartbeat decode skipped: %v", err)
+		return
+	}
+	key := sedpWriterKey{prefix: prefix, writer: writer}
+	if !idx.sedpHeartbeatNote(key, beat.Count, beat.LastSequence) {
+		sedpTracef("heartbeat replay writer=%02x%02x%02x%02x count=%d last=%d", writer[0], writer[1], writer[2], writer[3], beat.Count, beat.LastSequence)
+	}
+}
+
+// applySedpGapsFromDatagram decodes every builtin SEDP GAP list and applies it.
+//
+// The full skipped list applies via sedpApplyGapList, not just GapStart.
+// Malformed GAP bodies log loudly and skip without failing the datagram,
+// so one poison control submessage never drops valid endpoint DATA.
+func (idx *SEDPIndex) applySedpGapsFromDatagram(data []byte, prefix SEDPGUIDPrefix) {
+	verr := sedpValidateRTPSHeader(data)
+	if verr != nil {
+		return
+	}
+	off := sedpRTPSHeaderLen
+	seen := 0
+	for off < len(data) {
+		seen++
+		if seen > sedpMaxSubmessages {
+			return
+		}
+		id, body, flags, next, serr := sedpSplitSubmessage(data, off)
+		if serr != nil {
+			return
+		}
+		off = next
+		if id != sedpSubmessageGap {
+			continue
+		}
+		idx.applyOneGap(prefix, body, flags)
+	}
+}
+
+// applyOneGap applies one GAP submessage body.
+//
+// Short and undecodable bodies log loudly and skip. Non-endpoint writers
+// are ignored.
+func (idx *SEDPIndex) applyOneGap(prefix SEDPGUIDPrefix, body []byte, flags byte) {
+	writer, ok := sedpHeartbeatWriterOf(body)
+	if !ok {
+		log.Printf("dds: sedp gap short body, skipping")
+		return
+	}
+	var drops rtps.Counter
+	gap, err := rtps.DecodeGap(body, flags, &drops)
+	if err != nil {
+		log.Printf("dds: sedp gap decode skipped: %v", err)
+		return
+	}
+	key := sedpWriterKey{prefix: prefix, writer: writer}
+	idx.sedpApplyGapList(key, gap.SkippedSequences())
+}
+
 func (idx *SEDPIndex) ingestSample(data []byte) error {
 	sedpTracef("ingest recv wire len=%d", len(data))
+	prefix, err := sedpHeaderPrefix(data)
+	if err != nil {
+		sedpTracef("ingest header reject len=%d err=%v", len(data), err)
+		return fmt.Errorf("dds: sedp listen parse: %w", err)
+	}
+	idx.noteSedpHeartbeats(data, prefix)
+	idx.applySedpGapsFromDatagram(data, prefix)
 	bodies, flags, err := sedpFindAllEndpointDATA(data)
 	if err != nil {
 		sedpTracef("ingest parse reject len=%d err=%v", len(data), err)
@@ -1207,7 +1526,7 @@ func (idx *SEDPIndex) ingestSample(data []byte) error {
 	stale := 0
 
 	for i := range bodies {
-		didInstall, wasStale, err := idx.ingestOneEndpoint(data, bodies[i], flags[i], i, len(bodies))
+		didInstall, wasStale, err := idx.ingestOneEndpoint(prefix, bodies[i], flags[i], i, len(bodies))
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1242,40 +1561,106 @@ func ingestOutcomeError(installed, stale int, firstErr error) error {
 
 // ingestOneEndpoint decodes, gates, and upserts one endpoint DATA body.
 //
-// It reports whether the endpoint installed, whether it was a stale replay,
-// and any parse or upsert error for the caller to keep as first failure.
-func (idx *SEDPIndex) ingestOneEndpoint(data, body []byte, flag uint8, index, total int) (bool, bool, error) {
+// The header prefix binds the endpoint identity: a GUID prefix mismatch
+// drops loudly without installing or recording sequence. Replay gates on
+// the per-endpoint DATA sequence after successful upsert: the stale check
+// runs before upsert without storing, and the sequence records only when
+// the endpoint installs. Seq 0 never advances lastSeq. It reports whether
+// the endpoint installed, whether it was a stale replay, and any parse or
+// upsert error for the caller to keep as first failure.
+func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag uint8, index, total int) (bool, bool, error) {
 	littleEndian := flag&sedpFlagLittleEndian != 0
 	seq := sedpDecodeDataSeq(body, littleEndian)
 	ep, err := sedpDecodeEndpoint(body, flag)
 	if err != nil {
-		sedpTracef("ingest parse reject index=%d/%d len=%d flags=%#02x err=%v", index, total, len(data), flag, err)
+		sedpTracef("ingest parse reject index=%d/%d flags=%#02x err=%v", index, total, flag, err)
 
 		return false, false, err
 	}
 	sedpTracef("ingest parse accept guid=%s ros=%q dds=%q typeDDS=%q typeIDL=%q hash=%q domain=%d reader=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.TypeIDL, ep.TypeHash, ep.DomainID, ep.IsReader)
-
+	if ep.ID.Prefix != header {
+		sedpTracef("ingest prefix mismatch guid=%s header=%x", ep.ID.String(), header)
+		log.Printf("dds: sedp guid prefix mismatches header, dropping")
+		return false, false, fmt.Errorf("dds: sedp guid prefix mismatches header: %w", ErrSEDPInvalidDATA)
+	}
 	if ep.DomainID == 0 {
 		ep.DomainID = idx.stampDomain()
 		sedpTracef("ingest stamp domain=%d guid=%s", ep.ID.String())
 	}
-
-	if !idx.checkAndStoreSedpSeq(ep.ID, seq) {
+	if idx.sedpStaleCheck(ep.ID, seq) {
 		sedpTracef("ingest stale seq=%d guid=%s", seq, ep.ID.String())
-
 		return false, true, nil
 	}
-
 	err = idx.UpsertRemote(ep)
 	if err != nil {
 		sedpTracef("ingest upsert reject guid=%s err=%v", ep.ID.String(), err)
-
 		return false, false, err
 	}
-
+	idx.sedpStoreSeq(ep.ID, seq)
+	idx.sedpNoteWriterHigh(ep.ID.Prefix, body, flag, seq)
 	sedpTracef("ingest upsert ok guid=%s ros=%q domain=%d", ep.ID.String(), ep.ROSTopic, ep.DomainID)
-
 	return true, false, nil
+}
+
+// sedpStaleCheck reports whether seq is a stale replay without storing.
+//
+// Zero never gates and always reports false. A sequence at or below the
+// last accepted value reports true. It self-locks and is safe for
+// concurrent use.
+func (idx *SEDPIndex) sedpStaleCheck(id SEDPGUID, seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	last, seen := idx.lastSeq[id]
+	return seen && seq <= last
+}
+
+// sedpStoreSeq records seq after a successful upsert.
+//
+// Zero never advances lastSeq. Smaller or equal sequences never regress
+// the high. It self-locks and is safe for concurrent use.
+func (idx *SEDPIndex) sedpStoreSeq(id SEDPGUID, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.lastSeq == nil {
+		idx.lastSeq = make(map[SEDPGUID]uint64)
+	}
+	if last, seen := idx.lastSeq[id]; !seen || seq > last {
+		idx.lastSeq[id] = seq
+	}
+}
+
+// sedpNoteWriterHigh records the writer high after a successful DATA upsert.
+//
+// The key is the header prefix plus the DATA writer entity so GAP clamping
+// has a bound even before any heartbeat arrives. Zero sequences are
+// ignored. It self-locks and is safe for concurrent use.
+func (idx *SEDPIndex) sedpNoteWriterHigh(prefix SEDPGUIDPrefix, body []byte, _ uint8, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	writer, err := sedpDATAWriter(body)
+	if err != nil {
+		return
+	}
+	isEndpoint, _ := sedpClassifyWriter(writer)
+	if !isEndpoint {
+		return
+	}
+	key := sedpWriterKey{prefix: prefix, writer: writer}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.writerHigh == nil {
+		idx.writerHigh = make(map[sedpWriterKey]uint64)
+	}
+	if seq > idx.writerHigh[key] {
+		idx.writerHigh[key] = seq
+	}
 }
 
 // sedpDecodeDataSeq returns the DATA sequence number from one endpoint body.
@@ -1297,31 +1682,10 @@ func sedpDecodeDataSeq(body []byte, littleEndian bool) uint64 {
 	return uint64(high)<<32 | uint64(low)
 }
 
-// checkAndStoreSedpSeq gates one endpoint upsert on DATA sequence.
+// checkAndStoreSedpSeq is kept as a deprecated alias for sedpStaleCheck plus sedpStoreSeq.
 //
-// It tracks the last accepted sequence per endpoint GUID. Zero sequences
-// never gate and always pass. A sequence at or below the last accepted
-// value reports false for stale or reordered input. Otherwise it stores
-// the new high and reports true. It self-locks and is safe for concurrent
-// use.
-func (idx *SEDPIndex) checkAndStoreSedpSeq(id SEDPGUID, seq uint64) bool {
-	if seq == 0 {
-		return true
-	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	if idx.lastSeq == nil {
-		idx.lastSeq = make(map[SEDPGUID]uint64)
-	}
-	last, seen := idx.lastSeq[id]
-	if seen && seq <= last {
-		return false
-	}
-	idx.lastSeq[id] = seq
-
-	return true
-}
+// New code calls sedpStaleCheck before UpsertRemote and sedpStoreSeq after,
+// so invalid endpoints never pollute lastSeq. It remains for older tests.
 
 // sedpAnnounceSnapshot serializes and sends one local snapshot.
 func sedpAnnounceSnapshot(ctx context.Context, s SEDPSender, eps []SEDPEndpoint) error {
@@ -1608,7 +1972,12 @@ func sedpIsSEDPControl(data []byte) bool {
 		return false
 	}
 	off := sedpRTPSHeaderLen
+	count := 0
 	for off < len(data) {
+		count++
+		if count > sedpMaxSubmessages {
+			return false
+		}
 		id, body, _, next, err := sedpSplitSubmessage(data, off)
 		if err != nil {
 			return false
@@ -1876,8 +2245,34 @@ func ParseSEDPDATAs(data []byte) ([]SEDPEndpoint, error) {
 	return out, nil
 }
 
+// sedpCollectEndpointSub returns one endpoint DATA body with its flags.
+//
+// It returns a nil body for non-endpoint submessages. Truncation and writer
+// errors fail loudly with the submessage offset for the caller.
+func sedpCollectEndpointSub(data []byte, off int) ([]byte, byte, int, error) {
+	id, body, flags, next, err := sedpSplitSubmessage(data, off)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("dds: sedp parse submessage at %d: %w", off, err)
+	}
+	if id != sedpSubmessageDATA {
+		return nil, 0, next, nil
+	}
+	writer, err := sedpDATAWriter(body)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("dds: sedp parse data writer: %w", err)
+	}
+	isEndpoint, _ := sedpClassifyWriter(writer)
+	if !isEndpoint {
+		return nil, 0, next, nil
+	}
+	return body, flags, next, nil
+}
+
 // sedpFindAllEndpointDATA validates the RTPS header and returns every
 // DATA body from a builtin SEDP writer with its flags in wire order.
+//
+// The submessage walk caps at sedpMaxSubmessages before dispatch; over-cap
+// datagrams drop loudly instead of trusting an unbounded header chain.
 func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 	err := sedpValidateRTPSHeader(data)
 	if err != nil {
@@ -1890,28 +2285,21 @@ func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 
 	var endpointFlags []byte
 
+	seen := 0
+
 	for off < len(data) {
-		id, body, flags, next, err := sedpSplitSubmessage(data, off)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dds: sedp parse submessage at %d: %w", off, err)
+		seen++
+		if seen > sedpMaxSubmessages {
+			return nil, nil, fmt.Errorf("dds: sedp parse submessages above %d: %w", sedpMaxSubmessages, ErrSEDPInvalidDATA)
 		}
-
+		body, flags, next, err := sedpCollectEndpointSub(data, off)
+		if err != nil {
+			return nil, nil, err
+		}
 		off = next
-
-		if id != sedpSubmessageDATA {
+		if body == nil {
 			continue
 		}
-
-		writer, err := sedpDATAWriter(body)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dds: sedp parse data writer: %w", err)
-		}
-
-		isEndpoint, _ := sedpClassifyWriter(writer)
-		if !isEndpoint {
-			continue
-		}
-
 		endpointBodies = append(endpointBodies, body)
 		endpointFlags = append(endpointFlags, flags)
 	}
@@ -2501,16 +2889,84 @@ func sedpValidateRTPSHeader(data []byte) error {
 // same bytes because the pad rounds the total to 4. The list is capped
 // at sedpMaxParams entries for bounded work, and rtps errors join
 // ErrSEDPInvalidDATA so errors.Is keeps working.
+// sedpCountParamHeader loads one parameter id and length.
+func sedpCountParamHeader(blob []byte, off int, littleEndian bool) (int, int, error) {
+	if len(blob)-off < 4 {
+		return 0, 0, fmt.Errorf("dds: sedp parse params header need 4 have %d: %w", len(blob)-off, ErrSEDPInvalidDATA)
+	}
+	var id, length int
+	if littleEndian {
+		id = int(binary.LittleEndian.Uint16(blob[off : off+2]))
+		length = int(binary.LittleEndian.Uint16(blob[off+2 : off+4]))
+	} else {
+		id = int(binary.BigEndian.Uint16(blob[off : off+2]))
+		length = int(binary.BigEndian.Uint16(blob[off+2 : off+4]))
+	}
+	return id, length, nil
+}
+
+// sedpCountParamsStep advances one parameter entry.
+//
+// It returns the next offset and whether the sentinel terminated the list.
+func sedpCountParamsStep(blob []byte, off int, littleEndian bool) (int, bool, error) {
+	id, length, err := sedpCountParamHeader(blob, off, littleEndian)
+	if err != nil {
+		return 0, false, err
+	}
+	off += 4
+	if id == int(rtps.ParamSentinel) {
+		if length != 0 {
+			return 0, false, fmt.Errorf("dds: sedp parse params sentinel carries %d bytes: %w", length, ErrSEDPInvalidDATA)
+		}
+		return off, true, nil
+	}
+	if length < 0 || len(blob)-off < length {
+		return 0, false, fmt.Errorf("dds: sedp parse params value need %d have %d: %w", length, len(blob)-off, ErrSEDPInvalidDATA)
+	}
+	off += length
+	pad := (4 - length%4) % 4
+	if len(blob)-off < pad {
+		return 0, false, fmt.Errorf("dds: sedp parse params pad need %d have %d: %w", pad, len(blob)-off, ErrSEDPInvalidDATA)
+	}
+	return off + pad, false, nil
+}
+
+// sedpCountParams walks parameter headers counting entries without allocating values.
+//
+// Each entry needs at least a 4 byte header, so the walk bounds work before
+// the full decode allocates. It stops and reports over-cap loudly instead
+// of trusting a crafted length chain.
+func sedpCountParams(blob []byte, littleEndian bool) error {
+	off := 0
+	count := 0
+	for {
+		step, done, err := sedpCountParamsStep(blob, off, littleEndian)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		count++
+		if count > sedpMaxParams {
+			return fmt.Errorf("dds: sedp parse param count above %d: %w", sedpMaxParams, ErrSEDPInvalidDATA)
+		}
+		off = step
+	}
+}
+
 func sedpDecodeParams(blob []byte, littleEndian bool) ([]rtps.Param, int, error) {
+	err := sedpCountParams(blob, littleEndian)
+	if err != nil {
+		return nil, 0, err
+	}
 	params, consumed, err := rtps.DecodeParamsEndian(blob, littleEndian)
 	if err != nil {
 		return nil, 0, fmt.Errorf("dds: sedp parse params: %w", errors.Join(err, ErrSEDPInvalidDATA))
 	}
-
 	if len(params) > sedpMaxParams {
 		return nil, 0, fmt.Errorf("dds: sedp parse param count above %d: %w", sedpMaxParams, ErrSEDPInvalidDATA)
 	}
-
 	return params, consumed, nil
 }
 
@@ -3079,3 +3535,37 @@ func sedpSortEndpoints(eps []SEDPEndpoint) {
 		return bytes.Compare(a.ID.Entity[:], b.ID.Entity[:])
 	})
 }
+
+// INTEGRATION state for SEDP discovery hardening.
+//
+// Done in this file: endpoint GUID binds to the RTPS header prefix with a
+// loud drop on mismatch, so spoofed endpoints never install; replay gates
+// on the per-endpoint DATA sequence after successful upsert, with the
+// sequence recorded only when the endpoint installs and never before
+// validation; seq 0 never advances lastSeq; the parameter list caps at
+// sedpMaxParams entries before full decode via a header pre-walk, with NUL
+// termination checks as before; the datagram submessage walk caps at
+// sedpMaxSubmessages (64) before dispatch with a loud drop on over-cap;
+// HEARTBEAT Count tracks per builtin writer with replay ignore (Count at
+// or below last with no new LastSequence draws no work) and Count==0
+// handled as single processing per LastSequence without a NACK storm,
+// documented on sedpHeartbeatNote; GAP decodes the full skipped list and
+// applies it in order via sedpApplyGapList, clamped to the known heartbeat
+// bound plus one and capped at current high plus sedpGapNoBoundCap (64,
+// one repair window) when no bound is known; unicast INFO_DST enforcement
+// lives in sedpCheckInfoDstUnicast, which unicast ingress must call.
+//
+// Done elsewhere: backend shouldDropUnicastForInfoDst enforces the same
+// unicast INFO_DST on the live socket path; backend noteSedpHeartbeatBound
+// plus applySedpGaps mirror the writer bound and full gap list for ACK
+// decisions; rtps DecodeMessage caps submessages at 4096 before dispatch
+// and DecodeGap bounds the trailing set.
+//
+// Explicitly open and unenforced: multicast ingress never calls the
+// INFO_DST helper because group sockets carry every sender and have no
+// per-sender identity; standalone SEDPIndex.ingestSample stays transport
+// agnostic and relies on the unicast caller for INFO_DST, while the index
+// itself sends no ACKs so heartbeat suppression only bounds local
+// reprocessing. No rejected scaffolding remains: inline-only plus payload
+// duplicate handling stays for Cyclone interop and is covered by fixture
+// tests.

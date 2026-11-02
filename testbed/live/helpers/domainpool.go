@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,14 +189,20 @@ func releaseDomainLock(domain int) {
 // error; the caller must not proceed without a domain. The token is a
 // nonzero owner ID; ReleaseDomainLease frees only on token match so a
 // stale cleanup after an early manual release cannot free a reused
-// domain. Allocation purges stale ros2 daemons for the domain so every
-// test starts clean even after killed runs left participants behind.
+// domain. Allocation purges daemons plus topic peers for the domain so
+// every test starts clean even after killed runs left participants
+// behind. A purge failure releases the lease and fails the allocation
+// instead of handing out a dirty domain.
 func AllocateDomainLease() (int, uint64, error) {
 	domain, token, err := claimPooledDomain()
 	if err != nil {
 		return 0, 0, err
 	}
-	purgeStaleRosDaemon(domain)
+	err = purgeDomainResidue(domain)
+	if err != nil {
+		ReleaseDomainLease(domain, token)
+		return 0, 0, err
+	}
 	return domain, token, nil
 }
 
@@ -326,32 +331,64 @@ func WaitForContainerProcGone(ctx context.Context, container, pattern string, bo
 // may reap it without risking parallel or sequential suites.
 const stalePeerAgeSeconds = "900"
 
-// purgeStaleRosDaemon stops ros2 CLI daemon procs for one domain on every
-// fleet peer and reaps ancient topic peers fleet-wide, verifying daemons.
+// purgeDomainResidue stops ros2 CLI daemons plus topic peers for one domain
+// on every fleet peer, verifying each kill with SIGKILL escalation.
 //
 // Daemons linger after killed runs and join discovery on reused domains,
-// breaking isolation assertions and slot probes. Live daemons cannot
-// exist yet at allocate time because no test on this domain runs before
-// its allocator returns, so the purge only removes residue. Ancient
-// topic procs (older than stalePeerAgeSeconds) are crash residue too:
-// no live test holds a peer that long, and parallel suites hold other
-// domains, so reaping them cannot signal a live test. Survivors fail
-// loudly instead of handing out a dirty domain. Failures are ignored
-// only when docker itself is unreachable in every attempt; a surviving
-// daemon is loud.
-
+// breaking isolation assertions and slot probes. Leaked topic peers do
+// worse: their user DATA reaches take loops on the reused domain and
+// fails loudly as provisional decode errors. Live daemons and peers
+// cannot exist yet at allocate time because no test on this domain runs
+// before its allocator returns, and parallel suites hold other domains,
+// so the purge only removes residue. Only a domain environ match is
+// signaled, so parallel suites are never disturbed. A survivor or an
+// inconclusive kill fails loudly instead of handing out a dirty domain.
+// Ancient topic peers of any domain are still reaped fleet-wide as a
+// backup for crashes that predate domain scoping.
+//
 //nolint:contextcheck,nolintlint // cleanup contexts intentionally outlive test cancellation, the purge runs at allocate time with a bounded Background timeout
-func purgeStaleRosDaemon(domain int) {
+func purgeDomainResidue(domain int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	pattern := "daemonize.*ros-domain-id " + strconv.Itoa(domain) + " "
+	daemonPattern := "daemonize.*ros-domain-id " + strconv.Itoa(domain) + " "
 	for _, container := range fleetContainers() {
-		KillRosDaemon(ctx, container, domain)
-		if !WaitForContainerProcGone(ctx, container, pattern, 10*time.Second) {
-			log.Printf("helpers: purge domain %d daemon survives on %s pattern %q", domain, container, pattern)
+		err := KillAndWaitContainerProc(ctx, container, daemonPattern)
+		if err != nil {
+			return fmt.Errorf("helpers: purge domain %d daemon: %w", domain, err)
+		}
+		err = purgeDomainTopicPeers(ctx, container, domain)
+		if err != nil {
+			return fmt.Errorf("helpers: purge domain %d topic peers: %w", domain, err)
 		}
 		reapStaleTopicPeers(ctx, container)
 	}
+	return nil
+}
+
+// purgeDomainTopicPeers kills ros2 topic procs whose ROS_DOMAIN_ID environ
+// matches domain and verifies they are gone, all in one docker exec.
+//
+// The topic command line carries no domain, so scoping by argv alone is
+// impossible; the /proc environ check makes the kill exact per domain.
+// Splitting kill and verify across exec calls races docker latency under
+// load, so one server-side script handles TERM, a bounded poll, SIGKILL
+// escalation, and a final check. Patterns travel in WPAT plus DOMAIN env
+// vars so neither the local docker argv nor the container shell ever
+// carries the literal pattern as its own command line. It returns nil
+// only when no matching proc remains. A missing proc is success, not
+// an error.
+func purgeDomainTopicPeers(ctx context.Context, container string, domain int) error {
+	const script = `for pid in $(pgrep -f "$WPAT"); do if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q "^ROS_DOMAIN_ID=$DOMAIN$"; then kill $pid; fi; done; for i in $(seq 1 12); do alive=0; for pid in $(pgrep -f "$WPAT"); do if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q "^ROS_DOMAIN_ID=$DOMAIN$"; then alive=1; break; fi; done; if [ "$alive" = "0" ]; then exit 0; fi; sleep 0.5; done; for pid in $(pgrep -f "$WPAT"); do if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q "^ROS_DOMAIN_ID=$DOMAIN$"; then kill -9 $pid; fi; done; for i in $(seq 1 4); do alive=0; for pid in $(pgrep -f "$WPAT"); do if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q "^ROS_DOMAIN_ID=$DOMAIN$"; then alive=1; break; fi; done; if [ "$alive" = "0" ]; then exit 0; fi; sleep 0.5; done; exit 1`
+	args := []string{"exec", "-e", "WPAT=topic (pub|echo)", "-e", "DOMAIN=" + strconv.Itoa(domain), container, "sh", "-c", script}
+	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness kills only test-owned peer procs
+	if out, err := cmd.CombinedOutput(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return fmt.Errorf("helpers: domain %d topic peer survived kill: %w", domain, err)
+		}
+		return fmt.Errorf("helpers: domain %d topic peer kill inconclusive output %q: %w", domain, string(out), err)
+	}
+	return nil
 }
 
 // reapStaleTopicPeers kills ros2 topic procs older than the stale bound.

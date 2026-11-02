@@ -143,6 +143,22 @@ func (d Duration) IsInfinite() bool {
 	return d.TotalNanoseconds() == math.MaxInt64
 }
 
+// isSaturatingToInfinite reports whether a finite input saturates to the
+// infinite total. InfiniteDuration itself returns false: only non-canonical
+// huge finite values that would masquerade as infinite return true.
+// Saturation stays as the backstop in TotalNanoseconds and Compare, but
+// Validate rejects such inputs loudly so callers use InfiniteDuration
+// explicitly instead of relying on saturation.
+func isSaturatingToInfinite(d Duration) bool {
+	if d == InfiniteDuration() {
+		return false
+	}
+	if IsBestAvailableDuration(d) {
+		return false
+	}
+	return d.IsInfinite()
+}
+
 // Compare orders d against other by total nanoseconds, returning minus one,
 // zero, or one.
 //

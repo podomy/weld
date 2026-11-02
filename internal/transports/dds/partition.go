@@ -340,24 +340,38 @@ func DecodePartitionQoS(value []byte) ([]string, error) {
 //
 // The length prefix is little endian only, matching CycloneDDS. Bytes
 // past the first NUL up to the declared length must be zero pad; any
-// trailing garbage fails loudly instead of decoding silently.
-func decodePartitionString(value []byte, off int) (string, int, error) {
+// trailing garbage fails loudly instead of decoding silently. Standard
+// layout pad after the declared length is verified zero like the Cyclone
+// pad-in-length path instead of being skipped.
+// partitionStringBytes validates the length prefix at off and returns the
+// declared string bytes.
+//
+// It fails loudly on short buffers, missing NUL, over-cap lengths, and
+// truncation instead of slicing blindly.
+func partitionStringBytes(value []byte, off int) ([]byte, int, error) {
 	if len(value)-off < 4 {
-		return "", 0, fmt.Errorf("dds: partition string need 4 have %d: %w", len(value)-off, ErrInvalidPartition)
+		return nil, 0, fmt.Errorf("dds: partition string need 4 have %d: %w", len(value)-off, ErrInvalidPartition)
 	}
 
 	length := int(binary.LittleEndian.Uint32(value[off : off+4]))
 	if length < 1 {
-		return "", 0, fmt.Errorf("dds: partition string length %d misses NUL: %w", length, ErrInvalidPartition)
+		return nil, 0, fmt.Errorf("dds: partition string length %d misses NUL: %w", length, ErrInvalidPartition)
 	}
 	if length > MaxPartitionNameLen+4 {
-		return "", 0, fmt.Errorf("dds: partition string length %d above cap: %w", length, ErrInvalidPartition)
+		return nil, 0, fmt.Errorf("dds: partition string length %d above cap: %w", length, ErrInvalidPartition)
 	}
 	if len(value)-off-4 < length {
-		return "", 0, fmt.Errorf("dds: partition string need %d have %d: %w", length, len(value)-off-4, ErrInvalidPartition)
+		return nil, 0, fmt.Errorf("dds: partition string need %d have %d: %w", length, len(value)-off-4, ErrInvalidPartition)
 	}
 
-	raw := value[off+4 : off+4+length]
+	return value[off+4 : off+4+length], length, nil
+}
+
+// partitionStringName splits declared bytes at the first NUL and verifies
+// the remainder is zero pad.
+//
+// Trailing garbage past the NUL fails loudly instead of decoding silently.
+func partitionStringName(raw []byte) (string, error) {
 	nul := -1
 	for i, b := range raw {
 		if b == 0x00 {
@@ -366,25 +380,61 @@ func decodePartitionString(value []byte, off int) (string, int, error) {
 		}
 	}
 	if nul < 0 {
-		return "", 0, fmt.Errorf("dds: partition string misses NUL terminator: %w", ErrInvalidPartition)
+		return "", fmt.Errorf("dds: partition string misses NUL terminator: %w", ErrInvalidPartition)
 	}
 
 	name := string(raw[:nul])
 
 	for _, b := range raw[nul:] {
 		if b != 0x00 {
-			return "", 0, fmt.Errorf("dds: partition string has trailing garbage past NUL: %w", ErrInvalidPartition)
+			return "", fmt.Errorf("dds: partition string has trailing garbage past NUL: %w", ErrInvalidPartition)
 		}
 	}
 
 	err := ValidatePartitionName(name)
 	if err != nil {
+		return "", err
+	}
+
+	return name, nil
+}
+
+// partitionStringPad verifies the alignment pad after the declared bytes
+// is zero and returns the offset past it.
+func partitionStringPad(value []byte, off, length int) (int, error) {
+	pad := (4 - length%4) % 4
+	if pad == 0 {
+		return off + 4 + length, nil
+	}
+	if len(value)-off-4-length < pad {
+		return 0, fmt.Errorf("dds: partition string pad overruns value: %w", ErrInvalidPartition)
+	}
+	for _, b := range value[off+4+length : off+4+length+pad] {
+		if b != 0x00 {
+			return 0, fmt.Errorf("dds: partition string pad has trailing garbage: %w", ErrInvalidPartition)
+		}
+	}
+	next := off + 4 + length + pad
+	if next > len(value) {
+		return 0, fmt.Errorf("dds: partition string pad overruns value: %w", ErrInvalidPartition)
+	}
+	return next, nil
+}
+
+func decodePartitionString(value []byte, off int) (string, int, error) {
+	raw, length, err := partitionStringBytes(value, off)
+	if err != nil {
 		return "", 0, err
 	}
 
-	next := off + 4 + length + (4-length%4)%4
-	if next > len(value) {
-		return "", 0, fmt.Errorf("dds: partition string pad overruns value: %w", ErrInvalidPartition)
+	name, err := partitionStringName(raw)
+	if err != nil {
+		return "", 0, err
+	}
+
+	next, err := partitionStringPad(value, off, length)
+	if err != nil {
+		return "", 0, err
 	}
 
 	return name, next, nil
@@ -410,10 +460,11 @@ func PartitionParam(names []string) (rtps.Param, error) {
 // or nil when no entry is present (the default partition). Later
 // duplicates are ignored: identity stays first-wins like the SEDP
 // endpoint parser. Values decode little endian only, matching CycloneDDS
-// wire order; the SEDP call sites in sedp.go carry a littleEndian flag
-// but threading it here would churn the exported signature, so big-endian
+// wire order; SEDP call sites carry the same littleEndian flag they thread
+// to DecodeDurabilityService and ExtractSecurityInfoEndian, so big-endian
 // peers stay refused loudly through DecodePartitionQoSEndian and
-// FindPartitionParamEndian instead of mis-decoding silently.
+// FindPartitionParamEndian instead of mis-decoding silently. Callers with
+// an explicit endianness must use FindPartitionParamEndian.
 func FindPartitionParam(params []rtps.Param) ([]string, error) {
 	for _, p := range params {
 		if p.ID != PIDPartition {

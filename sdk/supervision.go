@@ -55,8 +55,14 @@ type serialEntry struct {
 // insertion order with lifecycle supervision and bond liveliness.
 //
 // REVIEW: background Spin and preshutdown hooks are deferred to user
-// review; callers drive delivery with SpinOnce. Close rejects new work
-// and is idempotent, matching Node.Close.
+// review; callers drive delivery with SpinOnce.
+//
+// Close versus Node.Close: Node.Close tears down tracked publishers,
+// subscriptions, servers, and clients, while SerialGroup.Close only marks
+// the group closed and rejects new work. It never runs Deactivate,
+// Cleanup, or Shutdown; the caller must drive the lifecycle explicitly
+// before Close. Close stays idempotent and a second Close is a quiet
+// success. Empty query results are always non-nil slices.
 type SerialGroup struct {
 	// mu guards entries plus lifecycle flags.
 	mu sync.Mutex
@@ -102,10 +108,11 @@ func (g *SerialGroup) Len() int {
 	return len(g.entries)
 }
 
-// Order returns entity names in scan order. A nil group returns nil.
+// Order returns entity names in scan order. A nil group returns a
+// non-nil empty slice. The result is always non-nil.
 func (g *SerialGroup) Order() []string {
 	if g == nil {
-		return nil
+		return []string{}
 	}
 	g.mu.Lock()
 	out := make([]*serialEntry, len(g.entries))
@@ -379,7 +386,7 @@ func (g *SerialGroup) SpinOnce() bool {
 	g.runMu.Lock()
 	defer g.runMu.Unlock()
 	takes := g.snapshotTakes()
-	if takes == nil {
+	if len(takes) == 0 {
 		return false
 	}
 	for _, take := range takes {
@@ -394,6 +401,11 @@ func (g *SerialGroup) SpinOnce() bool {
 }
 
 // Close rejects new work and is idempotent.
+//
+// Close only marks the group closed and rejects new work; it never runs
+// Deactivate, Cleanup, or Shutdown. Drive the lifecycle explicitly before
+// Close. This diverges from Node.Close, which tears down tracked entities.
+// A second Close is a quiet success.
 func (g *SerialGroup) Close() error {
 	if g == nil {
 		return errors.New("sdk: serial group close on nil group") //nolint:wrapcheck // new error, nothing to wrap
@@ -439,13 +451,16 @@ func (g *SerialGroup) BondAlive(entity string, nowNanos int64) (bool, error) {
 }
 
 // CheckBonds returns names of entities whose bond is dead at nowNanos.
+//
+// The result is always non-nil; a nil group yields an empty slice and a
+// healthy group yields an empty slice, never nil.
 func (g *SerialGroup) CheckBonds(nowNanos int64) []string {
 	if g == nil {
-		return nil
+		return []string{}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	var dead []string
+	dead := make([]string, 0)
 	for _, entry := range g.entries {
 		if !bondAliveAt(entry.hasHeartbeat, entry.lastHeartbeatNanos, nowNanos, SerialBondTimeoutNanos) {
 			dead = append(dead, entry.entity.Name)
@@ -495,13 +510,14 @@ func sortSerialEntries(out []*serialEntry) {
 	})
 }
 
-// snapshotTakes copies Take callbacks in scan order. It returns nil when
-// the group is closed or inactive so SpinOnce skips pending work.
+// snapshotTakes copies Take callbacks in scan order. It returns an empty
+// non-nil slice when the group is closed or inactive so SpinOnce skips
+// pending work without distinguishing nil from empty.
 func (g *SerialGroup) snapshotTakes() []func() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed || !g.active {
-		return nil
+		return []func() bool{}
 	}
 	out := make([]*serialEntry, len(g.entries))
 	copy(out, g.entries)

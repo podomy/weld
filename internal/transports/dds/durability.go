@@ -403,7 +403,8 @@ func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps Dura
 // applying them to the total: max samples per instance multiplies by the
 // effective instance total, max instances caps the instance total, and max
 // samples still caps the grand total. Unstated (0) and unlimited (-1) keep
-// the struct contract.
+// the struct contract. Products saturate at published instead of wrapping,
+// so huge depths never overflow before the published cap applies.
 func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS, instanceCount uint64) uint64 {
 	if instanceCount == 0 {
 		instanceCount = 1
@@ -418,7 +419,7 @@ func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint
 	}
 
 	if durabilityKind == sedpDurabilityTransientLocal {
-		return min(published, resolveWriterDepth(writerDepth)*instanceCount)
+		return cappedMultiply(resolveWriterDepth(writerDepth), instanceCount, published)
 	}
 
 	if durabilityKind != durabilityKindTransient && durabilityKind != durabilityKindPersistent {
@@ -440,14 +441,34 @@ func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint
 		effectiveInstances = min(effectiveInstances, uint64(caps.MaxInstances))
 	}
 
-	bound := effectiveInstances * perInstance
-	bound = min(bound, published)
+	bound := cappedMultiply(effectiveInstances, perInstance, published)
 
 	if caps.MaxSamples > 0 {
 		bound = min(bound, uint64(caps.MaxSamples))
 	}
 
 	return bound
+}
+
+// cappedMultiply returns min(a times b, limit) without wrapping.
+//
+// When either factor is zero the product is zero. When a exceeds limit
+// divided by b the product would meet or pass limit, so it returns limit
+// early instead of multiplying past uint64 range. Otherwise it returns
+// the exact product, which the caller then caps. The limit here is always
+// published, so replay never promises more than the writer sent.
+func cappedMultiply(a, b, limit uint64) uint64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	if a > limit/b {
+		return limit
+	}
+	product := a * b
+	if product > limit {
+		return limit
+	}
+	return product
 }
 
 // replayBoundKeyless is the single-instance bound preserved for keyless topics.

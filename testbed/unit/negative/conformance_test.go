@@ -761,7 +761,7 @@ func TestNegativeDisposeRemovesAndStaleDisposeIgnored(t *testing.T) {
 	dupAlive := negMustMarshalAlive(t, guid, 0, 5, 10*time.Second)
 	err = table.HandlePacket(dupAlive, base)
 	if err != nil {
-		t.Fatalf("handle dup alive: %v", err)
+		t.Fatalf("handle dup alive = %v, want silent duplicate", err)
 	}
 	if table.Generation() != genAfterAlive {
 		t.Fatalf("gen changed on duplicate alive")
@@ -771,7 +771,7 @@ func TestNegativeDisposeRemovesAndStaleDisposeIgnored(t *testing.T) {
 	staleBye := negMustMarshalDispose(t, guid, 0, 5)
 	err = table.HandlePacket(staleBye, base)
 	if err != nil {
-		t.Fatalf("handle stale dispose: %v", err)
+		t.Fatalf("handle stale dispose = %v, want silent duplicate", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("stale dispose removed entry, want len 1")
@@ -782,8 +782,8 @@ func TestNegativeDisposeRemovesAndStaleDisposeIgnored(t *testing.T) {
 
 	olderBye := negMustMarshalDispose(t, guid, 0, 3)
 	err = table.HandlePacket(olderBye, base)
-	if err != nil {
-		t.Fatalf("handle older dispose: %v", err)
+	if !errors.Is(err, dds.ErrStaleSPDP) {
+		t.Fatalf("handle older dispose = %v, want stale reject", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("older dispose removed entry, want len 1")
@@ -941,20 +941,32 @@ func TestNegativeNilContextSenderReceiverPeriodExplicitErrors(t *testing.T) {
 	if err == nil {
 		t.Fatalf("sedp announce nil context succeeded, want error")
 	}
+	if !errors.Is(err, dds.ErrSEDPInvalidEndpoint) {
+		t.Fatalf("sedp announce nil context error = %v, want ErrSEDPInvalidEndpoint", err)
+	}
 
 	err = idx.AnnounceLoop(context.Background(), nil)
 	if err == nil {
 		t.Fatalf("sedp announce nil sender succeeded, want error")
+	}
+	if !errors.Is(err, dds.ErrSEDPInvalidEndpoint) {
+		t.Fatalf("sedp announce nil sender error = %v, want ErrSEDPInvalidEndpoint", err)
 	}
 
 	err = idx.ListenLoop(nil, &negSedpFakeReceiver{}) //nolint:staticcheck // SA1012: test explicitly passes nil context to verify explicit error
 	if err == nil {
 		t.Fatalf("sedp listen nil context succeeded, want error")
 	}
+	if !errors.Is(err, dds.ErrSEDPInvalidEndpoint) {
+		t.Fatalf("sedp listen nil context error = %v, want ErrSEDPInvalidEndpoint", err)
+	}
 
 	err = idx.ListenLoop(context.Background(), nil)
 	if err == nil {
 		t.Fatalf("sedp listen nil receiver succeeded, want error")
+	}
+	if !errors.Is(err, dds.ErrSEDPInvalidEndpoint) {
+		t.Fatalf("sedp listen nil receiver error = %v, want ErrSEDPInvalidEndpoint", err)
 	}
 
 	_, err = dds.NewPublisher(negMakeWriterGUID(0x72), nil)

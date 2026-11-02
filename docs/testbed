@@ -90,6 +90,12 @@ Domain split (see Testbed Go - /docs/testbed-go):
 
 Only one run per domain and topic at a time. Every live run uses one per-run live ID for payload isolation and reuses that ID for start plus assert. See testbed/live/helpers/helpers.go:131.
 
+Residue purge: allocating a pooled domain first cleans that domain on every fleet container (testbed/live/helpers/domainpool.go:350). A ros2 daemon whose command line names the domain is killed, then every ros2 topic pub or echo whose container environ says ROS_DOMAIN_ID=<domain> is killed; each kill is verified and escalated to SIGKILL, and a survivor fails the allocation instead of handing out a dirty domain.
+
+A leftover peer is not harmless. It joins discovery on the reused domain, so its user DATA reaches take loops and fails loudly as provisional decode errors, and even a daemon with no topics counts as a route and breaks CLI route-wait isolation. Parallel suites hold other domains, so the environ match never disturbs them. The topic command line carries no domain, which is why the check reads /proc environ instead of matching argv. Crash residue older than 15 minutes is still reaped fleet-wide as a backup.
+
+Kill discipline: never run bare host pkill -f, because the host command line contains the pattern and matches itself. Kills run inside the container via docker exec with the pattern in an env var, and death is verified with pgrep before proceeding (testbed/live/helpers/helpers.go:694).
+
 Gates
 
 Canonical Go entrypoint is go test -tags live -timeout 60m ./testbed/live/... -count=1.

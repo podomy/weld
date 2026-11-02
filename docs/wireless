@@ -1,6 +1,6 @@
 Wireless for Weld
 
-Weld is robotics middleware in Go. It speaks ROS 2 on the wire (DDS RTPS with XCDR1 CDR) so Go programs join ROS 2 systems as first-class nodes. One Go core owns matching, routing, and supervision. Transports sit at the border behind one backend interface: DDS in v1 via a CycloneDDS sidecar, Zenoh and MQTT after v1. See docs/design, docs/transports, docs/qos.
+Weld is robotics middleware in Go. It speaks ROS 2 on the wire (DDS RTPS with XCDR1 CDR) so Go programs join ROS 2 systems as first-class nodes. One Go core owns matching, routing, and supervision. Transports sit at the border behind one backend interface: DDS in v1 against CycloneDDS peers directly, Zenoh and MQTT after v1. See docs/design, docs/transports, docs/qos.
 
 This file answers one question: what does the radio do to a fleet, and what must Weld do about it.
 

@@ -1461,11 +1461,16 @@ func (r *DataReceiver) countPlainDrop(guid WriterGUID, cause error, op string) e
 
 // trackSequenceLocked records one sequence for best effort ordering.
 //
-// The caller must hold mu. The first sample from a GUID is accepted with no
-// lost count. A gap adds the skipped count to lost and accepts the current
-// frame. A duplicate or old sequence counts a drop and returns
-// ErrStaleSequence.
+// The caller must hold mu. The zero value is not usable: use NewDataReceiver.
+// The nil map guards allocation so a zero value does not panic, but callers
+// must still use NewDataReceiver for correct drop and lost accounting. The
+// first sample from a GUID is accepted with no lost count. A gap adds the
+// skipped count to lost and accepts the current frame. A duplicate or old
+// sequence counts a drop and returns ErrStaleSequence.
 func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
+	if r.last == nil {
+		r.last = make(map[WriterGUID]uint64)
+	}
 	last, seen := r.last[guid]
 	if !seen {
 		r.last[guid] = seq

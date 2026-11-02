@@ -142,6 +142,13 @@ func qosDHFlagsSupported(ctx context.Context, domain int) (bool, bool, error) {
 	return true, keepAllOk, nil
 }
 
+// qosDHBudgetedSkip records one allowlisted product skip with distro pin and expiry.
+func qosDHBudgetedSkip(t *testing.T, reason string) {
+	t.Helper()
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
+}
+
 // qosDHRequireFlags skips the test when the peer lacks the QoS flags.
 //
 // It returns keepAllOk so callers can skip only keep_all cases with a reason
@@ -150,10 +157,10 @@ func qosDHRequireFlags(t *testing.T, ctx context.Context, domain int) bool {
 	t.Helper()
 	flagsOk, keepAllOk, err := qosDHFlagsSupported(ctx, domain)
 	if err != nil {
-		t.Skipf("qos durability history flag probe failed, skipping matrix: %v", err)
+		qosDHBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !flagsOk {
-		t.Skipf("ros2 topic pub or echo lacks --qos-durability, --qos-history, or --qos-depth, skipping matrix")
+		qosDHBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy")
 	}
 	if !keepAllOk {
 		t.Logf("ros2 topic pub or echo help lacks keep_all, keep_all cases will skip with reason")
@@ -338,6 +345,7 @@ func qosDHRunForward(t *testing.T, ctx context.Context, bin string, domain int, 
 		qosDHAssertCompatibleFlow(t, c, stdout, stderr, live, payload)
 		return
 	}
+	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "qos-dh")
 	qosDHAssertIncompatibleSilent(t, c, stdout, live, payload)
 }
 
@@ -413,9 +421,12 @@ func qosDHRunReverse(t *testing.T, ctx context.Context, bin string, domain int, 
 // core-only test which needs no peer flags.
 func qosDHRunCase(t *testing.T, ctx context.Context, bin string, domain int, c qosDHCase, keepAllOk bool) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	qosDHCheckCore(t, c)
 	if c.history == "keep_all" && !keepAllOk {
-		t.Skipf("case %s: peer lacks keep_all value, skipping live flow with reason", c.name)
+		qosDHBudgetedSkip(t, fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name))
 	}
 	if c.direction == "forward" {
 		qosDHRunForward(t, ctx, bin, domain, c)
@@ -498,6 +509,9 @@ func TestROSQoSDurabilityHistoryCore(t *testing.T) {
 // lacks the keep_all value.
 func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosDHTestTimeout)
 	defer cancel()
@@ -526,6 +540,9 @@ func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 // skip with reason when the peer help lacks the keep_all value.
 func TestROSQoSDurabilityHistoryIncompatibleLoud(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosDHTestTimeout)
 	defer cancel()

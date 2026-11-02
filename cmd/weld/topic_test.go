@@ -488,10 +488,10 @@ func checkInfoTopicFailure(t *testing.T, flagText string, explicit bool, args []
 func TestResolveInfoTopic(t *testing.T) {
 	checkInfoTopicSuccess(t, "/explicit", true, nil, "/explicit", "flag topic")
 	checkInfoTopicSuccess(t, defaultTopic, false, []string{"/pos"}, "/pos", "positional")
-	checkInfoTopicSuccess(t, defaultTopic, true, []string{"/pos"}, defaultTopic, "explicit default topic")
 	checkInfoTopicSuccess(t, defaultTopic, false, nil, defaultTopic, "default topic")
 	checkInfoTopicFailure(t, "", false, nil, "missing topic")
 	checkInfoTopicFailure(t, "/a", true, []string{"/b", "/c"}, "two args")
+	checkInfoTopicFailure(t, defaultTopic, true, []string{"/pos"}, "flag plus positional")
 }
 
 // TestFetchTopicSnapshotEmpty checks backend without graph yields empty.

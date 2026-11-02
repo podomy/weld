@@ -141,6 +141,7 @@ func runDiagStrictForward(t *testing.T, ctx context.Context, domain int, tc type
 	}
 	takeCtx, takeCancel := context.WithTimeout(ctx, typeMatrixTakeWait)
 	defer takeCancel()
+	unknownTakeErrs := 0
 	for takeCtx.Err() == nil {
 		msg, terr := backend.TakeBytes(takeCtx)
 		if terr != nil {
@@ -154,7 +155,8 @@ func runDiagStrictForward(t *testing.T, ctx context.Context, domain int, tc type
 			if strings.Contains(text, "not wired") {
 				t.Fatalf("weld take backend error %s: %v", tc.Label, terr)
 			}
-			continue
+			unknownTakeErrs++
+			t.Fatalf("weld take unexpected error %s count %d: %v", tc.Label, unknownTakeErrs, terr)
 		}
 		derr := tc.decode(msg.Payload, live)
 		if derr == nil {

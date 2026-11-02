@@ -235,8 +235,8 @@ func ValidateTypeName(name string) error {
 // FieldTypeString to FieldTypeBoundedWString may carry StringCapacity;
 // all other bases must carry StringCapacity 0. Bounded and fixed string
 // bases FieldTypeFixedString to FieldTypeBoundedWString must carry
-// StringCapacity greater than 0; plain String and WString may carry zero
-// for unbounded or nonzero for the bounded representation. Nested kinds
+// StringCapacity greater than 0; plain String and WString must carry zero
+// for unbounded and never carry nonzero. Nested kinds
 // with base FieldTypeNestedType (identifiers 1, 49, 97, 145) require a
 // nested type name; all other kinds forbid one.
 func (t FieldType) Validate() error {
@@ -294,8 +294,8 @@ func (t FieldType) validateNonNestedName() error {
 
 // validateStringCapacity rejects string capacity on non string kinds.
 // Bounded and fixed string bases must carry StringCapacity greater than 0.
-// Plain String and WString allow zero or nonzero: zero means unbounded and
-// nonzero carries the bounded representation used by existing fixtures.
+// Plain String and WString must carry zero: nonzero is rejected so bounded
+// strings always use the BoundedString or FixedString base.
 func (t FieldType) validateStringCapacity() error {
 	if !t.TypeID.IsString() {
 		if t.StringCapacity != 0 {
@@ -308,6 +308,10 @@ func (t FieldType) validateStringCapacity() error {
 		if t.StringCapacity == 0 {
 			return fmt.Errorf("types: bounded or fixed string type id %d misses string capacity", uint8(t.TypeID))
 		}
+		return nil
+	}
+	if t.StringCapacity != 0 {
+		return fmt.Errorf("types: plain string type id %d carries string capacity %d", uint8(t.TypeID), t.StringCapacity)
 	}
 	return nil
 }

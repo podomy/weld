@@ -20,6 +20,8 @@ coverage.out
 
 # Binary (repo root only, not cmd/ subdirectories)
 /weld
+# Built CLI binary inside its module directory
+cmd/weld/cmd-weld
 
 # History folder
 .history/

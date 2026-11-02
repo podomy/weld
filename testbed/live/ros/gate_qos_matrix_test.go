@@ -128,15 +128,22 @@ func qosMatrixSupported(ctx context.Context, domain int) (bool, error) {
 	return true, nil
 }
 
+// qosBudgetedSkip records one allowlisted product skip with distro pin and expiry.
+func qosBudgetedSkip(t *testing.T, reason string) {
+	t.Helper()
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
+}
+
 // qosRequireFlags skips the test when the peer lacks the QoS flags.
 func qosRequireFlags(t *testing.T, ctx context.Context, domain int) {
 	t.Helper()
 	ok, err := qosMatrixSupported(ctx, domain)
 	if err != nil {
-		t.Skipf("qos flag probe failed, skipping matrix: %v", err)
+		qosBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !ok {
-		t.Skipf("ros2 topic pub or echo lacks QoS flags, skipping matrix")
+		qosBudgetedSkip(t, "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy")
 	}
 }
 
@@ -463,6 +470,9 @@ func TestROSQoSMatrixCore(t *testing.T) {
 // ok echo output fails.
 func TestROSQoSCompatibleDelivers(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosTestTimeout)
 	defer cancel()
@@ -500,6 +510,9 @@ func TestROSQoSCompatibleDelivers(t *testing.T) {
 // present or when the QoS flags are unsupported.
 func TestROSQoSIncompatibleLoud(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosTestTimeout)
 	defer cancel()

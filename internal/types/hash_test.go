@@ -545,12 +545,12 @@ func TestFieldTypeCapacityStringCapacityTable(t *testing.T) {
 		{name: "unbounded with capacity", field: FieldType{TypeID: unboundedInt32, Capacity: 3}, wantErr: true},
 		{name: "unbounded nonstring stringcap", field: FieldType{TypeID: unboundedInt32, Capacity: 0, StringCapacity: 2}, wantErr: true},
 		{name: "scalar string zero", field: FieldType{TypeID: FieldTypeString}, wantErr: false},
-		{name: "scalar string bounded cap", field: FieldType{TypeID: FieldTypeString, StringCapacity: 5}, wantErr: false},
+		{name: "scalar string bounded cap", field: FieldType{TypeID: FieldTypeString, StringCapacity: 5}, wantErr: true},
 		{name: "scalar string carries capacity", field: FieldType{TypeID: FieldTypeString, Capacity: 1}, wantErr: true},
 		{name: "scalar bounded string cap", field: FieldType{TypeID: FieldTypeBoundedString, StringCapacity: 5}, wantErr: false},
-		{name: "array string full", field: FieldType{TypeID: arrayString, Capacity: 3, StringCapacity: 5}, wantErr: false},
+		{name: "array string full", field: FieldType{TypeID: arrayString, Capacity: 3, StringCapacity: 5}, wantErr: true},
 		{name: "array string missing capacity", field: FieldType{TypeID: arrayString, Capacity: 0, StringCapacity: 5}, wantErr: true},
-		{name: "unbounded string full", field: FieldType{TypeID: unboundedString, Capacity: 0, StringCapacity: 5}, wantErr: false},
+		{name: "unbounded string full", field: FieldType{TypeID: unboundedString, Capacity: 0, StringCapacity: 5}, wantErr: true},
 		{name: "unbounded string carries capacity", field: FieldType{TypeID: unboundedString, Capacity: 2, StringCapacity: 5}, wantErr: true},
 		{name: "bounded string seq", field: FieldType{TypeID: boundedStringSeq, Capacity: 3, StringCapacity: 5}, wantErr: false},
 		{name: "nested stringcap", field: FieldType{TypeID: FieldTypeNestedType, NestedTypeName: "pkg/msg/X", StringCapacity: 1}, wantErr: true},
@@ -637,4 +637,26 @@ func TestArrayOfHelpers(t *testing.T) {
 	t.Run("offsets", checkArrayOfOffsets)
 	t.Run("rejected", checkArrayOfRejected)
 	t.Run("kinds", checkArrayOfKinds)
+}
+
+// TestFieldInvalidUTF8Name checks malformed names are rejected loudly.
+func TestFieldInvalidUTF8Name(t *testing.T) {
+	bad := Field{Name: string([]byte{0xff, 0xfe}), Type: FieldType{TypeID: FieldTypeInt32}}
+	err := bad.Validate()
+	if err == nil {
+		t.Fatal("invalid UTF-8 field name accepted, want rejection")
+	}
+	other := Field{Name: string([]byte{0xff, 0xfd}), Type: FieldType{TypeID: FieldTypeInt32}}
+	err = other.Validate()
+	if err == nil {
+		t.Fatal("second malformed field name accepted, want rejection")
+	}
+	desc := IndividualTypeDescription{
+		TypeName: "pkg/msg/Bad",
+		Fields:   []Field{bad},
+	}
+	err = desc.Validate()
+	if err == nil {
+		t.Fatal("individual with malformed field accepted, want rejection")
+	}
 }

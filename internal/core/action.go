@@ -66,7 +66,10 @@ func (d ClockDomain) String() string {
 	}
 }
 
-// isValidClockDomain reports whether d is a concrete domain.
+// isValidClockDomain reports whether d is a concrete domain. Single rule
+// across NewClockState plus SetDomain plus ValidateGoalClock: invalid
+// domains are always rejected loudly (panic at construction, error
+// elsewhere), never coerced to wall.
 func isValidClockDomain(d ClockDomain) bool {
 	return d == ClockWall || d == ClockSim || d == ClockSteady
 }
@@ -202,7 +205,8 @@ func (e *ClockMismatchError) Error() string {
 }
 
 // ValidateGoalClock rejects a goal whose domain disagrees with the server.
-// Invalid domains on either side fail loudly instead of passing when equal.
+// Single rule: invalid domains on either side fail loudly instead of passing
+// when equal, matching NewClockState (panic) plus SetDomain (error).
 //
 // Any disagreement errors, so a wall stamped receding horizon goal against
 // sim time surfaces here instead of freezing silently. Matching domains
@@ -700,12 +704,14 @@ func (s *ActionServer) cacheLocked(goal *actionGoal, status GoalStatus, payload 
 // isExpiredLocked reports whether a result exceeded retention from completion.
 //
 // A backward jump where now is before completion never expires, so the
-// cache survives clock rewinds. Callers must hold the mutex.
+// cache survives clock rewinds. Elapsed uses the saturating helper so
+// near-range fake clocks cannot overflow the subtraction. Callers must hold
+// the mutex.
 func (s *ActionServer) isExpiredLocked(res *actionResult, nowNanos int64) bool {
 	if nowNanos < res.completedNanos {
 		return false
 	}
-	return nowNanos-res.completedNanos > s.resultTimeoutNanos
+	return saturatingSub(nowNanos, res.completedNanos) > s.resultTimeoutNanos
 }
 
 // purgeExpiredLocked evicts results whose retention lapsed at nowNanos.

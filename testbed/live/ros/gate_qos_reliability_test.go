@@ -138,15 +138,22 @@ func relSupported(ctx context.Context, domain int) (bool, error) {
 	return true, nil
 }
 
+// relBudgetedSkip records one allowlisted product skip with distro pin and expiry.
+func relBudgetedSkip(t *testing.T, reason string) {
+	t.Helper()
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
+}
+
 // relRequireFlag skips the test when the peer lacks the reliability flag.
 func relRequireFlag(t *testing.T, ctx context.Context, domain int) {
 	t.Helper()
 	ok, err := relSupported(ctx, domain)
 	if err != nil {
-		t.Skipf("reliability flag probe failed, skipping: %v", err)
+		relBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy reliability flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !ok {
-		t.Skipf("ros2 topic pub lacks --qos-reliability, skipping reliability gate")
+		relBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy")
 	}
 }
 
@@ -312,6 +319,7 @@ func relRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 		relAssertCompatibleFlow(t, c, stdout, stderr, live, payload)
 		return
 	}
+	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "reliability")
 	relAssertIncompatibleSilent(t, c, stdout, live, payload)
 }
 
@@ -527,6 +535,9 @@ func TestROSQoSReliabilityCore(t *testing.T) {
 // returned cancel.
 func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), relTestTimeout)
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
@@ -541,6 +552,9 @@ func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
 
 func TestROSQoSReliabilityCompatibleDelivers(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	ctx, cancel, bin := relGateSetup(t)
 	defer cancel()
 	// Reliability compatible cases span three entries: forward reliable to
@@ -565,6 +579,9 @@ func TestROSQoSReliabilityCompatibleDelivers(t *testing.T) {
 // peer is present or when the reliability flag is unsupported.
 func TestROSQoSReliabilityIncompatibleLoud(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	ctx, cancel, bin := relGateSetup(t)
 	defer cancel()
 	// Reliability incompatible cases pin the single best-effort offer against

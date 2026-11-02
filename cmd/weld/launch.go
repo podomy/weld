@@ -62,11 +62,16 @@ func prepareLaunchForwarded(left, right []string, stderr io.Writer) (launch.Node
 }
 
 // buildLaunchFinal resolves params, rewrites, and appends SDF.
+//
+// Flag syntax errors already returned 2 before this point. Every failure
+// here is a config or dump failure and exits 1: missing params files,
+// bad rewrite values, bad SDF paths, and dump errors share one loud code
+// instead of mixing 1 and 2.
 func buildLaunchFinal(forwarded launch.NodeOptions, cfg launchFlagConfig, stderr io.Writer) (map[string]core.ParamValue, string, int, bool) {
 	rewrites, err := parseRewriteFlags(cfg.rewrites)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return nil, "", 2, false
+		return nil, "", 1, false
 	}
 	resolved, err := resolveLaunchParams(forwarded)
 	if err != nil {
@@ -76,14 +81,14 @@ func buildLaunchFinal(forwarded launch.NodeOptions, cfg launchFlagConfig, stderr
 	final, err := launch.RewriteParamsForNamespace(resolved, forwarded.Namespace, rewrites, cfg.autostart)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-		return nil, "", 2, false
+		return nil, "", 1, false
 	}
 	sdfPath := strings.TrimSpace(cfg.sdf)
 	if sdfPath != "" {
 		validated, err := launch.AppendSDFParams(forwarded, sdfPath)
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
-			return nil, "", 2, false
+			return nil, "", 1, false
 		}
 		final[launch.SimTimeParam] = validated.Params[launch.SimTimeParam]
 	}
@@ -98,7 +103,8 @@ func buildLaunchFinal(forwarded launch.NodeOptions, cfg launchFlagConfig, stderr
 // node options with last wins. Files plus CLI resolve with FQN over
 // wildcard, rewrites apply per namespace, SDF appends with sim time forced
 // on, and the canonical dump shares form with ros2 param dump.
-// A cancelled context terminates with code 1 like params; the 1 here is
+// Config failures after flag parsing share exit 1; only flag syntax and
+// missing node exit 2. A cancelled context terminates with code 1 like params; the 1 here is
 // pinned by TestRunLaunchUsage so launch cancel stays loud.
 func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	err := ctx.Err()
@@ -134,6 +140,11 @@ func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 }
 
 // launchFlagConfig holds parsed left side launch flags.
+//
+// There is intentionally no --allow-undeclared flag: node resolution
+// always auto-declares overrides through ResolveNodeParams, matching the
+// store startup and override batches. A dead flag would imply a refused
+// path that resolution never takes, so the option stays out of the CLI.
 type launchFlagConfig struct {
 	node        string
 	namespace   string

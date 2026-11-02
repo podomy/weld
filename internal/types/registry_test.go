@@ -750,3 +750,48 @@ func TestRegistryConcurrent(t *testing.T) {
 		t.Fatalf("concurrent len = %d, want 1", r.Len())
 	}
 }
+
+// TestRegistryUnreachableClosure checks extra refs are rejected.
+func TestRegistryUnreachableClosure(t *testing.T) {
+	r := NewRegistry()
+	desc := TypeDescription{
+		Description: IndividualTypeDescription{
+			TypeName: "pkg/msg/A",
+			Fields:   []Field{{Name: "b", Type: FieldType{TypeID: FieldTypeNestedType, NestedTypeName: "pkg/msg/B"}}},
+		},
+		Referenced: []IndividualTypeDescription{
+			{TypeName: "pkg/msg/B", Fields: []Field{{Name: "x", Type: FieldType{TypeID: FieldTypeInt32}}}},
+			{TypeName: "pkg/msg/Unused", Fields: []Field{{Name: "y", Type: FieldType{TypeID: FieldTypeInt32}}}},
+		},
+	}
+	_, err := r.RegisterFull(desc, nil)
+	if err == nil {
+		t.Fatal("unreachable referenced accepted, want rejection")
+	}
+}
+
+// TestRegistryLookupFullVersionSensitive checks version mismatch misses.
+func TestRegistryLookupFullVersionSensitive(t *testing.T) {
+	r := NewRegistry()
+	full := headerDescription()
+	sources := []TypeSource{
+		{TypeName: "std_msgs/msg/Header", Encoding: EncodingMsg, RawFileContents: "stamp frame_id"},
+		{TypeName: "builtin_interfaces/msg/Time", Encoding: EncodingMsg, RawFileContents: "sec nanosec"},
+	}
+	h, err := r.RegisterFull(full, sources)
+	if err != nil {
+		t.Fatalf("RegisterFull failed: %v", err)
+	}
+	other := TypeHash{Version: HashVersionUnset, Digest: h.Digest}
+	_, ok := r.LookupFull("std_msgs/msg/Header", other)
+	if ok {
+		t.Fatal("LookupFull hit cross version digest, want miss")
+	}
+	back, ok := r.LookupFull("std_msgs/msg/Header", h)
+	if !ok {
+		t.Fatal("LookupFull missed stored versioned hash")
+	}
+	if back.Description.TypeName != "std_msgs/msg/Header" {
+		t.Fatal("LookupFull returned wrong description")
+	}
+}

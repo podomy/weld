@@ -5,6 +5,7 @@ package ros_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -170,13 +171,22 @@ func tfPublishTake(t *testing.T, ctx context.Context, pub, sub *dds.Backend, top
 	}
 	takeCtx, takeCancel := context.WithTimeout(ctx, tfGateSettle)
 	defer takeCancel()
+	unknownTakeErrs := 0
 	for takeCtx.Err() == nil {
 		got, terr := sub.TakeBytes(takeCtx)
 		if terr != nil {
-			continue
+			if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+				continue
+			}
+			text := terr.Error()
+			if strings.Contains(text, "not implemented") || strings.Contains(text, "not wired") {
+				t.Fatalf("weld take backend error tf %s: %v", topic, terr)
+			}
+			unknownTakeErrs++
+			t.Fatalf("weld take unexpected error tf %s count %d: %v", topic, unknownTakeErrs, terr)
 		}
 		if len(got.Payload) == 0 {
-			continue
+			t.Fatalf("weld take empty payload tf %s, want transform bytes", topic)
 		}
 		return got.Payload
 	}

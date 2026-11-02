@@ -326,4 +326,4 @@ Release Matrix and Support Boundary
 - Anything built purely on the rclcpp or rclpy interaction surface MUST work by construction, verified by mixed fleet tests with no forked protocol.
 - Custom rmw implementations, intra process pointer passing, zero copy loans and shared memory, and in process C++ type adapter plugins MUST be explicit later work and MUST NOT be claimed or silently half supported in version one.
 - New buses MUST arrive as pull requests behind the backend interface with interop tests, never via plugin registry or dynamic loading.
-- OPEN ITEM: Zenoh domain isolation by key prefix versus separate sessions, MQTT topic mapping with retained and will messages, the full verb and format conformance table, and TF string tables MUST each be decided with tests before claiming those features.
+- OPEN ITEM: live interop proof of Zenoh domain isolation (key prefix per domain within one session per ROS context, unit-pinned), MQTT topic mapping with retained and will messages, the full verb and format conformance table, and TF string tables MUST each be decided with tests before claiming those features.

@@ -137,6 +137,8 @@ func NewByteArrayParam(v []byte) ParamValue {
 }
 
 // NewBoolArrayParam returns a boolean array parameter value with a copy.
+// Empty slices stay permissive producing empty arrays because dump round
+// trips plus startup merges depend on empty retention; callers depend on it.
 func NewBoolArrayParam(v []bool) ParamValue {
 	out := make([]bool, len(v))
 	copy(out, v)
@@ -144,6 +146,8 @@ func NewBoolArrayParam(v []bool) ParamValue {
 }
 
 // NewIntegerArrayParam returns an integer array parameter value with a copy.
+// Empty slices stay permissive producing empty arrays because callers depend
+// on empty retention like booleans.
 func NewIntegerArrayParam(v []int64) ParamValue {
 	out := make([]int64, len(v))
 	copy(out, v)
@@ -151,6 +155,8 @@ func NewIntegerArrayParam(v []int64) ParamValue {
 }
 
 // NewDoubleArrayParam returns a double array parameter value with a copy.
+// Empty slices stay permissive producing empty arrays because callers depend
+// on empty retention like booleans.
 func NewDoubleArrayParam(v []float64) ParamValue {
 	out := make([]float64, len(v))
 	copy(out, v)
@@ -158,6 +164,8 @@ func NewDoubleArrayParam(v []float64) ParamValue {
 }
 
 // NewStringArrayParam returns a string array parameter value with a copy.
+// Empty slices stay permissive producing empty arrays because callers depend
+// on empty retention like booleans.
 func NewStringArrayParam(v []string) ParamValue {
 	out := make([]string, len(v))
 	copy(out, v)
@@ -418,6 +426,9 @@ type RemapRule struct {
 
 // ValidateParamName checks dotted parameter name shape: non-empty, at most
 // 255 bytes, dot-separated segments each matching [A-Za-z_][A-Za-z0-9_]*.
+// Single-segment names stay permissive because ExpandNodeScopedParam joins
+// them against a namespace and remap plus startup callers depend on that;
+// tightening to require a dot would break those callers, verified by tests.
 func ValidateParamName(name string) error {
 	if name == "" {
 		return errors.New("core: config: parameter name is empty") //nolint:wrapcheck // new error, nothing to wrap
@@ -775,19 +786,23 @@ func anySliceToStringArray(v []any) (ParamValue, error) {
 // names. Nested maps recurse with dot-joined prefixes; scalars convert with
 // ParamValueFromAny. Keys already containing dots are kept verbatim as one
 // segment join. There are no fixed size buffers: output grows by append.
+// Collisions from different nesting paths that flatten to one dotted name
+// fail loudly naming the dotted name plus both input keys.
 func FlattenNestedParams(nested map[string]any, prefix string) (map[string]ParamValue, error) {
 	out := make(map[string]ParamValue)
-	err := flattenInto(nested, prefix, out)
+	origins := make(map[string]string)
+	err := flattenInto(nested, prefix, out, origins)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// flattenInto recurses one map level into out.
+// flattenInto recurses one map level into out, tracking the first input key
+// per dotted name so collisions name both originals loudly.
 //
 //nolint:gocognit // flattening sequences key sorting, nesting, conversion, and validation in one traversal, splitting would obscure intent
-func flattenInto(nested map[string]any, prefix string, out map[string]ParamValue) error {
+func flattenInto(nested map[string]any, prefix string, out map[string]ParamValue, origins map[string]string) error {
 	keys := make([]string, 0, len(nested))
 	for k := range nested {
 		keys = append(keys, k)
@@ -805,7 +820,7 @@ func flattenInto(nested map[string]any, prefix string, out map[string]ParamValue
 		}
 		sub, ok := nested[k].(map[string]any)
 		if ok {
-			err := flattenInto(sub, full, out)
+			err := flattenInto(sub, full, out, origins)
 			if err != nil {
 				return err
 			}
@@ -820,9 +835,10 @@ func flattenInto(nested map[string]any, prefix string, out map[string]ParamValue
 			return err
 		}
 		if _, exists := out[full]; exists {
-			return fmt.Errorf("core: config: flatten collision %q from %q collides with existing entry", full, k)
+			return fmt.Errorf("core: config: flatten collision %q from %q collides with %q from earlier entry", full, k, origins[full])
 		}
 		out[full] = v
+		origins[full] = k
 	}
 	return nil
 }
@@ -1017,9 +1033,21 @@ type configEntry struct {
 	desc  ParamDescriptor
 }
 
-// configWatcher is one subscription.
+// configWatcher is one subscription with close-then-drain discipline.
+// Broadcast never sends on a channel the cancel path can close: cancel
+// deletes from the map under the store write lock then closes under the
+// watcher mutex, while broadcast holds only the watcher mutex during send.
+// The generation pins the Watch id so a reused id can never deliver to a
+// stale channel.
 type configWatcher struct {
+	// mu guards closed plus ch during send versus close.
+	mu sync.Mutex
+	// ch carries events to the subscriber; closed by cancel.
 	ch chan ConfigEvent
+	// closed is true after cancel; broadcast skips closed watchers.
+	closed bool
+	// gen pins the Watch id for generation-checked delivery.
+	gen uint64
 }
 
 // ConfigStore is a versioned parameter store with schema, validation,
@@ -1028,8 +1056,8 @@ type configWatcher struct {
 // History is bounded to the last configHistoryLimit entries; overflow drops
 // the oldest entries and counts each drop in HistoryDrops so long runs stay
 // bounded while remaining observable. Watch broadcast never holds the write
-// lock while sending; each watcher is checked plus sent under a read lock
-// with eviction counted in BroadcastDrops.
+// lock while sending; each watcher is checked plus sent under its own
+// watcher mutex with eviction counted in BroadcastDrops.
 type ConfigStore struct {
 	noCopy      noCopy
 	mu          sync.RWMutex
@@ -1121,45 +1149,13 @@ func (s *ConfigStore) Remapped(name string) string {
 // Validators for the declare run outside the write lock against a read
 // snapshot with optimistic generation; a concurrent mutation aborts loudly.
 // Validators must still avoid deep reentrancy.
-// declareNotSetFastPath inserts a NotSet value plus NotSet descriptor
-// directly. It reports handled when the fast path applied; otherwise the
-// caller falls through to the validated declare path.
-func (s *ConfigStore) declareNotSetFastPath(name string, value ParamValue, desc ParamDescriptor) (string, bool, error) {
-	s.mu.Lock()
-	final := s.remappedLocked(name)
-	err := ValidateParamName(final)
-	if err != nil {
-		s.mu.Unlock()
-		return "", false, err
-	}
-	if _, ok := s.params[final]; ok {
-		s.mu.Unlock()
-		return "", false, fmt.Errorf("core: config: declare %q: already declared", final)
-	}
-	if value.Type != ParamTypeNotSet || desc.Type != ParamTypeNotSet {
-		s.mu.Unlock()
-		return final, false, nil
-	}
-	event := ConfigEvent{Version: s.version + 1, Source: "declare"}
-	event.Changes = []ConfigChange{{Name: final, NewValue: cloneParamValue(value), HadOld: false}}
-	s.params[final] = &configEntry{value: cloneParamValue(value), desc: desc}
-	s.version = event.Version
-	s.history = append(s.history, ConfigHistoryEntry{
-		Version: event.Version, Name: final, NewValue: cloneParamValue(value), HadOld: false, Source: "declare",
-	})
-	s.trimHistoryLocked()
-	s.mu.Unlock()
-	s.broadcast(event)
-	return final, true, nil
-}
-
+// The NotSet plus NotSet declare routes through the same validator plus hook
+// collection and generation-retry path as every other declare: there is no
+// fast-path exemption, so registered validators and apply hooks observe
+// NotSet declares like any other write.
 func (s *ConfigStore) Declare(name string, value ParamValue, desc ParamDescriptor) error {
 	err := ValidateParamName(name)
 	if err != nil {
-		return err
-	}
-	_, handled, err := s.declareNotSetFastPath(name, value, desc)
-	if err != nil || handled {
 		return err
 	}
 	// Remap tables are fixed at creation, so resolving outside the lock is
@@ -1331,19 +1327,33 @@ func cloneEvent(e ConfigEvent) ConfigEvent {
 // event and counts the eviction in BroadcastDrops. Call cancel to unsubscribe;
 // cancel closes the channel. Consumers must tolerate non-monotonic event
 // order across concurrent batches: broadcast checks plus sends per watcher
-// under a read lock without holding the write lock.
+// under the watcher mutex without holding the store write lock, and cancel
+// deletes under the store write lock then closes under the watcher mutex,
+// so no send ever races a close.
 func (s *ConfigStore) Watch() (uint64, <-chan ConfigEvent, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := s.nextWatch
 	s.nextWatch++
 	ch := make(chan ConfigEvent, configWatchBuffer)
-	s.watchers[id] = &configWatcher{ch: ch}
+	s.watchers[id] = &configWatcher{ch: ch, gen: id}
 	cancel := func() {
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if w, ok := s.watchers[id]; ok {
-			delete(s.watchers, id)
+		w, ok := s.watchers[id]
+		if !ok {
+			s.mu.Unlock()
+			return
+		}
+		if w.gen != id {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.watchers, id)
+		s.mu.Unlock()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if !w.closed {
+			w.closed = true
 			close(w.ch)
 		}
 	}
@@ -1520,19 +1530,33 @@ func (s *ConfigStore) DumpAll() map[string]ConfigDumpEntry {
 // Missing names declare with the supplied descriptors; existing names set
 // through validation. Validators run outside the write lock with optimistic
 // generation like other batches.
+// Descriptor lookup is by final post-remap name: descs is keyed by the
+// remapped final while values stay keyed pre-remap so remapBatchLocked can
+// still detect input collisions loudly. A descriptor collision where two
+// pre-remap dump keys map to one final fails loudly naming both originals.
 func (s *ConfigStore) LoadDump(dump map[string]ConfigDumpEntry, source string) (ConfigEvent, error) {
 	if source == "" {
 		return ConfigEvent{}, errors.New("core: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	values := make(map[string]ParamValue, len(dump))
 	descs := make(map[string]ParamDescriptor, len(dump))
+	descOrigins := make(map[string]string, len(dump))
 	for name, entry := range dump {
 		err := ValidateParamName(name)
 		if err != nil {
 			return ConfigEvent{}, err
 		}
 		values[name] = entry.Value
-		descs[name] = entry.Descriptor
+		final := ApplyRemap(name, s.global, s.local)
+		err = ValidateParamName(final)
+		if err != nil {
+			return ConfigEvent{}, err
+		}
+		if first, ok := descOrigins[final]; ok {
+			return ConfigEvent{}, fmt.Errorf("core: config: load dump collision %q and %q both map to %q", first, name, final)
+		}
+		descOrigins[final] = name
+		descs[final] = entry.Descriptor
 	}
 	event, hooks, err := s.commitBatchWithValidators(values, descs, source, true)
 	if err != nil {
@@ -1686,12 +1710,13 @@ func (s *ConfigStore) prepareBatchLocked(
 		newValue := cloneParamValue(remapped[name])
 		entry, ok := s.params[name]
 		if !ok {
-			err := s.validateNewLocked(name, newValue, descs, autoDeclare)
+			hookVals, pend, err := s.validateNewLocked(name, newValue, descs, autoDeclare)
 			if err != nil {
 				return ConfigEvent{}, nil, nil, err
 			}
+			pending = append(pending, pend...)
 			changes = append(changes, ConfigChange{Name: name, NewValue: newValue, HadOld: false})
-			for _, fn := range s.hooks[name] {
+			for _, fn := range hookVals {
 				hooks = append(hooks, hookCall{fn: fn, old: ParamValue{}, new: cloneParamValue(newValue)})
 			}
 			continue
@@ -1715,26 +1740,38 @@ func (s *ConfigStore) prepareBatchLocked(
 // accepts any concrete value; NotSet needs a NotSet descriptor to validate.
 // Otherwise the write fails. A declare-time descriptor, when supplied, must
 // still validate.
+// Registered validators run on new plus auto-declared parameters like any
+// other write: the old snapshot is the zero NotSet value, so a validator
+// rejecting a transition from unset still aborts the whole batch loudly
+// before the version moves. There is no exempt new-parameter path.
 func (s *ConfigStore) validateNewLocked(
 	name string,
 	newValue ParamValue,
 	descs map[string]ParamDescriptor,
 	autoDeclare bool,
-) error {
+) ([]ConfigApplyHook, []pendingValidator, error) {
 	if desc, ok := descs[name]; ok {
 		err := desc.validateValue(newValue)
 		if err != nil {
-			return fmt.Errorf("core: config: declare %q: %w", name, err)
+			return nil, nil, fmt.Errorf("core: config: declare %q: %w", name, err)
 		}
-		return nil
+		var pending []pendingValidator
+		for _, fn := range s.validators[name] {
+			pending = append(pending, pendingValidator{name: name, old: ParamValue{}, new: cloneParamValue(newValue), fn: fn})
+		}
+		return s.hooks[name], pending, nil
 	}
 	if newValue.Type == ParamTypeNotSet {
-		return fmt.Errorf("core: config: set %q: value type not_set is not concrete", name)
+		return nil, nil, fmt.Errorf("core: config: set %q: value type not_set is not concrete", name)
 	}
 	if !autoDeclare {
-		return fmt.Errorf("core: config: set %q: not declared and undeclared parameters are not allowed", name)
+		return nil, nil, fmt.Errorf("core: config: set %q: not declared and undeclared parameters are not allowed", name)
 	}
-	return nil
+	var pending []pendingValidator
+	for _, fn := range s.validators[name] {
+		pending = append(pending, pendingValidator{name: name, old: ParamValue{}, new: cloneParamValue(newValue), fn: fn})
+	}
+	return s.hooks[name], pending, nil
 }
 
 // validateExistingNoValidatorsLocked checks type and read-only for a write
@@ -1805,31 +1842,31 @@ func (s *ConfigStore) trimHistoryLocked() {
 }
 
 // broadcast delivers the event to every watcher without holding the write
-// lock. Each watcher is checked plus sent under a read lock with a
+// lock. Each watcher is checked plus sent under its own watcher mutex with a
 // per-watcher nonblocking send; a full channel evicts its oldest event and
 // counts loudly in BroadcastDrops, and a second full send drops loudly.
 // The evicted range stays available through HistorySince. Never sends on a
-// closed channel because cancel deletes plus closes under the write lock,
-// which waits for the read lock.
+// closed channel because cancel deletes under the store write lock then
+// closes under the watcher mutex, while broadcast sends only while holding
+// that same watcher mutex with closed false (generation-checked delivery).
 func (s *ConfigStore) broadcast(event ConfigEvent) {
 	s.mu.RLock()
-	ids := make([]uint64, 0, len(s.watchers))
-	for id := range s.watchers {
-		ids = append(ids, id)
+	watchers := make([]*configWatcher, 0, len(s.watchers))
+	for _, w := range s.watchers {
+		watchers = append(watchers, w)
 	}
 	s.mu.RUnlock()
-	for _, id := range ids {
-		s.mu.RLock()
-		w, ok := s.watchers[id]
-		if !ok {
-			s.mu.RUnlock()
+	for _, w := range watchers {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
 			continue
 		}
 		ch := w.ch
 		deliver := cloneEvent(event)
 		select {
 		case ch <- deliver:
-			s.mu.RUnlock()
+			w.mu.Unlock()
 		default:
 			select {
 			case <-ch:
@@ -1838,10 +1875,10 @@ func (s *ConfigStore) broadcast(event ConfigEvent) {
 			}
 			select {
 			case ch <- deliver:
-				s.mu.RUnlock()
+				w.mu.Unlock()
 			default:
 				s.drops.Add(1)
-				s.mu.RUnlock()
+				w.mu.Unlock()
 			}
 		}
 	}

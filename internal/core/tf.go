@@ -22,6 +22,10 @@ import (
 // overwrite is replace on rebroadcast keyed by parent plus child. Clear is
 // sticky: Clear drops dynamics and preserves statics, so latched data
 // survives dynamic resets; use ClearStatics to drop the latched set.
+// Static shadows dynamic as intended precedence: when one frame pair carries
+// both a latched static and volatile dynamics, Lookup composes the static
+// sample and ignores dynamics for that edge, because statics are explicit
+// calibration that must survive dynamic resets and bag loops.
 // Lookup implements the TF taxonomy with exact strings and zero time means
 // latest. Jump handling clears dynamics on backward jumps and on sim
 // activation changes while preserving statics, because statics ignore time.
@@ -631,7 +635,9 @@ func tfFindPath(dynamics map[tfKey][]TransformStamped, statics map[tfKey]Transfo
 	return nil, false
 }
 
-// tfComposePath multiplies the transforms along a found path.
+// tfComposePath multiplies the transforms along a found path. Static shadows
+// dynamic as intended precedence: a frame pair carrying both uses the
+// latched static sample and ignores dynamics for that edge.
 func tfComposePath(dynamics map[tfKey][]TransformStamped, statics map[tfKey]TransformStamped, path []tfEdge, stamp int64) (TransformStamped, error) {
 	result := IdentityTransform()
 	for _, edge := range path {

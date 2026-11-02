@@ -41,6 +41,29 @@ func validateParamsNode(node string) error {
 	return nil
 }
 
+// validateParamsName rejects bad parameter names at the CLI layer before
+// the store fails late.
+//
+// It mirrors the store shape rules so usage errors exit 2 with a weld
+// prefix instead of surfacing as runtime failures: empty, spaces or
+// slashes, leading or trailing dots, and empty segments all fail loudly.
+// The store still enforces the same rules as defense in depth.
+func validateParamsName(name string) error {
+	if name == "" {
+		return errors.New("weld: parameter name is empty") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if strings.ContainsAny(name, " \t\n\r/") {
+		return fmt.Errorf("weld: parameter name %q has spaces or slashes", name)
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
+		return fmt.Errorf("weld: parameter name %q has leading or trailing dot", name)
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("weld: parameter name %q has an empty segment", name)
+	}
+	return nil
+}
+
 // paramsTypeName returns the lowercase type name for a type code.
 func paramsTypeName(t uint8) string {
 	switch t {
@@ -453,6 +476,11 @@ func runParamsDeclareCommand(args []string, stdout, stderr io.Writer, store *dds
 	}
 	name := pos[0]
 	text := pos[1]
+	err = validateParamsName(name)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 2
+	}
 	typeCode, err := parseParamsType(*typeFlag)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
@@ -505,6 +533,13 @@ func runParamsGetCommand(args []string, stdout, stderr io.Writer, store *dds.Mem
 		_, _ = fmt.Fprintln(stderr, "weld: params get needs at least one <name>") //nolint:errcheck // final error output is best effort
 		return 2
 	}
+	for _, n := range names {
+		err = validateParamsName(n)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+			return 2
+		}
+	}
 	owned, ok := resolveParamsStore(nodeFlag, store, stderr)
 	if !ok {
 		return 2
@@ -535,10 +570,11 @@ func applyParamsSetAtomic(owned *dds.MemoryStore, param dds.Parameter, stderr io
 	if result.Successful {
 		return 0
 	}
-	_, _ = fmt.Fprintln(stderr, oneLine(errors.New(result.Reason))) //nolint:errcheck // reason is already weld style text
 	if result.Reason == "" {
 		_, _ = fmt.Fprintf(stderr, "weld: atomic set of %q failed\n", param.Name) //nolint:errcheck // final error output is best effort
+		return 1
 	}
+	_, _ = fmt.Fprintln(stderr, oneLine(errors.New(result.Reason))) //nolint:errcheck // reason is already weld style text
 	return 1
 }
 
@@ -578,6 +614,11 @@ func runParamsSetCommand(args []string, stdout, stderr io.Writer, store *dds.Mem
 	}
 	name := pos[0]
 	text := pos[1]
+	err = validateParamsName(name)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 2
+	}
 	typeCode, err := parseParamsType(*typeFlag)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
@@ -630,6 +671,13 @@ func runParamsDescribeCommand(args []string, stdout, stderr io.Writer, store *dd
 		_, _ = fmt.Fprintln(stderr, "weld: params describe needs at least one <name>") //nolint:errcheck // final error output is best effort
 		return 2
 	}
+	for _, n := range names {
+		err = validateParamsName(n)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+			return 2
+		}
+	}
 	owned, ok := resolveParamsStore(nodeFlag, store, stderr)
 	if !ok {
 		return 2
@@ -646,11 +694,14 @@ func runParamsDescribeCommand(args []string, stdout, stderr io.Writer, store *dd
 }
 
 // parseListPrefixes splits comma separated prefixes, dropping blanks.
+//
+// The result is always non-nil so callers never distinguish nil from
+// empty; a blank flag yields an empty slice.
 func parseListPrefixes(prefixesFlag string) []string {
 	if strings.TrimSpace(prefixesFlag) == "" {
-		return nil
+		return []string{}
 	}
-	var prefixes []string
+	prefixes := make([]string, 0)
 	for p := range strings.SplitSeq(prefixesFlag, ",") {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
@@ -1157,7 +1208,7 @@ func loadParams(store *dds.MemoryStore, r io.Reader) error {
 	}
 	lines := strings.Split(string(data), "\n")
 	inParams := false
-	var params []dds.Parameter
+	params := make([]dds.Parameter, 0)
 	for _, raw := range lines {
 		line := stripYAMLComment(raw)
 		if strings.TrimSpace(line) == "" {

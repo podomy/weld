@@ -5,12 +5,12 @@ package types
 
 // Synthetic keyed descriptors for keyed topic testing.
 //
-// These are test helpers compiled into the non-test package so the
-// cross-package keyed_test in internal/transports/dds can use them: Go
-// test files cannot be imported across packages, so the helpers live here
-// instead of a _test file by design. They are not ROS standard types, they
-// never enter the global registry, and each constructor returns fresh
-// pointers so tests never share mutable tables.
+// These test helpers ship in the production package by design for
+// cross-package test use: Go test files cannot be imported across packages,
+// so the cross-package keyed_test in internal/transports/dds uses these
+// helpers and they live here instead of a _test file. They are not ROS
+// standard types, they never enter the global registry, and each
+// constructor returns fresh pointers so tests never share mutable tables.
 //
 // Shapes:
 //   - Keyed flat: weld_test/msg/Keyed with uint32 seq plus string label

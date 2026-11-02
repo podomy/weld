@@ -201,8 +201,8 @@ func TestRunDoctorReportListsEntities(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := runDoctorCommand(context.Background(), []string{"--domain", "42"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("report code = %d, want 0\nstderr:\n%s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("report code = %d, want 1 for loud mismatch\nstderr:\n%s", code, stderr.String())
 	}
 	for _, want := range []string{"Topic: /scan", "gid=pub", "gid=sub", "Mismatches (1):", "weld_mismatch_total 1"} {
 		if !strings.Contains(stdout.String(), want) {

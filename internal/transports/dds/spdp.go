@@ -75,6 +75,8 @@ var (
 	ErrInvalidTime = errors.New("dds: invalid time")
 	// ErrInvalidPeriod reports a non positive loop period.
 	ErrInvalidPeriod = errors.New("dds: non positive period")
+	// ErrStaleSPDP reports a replayed sequence at or below the last accepted value.
+	ErrStaleSPDP = errors.New("dds: stale SPDP sequence")
 )
 
 // spdpParseDrops counts SPDP DATA entries skipped after a parse failure.
@@ -400,6 +402,13 @@ func SPDPUnicastPort(domain uint32) (uint16, error) {
 // participant, publications, and subscriptions bits CycloneDDS sends,
 // without claiming participant message or type lookup support.
 const spdpBuiltinEndpointMask uint32 = 0x0000003F
+
+// spdpMaxSubmessages caps one datagram submessage walk for bounded work.
+//
+// The bound matches rtps maxSubmessagesPerDatagram (4096) so the
+// standalone patch walk and the rtps decode path agree; over-cap
+// datagrams drop loudly instead of trusting an unbounded header chain.
+const spdpMaxSubmessages = 4096
 
 // spdpEncapSize is the 4 byte parameter list encapsulation header.
 const spdpEncapSize = 4
@@ -1096,7 +1105,16 @@ func patchSPDPLocatorPorts(packet []byte, port uint16) []byte {
 
 	off := rtps.HeaderSize
 
+	count := 0
+
 	for len(out)-off >= rtps.SubmessageHeaderSize {
+		count++
+		if count > spdpMaxSubmessages {
+			n := spdpParseDrops.Add(1)
+			log.Printf("dds: spdp patch submessages above %d, leaving %d", spdpMaxSubmessages, n)
+
+			return out
+		}
 		id := out[off]
 		flags := out[off+1]
 		littleEndian := flags&rtps.FlagLittleEndian != 0
@@ -1378,26 +1396,41 @@ func notifyChange(changed bool, gen uint64, hook func(uint64)) {
 
 // handleDisposeLocked removes one prefix. Caller holds the lock.
 //
-// Stale dispose sequences at or below the stored LastSeq are ignored
-// without bumping generation, matching the alive path ordering.
-func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(uint64)) {
+// A dispose at the stored sequence is a routine multicast duplicate and
+// returns silently without touching generation: senders repeat packets
+// on lossy groups. Only a strictly older sequence fails loudly with
+// ErrStaleSPDP, since rollbacks never occur legitimately. Only a newer
+// sequence deletes the entry and its routes.
+func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(uint64), error) {
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
-		return false, 0, nil
+		return false, 0, nil, nil
 	}
 
-	if ann.Sequence <= existing.LastSeq {
-		return false, 0, nil
+	if ann.Sequence == existing.LastSeq {
+		return false, 0, nil, nil
+	}
+
+	if ann.Sequence < existing.LastSeq {
+		n := spdpParseDrops.Add(1)
+		log.Printf("dds: spdp stale dispose seq=%d last=%d dropping %d", ann.Sequence, existing.LastSeq, n)
+
+		return false, 0, nil, fmt.Errorf("dds: spdp stale dispose seq=%d last=%d: %w", ann.Sequence, existing.LastSeq, ErrStaleSPDP)
 	}
 
 	delete(t.entries, ann.GUID.Prefix)
 	t.generation++
 
-	return true, t.generation, t.onChange
+	return true, t.generation, t.onChange, nil
 }
 
 // handleAliveLocked adds or refreshes one entry. Caller holds the lock.
-func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (bool, uint64, func(uint64)) {
+//
+// An alive at the stored sequence is a routine multicast duplicate and
+// returns silently without touching generation or the entry. Only a
+// strictly older sequence fails loudly with ErrStaleSPDP. Only a newer
+// sequence installs or refreshes the entry.
+func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (bool, uint64, func(uint64), error) {
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
 		t.entries[ann.GUID.Prefix] = ParticipantInfo{
@@ -1408,11 +1441,18 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 		}
 		t.generation++
 
-		return true, t.generation, t.onChange
+		return true, t.generation, t.onChange, nil
 	}
 
-	if ann.Sequence <= existing.LastSeq {
-		return false, 0, nil
+	if ann.Sequence == existing.LastSeq {
+		return false, 0, nil, nil
+	}
+
+	if ann.Sequence < existing.LastSeq {
+		n := spdpParseDrops.Add(1)
+		log.Printf("dds: spdp stale alive seq=%d last=%d dropping %d", ann.Sequence, existing.LastSeq, n)
+
+		return false, 0, nil, fmt.Errorf("dds: spdp stale alive seq=%d last=%d: %w", ann.Sequence, existing.LastSeq, ErrStaleSPDP)
 	}
 
 	existing.GUID = ann.GUID
@@ -1422,17 +1462,22 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 	t.entries[ann.GUID.Prefix] = existing
 	t.generation++
 
-	return true, t.generation, t.onChange
+	return true, t.generation, t.onChange, nil
 }
 
 // HandlePacket parses one SPDP packet and updates the table.
 //
 // Alive packets add or refresh the entry with expiry now plus lease.
-// Stale sequences at or below the stored LastSeq are ignored without
-// bumping generation. Dispose packets remove the entry when their
-// sequence is newer than the stored LastSeq; stale disposes are ignored
-// like stale alive packets. Unknown params are ignored. Generation
-// bumps once per effective change.
+// Same-sequence duplicates return nil quietly: senders repeat packets on
+// lossy groups, so a duplicate is routine, not an error. Strictly older
+// sequences fail loudly with ErrStaleSPDP without bumping generation.
+// Dispose packets remove the entry only when their sequence is newer
+// than the stored LastSeq; older disposes fail loudly like stale alive
+// packets, while same-sequence disposes are routine duplicates. A missing entry
+// for a dispose succeeds quietly with no generation bump because there
+// is no route to delete. Unknown params are ignored. Generation bumps
+// once per effective change. Prefix mismatches against the RTPS header
+// already drop loudly inside ParseAnnouncement and never install.
 func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 	if now.IsZero() {
 		return fmt.Errorf("dds: handle zero time: %w", ErrInvalidTime)
@@ -1445,8 +1490,11 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 
 	if !ann.Alive {
 		t.mu.Lock()
-		changed, gen, hook := t.handleDisposeLocked(ann)
+		changed, gen, hook, herr := t.handleDisposeLocked(ann)
 		t.mu.Unlock()
+		if herr != nil {
+			return fmt.Errorf("dds: handle packet: %w", herr)
+		}
 		notifyChange(changed, gen, hook)
 
 		return nil
@@ -1455,9 +1503,67 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 	expiry := now.Add(ann.Lease)
 
 	t.mu.Lock()
-	changed, gen, hook := t.handleAliveLocked(ann, expiry)
+	changed, gen, hook, herr := t.handleAliveLocked(ann, expiry)
 	t.mu.Unlock()
+	if herr != nil {
+		return fmt.Errorf("dds: handle packet: %w", herr)
+	}
 	notifyChange(changed, gen, hook)
+
+	return nil
+}
+
+// checkSPDPInfoDstUnicast enforces INFO_DST on unicast ingress.
+//
+// It decodes the datagram and drops loudly with ErrInvalidSPDP when an
+// INFO_DST submessage names a 12 byte prefix other than local. Parse
+// failures return nil so the caller flows to the normal decode path,
+// which counts the failure. Multicast ingress must never call this
+// helper: group sockets carry every sender, so per-sender identity has
+// no meaning there and enforcement would drop valid peers.
+func checkSPDPInfoDstUnicast(data []byte, local GUIDPrefix) error {
+	header, subs, derr := rtps.DecodeMessage(data, nil)
+	if derr != nil {
+		return nil //nolint:nilerr // decode failures flow to the normal parse path which counts them
+	}
+	_ = header
+
+	for _, sub := range subs {
+		if sub.ID != rtps.SubmessageInfoDst {
+			continue
+		}
+		if len(sub.Body) < 12 {
+			continue
+		}
+		var dst GUIDPrefix
+		copy(dst[:], sub.Body[:12])
+		if dst != local {
+			n := spdpParseDrops.Add(1)
+			log.Printf("dds: spdp unicast INFO_DST %x mismatches local %x, dropping %d", dst, local, n)
+
+			return fmt.Errorf("dds: spdp INFO_DST mismatch: %w", ErrInvalidSPDP)
+		}
+	}
+
+	return nil
+}
+
+// HandlePacketUnicast enforces INFO_DST for unicast ingress then handles the packet.
+//
+// It drops loudly when INFO_DST addresses another participant, then
+// delegates to HandlePacket for prefix binding plus monotonic sequence
+// gating. Multicast ingress must call HandlePacket directly without this
+// wrapper because group sockets carry every sender.
+func (t *RemoteTable) HandlePacketUnicast(data []byte, now time.Time, local GUIDPrefix) error {
+	err := checkSPDPInfoDstUnicast(data, local)
+	if err != nil {
+		return err
+	}
+
+	err = t.HandlePacket(data, now)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -1568,11 +1674,12 @@ func (t *RemoteTable) ListenLoop(ctx context.Context, receiver Receiver, sweep t
 		now := time.Now()
 
 		if err == nil {
-			// Malformed packets must not kill discovery; the error is
-			// intentionally ignored and the sweep check below still runs.
+			// Malformed and stale packets must not kill discovery; errors
+			// count loudly here and the sweep check below still runs.
 			herr := t.HandlePacket(data, now)
 			if herr != nil {
-				_ = herr
+				n := spdpParseDrops.Add(1)
+				log.Printf("dds: spdp listen dropped %d: %v", n, herr)
 			}
 		} else if ctx.Err() != nil {
 			return fmt.Errorf("dds: listen loop stopped: %w", ctx.Err())
@@ -1593,3 +1700,28 @@ func compareInfo(a, b ParticipantInfo) int {
 
 	return bytes.Compare(a.GUID.EntityID[:], b.GUID.EntityID[:])
 }
+
+// INTEGRATION state for SPDP discovery hardening.
+//
+// Done in this file: endpoint identity binds to the RTPS header prefix in
+// ParseAnnouncement with a loud drop on mismatch, so spoofed routes never
+// install; monotonic sequence gates both alive and dispose paths with a
+// loud ErrStaleSPDP reject that leaves generation unchanged; dispose
+// deletes only on a newer sequence, and a missing entry succeeds quietly
+// because there is no route to delete; the patch walk caps at
+// spdpMaxSubmessages (4096, matching rtps) with a loud leave-unchanged
+// drop; unicast INFO_DST enforcement lives in checkSPDPInfoDstUnicast
+// plus HandlePacketUnicast, which unicast ingress must call.
+//
+// Done elsewhere: backend shouldDropUnicastForInfoDst plus
+// storeAnnouncementRoutes enforce the same unicast INFO_DST and
+// per-prefix route sequence checks on the live socket path, including
+// lease expiry sweep and port filtering; rtps DecodeMessage caps
+// submessages at 4096 before dispatch.
+//
+// Explicitly open and unenforced: multicast ingress never calls the
+// INFO_DST helper because group sockets carry every sender and have no
+// per-sender identity; standalone RemoteTable.HandlePacket stays
+// transport agnostic and relies on the unicast wrapper or the backend
+// demux for INFO_DST. No rejected scaffolding remains: the legacy custom
+// locator path is gone and all framing flows through rtps.

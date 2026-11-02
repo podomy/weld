@@ -170,8 +170,10 @@ type ClockState struct {
 }
 
 // NewClockState returns a state with explicit wall plus steady fallbacks.
-// An invalid domain fails loudly with a panic because the domain selects the
-// active source and silent fallback to wall would hide misconfiguration.
+// Single rule: an invalid domain fails loudly with a panic because the domain
+// selects the active source and silent fallback to wall would hide
+// misconfiguration. SetDomain plus ValidateGoalClock reject invalid the same
+// way (error), never coercing to wall.
 //
 // The domain selects the active source: sim reads sim ticks when valid,
 // steady reads the steady source, wall reads the wall source. When the
@@ -337,12 +339,14 @@ func (d *ClockState) SetSimTime(nanos int64) ClockJump {
 	return jump
 }
 
-// SetDomain switches the active domain with jump notification.
+// SetDomain switches the active domain with jump notification. Single rule:
+// an invalid domain is an error and changes nothing, matching NewClockState
+// (panic) plus ValidateGoalClock (mismatch error).
 //
 // Moving to or from sim generates a jump with ActivationChanged set, which
 // clears TF dynamics through HandleClockJump even when the tick does not
 // move backward. Setting the same domain twice generates no jump and invokes
-// no callbacks. An invalid domain is an error and changes nothing.
+// no callbacks.
 func (d *ClockState) SetDomain(domain ClockDomain) (ClockJump, error) {
 	if !isValidClockDomain(domain) {
 		return ClockJump{}, fmt.Errorf("core: set domain: invalid clock domain %d", int(domain))

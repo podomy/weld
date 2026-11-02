@@ -137,6 +137,13 @@ func wqCheckWireIncompatible(t *testing.T, name string, report core.Compatibilit
 	helpers.CheckQoSIncompatible(t, name, report, offered, requested, publisher, subscriber, wantPolicy, "writerqos", domain, runID)
 }
 
+// wqBudgetedSkip records one allowlisted product skip with distro pin and expiry.
+func wqBudgetedSkip(t *testing.T, reason string) {
+	t.Helper()
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
+}
+
 // wqRequireQoSFlags skips the test when the peer lacks the ros2 QoS flags.
 func wqRequireQoSFlags(t *testing.T, ctx context.Context, domain int) {
 	t.Helper()
@@ -148,11 +155,11 @@ func wqRequireQoSFlags(t *testing.T, ctx context.Context, domain int) {
 	cmd := exec.CommandContext(probeCtx, "docker", argv...) //nolint:gosec // live harness probes ros2 help with fixed argv and no shell
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Skipf("writerqos pub help probe failed, skipping: %v", err)
+		wqBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy writerqos pub help probe failed, distro pin Jazzy: %v", err))
 	}
 
 	if !strings.Contains(string(out), "--qos-reliability") || !strings.Contains(string(out), "--qos-durability") {
-		t.Skipf("ros2 topic pub lacks QoS flags, skipping writerqos gate")
+		wqBudgetedSkip(t, "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate")
 	}
 }
 
@@ -160,6 +167,9 @@ func wqRequireQoSFlags(t *testing.T, ctx context.Context, domain int) {
 // and builds weld once per test binary process.
 func wqSetup(t *testing.T) (context.Context, context.CancelFunc, string, int) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 
 	domain := helpers.MustAllocateDomain(t)
 	ctx, cancel := context.WithTimeout(context.Background(), wqTestTimeout)

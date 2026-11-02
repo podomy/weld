@@ -134,26 +134,24 @@ func (e *Encoder) Bytes() []byte {
 
 // Align pads with zeroes until the buffer offset is a multiple of n.
 //
-// Precondition: callers pass 1, 2, 4, or 8. All current callers satisfy
-// this, so the silent ignore below never triggers in practice. Any other
-// n is a caller bug and leaves the buffer unchanged without reporting an
-// error. The signature stays void to avoid rippling through every write
-// path; changing it would force error returns on all callers. This differs
-// from Decoder.Align which returns an error for invalid n without
-// counting a drop.
+// Only 1, 2, 4, or 8 are valid. Any other n is a caller bug and returns
+// an error without mutating the buffer. All current callers pass constants,
+// so the error never triggers in practice. This mirrors Decoder.Align
+// which returns an error for invalid n without counting a drop.
 //
 // Alignment is relative to the user payload start, not the buffer
 // start: the encapsulation header (and service prefix when present) is
 // outside the CDR alignment domain, matching the de facto ROS 2 wire
 // layout where a leading double needs no pad.
-func (e *Encoder) Align(n int) {
+func (e *Encoder) Align(n int) error {
 	if n != 1 && n != 2 && n != 4 && n != 8 {
-		return
+		return fmt.Errorf("cdr: invalid alignment %d", n)
 	}
 	pad := alignPad(len(e.buf)-e.payloadStart, n)
 	for range pad {
 		e.buf = append(e.buf, nulByte)
 	}
+	return nil
 }
 
 // putByte appends one raw byte with 1 byte alignment.
@@ -162,27 +160,39 @@ func (e *Encoder) putByte(v byte) {
 }
 
 // putUint16 appends a 2 byte value with 2 byte alignment.
-func (e *Encoder) putUint16(v uint16) {
-	e.Align(2)
+func (e *Encoder) putUint16(v uint16) error {
+	err := e.Align(2)
+	if err != nil {
+		return err
+	}
 	var tmp [2]byte
 	e.order.PutUint16(tmp[:], v)
 	e.buf = append(e.buf, tmp[:]...)
+	return nil
 }
 
 // putUint32 appends a 4 byte value with 4 byte alignment.
-func (e *Encoder) putUint32(v uint32) {
-	e.Align(4)
+func (e *Encoder) putUint32(v uint32) error {
+	err := e.Align(4)
+	if err != nil {
+		return err
+	}
 	var tmp [4]byte
 	e.order.PutUint32(tmp[:], v)
 	e.buf = append(e.buf, tmp[:]...)
+	return nil
 }
 
 // putUint64 appends an 8 byte value with 8 byte alignment.
-func (e *Encoder) putUint64(v uint64) {
-	e.Align(8)
+func (e *Encoder) putUint64(v uint64) error {
+	err := e.Align(8)
+	if err != nil {
+		return err
+	}
 	var tmp [8]byte
 	e.order.PutUint64(tmp[:], v)
 	e.buf = append(e.buf, tmp[:]...)
+	return nil
 }
 
 // WriteUint8 writes an octet or uint8 with 1 byte alignment.
@@ -211,47 +221,74 @@ func (e *Encoder) WriteBool(v bool) {
 
 // WriteWchar writes an IDL wchar as 2 bytes with 2 byte alignment.
 func (e *Encoder) WriteWchar(v uint16) {
-	e.putUint16(v)
+	err := e.putUint16(v)
+	if err != nil {
+		panic("types: wchar align failed")
+	}
 }
 
 // WriteInt16 writes a 2 byte signed value with 2 byte alignment.
 func (e *Encoder) WriteInt16(v int16) {
-	e.putUint16(uint16(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	err := e.putUint16(uint16(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	if err != nil {
+		panic("types: int16 align failed")
+	}
 }
 
 // WriteUint16 writes a 2 byte unsigned value with 2 byte alignment.
 func (e *Encoder) WriteUint16(v uint16) {
-	e.putUint16(v)
+	err := e.putUint16(v)
+	if err != nil {
+		panic("types: uint16 align failed")
+	}
 }
 
 // WriteInt32 writes a 4 byte signed value with 4 byte alignment.
 func (e *Encoder) WriteInt32(v int32) {
-	e.putUint32(uint32(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	err := e.putUint32(uint32(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	if err != nil {
+		panic("types: int32 align failed")
+	}
 }
 
 // WriteUint32 writes a 4 byte unsigned value with 4 byte alignment.
 func (e *Encoder) WriteUint32(v uint32) {
-	e.putUint32(v)
+	err := e.putUint32(v)
+	if err != nil {
+		panic("types: uint32 align failed")
+	}
 }
 
 // WriteInt64 writes an 8 byte signed value with 8 byte alignment.
 func (e *Encoder) WriteInt64(v int64) {
-	e.putUint64(uint64(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	err := e.putUint64(uint64(v)) //nolint:gosec // G115: intentional two's-complement reinterpret for XCDR1 encoding
+	if err != nil {
+		panic("types: int64 align failed")
+	}
 }
 
 // WriteUint64 writes an 8 byte unsigned value with 8 byte alignment.
 func (e *Encoder) WriteUint64(v uint64) {
-	e.putUint64(v)
+	err := e.putUint64(v)
+	if err != nil {
+		panic("types: uint64 align failed")
+	}
 }
 
 // WriteFloat32 writes a 4 byte float with 4 byte alignment.
 func (e *Encoder) WriteFloat32(v float32) {
-	e.putUint32(math.Float32bits(v))
+	err := e.putUint32(math.Float32bits(v))
+	if err != nil {
+		panic("types: float32 align failed")
+	}
 }
 
 // WriteFloat64 writes an 8 byte float with 8 byte alignment.
 func (e *Encoder) WriteFloat64(v float64) {
-	e.putUint64(math.Float64bits(v))
+	err := e.putUint64(math.Float64bits(v))
+	if err != nil {
+		panic("types: float64 align failed")
+	}
 }
 
 // countRunes returns the rune count of s without allocating a slice.
@@ -279,14 +316,18 @@ func truncateRunes(s string, bound int) string {
 // no trailing pad. The next member's Align absorbs any gap, and Bytes
 // pads a terminal string to 4. The decoder never skips string pad and
 // checks the NUL only.
-func (e *Encoder) encodeString(s string) {
-	e.Align(4)
+func (e *Encoder) encodeString(s string) error {
+	err := e.Align(4)
+	if err != nil {
+		return err
+	}
 	total := len(s) + 1
 	var lenBytes [4]byte
 	e.order.PutUint32(lenBytes[:], uint32(total)) //nolint:gosec // G115: total is a non-negative length guarded by callers
 	e.buf = append(e.buf, lenBytes[:]...)
 	e.buf = append(e.buf, s...)
 	e.buf = append(e.buf, nulByte)
+	return nil
 }
 
 // WriteString writes an IDL string as length plus NUL.
@@ -308,7 +349,10 @@ func (e *Encoder) WriteString(s string) error {
 	if uint64(len(s))+1 > uint64(math.MaxUint32) {
 		return errors.New("cdr: string length overflows uint32") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	e.encodeString(s)
+	err := e.encodeString(s)
+	if err != nil {
+		return fmt.Errorf("cdr: encode string: %w", err)
+	}
 	return nil
 }
 
@@ -324,7 +368,10 @@ func (e *Encoder) WriteStringChecked(s string) error {
 	if len(s)+1 > maxStringBytes {
 		return fmt.Errorf("cdr: string length %d exceeds cap %d", len(s)+1, maxStringBytes)
 	}
-	e.encodeString(s)
+	err := e.encodeString(s)
+	if err != nil {
+		return fmt.Errorf("cdr: encode string: %w", err)
+	}
 	return nil
 }
 
@@ -354,13 +401,19 @@ func (e *Encoder) WriteBoundedString(s string, bound int) (bool, error) {
 		if uint64(len(truncated))+1 > uint64(math.MaxUint32) {
 			return false, errors.New("cdr: string length overflows uint32") //nolint:wrapcheck // new error, nothing to wrap
 		}
-		e.encodeString(truncated)
+		err := e.encodeString(truncated)
+		if err != nil {
+			return false, fmt.Errorf("cdr: encode string: %w", err)
+		}
 		return true, nil
 	}
 	if uint64(len(s))+1 > uint64(math.MaxUint32) {
 		return false, errors.New("cdr: string length overflows uint32") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	e.encodeString(s)
+	err := e.encodeString(s)
+	if err != nil {
+		return false, fmt.Errorf("cdr: encode string: %w", err)
+	}
 	return false, nil
 }
 
@@ -369,9 +422,12 @@ func (e *Encoder) WriteBoundedString(s string, bound int) (bool, error) {
 // The length prefix counts UTF-16 code units including the trailing NUL.
 // No trailing pad is written. Pad ownership matches encodeString: the
 // next member's Align absorbs any gap and Bytes pads a terminal wstring.
-func (e *Encoder) encodeWString(s string) {
+func (e *Encoder) encodeWString(s string) error {
 	units := utf16.Encode([]rune(s))
-	e.Align(4)
+	err := e.Align(4)
+	if err != nil {
+		return err
+	}
 	total := len(units) + 1
 	var lenBytes [4]byte
 	e.order.PutUint32(lenBytes[:], uint32(total)) //nolint:gosec // G115: total is a non-negative length guarded by callers
@@ -382,6 +438,7 @@ func (e *Encoder) encodeWString(s string) {
 		e.buf = append(e.buf, tmp[:]...)
 	}
 	e.buf = append(e.buf, nulByte, nulByte)
+	return nil
 }
 
 // WriteWString writes an IDL wstring as length plus units plus NUL.
@@ -403,7 +460,10 @@ func (e *Encoder) WriteWString(s string) error {
 	if uint64(len(units))+1 > uint64(math.MaxUint32) {
 		return errors.New("cdr: wstring length overflows uint32") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	e.encodeWString(s)
+	err := e.encodeWString(s)
+	if err != nil {
+		return fmt.Errorf("cdr: encode wstring: %w", err)
+	}
 	return nil
 }
 
@@ -419,7 +479,10 @@ func (e *Encoder) WriteWStringChecked(s string) error {
 	if len(units)+1 > maxWStringUnits {
 		return fmt.Errorf("cdr: wstring length %d exceeds cap %d", len(units)+1, maxWStringUnits)
 	}
-	e.encodeWString(s)
+	err := e.encodeWString(s)
+	if err != nil {
+		return fmt.Errorf("cdr: encode wstring: %w", err)
+	}
 	return nil
 }
 
@@ -451,7 +514,10 @@ func (e *Encoder) WriteBoundedWString(s string, bound int) (bool, error) {
 		if uint64(len(units))+1 > uint64(math.MaxUint32) {
 			return false, errors.New("cdr: wstring length overflows uint32") //nolint:wrapcheck // new error, nothing to wrap
 		}
-		e.encodeWString(truncated)
+		err := e.encodeWString(truncated)
+		if err != nil {
+			return false, fmt.Errorf("cdr: encode wstring: %w", err)
+		}
 		return true, nil
 	}
 	err := e.WriteWString(s)
@@ -478,7 +544,10 @@ func (e *Encoder) WriteSequenceLength(n int) error {
 	if uint64(n) > uint64(math.MaxUint32) {
 		return fmt.Errorf("cdr: sequence length %d overflows uint32", n)
 	}
-	e.putUint32(uint32(n))
+	err := e.putUint32(uint32(n))
+	if err != nil {
+		return fmt.Errorf("cdr: encode sequence length: %w", err)
+	}
 	return nil
 }
 
@@ -496,7 +565,10 @@ func (e *Encoder) WriteSequenceLengthChecked(n int) error {
 	if n > maxSequenceElements {
 		return fmt.Errorf("cdr: sequence length %d exceeds cap %d", n, maxSequenceElements)
 	}
-	e.putUint32(uint32(n))
+	err := e.putUint32(uint32(n))
+	if err != nil {
+		return fmt.Errorf("cdr: encode sequence length: %w", err)
+	}
 	return nil
 }
 
@@ -521,7 +593,10 @@ func (e *Encoder) WriteBoundedSequenceLength(n, bound int) error {
 	if bound > 0 && n > bound {
 		return fmt.Errorf("cdr: sequence length %d exceeds bound %d", n, bound)
 	}
-	e.putUint32(uint32(n))
+	err := e.putUint32(uint32(n))
+	if err != nil {
+		return fmt.Errorf("cdr: encode sequence length: %w", err)
+	}
 	return nil
 }
 
@@ -594,7 +669,10 @@ func (e *Encoder) WriteServiceHeader(guid [8]byte, seq uint64) error {
 		return errors.New("cdr: service header requires empty encoder") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	e.buf = append(e.buf, guid[:]...)
-	e.Align(4)
+	err := e.Align(4)
+	if err != nil {
+		return fmt.Errorf("cdr: service header align: %w", err)
+	}
 	tmp := encodeServiceSequence(seq, e.le)
 	e.buf = append(e.buf, tmp[:]...)
 	e.payloadStart = ServiceEnvelopeSize
@@ -1036,6 +1114,35 @@ func (d *Decoder) ReadBoundedSequenceLength(bound int) (int, error) {
 		return 0, fmt.Errorf("cdr: sequence length %d exceeds bound %d: %w", n, bound, ErrInvalid)
 	}
 	return n, nil
+}
+
+// CheckSequenceAllocation verifies that n elements of elemSize bytes fit
+// before the caller allocates with make or reflect.MakeSlice.
+//
+// It enforces two layers: the 32M element count cap plus remaining wire
+// bytes for wide element types. A negative n or non positive elemSize is
+// a caller bug and returns an error without counting a drop. A count above
+// the cap counts a drop with ErrInvalid. A byte total above Remaining
+// counts a drop with ErrTruncated. Callers must invoke this after
+// ReadSequenceLength and before allocation so a corrupt prefix with a
+// large count but short wire fails without OOM.
+func (d *Decoder) CheckSequenceAllocation(n, elemSize int) error {
+	if n < 0 {
+		return fmt.Errorf("cdr: negative sequence allocation %d: %w", n, ErrInvalid)
+	}
+	if elemSize <= 0 {
+		return fmt.Errorf("cdr: invalid element size %d: %w", elemSize, ErrInvalid)
+	}
+	if uint64(n) > uint64(maxSequenceElements) {
+		d.drops++
+		return fmt.Errorf("cdr: sequence length %d exceeds cap %d: %w", n, maxSequenceElements, ErrInvalid)
+	}
+	total := uint64(n) * uint64(elemSize)
+	if total > uint64(d.Remaining()) { //nolint:gosec // G115: Remaining is len minus off and non-negative
+		d.drops++
+		return fmt.Errorf("cdr: sequence needs %d bytes have %d: %w", total, d.Remaining(), ErrTruncated)
+	}
+	return nil
 }
 
 // ReadOctetSequence reads a uint8 sequence with a length prefix.

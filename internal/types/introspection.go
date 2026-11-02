@@ -232,17 +232,27 @@ func (m *MessageMember) IsBuffer() bool {
 // NestedMembers returns the nested table, patching it lazily on first call.
 // The patch is guarded by a global mutex so concurrent callers race safely.
 // Reads and writes of Members hold nestedPatchMu through nestedMembersLocked.
+// The returned table is a clone like LookupMessageMembers: the struct and
+// its Members slice are copied so callers cannot mutate the registry table
+// without holding a lock. The patch itself stores the shared table in
+// m.Members before cloning for return, so later patches reuse the same
+// shared entry while callers stay isolated.
 func (m *MessageMember) NestedMembers() (*MessageMembers, error) {
 	nestedPatchMu.Lock()
 	defer nestedPatchMu.Unlock()
-	return m.nestedMembersLocked()
+	resolved, err := m.nestedMembersLocked()
+	if err != nil {
+		return nil, err
+	}
+	return cloneMessageMembers(resolved), nil
 }
 
 // nestedMembersLocked implements NestedMembers with nestedPatchMu held.
 // Callers must hold nestedPatchMu; EnsureNestedPatched relies on this
 // to keep reads of Members race free while patching. It resolves through
 // the registry directly (not the cloning Lookup) so lazy patching stores
-// the shared table and pointer identity is preserved for patch callers.
+// the shared table in m.Members. The caller clones for return to keep the
+// clone-on-return discipline shared with LookupMessageMembers.
 func (m *MessageMember) nestedMembersLocked() (*MessageMembers, error) {
 	if !m.IsNested() {
 		return nil, fmt.Errorf("types: member %q is not nested", m.Name)
@@ -738,7 +748,7 @@ func RegisterMessageMembers(m *MessageMembers) error {
 
 // LookupMessageMembers returns a registered message table by namespace and name.
 //
-// The returned table is a clone like Registry.LookupType: the struct and
+// The returned table is a clone like NestedMembers: the struct and
 // its Members slice are copied so callers cannot mutate the registry
 // table without holding a lock. Nested table pointers remain shared;
 // callers are read-only and must not mutate through them. Lazy patching
@@ -1146,12 +1156,17 @@ func arrayDataSliceStruct(f reflect.Value, field string) (reflect.Value, reflect
 
 // syncSequenceTriple refreshes Size and Capacity from the Data slice.
 // It returns an error for malformed wrappers instead of a silent no-op.
+// It rejects unexported Data and unsettable Size or Capacity loudly
+// instead of risking reflect panics.
 func syncSequenceTriple(parent reflect.Value) error {
 	dataField := parent.FieldByName("Data")
 	sizeField := parent.FieldByName("Size")
 	capField := parent.FieldByName("Capacity")
 	if !dataField.IsValid() || !sizeField.IsValid() || !capField.IsValid() {
 		return errors.New("types: wrapper misses Data Size Capacity") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if !dataField.CanInterface() {
+		return errors.New("types: wrapper data is unexported") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	if sizeField.Kind() != reflect.Uint || capField.Kind() != reflect.Uint {
 		return errors.New("types: wrapper size and capacity must be uint") //nolint:wrapcheck // new error, nothing to wrap
@@ -1231,7 +1246,8 @@ func arrayGetFunc(field string) GetFunc {
 }
 
 // arrayFetchFunc returns a FetchFunc copying one element into out.
-// It rejects overflow indexes and unexported sources loudly.
+// It rejects overflow indexes, unexported sources, and unsettable
+// destinations loudly instead of risking reflect panics.
 func arrayFetchFunc(field string) FetchFunc {
 	return func(base any, index uint, out any) error {
 		f, _, _, err := arrayDataSlice(base, field)
@@ -1251,6 +1267,9 @@ func arrayFetchFunc(field string) FetchFunc {
 			return fmt.Errorf("types: fetch field %q element is unexported", field)
 		}
 		dst := ov.Elem()
+		if !dst.CanSet() {
+			return errors.New("types: fetch out cannot be set")
+		}
 		if !src.Type().AssignableTo(dst.Type()) {
 			return fmt.Errorf("types: cannot fetch %s into %s", src.Type().String(), dst.Type().String())
 		}
@@ -1294,20 +1313,29 @@ func arrayAssignFunc(field string) AssignFunc {
 // nested fini for the dropped tail or init for the grown head. Callers that
 // store nested resources must finalize the tail through the table Fini path.
 // Growth uses reflect.MakeSlice with len equal cap, so spare capacity is
-// dropped and the new cap equals the requested size.
+// dropped and the new cap equals the requested size. Allocation enforces
+// two layers: the 32M element count cap via checkResizeBound plus MaxInt
+// and total byte guards in buildResizedSlice. Wire decoders must also call
+// Decoder.CheckSequenceAllocation before Resize so wide element types fail
+// on short wire without allocating.
 func sequenceResizeFunc(field string, maxSize uint) ResizeFunc {
 	return func(base any, size uint) error {
-		if err := checkResizeBound(size, maxSize); err != nil {
+		err := checkResizeBound(size, maxSize)
+		if err != nil {
 			return err
 		}
 		data, parent, isWrapper, err := arrayDataSlice(base, field)
 		if err != nil {
 			return fmt.Errorf("types: resize field %q: %w", field, err)
 		}
-		if err := checkResizeKind(data, field); err != nil {
+		err = checkResizeKind(data, field)
+		if err != nil {
 			return err
 		}
-		next := buildResizedSlice(data, size)
+		next, err := buildResizedSlice(data, size)
+		if err != nil {
+			return err
+		}
 		if isWrapper {
 			return storeWrapperSlice(parent, field, next)
 		}
@@ -1316,10 +1344,15 @@ func sequenceResizeFunc(field string, maxSize uint) ResizeFunc {
 }
 
 // checkResizeBound rejects sizes above the sequence max.
-// Unbounded sequences with maxSize zero are still capped by
-// maxSequenceElements before reflect allocation so a huge size returns an
-// error instead of panicking or OOM on MakeSlice.
+// It enforces two layers: the IDL max when set, then the 32M element count
+// cap, with a MaxInt guard first so uint to int conversion before
+// reflect.MakeSlice cannot overflow on 32 bit builds. The count cap alone
+// does not bound wire bytes for wide element types: wire decoders must also
+// check Remaining against size times element width before calling Resize.
 func checkResizeBound(size, maxSize uint) error {
+	if uint64(size) > uint64(math.MaxInt) {
+		return fmt.Errorf("types: resize %d overflows int", size)
+	}
 	if maxSize != 0 && size > maxSize {
 		return fmt.Errorf("types: resize %d above max %d", size, maxSize)
 	}
@@ -1341,7 +1374,18 @@ func checkResizeKind(data reflect.Value, field string) error {
 }
 
 // buildResizedSlice copies the assignable prefix and zeroes the remainder.
-func buildResizedSlice(data reflect.Value, size uint) reflect.Value {
+// It checks MaxInt and total byte size before reflect.MakeSlice so wide
+// element types cannot overflow int or allocate huge byte totals from a
+// large count. The caller already enforces the 32M element count cap via
+// checkResizeBound; this is the second layer guarding the byte total.
+func buildResizedSlice(data reflect.Value, size uint) (reflect.Value, error) {
+	if uint64(size) > uint64(math.MaxInt) {
+		return reflect.Value{}, fmt.Errorf("types: resize %d overflows int", size)
+	}
+	elemSize := uint64(data.Type().Elem().Size())
+	if elemSize != 0 && uint64(size) > uint64(math.MaxInt)/elemSize {
+		return reflect.Value{}, fmt.Errorf("types: resize %d bytes overflow int", size)
+	}
 	elem := data.Type().Elem()
 	next := reflect.MakeSlice(data.Type(), int(size), int(size))
 	limit := min(data.Len(), int(size))
@@ -1354,7 +1398,7 @@ func buildResizedSlice(data reflect.Value, size uint) reflect.Value {
 			dst.Set(reflect.Zero(elem))
 		}
 	}
-	return next
+	return next, nil
 }
 
 // storeWrapperSlice stores the slice in a Data plus Size plus Capacity wrapper.

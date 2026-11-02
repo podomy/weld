@@ -73,6 +73,19 @@ var ErrDataPathNotWired = errors.New("dds: data path not wired, see datapath.go"
 // ErrNoRoute reports that publish has no discovered peer for the topic.
 var ErrNoRoute = errors.New("dds: no route to peers")
 
+// ErrRepairBackpressure reports that the repair queue is full.
+//
+// It is distinct from ErrNoRoute so demux can tell backpressure apart from
+// a missing route: backpressure counts loudly, while a missing route on the
+// prompt-NACK path stays best-effort quiet.
+var ErrRepairBackpressure = errors.New("dds: repair queue full")
+
+// ErrSequenceOverflow reports that a per-writer sequence reached MaxUint64.
+//
+// Claiming past MaxUint64 would wrap to 1 and reuse a sequence, so callers
+// fail loudly instead of wrapping silently.
+var ErrSequenceOverflow = errors.New("dds: sequence overflow")
+
 // Clock abstracts time for discovery leases and announcement ticks.
 type Clock interface {
 	// Now returns the current time.
@@ -327,8 +340,6 @@ type Backend struct {
 	repairDone chan struct{}
 	// repairGen is the backend generation for repair tasks; Close bumps it.
 	repairGen uint64
-	// routeSeq tracks the last accepted SPDP sequence per route prefix.
-	routeSeq map[GUIDPrefix]uint64
 	// routeExpiry tracks lease expiry per route prefix for sweep.
 	routeExpiry map[GUIDPrefix]time.Time
 }
@@ -950,7 +961,6 @@ func (b *Backend) installLiveLocked(
 	b.sedpHeartbeatLast = make(map[WriterGUID]uint64)
 	b.sedpHeartbeatCount = make(map[WriterGUID]int32)
 	b.fragSend = make(map[fragKey]*fragSendEntry)
-	b.routeSeq = make(map[GUIDPrefix]uint64)
 	b.routeExpiry = make(map[GUIDPrefix]time.Time)
 	b.ensureRepairWorkerLocked()
 	if b.rtpsSeqByWriter == nil {
@@ -992,26 +1002,66 @@ func (b *Backend) installLiveLocked(
 //
 // It shares the select plus closed check used by spdpLoop and sedpLoop so
 // the two loops cannot drift. The onTick callback runs under mu and
-// returns false to exit when closed.
+// returns false to exit when closed. Production clocks use a single stopped
+// timer with Reset so canceling the context releases the timer immediately
+// instead of lingering one interval like time.After per tick. Test clocks
+// keep the Clock.After path so fake time stays controllable.
 func (b *Backend) counterLoop(ctx context.Context, clock Clock, interval time.Duration, onTick func() bool) {
 	defer b.runWG.Done()
 
+	if _, ok := clock.(systemClock); !ok {
+		b.counterLoopWithClock(ctx, clock, interval, onTick)
+		return
+	}
+
+	b.counterLoopWithTimer(ctx, interval, onTick)
+}
+
+// counterLoopWithClock runs one counter with the Clock.After path.
+//
+// It serves test clocks where fake time stays controllable and no timer
+// resource needs release.
+func (b *Backend) counterLoopWithClock(ctx context.Context, clock Clock, interval time.Duration, onTick func() bool) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-clock.After(interval):
-			b.mu.Lock()
-
-			keep := onTick()
-
-			b.mu.Unlock()
-
-			if !keep {
+			if !b.runCounterTick(onTick) {
 				return
 			}
 		}
 	}
+}
+
+// counterLoopWithTimer runs one counter with a single stopped timer.
+//
+// It serves production clocks so canceling the context releases the timer
+// immediately instead of lingering one interval.
+func (b *Backend) counterLoopWithTimer(ctx context.Context, interval time.Duration, onTick func() bool) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if !b.runCounterTick(onTick) {
+				return
+			}
+
+			timer.Reset(interval)
+		}
+	}
+}
+
+// runCounterTick runs one tick under mu and reports whether to continue.
+func (b *Backend) runCounterTick(onTick func() bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return onTick()
 }
 
 // spdpLoop announces the local participant until the run context ends.
@@ -1261,6 +1311,10 @@ type spdpReceiver struct {
 }
 
 // Receive blocks until one SPDP payload arrives or ctx ends.
+//
+// It parses once via snoopAnnouncement for route snooping; the remote
+// table update reuses the same parsed result in the single-parse listen
+// loop so the packet is not parsed twice.
 func (r *spdpReceiver) Receive(ctx context.Context) ([]byte, error) {
 	err := ctx.Err()
 	if err != nil {
@@ -1306,14 +1360,15 @@ func (b *Backend) snapshotSPDP() (chan []byte, uint32, *LocalParticipant) {
 
 // snoopAnnouncement records the unicast routes from one SPDP packet.
 //
-// It returns the parsed announcement when the packet is usable and keep
-// true when the caller should return the bytes to the listen loop. Parse
+// It parses once and reuses the result for route snooping; the table
+// update reuses the same parsed announcement via updateRemoteTableWithAnnouncement
+// so the packet is not parsed twice for snooping and listen. Parse
 // failures return nil plus true so the table can ignore them. Domain
 // mismatches and self packets return nil plus false so the receiver keeps
-// waiting. Disposals delete the route. Sequence gates installs like the
-// participant table: stale sequences at or below the last accepted value
-// are ignored without bumping state. Expiry is tracked from the announced
-// lease and swept by lease.
+// waiting. Disposals delete the route. The RemoteTable sequence is the
+// single gate: stale sequences at or below the table LastSeq are ignored
+// without bumping state. Expiry is tracked from the announced lease and
+// swept by lease.
 func (b *Backend) snoopAnnouncement(
 	data []byte,
 	domain uint32,
@@ -1347,36 +1402,112 @@ func (b *Backend) snoopAnnouncement(
 	return &out, true
 }
 
-// storeAnnouncementRoutes installs one SPDP announcement in the route table
-// under the backend lock. Stale sequences at or below the last accepted
-// value are ignored. Disposals delete the route and evict the participant
-// outside the lock. A closed backend stores nothing.
-func (b *Backend) storeAnnouncementRoutes(ann Announcement, ports []int) {
-	b.mu.Lock()
+// updateRemoteTableWithAnnouncement installs one pre-parsed announcement.
+//
+// It shares the single ParseAnnouncement result from snoopAnnouncement so
+// snooping and listen do not parse twice. It mirrors RemoteTable.HandlePacket
+// without re-parsing: disposes remove on newer sequences, alive installs on
+// newer sequences with expiry now plus lease, and stale sequences are ignored.
+func (b *Backend) updateRemoteTableWithAnnouncement(ann Announcement, now time.Time) {
+	if now.IsZero() {
+		return
+	}
 
-	if b.closed {
-		b.mu.Unlock()
+	b.mu.RLock()
+	remotes := b.remotes
+	b.mu.RUnlock()
+
+	if remotes == nil {
+		return
+	}
+
+	if !ann.Alive {
+		remotes.mu.Lock()
+		changed, gen, hook, herr := remotes.handleDisposeLocked(ann)
+		remotes.mu.Unlock()
+		if herr != nil {
+			return
+		}
+		notifyChange(changed, gen, hook)
 
 		return
 	}
 
+	expiry := now.Add(ann.Lease)
+
+	remotes.mu.Lock()
+	changed, gen, hook, herr := remotes.handleAliveLocked(ann, expiry)
+	remotes.mu.Unlock()
+	if herr != nil {
+		return
+	}
+	notifyChange(changed, gen, hook)
+}
+
+// storeAnnouncementRoutes installs one SPDP announcement in the route table
+// under the backend lock. The RemoteTable sequence is the single gate: stale
+// sequences at or below the table LastSeq are ignored so a reordered
+// announce cannot reinstall a route the table rejected. Disposals delete
+// the route and evict the participant outside the lock. Expiry is tracked
+// from the announced lease and swept by lease. A closed backend stores nothing.
+func (b *Backend) storeAnnouncementRoutes(ann Announcement, ports []int) {
+	if !b.ensureRouteMapsForStore() {
+		return
+	}
+
+	if b.isAnnouncementStale(ann) {
+		return
+	}
+
+	b.installAnnouncementRoutes(ann, ports)
+}
+
+// ensureRouteMapsForStore allocates route maps unless closed.
+//
+// It reports false when closed so the caller stores nothing.
+func (b *Backend) ensureRouteMapsForStore() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
 	if b.routes == nil {
 		b.routes = make(map[GUIDPrefix][]int)
-	}
-	if b.routeSeq == nil {
-		b.routeSeq = make(map[GUIDPrefix]uint64)
 	}
 	if b.routeExpiry == nil {
 		b.routeExpiry = make(map[GUIDPrefix]time.Time)
 	}
+	return true
+}
 
-	last, seen := b.routeSeq[ann.GUID.Prefix]
-	if seen && ann.Sequence <= last {
+// isAnnouncementStale reports whether one announcement loses the table gate.
+//
+// It reads the RemoteTable LastSeq without holding the backend lock across
+// the table lock beyond a snapshot.
+func (b *Backend) isAnnouncementStale(ann Announcement) bool {
+	b.mu.RLock()
+	remotes := b.remotes
+	b.mu.RUnlock()
+	if remotes == nil {
+		return false
+	}
+	info, ok := remotes.Get(ann.GUID.Prefix)
+	return ok && ann.Sequence <= info.LastSeq
+}
+
+// installAnnouncementRoutes writes one gated announcement to the tables.
+func (b *Backend) installAnnouncementRoutes(ann Announcement, ports []int) {
+	b.mu.Lock()
+	if b.closed {
 		b.mu.Unlock()
-
 		return
 	}
-	b.routeSeq[ann.GUID.Prefix] = ann.Sequence
+	if b.routes == nil {
+		b.routes = make(map[GUIDPrefix][]int)
+	}
+	if b.routeExpiry == nil {
+		b.routeExpiry = make(map[GUIDPrefix]time.Time)
+	}
 
 	switch {
 	case !ann.Alive:
@@ -1406,7 +1537,8 @@ func (b *Backend) storeAnnouncementRoutes(ann Announcement, ports []int) {
 //
 // It self-locks and is safe for concurrent use. Expired prefixes are
 // removed under one lock, then participants are evicted without holding
-// the lock across receiver locks.
+// the lock across receiver locks. The RemoteTable sequence stays the single
+// gate; expiry only drops routes, never the table LastSeq.
 func (b *Backend) sweepExpiredRoutes(now time.Time) int {
 	b.mu.Lock()
 	var expired []GUIDPrefix
@@ -1417,7 +1549,6 @@ func (b *Backend) sweepExpiredRoutes(now time.Time) int {
 	}
 	for _, prefix := range expired {
 		delete(b.routes, prefix)
-		delete(b.routeSeq, prefix)
 		delete(b.routeExpiry, prefix)
 	}
 	b.mu.Unlock()
@@ -1519,6 +1650,7 @@ func (r *sedpReceiver) ReceiveSEDP(ctx context.Context) ([]byte, error) {
 			sedpTracef("receiver recv wire len=%d local-domain=%d", len(data), domain)
 			eps, err := ParseSEDPDATAs(data)
 			if err != nil {
+				r.backend.bumpDemuxError()
 				sedpTracef("receiver parse reject len=%d err=%v", len(data), err)
 				continue
 			}
@@ -1917,33 +2049,52 @@ func (b *Backend) buildFragMessage(guid WriterGUID, seq uint64, fragNum, total u
 	return msg, nil
 }
 
+// claimSeqLocked claims the next sequence for one writer under lock.
+//
+// The caller must hold b.mu for write. It returns the sequence to use and
+// advances tracking past it, failing with ErrSequenceOverflow instead of
+// wrapping to 1. The op names the caller for error prefixes.
+func (b *Backend) claimSeqLocked(guid WriterGUID, op string) (uint64, error) {
+	if b.rtpsSeqByWriter == nil {
+		b.rtpsSeqByWriter = make(map[WriterGUID]uint64)
+	}
+	seq, ok := b.rtpsSeqByWriter[guid]
+	if !ok {
+		seq = FirstSequenceNumber
+	} else if seq == 0 {
+		return 0, fmt.Errorf("dds: %s sequence overflow: %w", op, ErrSequenceOverflow)
+	}
+	if seq == ^uint64(0) {
+		b.rtpsSeqByWriter[guid] = 0
+		if b.rtpsSeq != ^uint64(0) && b.rtpsSeq != 0 {
+			b.rtpsSeq++
+		}
+		return seq, nil
+	}
+	if b.rtpsSeq == ^uint64(0) || b.rtpsSeq == 0 {
+		return 0, fmt.Errorf("dds: %s global sequence overflow: %w", op, ErrSequenceOverflow)
+	}
+	b.rtpsSeqByWriter[guid] = seq + 1
+	b.rtpsSeq++
+	return seq, nil
+}
+
 // nextRTPSSeqFor claims the next RTPS DATA sequence for one writer.
 //
 // Each DDS writer needs its own contiguous sequence starting at 1.
 // Sharing one global counter across writers leaves per-writer gaps that
 // reliable ROS readers NACK while waiting, so mixed service callers
 // stall. The map keeps contiguity per writer; rtpsSeq still counts
-// total publishes for observability and unit-test compat.
-func (b *Backend) nextRTPSSeqFor(guid WriterGUID) uint64 {
+// total publishes for observability and unit-test compat. Claiming past
+// MaxUint64 fails with ErrSequenceOverflow instead of wrapping to 1.
+func (b *Backend) nextRTPSSeqFor(guid WriterGUID) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.rtpsSeqByWriter == nil {
-		b.rtpsSeqByWriter = make(map[WriterGUID]uint64)
+	seq, err := b.claimSeqLocked(guid, "rtps")
+	if err != nil {
+		return 0, err
 	}
-	seq, ok := b.rtpsSeqByWriter[guid]
-	if !ok || seq == 0 {
-		seq = FirstSequenceNumber
-	}
-	b.rtpsSeqByWriter[guid] = seq + 1
-	if b.rtpsSeqByWriter[guid] == 0 {
-		b.rtpsSeqByWriter[guid] = FirstSequenceNumber
-	}
-	// Compat: keep the global counting for tests that assert it.
-	b.rtpsSeq++
-	if b.rtpsSeq == 0 {
-		b.rtpsSeq = FirstSequenceNumber
-	}
-	return seq
+	return seq, nil
 }
 
 // sendData embeds payload in RTPS DATA and unicasts to each port.
@@ -1962,7 +2113,10 @@ func (b *Backend) sendData(
 		return fmt.Errorf("dds: send data without transport: %w", ErrDataPathNotWired)
 	}
 
-	seq := b.nextRTPSSeqFor(guid)
+	seq, err := b.nextRTPSSeqFor(guid)
+	if err != nil {
+		return err
+	}
 
 	b.mu.RLock()
 	history := b.repairHistory
@@ -1996,12 +2150,14 @@ func (b *Backend) sendData(
 
 // WriteFrag accepts one fragment for the given writer GUID and seq.
 //
-// It claims RTPS sequencing via nextRTPSSeqFor on the first fragment of a
-// sample so the per-writer stream stays contiguous, stores the reassembled
+// It uses the Publisher seq as the single sequence domain: the seq names
+// the DATA_FRAG sample, the reassembled repair history, and the terminal
+// heartbeat under one value. It records the Publisher seq in the per-writer
+// RTPS tracking so later plain sends stay contiguous, stores the reassembled
 // sample in repair history when the last fragment completes, and sends the
 // terminal heartbeat matching sendData and sendPlainFrags. Fragments send
 // immediately in emission order; history and heartbeat happen once the
-// sample is complete.
+// sample is complete. Claiming past MaxUint64 fails with ErrSequenceOverflow.
 func (b *Backend) WriteFrag(ctx context.Context, guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) error {
 	err := ctx.Err()
 	if err != nil {
@@ -2013,7 +2169,9 @@ func (b *Backend) WriteFrag(ctx context.Context, guid WriterGUID, seq uint64, fr
 	}
 
 	if fragNum == 1 {
-		_ = b.nextRTPSSeqFor(guid)
+		if err = b.recordFragSeqUse(guid, seq); err != nil {
+			return err
+		}
 	}
 
 	ports := b.snapshotRoutes()
@@ -2045,6 +2203,45 @@ func (b *Backend) WriteFrag(ctx context.Context, guid WriterGUID, seq uint64, fr
 	return nil
 }
 
+// recordFragSeqUse records one Publisher seq as the single RTPS seq.
+//
+// It advances the per-writer tracking past seq and bumps the global count
+// so later plain sends stay contiguous with fragmented samples. A seq of
+// MaxUint64 marks overflow for the next claim; a stored overflow marker
+// fails with ErrSequenceOverflow instead of wrapping to 1.
+func (b *Backend) recordFragSeqUse(guid WriterGUID, seq uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rtpsSeqByWriter == nil {
+		b.rtpsSeqByWriter = make(map[WriterGUID]uint64)
+	}
+	stored, ok := b.rtpsSeqByWriter[guid]
+	if ok && stored == 0 {
+		return fmt.Errorf("dds: frag seq overflow: %w", ErrSequenceOverflow)
+	}
+	if b.rtpsSeq == 0 {
+		return fmt.Errorf("dds: frag global sequence overflow: %w", ErrSequenceOverflow)
+	}
+	if seq == ^uint64(0) {
+		b.rtpsSeqByWriter[guid] = 0
+		if b.rtpsSeq == ^uint64(0) {
+			b.rtpsSeq = 0
+		} else {
+			b.rtpsSeq++
+		}
+		return nil
+	}
+	if b.rtpsSeq == ^uint64(0) {
+		return fmt.Errorf("dds: frag global sequence overflow: %w", ErrSequenceOverflow)
+	}
+	want := seq + 1
+	if !ok || stored < want {
+		b.rtpsSeqByWriter[guid] = want
+	}
+	b.rtpsSeq++
+	return nil
+}
+
 // sendFragTerminalHeartbeat stores the completed frag run in repair history
 // and sends its terminal heartbeat. It returns nil only when at least one
 // route accepted the heartbeat.
@@ -2071,7 +2268,10 @@ func (b *Backend) sendFragTerminalHeartbeat(ctx context.Context, uni *rtps.Unica
 // accumulateFragSend buffers one outbound fragment for later history store.
 //
 // It copies the fragment bytes so the caller may reuse the input. The
-// caller must hold no lock; this self-locks.
+// caller must hold no lock; this self-locks. The table is bounded by
+// fragSendMaxEntries with a fragSendTimeout sweep mirroring the inbound
+// reassembler: expired entries drop loudly and a full table evicts the
+// oldest entry loudly instead of growing without limit.
 func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2079,15 +2279,20 @@ func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total
 	if b.fragSend == nil {
 		b.fragSend = make(map[fragKey]*fragSendEntry)
 	}
+	b.sweepFragSendLocked(time.Now())
 	key := fragKey{guid: guid, seq: seq}
 	entry, ok := b.fragSend[key]
 	if !ok {
+		if len(b.fragSend) >= fragSendMaxEntries {
+			b.evictOldestFragSendLocked()
+		}
 		entry = &fragSendEntry{
 			sampleSize:   sampleSize,
 			fragmentSize: fragmentSize,
 			total:        total,
 			buf:          make([]byte, sampleSize),
 			received:     make([]bool, total),
+			firstSeen:    time.Now(),
 		}
 		b.fragSend[key] = entry
 	}
@@ -2113,6 +2318,52 @@ func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total
 	copy(entry.buf[off:off+want], data)
 	entry.received[idx] = true
 	entry.count++
+}
+
+// sweepFragSendLocked deletes expired outbound entries and counts loudly.
+//
+// The caller must hold b.mu for write. Expired entries drop with a demux
+// error plus log so the eviction is loud instead of silent.
+func (b *Backend) sweepFragSendLocked(now time.Time) {
+	for key, entry := range b.fragSend {
+		if entry == nil {
+			delete(b.fragSend, key)
+			continue
+		}
+		if now.Sub(entry.firstSeen) < fragSendTimeout {
+			continue
+		}
+		delete(b.fragSend, key)
+		b.demuxErrors++
+		log.Printf("dds: frag send timeout evict guid=%x seq=%d", key.guid, key.seq)
+	}
+}
+
+// evictOldestFragSendLocked drops the oldest outbound entry loudly.
+//
+// The caller must hold b.mu for write and must have swept timeouts first.
+// It bounds the table at fragSendMaxEntries when many writers interleave.
+func (b *Backend) evictOldestFragSendLocked() {
+	var (
+		oldestKey fragKey
+		oldest    time.Time
+		first     = true
+	)
+	for key, entry := range b.fragSend {
+		t := time.Now()
+		if entry != nil {
+			t = entry.firstSeen
+		}
+		if first || t.Before(oldest) {
+			oldestKey, oldest, first = key, t, false
+		}
+	}
+	if first {
+		return
+	}
+	delete(b.fragSend, oldestKey)
+	b.demuxErrors++
+	log.Printf("dds: frag send table full evict guid=%x seq=%d", oldestKey.guid, oldestKey.seq)
 }
 
 // storeFragSendHistory stores one completed outbound sample in history.
@@ -2199,7 +2450,10 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 		return fmt.Errorf("dds: send frag without transport: %w", ErrDataPathNotWired)
 	}
 
-	seq := b.claimPlainFragSeq(guid)
+	seq, err := b.claimPlainFragSeq(guid)
+	if err != nil {
+		return err
+	}
 
 	b.mu.RLock()
 	history := b.repairHistory
@@ -2220,27 +2474,17 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 }
 
 // claimPlainFragSeq claims the next DATA sequence for one writer.
-func (b *Backend) claimPlainFragSeq(guid WriterGUID) uint64 {
+//
+// It mirrors nextRTPSSeqFor for the plain frag path and fails with
+// ErrSequenceOverflow instead of wrapping to 1.
+func (b *Backend) claimPlainFragSeq(guid WriterGUID) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.rtpsSeqByWriter == nil {
-		b.rtpsSeqByWriter = make(map[WriterGUID]uint64)
+	seq, err := b.claimSeqLocked(guid, "plain frag")
+	if err != nil {
+		return 0, err
 	}
-	seq, ok := b.rtpsSeqByWriter[guid]
-	if !ok || seq == 0 {
-		seq = FirstSequenceNumber
-	}
-	next := seq + 1
-	if next == 0 {
-		next = FirstSequenceNumber
-	}
-	b.rtpsSeqByWriter[guid] = next
-	// Compat: keep global counting with the claim like nextRTPSSeqFor.
-	b.rtpsSeq++
-	if b.rtpsSeq == 0 {
-		b.rtpsSeq = FirstSequenceNumber
-	}
-	return seq
+	return seq, nil
 }
 
 // commitPlainFragSeq keeps compatibility after a successful run.
@@ -2366,17 +2610,108 @@ func (b *Backend) spdpAnnounceLoop(ctx context.Context) {
 }
 
 // spdpListenLoop receives SPDP packets until the run context ends.
+//
+// It parses once per packet and reuses the result for route snooping plus
+// the remote table so the packet is not parsed twice. Domain mismatches
+// and self packets drop without updating either. Stale sequences are
+// ignored via the single table gate. Expired table entries sweep on the
+// announce interval.
 func (b *Backend) spdpListenLoop(ctx context.Context) {
 	defer b.runWG.Done()
 
 	remotes, interval := b.snapshotRemotesInterval()
-
 	if remotes == nil {
 		return
 	}
+	if interval <= 0 {
+		b.logLoopError(ctx, fmt.Errorf("dds: spdp listen sweep must be positive: %w", ErrInvalidFrame), "spdp listen")
+		return
+	}
 
-	err := remotes.ListenLoop(ctx, &spdpReceiver{backend: b}, interval)
-	b.logLoopError(ctx, err, "spdp listen")
+	b.spdpSingleParseLoop(ctx, remotes, interval)
+}
+
+// spdpSingleParseLoop feeds one parsed announcement to routes plus table.
+//
+// The caller holds no lock; this snapshots the SPDP queue plus domain and
+// local per iteration so Close teardown stays consistent. Each datagram
+// parses once via ParseAnnouncement and the result updates both routes and
+// the table without a second parse. Malformed packets count loudly and are
+// ignored. Table sweep runs when the interval elapses sharing one clock
+// reading for update plus sweep.
+func (b *Backend) spdpSingleParseLoop(ctx context.Context, remotes *RemoteTable, sweep time.Duration) {
+	lastSweep := time.Now()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			b.logLoopError(ctx, err, "spdp listen")
+			return
+		}
+
+		ch, domain, local := b.snapshotSPDP()
+		if ch == nil {
+			return
+		}
+
+		child, cancel := context.WithTimeout(ctx, sweep)
+		data, err := b.receiveSpdpBytes(child, ch)
+		cancel()
+
+		now := time.Now()
+
+		if err == nil {
+			b.handleSpdpBytesOnce(data, domain, local, now)
+		} else if ctx.Err() != nil {
+			b.logLoopError(ctx, ctx.Err(), "spdp listen")
+			return
+		}
+
+		if now.Sub(lastSweep) >= sweep {
+			remotes.Sweep(now)
+			lastSweep = now
+		}
+	}
+}
+
+// receiveSpdpBytes blocks until one SPDP payload arrives or ctx ends.
+func (b *Backend) receiveSpdpBytes(ctx context.Context, ch chan []byte) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("dds: spdp receive context: %w", ctx.Err())
+	case data := <-ch:
+		return data, nil
+	}
+}
+
+// handleSpdpBytesOnce parses once and updates routes plus table.
+//
+// Domain mismatches and self packets drop without updating either. Parse
+// failures count loudly. Stale sequences are ignored via the single table
+// gate so a reordered announce cannot reinstall a route the table rejected.
+func (b *Backend) handleSpdpBytesOnce(data []byte, domain uint32, local *LocalParticipant, now time.Time) {
+	ann, err := ParseAnnouncement(data)
+	if err != nil {
+		b.bumpDemuxError()
+		return
+	}
+
+	if ann.DomainID != domain {
+		return
+	}
+
+	if local != nil && ann.GUID.Prefix == local.GUID().Prefix {
+		return
+	}
+
+	ports, truncated := filterAnnouncementPorts(ann)
+
+	b.storeAnnouncementRoutes(ann, ports)
+	b.updateRemoteTableWithAnnouncement(ann, now)
+
+	if truncated {
+		b.bumpDemuxError()
+		log.Printf("dds: spdp routes truncated to %d for %x", maxRoutesPerPrefix, ann.GUID.Prefix)
+	}
 }
 
 // sedpAnnounceLoop publishes local endpoints until the run context ends.
@@ -2684,15 +3019,25 @@ func enqueueBestEffort[T any](ctx context.Context, ch chan T, v T) bool {
 }
 
 // enqueueSEDP queues SEDP bytes best effort.
+//
+// A full queue counts a demux error loudly instead of dropping silently.
 func (b *Backend) enqueueSEDP(ctx context.Context, sedpCh chan []byte, data []byte) {
 	cp := append([]byte(nil), data...)
-	enqueueBestEffort(ctx, sedpCh, cp)
+	if !enqueueBestEffort(ctx, sedpCh, cp) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux sedp queue full dropped %d bytes", len(cp))
+	}
 }
 
 // enqueueSPDP queues SPDP bytes best effort.
+//
+// A full queue counts a demux error loudly instead of dropping silently.
 func (b *Backend) enqueueSPDP(ctx context.Context, spdpCh chan []byte, data []byte) {
 	cp := append([]byte(nil), data...)
-	enqueueBestEffort(ctx, spdpCh, cp)
+	if !enqueueBestEffort(ctx, spdpCh, cp) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux spdp queue full dropped %d bytes", len(cp))
+	}
 }
 
 // sedpBuiltinWriter reports whether id is a SEDP builtin writer entity.
@@ -3017,7 +3362,9 @@ func (b *Backend) noteSedpHeartbeatBound(remote WriterGUID, beat rtps.Heartbeat)
 // routeDiscoveryData enqueues one DATA submessage to SPDP or SEDP when builtin.
 //
 // It returns updated found flags so the whole datagram enqueues at most
-// once per path. Non-builtin DATA is left for the user path.
+// once per path. Non-builtin DATA is left for the user path. The DATA
+// decodes once via decodeDataOnce and the result is shared with sequence
+// tracking so the same sub is not decoded twice.
 func (b *Backend) routeDiscoveryData(
 	ctx context.Context,
 	header rtps.Header,
@@ -3028,13 +3375,14 @@ func (b *Backend) routeDiscoveryData(
 	spdpFound bool,
 	sedpFound bool,
 ) (bool, bool) {
-	writer, ok := builtinWriterOf(sub)
+	dataDecoded, ok := decodeDataOnce(sub)
 	if !ok {
 		if sub.ID == rtps.SubmessageData {
 			sedpTracef("demux data non-builtin sub-id=%#02x len=%d", sub.ID, len(data))
 		}
 		return spdpFound, sedpFound
 	}
+	writer := dataDecoded.WriterID
 
 	if writer == rtps.EntitySPDPWriter {
 		sedpTracef("demux spdp-data writer=%02x%02x%02x%02x len=%d", writer[0], writer[1], writer[2], writer[3], len(data))
@@ -3048,7 +3396,7 @@ func (b *Backend) routeDiscoveryData(
 
 	if sedpBuiltinWriter(writer) {
 		sedpTracef("demux sedp-data writer=%02x%02x%02x%02x len=%d", writer[0], writer[1], writer[2], writer[3], len(data))
-		b.noteSedpData(header, sub, writer)
+		b.noteSedpDataWithSeq(header, writer, dataDecoded.SequenceNumber)
 		if !sedpFound {
 			b.enqueueSEDP(ctx, sedpCh, data)
 			sedpFound = true
@@ -3060,22 +3408,15 @@ func (b *Backend) routeDiscoveryData(
 	return spdpFound, sedpFound
 }
 
-// noteSedpData records the DATA sequence for one remote SEDP writer.
+// noteSedpDataWithSeq records one pre-decoded DATA sequence for an SEDP writer.
 //
-// It decodes the submessage sequence and stores the max under the writer
-// GUID built from the datagram header prefix, so later heartbeats ack
-// only missing samples. Decode failures are ignored: the listen loop
-// reports them when it parses the enqueued datagram.
-func (b *Backend) noteSedpData(header rtps.Header, sub rtps.RawSubmessage, writer rtps.EntityID) {
-	var drops rtps.Counter
-	decoded, err := rtps.DecodeSubmessage(sub, &drops)
-	if err != nil || decoded.Data == nil {
-		return
-	}
+// The caller decodes once via decodeDataOnce and shares the sequence so
+// the same sub is not decoded twice.
+func (b *Backend) noteSedpDataWithSeq(header rtps.Header, writer rtps.EntityID, seq uint64) {
 	var guid WriterGUID
 	copy(guid[:12], header.Prefix[:])
 	copy(guid[12:16], writer[:])
-	b.noteSedpSeq(guid, decoded.Data.SequenceNumber)
+	b.noteSedpSeq(guid, seq)
 }
 
 // sedpNackBitmap returns an all-ones bitmap for n samples.
@@ -3120,14 +3461,21 @@ func sedpBuiltinReaderForWriter(writer rtps.EntityID) (rtps.EntityID, bool) {
 	return rtps.EntityID{0x00, 0x00, sedpWriterEntityB14Cyclone, 0xC7}, true
 }
 
-// builtinWriterOf returns the writer entity for one DATA submessage.
-func builtinWriterOf(sub rtps.RawSubmessage) (rtps.EntityID, bool) {
+// decodeDataOnce decodes one DATA submessage once and shares the result.
+//
+// It returns the decoded DATA for builtin checks plus sequence tracking so
+// routeDiscoveryData and enqueueUserSubs do not decode the same sub twice.
+// Non-DATA subs and decode failures report false.
+func decodeDataOnce(sub rtps.RawSubmessage) (*rtps.Data, bool) {
+	if sub.ID != rtps.SubmessageData {
+		return nil, false
+	}
 	decoded, err := rtps.DecodeSubmessage(sub, nil)
 	if err != nil || decoded.Data == nil {
-		return rtps.EntityID{}, false
+		return nil, false
 	}
 
-	return decoded.Data.WriterID, true
+	return decoded.Data, true
 }
 
 // enqueueUserSubs queues each user DATA payload from decoded subs.
@@ -3137,7 +3485,9 @@ func builtinWriterOf(sub rtps.RawSubmessage) (rtps.EntityID, bool) {
 // discovery plus user DATA from delivering builtin samples to TakeFrom.
 // User control (ACKNACK, HEARTBEAT, GAP) routes to the reliability
 // handler, not to dataCh, before DATA queueing. DATA_FRAG reassembles to
-// one payload and queues to dataCh when complete.
+// one payload and queues to dataCh when complete. DATA decodes once via
+// decodeDataOnce and the result is shared with enqueueData so the same sub
+// is not decoded twice.
 func (b *Backend) enqueueUserSubs(
 	ctx context.Context,
 	header rtps.Header,
@@ -3158,13 +3508,19 @@ func (b *Backend) enqueueUserSubs(
 			continue
 		}
 
-		if writer, ok := builtinWriterOf(sub); ok {
-			if writer == rtps.EntitySPDPWriter || sedpBuiltinWriter(writer) {
-				continue
-			}
+		dataDecoded, ok := decodeDataOnce(sub)
+		if !ok {
+			b.bumpDemuxError()
+			sampleDropLog("dds: demux submessage decode failed")
+			continue
 		}
 
-		b.enqueueData(ctx, dataCh, header, sub)
+		writer := dataDecoded.WriterID
+		if writer == rtps.EntitySPDPWriter || sedpBuiltinWriter(writer) {
+			continue
+		}
+
+		b.enqueueDataWithDecoded(ctx, dataCh, header, dataDecoded)
 	}
 }
 
@@ -3174,26 +3530,41 @@ func (b *Backend) enqueueUserSubs(
 // answered without changing best effort Take ordering. Tracking advances
 // only after successful enqueue; on queue-full drop the sample stays
 // unmarked as received so a later NACK can repair it, and the drop counts
-// a demux error loudly instead of silently vanishing.
+// a demux error loudly instead of silently vanishing. The sub decodes once
+// and empty payloads count loudly instead of dropping silently.
 func (b *Backend) enqueueData(
 	ctx context.Context,
 	dataCh chan dataItem,
 	header rtps.Header,
 	sub rtps.RawSubmessage,
 ) {
-	decoded, err := rtps.DecodeSubmessage(sub, nil)
-	if err != nil {
+	decoded, ok := decodeDataOnce(sub)
+	if !ok {
 		b.bumpDemuxError()
-		sampleDropLog("dds: demux submessage decode failed: %v", err)
-
+		sampleDropLog("dds: demux submessage decode failed")
 		return
 	}
 
-	if decoded.Data == nil || len(decoded.Data.Payload) == 0 {
+	b.enqueueDataWithDecoded(ctx, dataCh, header, decoded)
+}
+
+// enqueueDataWithDecoded queues one pre-decoded DATA payload.
+//
+// The caller decodes once via decodeDataOnce and shares the result so the
+// same sub is not decoded twice.
+func (b *Backend) enqueueDataWithDecoded(
+	ctx context.Context,
+	dataCh chan dataItem,
+	header rtps.Header,
+	dataDecoded *rtps.Data,
+) {
+	if dataDecoded == nil || len(dataDecoded.Payload) == 0 {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux data empty payload")
 		return
 	}
 
-	if decoded.Data.SequenceNumber == 0 {
+	if dataDecoded.SequenceNumber == 0 {
 		b.bumpDemuxError()
 		sampleDropLog("dds: demux data sequence 0")
 
@@ -3203,20 +3574,20 @@ func (b *Backend) enqueueData(
 	var guid WriterGUID
 
 	copy(guid[:12], header.Prefix[:])
-	copy(guid[12:16], decoded.Data.WriterID[:])
+	copy(guid[12:16], dataDecoded.WriterID[:])
 
-	payload := append([]byte(nil), decoded.Data.Payload...)
+	payload := append([]byte(nil), dataDecoded.Payload...)
 
-	queued := enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: decoded.Data.SequenceNumber, payload: payload})
+	queued := enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: dataDecoded.SequenceNumber, payload: payload})
 	if !queued {
 		b.bumpDemuxError()
-		sampleDropLog("dds: demux data queue full guid=%x seq=%d", guid, decoded.Data.SequenceNumber)
+		sampleDropLog("dds: demux data queue full guid=%x seq=%d", guid, dataDecoded.SequenceNumber)
 
 		return
 	}
 
-	b.maybePromptNackOnData(guid, decoded.Data.SequenceNumber)
-	b.noteRemoteData(guid, decoded.Data.SequenceNumber)
+	b.maybePromptNackOnData(guid, dataDecoded.SequenceNumber)
+	b.noteRemoteData(guid, dataDecoded.SequenceNumber)
 }
 
 // ReportLiveliness reports local endpoint liveliness on the SEDP path.
@@ -3587,25 +3958,24 @@ func (b *Backend) HasRemoteEndpoint(topic string) bool {
 // interval to process SEDP and match. It polls every 20ms up to 1s and
 // returns true when a match appears. On timeout it returns false so the
 // caller still sends best-effort for Weld-to-Weld peers that never
-// announce readers. Context cancellation aborts early with false.
+// announce readers. Context cancellation aborts early with false. A single
+// stopped timer with Reset paces polls instead of a fresh timer per tick.
 func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) bool {
 	if b.hasMatchingRemoteReader(ep) {
 		return true
 	}
 
+	timer := newStoppedTimer()
+	defer timer.Stop()
+
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
-		err := ctx.Err()
-		if err != nil {
+		if ctx.Err() != nil {
 			return false
 		}
 
-		timer := time.NewTimer(20 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !waitForTimerOrCancel(ctx, timer, 20*time.Millisecond) {
 			return false
-		case <-timer.C:
 		}
 
 		if b.hasMatchingRemoteReader(ep) {
@@ -3614,6 +3984,38 @@ func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) bo
 	}
 
 	return b.hasMatchingRemoteReader(ep)
+}
+
+// newStoppedTimer returns a timer stopped and drained for Reset reuse.
+func newStoppedTimer() *time.Timer {
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	return timer
+}
+
+// waitForTimerOrCancel waits one interval or context cancel.
+//
+// It resets the stopped timer and reports false on cancel so the caller
+// exits early. It drains the timer on cancel to keep Reset safe.
+func waitForTimerOrCancel(ctx context.Context, timer *time.Timer, interval time.Duration) bool {
+	timer.Reset(interval)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // pauseForPeerProcessing pauses briefly so the peer processes our SEDP.

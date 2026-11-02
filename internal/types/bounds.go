@@ -5,6 +5,8 @@ package types
 import (
 	"errors"
 	"fmt"
+	"math"
+	"unsafe"
 )
 
 // IDL to C mapping aliases. Each alias is byte for byte identical to the
@@ -203,19 +205,30 @@ func (s *Sequence[T]) Fini() error {
 
 // Resize applies fini plus init resize within the bound.
 // Growth uses MakeSlice with len equal cap, so spare capacity is dropped.
-// Unbounded sizes are capped by maxSequenceElements before allocation so a
-// corrupt huge size returns an error instead of panicking or OOM on make.
+// It enforces two layers: the IDL bound plus the 32M element count cap,
+// with a MaxInt guard first so uint to int conversion before make cannot
+// overflow on 32 bit builds, plus a total byte guard so wide element types
+// cannot overflow int bytes. Wire decoders must also check Remaining
+// against size times element width before calling Resize.
 func (s *Sequence[T]) Resize(size uint, bound SequenceBound) error {
 	err := CheckSequenceLength(size, bound)
 	if err != nil {
 		return fmt.Errorf("types: resize sequence: %w", err)
 	}
+	if uint64(size) > uint64(math.MaxInt) {
+		return fmt.Errorf("types: sequence len %d overflows int", size)
+	}
 	if uint64(size) > uint64(maxSequenceElements) {
 		return fmt.Errorf("types: sequence len %d exceeds cap %d", size, maxSequenceElements)
 	}
+	var zero T
+	elemSize := uint64(unsafe.Sizeof(zero))
+	if elemSize != 0 && uint64(size) > uint64(math.MaxInt)/elemSize {
+		return fmt.Errorf("types: sequence len %d bytes overflow int", size)
+	}
 	next := make([]T, size)
 	limit := len(s.Data)
-	if uint(limit) > size {
+	if uint64(limit) > uint64(size) {
 		limit = int(size)
 	}
 	copy(next, s.Data[:limit])

@@ -582,7 +582,9 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
-		t.Skipf("matrix hash unavailable for %s topic %s, skipping: %v", tc.Label, topic, err)
+		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix forward %s topic %s hash %s", tc.Label, topic, typeHash)
 	payload, err := tc.encode(live)
@@ -611,6 +613,7 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	takeCtx, takeCancel := context.WithTimeout(ctx, typeMatrixTakeWait)
 	defer takeCancel()
+	unknownTakeErrs := 0
 	for takeCtx.Err() == nil {
 		msg, terr := backend.TakeBytes(takeCtx)
 		if terr != nil {
@@ -624,7 +627,8 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 			if strings.Contains(text, "not wired") {
 				t.Fatalf("weld take backend error %s: %v", tc.Label, terr)
 			}
-			continue
+			unknownTakeErrs++
+			t.Fatalf("weld take unexpected error %s count %d: %v", tc.Label, unknownTakeErrs, terr)
 		}
 		derr := tc.decode(msg.Payload, live)
 		if derr == nil {
@@ -693,7 +697,9 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
-		t.Skipf("matrix hash unavailable for %s topic %s, skipping: %v", tc.Label, topic, err)
+		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse %s topic %s hash %s", tc.Label, topic, typeHash)
 	payload, err := tc.encode(live)

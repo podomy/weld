@@ -783,3 +783,23 @@ func TestBoundsCovarianceDefaults(t *testing.T) {
 		t.Fatal("fixed zero size must fail")
 	}
 }
+
+// TestBoundsRuneCounts checks rune bound agreement with CDR.
+func TestBoundsRuneCounts(t *testing.T) {
+	bound := StringBound{StringUpperBound: 2}
+	err := CheckStringLength("a✅", bound)
+	if err != nil {
+		t.Fatalf("two runes within bound 2 rejected: %v", err)
+	}
+	err = CheckStringLength("abc", bound)
+	if err == nil {
+		t.Fatal("three runes above bound 2 accepted, want rejection")
+	}
+	multi := "a✅b"
+	if countRunes(multi) != 3 {
+		t.Fatalf("rune count = %d, want 3", countRunes(multi))
+	}
+	if len(multi) == countRunes(multi) {
+		t.Fatal("fixture must be multi byte to pin rune versus byte")
+	}
+}

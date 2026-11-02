@@ -3161,3 +3161,310 @@ func TestSEDPProvisionalExpiryRemovesStale(t *testing.T) {
 		t.Fatalf("generation = %d, want %d after confirmed sweep", got, before)
 	}
 }
+
+// TestSEDPPrefixMismatchDrops pins header prefix binding.
+//
+// An endpoint GUID prefix differing from the RTPS header prefix drops
+// loudly without installing or recording sequence.
+func TestSEDPPrefixMismatchDrops(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xF1)
+	peer := mustSEDPIndexWithPrefix(t, 0xF2)
+
+	writer := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	data, err := SerializeSEDPDATA(writer)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+
+	bad := append([]byte(nil), data...)
+	for i := 8; i < 20; i++ {
+		bad[i] ^= 0xFF
+	}
+
+	err = local.ingestSample(bad)
+	if !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("prefix mismatch ingest = %v, want ErrSEDPInvalidDATA", err)
+	}
+
+	if local.Generation() != 0 {
+		t.Fatalf("gen = %d, want 0 after prefix drop", local.Generation())
+	}
+
+	if len(local.RemoteEndpoints()) != 0 {
+		t.Fatalf("remotes installed after prefix mismatch")
+	}
+}
+
+// TestSEDPSeqGatingAfterUpsert pins post-validation sequence recording.
+//
+// An invalid endpoint with sequence N must not pollute lastSeq: a later
+// valid endpoint with the same sequence still installs.
+func TestSEDPSeqGatingAfterUpsert(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xF3)
+	peer := mustSEDPIndexWithPrefix(t, 0xF4)
+
+	writer := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	validParams := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(writer.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(writer.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
+	}
+
+	invalidParams := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: []byte{0x04, 0x00, 0x00, 0x00, 'r', 't', 'x', 'x'}},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(writer.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
+	}
+
+	setSeq := func(body []byte, seq uint64) {
+		binary.LittleEndian.PutUint32(body[sedpDATASeqOff:sedpDATASeqOff+4], uint32(seq>>32))
+		binary.LittleEndian.PutUint32(body[sedpDATASeqOff+4:sedpDATASeqOff+8], uint32(seq)) //nolint:gosec // G115: test sequences are small
+	}
+
+	badBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, invalidParams)
+	setSeq(badBody, 9)
+	bad := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, badBody)
+
+	err := local.ingestSample(bad)
+	if err == nil {
+		t.Fatalf("invalid ingest succeeded, want error")
+	}
+
+	goodBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, validParams)
+	setSeq(goodBody, 9)
+	good := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, goodBody)
+
+	err = local.ingestSample(good)
+	if err != nil {
+		t.Fatalf("valid same-seq ingest = %v, want nil (invalid must not pollute)", err)
+	}
+
+	if local.Generation() != 1 {
+		t.Fatalf("gen = %d, want 1", local.Generation())
+	}
+}
+
+// TestSEDPSeqZeroNeverAdvances pins seq 0 staleness behavior.
+func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xF5)
+	peer := mustSEDPIndexWithPrefix(t, 0xF6)
+
+	writer := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	params := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(writer.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(writer.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
+	}
+
+	zeroBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	binary.LittleEndian.PutUint64(zeroBody[sedpDATASeqOff:sedpDATASeqOff+8], 0)
+	zero := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, zeroBody)
+
+	if local.sedpStaleCheck(writer.ID, 0) {
+		t.Fatalf("seq 0 reports stale, want false")
+	}
+
+	err := local.ingestSample(zero)
+	if err != nil {
+		t.Fatalf("seq 0 ingest = %v, want nil", err)
+	}
+
+	oneBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	binary.LittleEndian.PutUint64(oneBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
+	one := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, oneBody)
+
+	err = local.ingestSample(one)
+	if err != nil {
+		t.Fatalf("seq 1 after seq 0 = %v, want nil (seq 0 never advances)", err)
+	}
+}
+
+// TestSEDPHeartbeatReplay pins per-writer Count gating with Count==0 single processing.
+func TestSEDPHeartbeatReplay(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF7)
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xF7 + byte(i)
+	}
+
+	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+
+	if !idx.sedpHeartbeatNote(key, 5, 10) {
+		t.Fatalf("first heartbeat not processed")
+	}
+
+	if idx.sedpHeartbeatNote(key, 5, 10) {
+		t.Fatalf("replay processed, want ignore")
+	}
+
+	if idx.sedpHeartbeatNote(key, 4, 10) {
+		t.Fatalf("older count processed, want ignore")
+	}
+
+	if !idx.sedpHeartbeatNote(key, 6, 12) {
+		t.Fatalf("newer heartbeat not processed")
+	}
+
+	zeroKey := sedpWriterKey{prefix: prefix, writer: sedpSubscriptionsWriter}
+	if !idx.sedpHeartbeatNote(zeroKey, 0, 7) {
+		t.Fatalf("first Count==0 not processed")
+	}
+
+	if idx.sedpHeartbeatNote(zeroKey, 0, 7) {
+		t.Fatalf("repeat Count==0 processed, want single processing without storm")
+	}
+
+	if !idx.sedpHeartbeatNote(zeroKey, 0, 8) {
+		t.Fatalf("new LastSequence Count==0 not processed")
+	}
+}
+
+// TestSEDGapFullListClampAndCap pins GAP list application with bounds.
+func TestSEDGapFullListClampAndCap(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF8)
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xF8 + byte(i)
+	}
+
+	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+
+	idx.sedpApplyGapList(key, []uint64{0, 5})
+	idx.mu.Lock()
+	got := idx.writerHigh[key]
+	idx.mu.Unlock()
+	if got != 5 {
+		t.Fatalf("no-bound gap high = %d, want 5", got)
+	}
+
+	idx.sedpApplyGapList(key, []uint64{1000})
+	idx.mu.Lock()
+	got = idx.writerHigh[key]
+	idx.mu.Unlock()
+	if got != 5+sedpGapNoBoundCap {
+		t.Fatalf("no-bound over-jump high = %d, want %d", got, 5+sedpGapNoBoundCap)
+	}
+
+	boundKey := sedpWriterKey{prefix: prefix, writer: sedpSubscriptionsWriter}
+	if !idx.sedpHeartbeatNote(boundKey, 1, 20) {
+		t.Fatalf("heartbeat bound not processed")
+	}
+
+	idx.sedpApplyGapList(boundKey, []uint64{3, 100})
+	idx.mu.Lock()
+	got = idx.writerHigh[boundKey]
+	idx.mu.Unlock()
+	if got != 21 {
+		t.Fatalf("clamped gap high = %d, want 21 (bound 20 plus one)", got)
+	}
+
+	idx.sedpApplyGapList(boundKey, []uint64{4, 6, 5})
+	idx.mu.Lock()
+	got = idx.writerHigh[boundKey]
+	idx.mu.Unlock()
+	if got != 21 {
+		t.Fatalf("ordered full-list high = %d, want 21 (stays clamped)", got)
+	}
+}
+
+// TestSEDPInfoDstUnicast pins INFO_DST enforcement with multicast unenforced.
+func TestSEDPInfoDstUnicast(t *testing.T) {
+	t.Parallel()
+
+	var local SEDPGUIDPrefix
+	for i := range local {
+		local[i] = 0xA0 + byte(i)
+	}
+
+	build := func(dst *SEDPGUIDPrefix) []byte {
+		out := make([]byte, 0, sedpRTPSHeaderLen+sedpSubmessageHeaderLen+12)
+		out = append(out, sedpRTPSMagic...)
+		out = append(out, sedpRTPSMajor, sedpRTPSMinor, sedpVendorID0, sedpVendorID1)
+		out = append(out, local[:]...)
+		if dst == nil {
+			return out
+		}
+		out = append(out, sedpSubmessageInfoDst, sedpFlagLittleEndian)
+		out = binary.LittleEndian.AppendUint16(out, 12)
+		out = append(out, (*dst)[:]...)
+		return out
+	}
+
+	if err := sedpCheckInfoDstUnicast(build(nil), local); err != nil {
+		t.Fatalf("no INFO_DST = %v, want nil", err)
+	}
+
+	if err := sedpCheckInfoDstUnicast(build(&local), local); err != nil {
+		t.Fatalf("matching INFO_DST = %v, want nil", err)
+	}
+
+	var other SEDPGUIDPrefix
+	for i := range other {
+		other[i] = 0xB0 + byte(i)
+	}
+
+	err := sedpCheckInfoDstUnicast(build(&other), local)
+	if !errors.Is(err, ErrSEDPInfoDst) {
+		t.Fatalf("mismatch = %v, want ErrSEDPInfoDst", err)
+	}
+}
+
+// TestSEDPSubmessageCountCap pins the per-datagram walk bound.
+func TestSEDPSubmessageCountCap(t *testing.T) {
+	t.Parallel()
+
+	out := make([]byte, 0, sedpRTPSHeaderLen+(sedpMaxSubmessages+1)*sedpSubmessageHeaderLen)
+	out = append(out, sedpRTPSMagic...)
+	out = append(out, sedpRTPSMajor, sedpRTPSMinor, sedpVendorID0, sedpVendorID1)
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = byte(i)
+	}
+	out = append(out, prefix[:]...)
+	for range sedpMaxSubmessages + 1 {
+		out = append(out, 0x01, sedpFlagLittleEndian, 0x00, 0x00)
+	}
+
+	_, _, err := sedpFindAllEndpointDATA(out)
+	if !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("over-cap = %v, want ErrSEDPInvalidDATA", err)
+	}
+}
+
+// TestSEDPParamPreCap pins entry counting before full decode.
+func TestSEDPParamPreCap(t *testing.T) {
+	t.Parallel()
+
+	blob := make([]byte, 0, (sedpMaxParams+2)*4)
+	for range sedpMaxParams + 1 {
+		blob = binary.LittleEndian.AppendUint16(blob, 0x0040)
+		blob = binary.LittleEndian.AppendUint16(blob, 0)
+	}
+	blob = binary.LittleEndian.AppendUint16(blob, rtps.ParamSentinel)
+	blob = binary.LittleEndian.AppendUint16(blob, 0)
+
+	err := sedpCountParams(blob, true)
+	if !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("pre-cap count = %v, want ErrSEDPInvalidDATA", err)
+	}
+
+	_, _, err = sedpDecodeParams(blob, true)
+	if !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("pre-cap decode = %v, want ErrSEDPInvalidDATA", err)
+	}
+}

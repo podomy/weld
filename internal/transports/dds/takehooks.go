@@ -406,13 +406,21 @@ func writerGUIDLabel(guid WriterGUID) string {
 // evalTakeHooks runs content filtering, keyed extraction, and liveliness
 // gating for one validated sample against a snapshot.
 //
-// It never counts and never takes receiver locks: the caller counts
-// reasoned drops exactly once and propagates holds uncounted. Order is
-// filter, then keyed, then liveliness, so dashboards blame the earliest
-// applicable cause. A nil return means deliver. It never panics.
+// Receipt asserts liveliness and anchors the deadline even when the sample
+// is later filtered: the assert runs before filter evaluation so filtered
+// traffic still proves the writer alive. The deadline miss flag is captured
+// before anchoring, so the current sample still drops on a miss instead of
+// hiding behind its own anchor. It never counts and never takes receiver
+// locks: the caller counts reasoned drops exactly once and propagates holds
+// uncounted. Order after the assert is filter, then keyed, then liveliness
+// gate, so dashboards blame the earliest applicable cause. A nil return
+// means deliver. It never panics.
 //
 //nolint:unparam // topic documents the sampled topic for call-site symmetry though the snapshot already carries the filter
 func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte, guid WriterGUID, keyed bool) *takeHookReject {
+	now := time.Now().UnixNano()
+	deadlineMissed := assertTakeReceipt(snap, now)
+
 	if snap.filter != nil && snap.filter.filter != nil {
 		if rej := applyContentFilterHook(snap.filter, payload); rej != nil {
 			return rej
@@ -425,7 +433,25 @@ func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte,
 		}
 	}
 
-	return evalLivelinessHook(snap)
+	return evalLivelinessHook(snap, deadlineMissed, now)
+}
+
+// assertTakeReceipt records one receipt against liveliness and deadline.
+//
+// Automatic writers assert through RecordSampleAt; manual writers never ride
+// free on data. The deadline miss flag is captured before MarkSeen so the
+// caller gates on the pre-receipt miss while the anchor still moves forward
+// for filtered traffic. It reports the pre-anchor miss for the gate step.
+func assertTakeReceipt(snap takeHookSnapshot, now int64) bool {
+	var missed bool
+	if snap.deadline != nil {
+		missed = snap.deadline.MissedAt(now)
+		snap.deadline.MarkSeen(now)
+	}
+	if snap.tracker != nil {
+		snap.tracker.RecordSampleAt(now)
+	}
+	return missed
 }
 
 // applyContentFilterHook evaluates one compiled filter on a raw payload.
@@ -491,25 +517,14 @@ func applyKeyedHook(typeIDL string, payload []byte) *takeHookReject {
 	return nil
 }
 
-// evalLivelinessHook records the sample and gates delivery by writer state.
+// evalLivelinessHook gates delivery by writer state without re-asserting.
 //
-// Automatic writers record each sample; manual writers only assert through
-// the explicit API. Accepted samples anchor the deadline tracker through
-// MarkSeen so enforcement follows traffic, not registration time. Expired
-// writers drop loudly naming lease duration. Stale writers hold without
-// counting. Missing trackers or topics pass through untouched, preserving
-// the unwatched take path exactly, with accepted samples still anchoring
-// the deadline window. Out-of-range gate decisions fail closed with a loud
-// drop naming the invalid decision instead of delivering. The snapshot
-// carries preloaded pointers, so this never takes receiver locks.
-func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
-	now := time.Now().UnixNano()
-
-	deadlineMissed := false
-	if snap.deadline != nil {
-		deadlineMissed = snap.deadline.MissedAt(now)
-	}
-
+// The caller must have run assertTakeReceipt first with the same now, so the
+// tracker state already reflects this receipt and the deadline already
+// anchored. It uses the pre-anchor miss flag so the current sample still
+// drops on a miss. Missing trackers pass through unless the captured miss
+// says otherwise. Out-of-range gate decisions fail closed with a loud drop.
+func evalLivelinessHook(snap takeHookSnapshot, deadlineMissed bool, now int64) *takeHookReject {
 	if snap.tracker == nil {
 		if deadlineMissed {
 			reason := DropReasonDeadlineMissed
@@ -520,22 +535,13 @@ func evalLivelinessHook(snap takeHookSnapshot) *takeHookReject {
 			}
 		}
 
-		if snap.deadline != nil {
-			snap.deadline.MarkSeen(now)
-		}
-
 		return nil
 	}
 
-	snap.tracker.RecordSampleAt(now)
 	outcome := core.GateDelivery(snap.tracker.StateAt(now), deadlineMissed)
 
 	switch outcome.Decision {
 	case core.GateDeliver:
-		if snap.deadline != nil {
-			snap.deadline.MarkSeen(now)
-		}
-
 		return nil
 	case core.GateHold:
 		return &takeHookReject{err: fmt.Errorf("dds: take held stale writer: %w", ErrLivelinessHold)}

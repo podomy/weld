@@ -409,8 +409,8 @@ func testServicesDeadline(t *testing.T, ctx context.Context, planner, tracker *s
 	}
 }
 
-// testServicesLifecycle pins duplicate rejection, gone servers, and cancel.
-func testServicesLifecycle(t *testing.T, ctx context.Context, tracker *sdk.Node, server *sdk.ServiceServer, client *sdk.ServiceClient) {
+// testServicesDuplicate pins duplicate registration rejection.
+func testServicesDuplicate(t *testing.T, tracker *sdk.Node) {
 	t.Helper()
 	_, err := tracker.NewServiceServer("/plan", func(_ context.Context, req []byte) ([]byte, error) {
 		return req, nil
@@ -418,7 +418,12 @@ func testServicesLifecycle(t *testing.T, ctx context.Context, tracker *sdk.Node,
 	if err == nil {
 		t.Fatalf("duplicate service registration succeeded")
 	}
-	err = server.Close()
+}
+
+// testServicesGone pins calls to a closed server failing loudly.
+func testServicesGone(t *testing.T, ctx context.Context, server *sdk.ServiceServer, client *sdk.ServiceClient) {
+	t.Helper()
+	err := server.Close()
 	if err != nil {
 		t.Fatalf("close server: %v", err)
 	}
@@ -431,15 +436,28 @@ func testServicesLifecycle(t *testing.T, ctx context.Context, tracker *sdk.Node,
 	if !errors.Is(err, sdk.ErrNoSuchService) {
 		t.Fatalf("gone server error = %v, want no such service", err)
 	}
+}
+
+// testServicesCanceled pins immediate failure on a canceled context.
+func testServicesCanceled(t *testing.T, ctx context.Context, client *sdk.ServiceClient) {
+	t.Helper()
 	canceled, cancelFunc := context.WithCancel(ctx)
 	cancelFunc()
-	_, err = client.Call(canceled, []byte("canceled"))
+	_, err := client.Call(canceled, []byte("canceled"))
 	if err == nil {
 		t.Fatalf("call with canceled context succeeded")
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled call error = %v, want canceled", err)
 	}
+}
+
+// testServicesLifecycle pins duplicate rejection, gone servers, and cancel.
+func testServicesLifecycle(t *testing.T, ctx context.Context, tracker *sdk.Node, server *sdk.ServiceServer, client *sdk.ServiceClient) {
+	t.Helper()
+	testServicesDuplicate(t, tracker)
+	testServicesGone(t, ctx, server, client)
+	testServicesCanceled(t, ctx, client)
 }
 
 // testSupervision covers serial order, bond liveness, and pooled work.
@@ -552,6 +570,9 @@ func testSupervisionBonds(t *testing.T, group *sdk.SerialGroup) {
 	if len(dead) == 0 {
 		t.Fatalf("expired bonds reported none dead")
 	}
+	if dead == nil {
+		t.Fatalf("CheckBonds returned nil, want non-nil empty-or-dead slice")
+	}
 	err = group.Deactivate()
 	if err != nil {
 		t.Fatalf("serial deactivate: %v", err)
@@ -567,6 +588,77 @@ func testSupervisionBonds(t *testing.T, group *sdk.SerialGroup) {
 	if err != nil {
 		t.Fatalf("serial second close: %v", err)
 	}
+	testSerialCloseContract(t)
+}
+
+// testSerialCloseContract pins Close versus Node.Close semantics plus the non-nil empty contract.
+//
+// Close only marks the group closed and never runs Deactivate, Cleanup, or
+// Shutdown; a Shutdown counter stays zero after Close. It also pins that
+// Order and CheckBonds return non-nil empty slices on empty and nil groups.
+// testSerialCloseNoShutdown pins Close as reject-only with no shutdown side effects.
+func testSerialCloseNoShutdown(t *testing.T, group *sdk.SerialGroup) {
+	t.Helper()
+	shutdowns := 0
+	err := group.Attach(sdk.SerialEntity{
+		Name:     "tracked",
+		Shutdown: func() error { shutdowns++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("attach tracked: %v", err)
+	}
+	if err := group.Close(); err != nil {
+		t.Fatalf("close contract: %v", err)
+	}
+	if shutdowns != 0 {
+		t.Fatalf("Close ran Shutdown %d times, want 0: caller drives lifecycle", shutdowns)
+	}
+	if err := group.Close(); err != nil {
+		t.Fatalf("second close contract: %v", err)
+	}
+	if order := group.Order(); order == nil {
+		t.Fatalf("Order returned nil, want non-nil empty-or-names slice")
+	}
+}
+
+// testSerialEmptyContract pins non-nil empty Order and CheckBonds results.
+func testSerialEmptyContract(t *testing.T) {
+	t.Helper()
+	empty, err := sdk.NewSerialGroup("close-empty")
+	if err != nil {
+		t.Fatalf("new empty group: %v", err)
+	}
+	if order := empty.Order(); order == nil || len(order) != 0 {
+		t.Fatalf("empty Order = %v, want non-nil empty", order)
+	}
+	if dead := empty.CheckBonds(0); dead == nil || len(dead) != 0 {
+		t.Fatalf("empty CheckBonds = %v, want non-nil empty", dead)
+	}
+	var nilGroup *sdk.SerialGroup
+	if order := nilGroup.Order(); order == nil || len(order) != 0 {
+		t.Fatalf("nil Order = %v, want non-nil empty", order)
+	}
+	if dead := nilGroup.CheckBonds(0); dead == nil || len(dead) != 0 {
+		t.Fatalf("nil CheckBonds = %v, want non-nil empty", dead)
+	}
+	if err := empty.Close(); err != nil {
+		t.Fatalf("close empty: %v", err)
+	}
+}
+
+// testSerialCloseContract pins Close versus Node.Close semantics plus the non-nil empty contract.
+//
+// Close only marks the group closed and never runs Deactivate, Cleanup, or
+// Shutdown; a Shutdown counter stays zero after Close. It also pins that
+// Order and CheckBonds return non-nil empty slices on empty and nil groups.
+func testSerialCloseContract(t *testing.T) {
+	t.Helper()
+	group, err := sdk.NewSerialGroup("close-contract")
+	if err != nil {
+		t.Fatalf("new serial group: %v", err)
+	}
+	testSerialCloseNoShutdown(t, group)
+	testSerialEmptyContract(t)
 }
 
 // testSupervisionPooled pins bounded pooled execution without loss.
@@ -610,6 +702,56 @@ func testSupervisionPooled(t *testing.T) {
 	}
 	if pooled.Lost() != 0 {
 		t.Fatalf("pooled lost = %d, want 0", pooled.Lost())
+	}
+	testPooledSecondCloseJoins(t)
+}
+
+// testPooledSecondCloseJoins pins that a second Close joins workers.
+//
+// The second Close must wait for workers instead of returning early; after
+// the first Close completes, a second Close returns nil promptly.
+func testPooledSecondCloseJoins(t *testing.T) {
+	t.Helper()
+	pooled, err := sdk.NewPooledGroup(2, 16)
+	if err != nil {
+		t.Fatalf("new pooled group: %v", err)
+	}
+	const tasks = 4
+	var wg sync.WaitGroup
+	wg.Add(tasks)
+	for range tasks {
+		_, err = pooled.Submit(func() { wg.Done() })
+		if err != nil {
+			t.Fatalf("pooled submit: %v", err)
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("pooled tasks did not finish")
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- pooled.Close()
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second close join: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("second Close did not return")
+	}
+	if _, err := pooled.Submit(func() {}); err == nil {
+		t.Fatalf("submit after close succeeded")
 	}
 }
 

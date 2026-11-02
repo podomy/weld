@@ -57,6 +57,12 @@ SPDP
   Per-peer port lists flatten deduped
   (internal/transports/dds/backend.go:1283)
   and fan out unicast (internal/transports/dds/backend.go:1316).
+- Sequence gating: a repeat announcement at the stored sequence is routine
+  multicast duplication and returns quietly with no generation bump; only
+  a strictly older sequence fails loudly with ErrStaleSPDP, and only a
+  newer sequence installs or removes
+  (internal/transports/dds/spdp.go:1395-1465,
+  internal/transports/dds/spdp_test.go:1236).
 
 SEDP
 
@@ -434,6 +440,10 @@ testbed/live/cyclone/gate1_spdp_test.go:379 and :421.
   (gate_liveliness_live_test alongside the earlier gate_liveliness_test
   lease and isolation gates); secured-payload loud drop
   (gate_security_live_test). Unit plus vet plus cmd/weld PASS.
+
+- Verified green 2026-11-01: the full live matrix above ran 17 runs PASS
+  with 0 FAIL on the current tree. The only skip was environmental
+  (container log retention in the SPDP cross-check), not a product gap.
 
 Full run detail is in Testbed - /docs/testbed. Live harness detail is in
 Testbed Go - /docs/testbed-go.

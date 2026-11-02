@@ -109,6 +109,7 @@ type SerialGroup struct {
 	configured  bool
 	active      bool
 	destroyed   bool
+	shutdown    bool
 	done        chan struct{}
 	started     chan struct{}
 	spinStarted bool
@@ -307,7 +308,8 @@ func (g *SerialGroup) RegisterPreshutdown(fn func()) error {
 
 // Configure runs entity Configure forward in attach order.
 //
-// Success marks the group configured. The call is idempotent once
+// Success marks the group configured and clears the Shutdown done flag so a
+// later Shutdown runs again after bringup. The call is idempotent once
 // configured. A destroyed group and the first failing callback are errors;
 // the group stays unconfigured on failure.
 func (g *SerialGroup) Configure() error {
@@ -337,6 +339,7 @@ func (g *SerialGroup) Configure() error {
 		return errors.New("core: serial group configure on destroyed group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	g.configured = true
+	g.shutdown = false
 	return nil
 }
 
@@ -444,11 +447,22 @@ func (g *SerialGroup) Cleanup() error {
 // Preshutdown callbacks run in reverse registration order before entities,
 // which run in reverse attach order. Shutdown clears active and configured so
 // the group can be brought up again. The first failing callback is an error.
+// Shutdown is idempotent guarded by a done flag: a second call while already
+// shut down is a no-op success without re-running callbacks. Configure
+// clears the flag so a later Shutdown after bringup runs again.
 func (g *SerialGroup) Shutdown() error {
 	if g == nil {
 		return errors.New("core: serial group shutdown on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
 	g.mu.Lock()
+	if g.destroyed {
+		g.mu.Unlock()
+		return errors.New("core: serial group shutdown on destroyed group") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if g.shutdown {
+		g.mu.Unlock()
+		return nil
+	}
 	entities := copySerialEntities(g.entries)
 	preshutdown := make([]func(), len(g.preshutdown))
 	copy(preshutdown, g.preshutdown)
@@ -468,6 +482,7 @@ func (g *SerialGroup) Shutdown() error {
 	defer g.mu.Unlock()
 	g.active = false
 	g.configured = false
+	g.shutdown = true
 	return nil
 }
 
@@ -775,9 +790,10 @@ func (c *SerialChannel[T]) Closed() bool {
 
 // TryPublish enqueues v without blocking and reports whether an oldest sample
 // was evicted. A full channel drops the oldest, counts one lost, and stores
-// v. A nil or closed channel drops v and reports no eviction. A zero value
-// channel with non-positive capacity drops v safely without an index panic;
-// build channels with NewSerialChannel.
+// v. A nil or closed channel drops v and reports no eviction. A non-nil
+// channel with non-positive capacity panics loudly: zero means not set, so
+// derive depth from RetentionCapacity instead of silently dropping; build
+// channels with NewSerialChannel.
 func (c *SerialChannel[T]) TryPublish(v T) bool {
 	if c == nil {
 		return false
@@ -788,7 +804,7 @@ func (c *SerialChannel[T]) TryPublish(v T) bool {
 		return false
 	}
 	if c.capacity <= 0 {
-		return false
+		panic("core: SerialChannel: capacity <= 0 means not set; derive depth from RetentionCapacity")
 	}
 	if len(c.buf) >= c.capacity {
 		var zero T

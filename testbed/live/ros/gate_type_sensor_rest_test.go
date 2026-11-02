@@ -2542,36 +2542,6 @@ func TestROSTypeSensorPointCloud2(t *testing.T) {
 	runSensorRestLabel(t, ctx, domain, "sensor-pointcloud2")
 }
 
-// sensorRestLargeAllowEntry pins one temporary payload miss exception.
-//
-// An entry allows a skip only for an exact RosType plus exact RIHS01 Hash
-// while time is before Expiry. Reason names the peer interop cause. The
-// list stays empty so every miss fails.
-type sensorRestLargeAllowEntry struct {
-	RosType string
-	Hash    string
-	Reason  string
-	Expiry  time.Time
-}
-
-// sensorRestLargeAllowlist holds temporary exceptions. Empty is strict.
-var sensorRestLargeAllowlist []sensorRestLargeAllowEntry
-
-// sensorRestLargeAllowlisted reports whether a miss may skip.
-//
-// It requires exact type plus exact hash plus unexpired time plus a
-// non-empty reason. Empty list means false so callers fail. It returns
-// the matching entry so callers log entry expiry and reason instead of
-// hardcoded dates.
-func sensorRestLargeAllowlisted(rosType, hash string, now time.Time) (sensorRestLargeAllowEntry, bool) {
-	for _, e := range sensorRestLargeAllowlist {
-		if e.RosType == rosType && e.Hash == hash && e.Reason != "" && now.Before(e.Expiry) {
-			return e, true
-		}
-	}
-	return sensorRestLargeAllowEntry{}, false
-}
-
 // publishSensorRestLargeStrict publishes until ros2 echo holds the live ID.
 //
 // It fails on any publish error including no route. It returns false only
@@ -2642,9 +2612,6 @@ func TestROSTypeSensorImageLarge(t *testing.T) {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // live harness reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("ros echo did not see rest large image %q: %v", runID, rerr)
-		}
-		if entry, ok := sensorRestLargeAllowlisted(largePayloadRosType, sensorRest2HashImage, time.Now()); ok {
-			t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: ros echo did not see rest large image %q", "sensor-image-large", entry.Hash, entry.Reason, entry.Expiry.Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest large image %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

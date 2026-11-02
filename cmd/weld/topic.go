@@ -339,15 +339,14 @@ func formatMismatch(event core.MismatchEvent) string {
 	return "weld: " + event.LogLine()
 }
 
-// detectQoSMismatches checks each publisher versus subscriber pair with core.
+// splitTopicEndpoints partitions endpoints into publishers and subscribers
+// sorted by GID for deterministic mismatch reports.
 //
-// Pairs without QoS on both sides are skipped. Compatible pairs yield no
-// events. Incompatible pairs yield one event per policy kind through
-// core.CompatibilityEvents, each loud with topic plus endpoint pair plus
-// policy kind.
-func detectQoSMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
-	var pubs []topicEndpoint
-	var subs []topicEndpoint
+// Both results are always non-nil so callers never distinguish nil from
+// empty; a topic with only publishers yields an empty subscriber slice.
+func splitTopicEndpoints(endpoints []topicEndpoint) (pubs, subs []topicEndpoint) {
+	pubs = make([]topicEndpoint, 0)
+	subs = make([]topicEndpoint, 0)
 
 	for _, ep := range endpoints {
 		if ep.IsReader {
@@ -364,7 +363,19 @@ func detectQoSMismatches(topic string, endpoints []topicEndpoint) []core.Mismatc
 		return strings.Compare(a.GID, b.GID)
 	})
 
-	var out []core.MismatchEvent
+	return pubs, subs
+}
+
+// detectQoSMismatches checks each publisher versus subscriber pair with core.
+//
+// Pairs without QoS on both sides are skipped. Compatible pairs yield no
+// events. Incompatible pairs yield one event per policy kind through
+// core.CompatibilityEvents, each loud with topic plus endpoint pair plus
+// policy kind. The result is always non-nil.
+func detectQoSMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
+	pubs, subs := splitTopicEndpoints(endpoints)
+
+	out := make([]core.MismatchEvent, 0)
 
 	for _, pub := range pubs {
 		if !pub.HasQoS {
@@ -388,27 +399,12 @@ func detectQoSMismatches(topic string, endpoints []topicEndpoint) []core.Mismatc
 //
 // Each pair with differing Type or TypeHash yields one error event with
 // topicTypeHashPolicy kind so output keeps topic plus endpoint pair plus
-// policy kind. Pairs with equal type and hash flow silently.
+// policy kind. Pairs with equal type and hash flow silently. The result
+// is always non-nil.
 func detectTypeMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
-	var pubs []topicEndpoint
-	var subs []topicEndpoint
+	pubs, subs := splitTopicEndpoints(endpoints)
 
-	for _, ep := range endpoints {
-		if ep.IsReader {
-			subs = append(subs, ep)
-		} else {
-			pubs = append(pubs, ep)
-		}
-	}
-
-	slices.SortFunc(pubs, func(a, b topicEndpoint) int {
-		return strings.Compare(a.GID, b.GID)
-	})
-	slices.SortFunc(subs, func(a, b topicEndpoint) int {
-		return strings.Compare(a.GID, b.GID)
-	})
-
-	var out []core.MismatchEvent
+	out := make([]core.MismatchEvent, 0)
 
 	for _, pub := range pubs {
 		for _, sub := range subs {
@@ -433,6 +429,8 @@ func detectTypeMismatches(topic string, endpoints []topicEndpoint) []core.Mismat
 }
 
 // detectMismatches combines type plus QoS mismatches sorted deterministically.
+//
+// The result is always non-nil; a clean topic yields an empty slice.
 func detectMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEvent {
 	out := append(detectTypeMismatches(topic, endpoints), detectQoSMismatches(topic, endpoints)...)
 
@@ -453,8 +451,9 @@ func detectMismatches(topic string, endpoints []topicEndpoint) []core.MismatchEv
 
 // resolveInfoTopic picks the info topic from flag or positional arg.
 //
-// An explicit --topic wins even when equal to default. Otherwise one
-// positional supplies the topic when the flag was left at default. The
+// An explicit --topic wins only when no positional is present; flag plus
+// positional is a usage error like service call and action send. Otherwise
+// one positional supplies the topic when the flag was left at default. The
 // shared --topic flag defaults to /chatter like echo and pub, so no
 // positional with default flag reports the default topic.
 func resolveInfoTopic(flagText string, flagExplicit bool, args []string) (string, error) {
@@ -463,6 +462,9 @@ func resolveInfoTopic(flagText string, flagExplicit bool, args []string) (string
 	}
 
 	if flagExplicit {
+		if len(args) != 0 {
+			return "", errors.New("weld: topic info takes one topic, have flag plus positionals") //nolint:wrapcheck // new error, nothing to wrap
+		}
 		if flagText == "" {
 			return "", errors.New("weld: topic info needs --topic or one positional topic") //nolint:wrapcheck // new error, nothing to wrap
 		}
@@ -560,6 +562,11 @@ func fetchTopicSnapshot(backend transports.Backend) (graphSnapshot, error) {
 }
 
 // waitForTopicDiscovery pauses for SPDP and SEDP to settle or ctx to end.
+//
+// Unlike the echo discovery wait, which is best effort and never fails,
+// this wait fails loudly on context cancel so topic list and info exit 1
+// through handleRunError. A timeout expiry returns nil so the snapshot
+// still runs with whatever discovery settled.
 func waitForTopicDiscovery(ctx context.Context) error {
 	wait := topicDiscoveryWaitVar
 	if wait <= 0 {

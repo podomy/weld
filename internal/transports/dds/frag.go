@@ -46,6 +46,18 @@ const fragSingleMax = 65535 - 20
 // fragments, well under fragMaxCount.
 const fragSendSize uint16 = 16384
 
+// fragSendMaxEntries bounds concurrent outbound fragmented samples.
+//
+// It mirrors fragMaxEntries for the inbound reassembler so the send path
+// cannot grow without limit under writer churn.
+const fragSendMaxEntries = 16
+
+// fragSendTimeout bounds one outbound fragmented sample lifetime.
+//
+// Entries older than the timeout sweep on the next accumulate, mirroring
+// fragReassemblyTimeout for the inbound path.
+const fragSendTimeout = 10 * time.Second
+
 // fragKey names one fragmented sample.
 type fragKey struct {
 	guid WriterGUID
@@ -53,6 +65,9 @@ type fragKey struct {
 }
 
 // fragSendEntry holds one outbound fragmented sample for repair history.
+//
+// firstSeen bounds the entry lifetime so the outbound table cannot grow
+// without limit; see fragSendMaxEntries and fragSendTimeout.
 type fragSendEntry struct {
 	sampleSize   uint32
 	fragmentSize uint16
@@ -60,6 +75,8 @@ type fragSendEntry struct {
 	buf          []byte
 	received     []bool
 	count        uint32
+	// firstSeen is the wall time the entry was created for timeout sweep.
+	firstSeen time.Time
 }
 
 // fragEntry holds one in progress sample.
@@ -288,9 +305,13 @@ func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool
 //
 // Tracking advances only after successful enqueue; on queue-full drop the
 // sample stays unmarked so repair can serve it, and the drop counts loudly.
+// Context cancellation also counts loudly with a distinct log so shutdown
+// drops stay visible instead of silent.
 func (b *Backend) handleDataFrag(ctx context.Context, header rtps.Header, sub rtps.RawSubmessage, dataCh chan dataItem) bool {
 	err := ctx.Err()
 	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux datafrag context canceled: %v", err)
 		return true
 	}
 	frag, err := rtps.DecodeDataFrag(sub.Body, sub.Flags, nil)

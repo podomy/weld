@@ -221,7 +221,7 @@ Open Questions
 
 These are decisions recorded early so later work does not reopen them silently. Each names the default and the test that will settle it. Resolved items move to the invariants; what remains here is genuinely open.
 
-- RESOLVED: Zenoh domain isolation is separate sessions. Users expect real isolation; prefix mode needs interop proof to be reconsidered.
+- RESOLVED: Zenoh domain isolation is key prefix per domain within one session per ROS context, pinned by unit tests on the prefix scheme. Live interop proof against a Zenoh peer is still pending and tracked with the other post-v1 transports.
 - RESOLVED: v1 interoperates with Humble, Jazzy, and Rolling against CycloneDDS as the reference peer. Humble pins the pre hash wire variants; Jazzy and Rolling pin current behavior.
 - RESOLVED: Weld links no C code and needs no C toolchain in builds. The Sidecar type stays a validator stub returning ErrSidecarNotImplemented except Close; the live backend speaks RTPS directly over UDP.
 - RESOLVED: v1 scope is CDR plus types plus DDS unreliable round trip plus CLI echo plus one green interop test.

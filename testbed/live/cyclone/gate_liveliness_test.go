@@ -449,7 +449,7 @@ func checkStaleDispose(t *testing.T, announcer *dds.LocalParticipant, table *dds
 	}
 	err = table.HandlePacket(stale, time.Now())
 	if err != nil {
-		t.Fatalf("handle stale dispose: %v", err)
+		t.Fatalf("handle stale dispose = %v, want silent duplicate", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("table len after stale dispose = %d, want 1", table.Len())

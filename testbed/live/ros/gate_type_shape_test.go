@@ -177,6 +177,7 @@ func wantShapeSolidPrimitive() string {
 // takeShapeSamples takes until the BOX payload decodes or the context ends.
 func takeShapeSamples(t *testing.T, takeCtx context.Context, backend *dds.Backend) bool {
 	t.Helper()
+	unknownErrs := 0
 	for takeCtx.Err() == nil {
 		msg, terr := backend.TakeBytes(takeCtx)
 		if terr != nil {
@@ -190,7 +191,8 @@ func takeShapeSamples(t *testing.T, takeCtx context.Context, backend *dds.Backen
 			if strings.Contains(text, "not wired") {
 				t.Fatalf("weld take backend error shape: %v", terr)
 			}
-			continue
+			unknownErrs++
+			t.Fatalf("weld take unexpected error shape count %d: %v", unknownErrs, terr)
 		}
 		derr := decodeShapeSolidPrimitive(msg.Payload)
 		if derr == nil {
@@ -255,7 +257,9 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
-		t.Skipf("shape hash unavailable for topic %s, skipping: %v", topic, err)
+		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape forward topic %s hash %s", topic, typeHash)
 	payload, err := encodeShapeSolidPrimitive()
@@ -346,7 +350,9 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
-		t.Skipf("shape hash unavailable for topic %s, skipping: %v", topic, err)
+		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape reverse topic %s hash %s", topic, typeHash)
 	payload, err := encodeShapeSolidPrimitive()

@@ -360,6 +360,7 @@ func resolveStereoDisparityHash(ctx context.Context, domain int, topic string) (
 // takeStereoSamples takes until the DisparityImage decodes or the context ends.
 func takeStereoSamples(t *testing.T, takeCtx context.Context, backend *dds.Backend, live string) bool {
 	t.Helper()
+	unknownErrs := 0
 	for takeCtx.Err() == nil {
 		msg, terr := backend.TakeBytes(takeCtx)
 		if terr != nil {
@@ -373,7 +374,8 @@ func takeStereoSamples(t *testing.T, takeCtx context.Context, backend *dds.Backe
 			if strings.Contains(text, "not wired") {
 				t.Fatalf("weld take backend error stereo disparity: %v", terr)
 			}
-			continue
+			unknownErrs++
+			t.Fatalf("weld take unexpected error stereo disparity count %d: %v", unknownErrs, terr)
 		}
 		derr := decodeStereoDisparity(msg.Payload, live)
 		if derr == nil {
@@ -433,7 +435,9 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 	}
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
-		t.Skipf("stereo disparity hash unavailable for topic %s, skipping: %v", topic, err)
+		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity forward topic %s hash %s", topic, typeHash)
 	payload, err := encodeStereoDisparity(live)
@@ -530,7 +534,9 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 	}
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
-		t.Skipf("stereo disparity hash unavailable for topic %s, skipping: %v", topic, err)
+		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity reverse topic %s hash %s", topic, typeHash)
 	payload, err := encodeStereoDisparity(live)

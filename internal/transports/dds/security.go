@@ -295,7 +295,10 @@ func ClassifySecurity(properties map[string]string, securityInfoSeen bool) Secur
 // It never fails the parse loop: each malformed security value appends one
 // loud warning and parsing continues with the next param, so secured peers
 // can never kill discovery of unsecured peers. The returned warnings are
-// empty when every security value parsed cleanly.
+// empty when every security value parsed cleanly. It assumes little endian
+// wire order, matching CycloneDDS; big-endian peers must use
+// ExtractSecurityInfoEndian so the same endianness threads to durability,
+// partition, and security decoders consistently instead of mis-decoding.
 func ExtractSecurityInfo(params []rtps.Param) (SecurityInfo, []error) {
 	info := SecurityInfo{Properties: make(map[string]string)}
 
@@ -303,6 +306,32 @@ func ExtractSecurityInfo(params []rtps.Param) (SecurityInfo, []error) {
 
 	for _, p := range params {
 		err := applySecurityParam(&info, p)
+		if err != nil {
+			warnings = append(warnings, err)
+		}
+	}
+
+	finalizeSecurityInfo(&info)
+
+	return info, warnings
+}
+
+// ExtractSecurityInfoEndian parses security PIDs with explicit endianness.
+//
+// Little endian decodes through the same path as ExtractSecurityInfo.
+// Big-endian values decode in big-endian order for masks and property
+// lists instead of mis-decoding as little endian, so SEDP call sites thread
+// one endianness flag to durability, partition, and security decoders
+// consistently. Presence flags are still recorded before any malformed
+// value fails, keeping classification fail-closed. It never fails the loop;
+// malformed values warn and continue.
+func ExtractSecurityInfoEndian(params []rtps.Param, littleEndian bool) (SecurityInfo, []error) {
+	info := SecurityInfo{Properties: make(map[string]string)}
+
+	var warnings []error
+
+	for _, p := range params {
+		err := applySecurityParamEndian(&info, p, littleEndian)
 		if err != nil {
 			warnings = append(warnings, err)
 		}
@@ -347,6 +376,49 @@ func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 	case PIDPropertyList:
 		info.PropertyListPresent = true
 		props, err := ParseSecurityPropertyList(p.Value)
+		if err != nil {
+			return fmt.Errorf("dds: security property list: %w", err)
+		}
+		mergeSecurityProperties(info.Properties, props)
+	default:
+		return nil
+	}
+	return nil
+}
+
+// applySecurityParamEndian folds one param with explicit endianness.
+//
+// Presence is recorded before any malformed value fails, keeping the peer
+// fail-closed even when the value cannot decode. Masks and property lists
+// decode in the given byte order so SEDP threads one endianness flag
+// consistently across durability, partition, and security decoders.
+func applySecurityParamEndian(info *SecurityInfo, p rtps.Param, littleEndian bool) error {
+	switch p.ID {
+	case PIDParticipantSecurityInfo:
+		info.HasParticipantSecurityInfo = true
+		mask, err := parseSecurityAttributesEndian(p.Value, littleEndian)
+		if err != nil {
+			return fmt.Errorf("dds: security participant info: %w", err)
+		}
+		info.ParticipantSecurityAttributes = mask
+	case PIDEndpointSecurityInfo:
+		info.HasEndpointSecurityInfo = true
+		mask, err := parseSecurityAttributesEndian(p.Value, littleEndian)
+		if err != nil {
+			return fmt.Errorf("dds: security endpoint info: %w", err)
+		}
+		info.EndpointSecurityAttributes = mask
+	case PIDIdentityToken:
+		info.IdentityTokenPresent = true
+	case PIDPermissionsToken:
+		info.PermissionsTokenPresent = true
+	case PIDDataTags:
+		info.DataTagsPresent = true
+	case PIDIdentityStatusToken:
+		info.IdentityStatusPresent = true
+	case PIDPropertyList:
+		info.PropertyListPresent = true
+		props, err := ParseSecurityPropertyListEndian(p.Value, littleEndian)
 		if err != nil {
 			return fmt.Errorf("dds: security property list: %w", err)
 		}
@@ -402,11 +474,27 @@ func hasSecurityProperty(properties map[string]string) bool {
 // Shorter values fail loudly with the warning sentinel so the caller can
 // warn without killing the loop.
 func parseSecurityAttributes(value []byte) (uint32, error) {
+	return parseSecurityAttributesEndian(value, true)
+}
+
+// parseSecurityAttributesEndian reads the mask in the given byte order.
+//
+// Presence is recorded by the caller before this runs, so a short value
+// fails closed with the warning sentinel while the presence flag stays set.
+// Threading the SEDP endianness flag here keeps security consistent with
+// the durability decoder instead of mis-decoding big-endian peers as
+// little endian.
+func parseSecurityAttributesEndian(value []byte, littleEndian bool) (uint32, error) {
 	if len(value) < 4 {
 		return 0, fmt.Errorf("dds: security attributes need 4 have %d: %w", len(value), ErrSecurityPropertyInvalid)
 	}
 
-	mask := binary.LittleEndian.Uint32(value[:4])
+	var mask uint32
+	if littleEndian {
+		mask = binary.LittleEndian.Uint32(value[:4])
+	} else {
+		mask = binary.BigEndian.Uint32(value[:4])
+	}
 
 	return mask, nil
 }
@@ -419,9 +507,27 @@ func parseSecurityAttributes(value []byte) (uint32, error) {
 // big-endian values fail loudly with the warning sentinel instead of a
 // silent LE-then-BE fallback. Malformed input fails loudly; callers warn
 // and continue the discovery loop. Duplicate names keep the first value,
-// matching the SEDP first-wins convention.
+// matching the SEDP first-wins convention. Trailing bytes past the declared
+// entries fail loudly instead of decoding silently.
 func ParseSecurityPropertyList(value []byte) (map[string]string, error) {
 	props, err := parseSecurityPropertyListEndian(value, true)
+	if err != nil {
+		return nil, fmt.Errorf("dds: security property list malformed: %w", errors.Join(ErrSecurityPropertyInvalid, err))
+	}
+
+	return props, nil
+}
+
+// ParseSecurityPropertyListEndian decodes a property list with explicit endianness.
+//
+// It threads the SEDP endianness flag like DecodeDurabilityService so
+// durability, partition, and security decoders stay consistent instead of
+// mixing little-endian property decoding with big-endian durability
+// decoding. Presence is recorded by the caller before this runs, so a
+// malformed value still keeps the list flag and fails closed. Trailing
+// bytes past the declared entries fail loudly.
+func ParseSecurityPropertyListEndian(value []byte, littleEndian bool) (map[string]string, error) {
+	props, err := parseSecurityPropertyListEndian(value, littleEndian)
 	if err != nil {
 		return nil, fmt.Errorf("dds: security property list malformed: %w", errors.Join(ErrSecurityPropertyInvalid, err))
 	}

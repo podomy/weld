@@ -269,7 +269,10 @@ func (g *Graph) UpsertWriter(gid GID, info EntityInfo) error {
 // RemoveWriter deletes a writer record by GID.
 //
 // It reports false when the GID is absent with no generation increment.
-// On removal the generation increments and the hook fires outside the lock.
+// The zero GID is quiet here (treated as absent, reports false) while
+// creation paths (Add plus Upsert plus ReportParticipantAlive) fail loudly
+// on zero because the zero value means unset. On removal the generation
+// increments and the hook fires outside the lock.
 func (g *Graph) RemoveWriter(gid GID) bool {
 	g.mu.Lock()
 	if _, seen := g.writers[gid]; !seen {
@@ -326,7 +329,9 @@ func (g *Graph) UpsertReader(gid GID, info EntityInfo) error {
 // RemoveReader deletes a reader record by GID.
 //
 // It reports false when the GID is absent with no generation increment.
-// On removal the generation increments and the hook fires outside the lock.
+// The zero GID is quiet here (treated as absent, reports false) while
+// creation paths fail loudly on zero. On removal the generation increments
+// and the hook fires outside the lock.
 func (g *Graph) RemoveReader(gid GID) bool {
 	g.mu.Lock()
 	if _, seen := g.readers[gid]; !seen {
@@ -383,7 +388,9 @@ func (g *Graph) UpsertService(gid GID, info ServiceInfo) error {
 // RemoveService deletes a service record by GID.
 //
 // It reports false when the GID is absent with no generation increment.
-// On removal the generation increments and the hook fires outside the lock.
+// The zero GID is quiet here (treated as absent, reports false) while
+// creation paths fail loudly on zero. On removal the generation increments
+// and the hook fires outside the lock.
 func (g *Graph) RemoveService(gid GID) bool {
 	g.mu.Lock()
 	if _, seen := g.services[gid]; !seen {
@@ -463,7 +470,9 @@ func (g *Graph) UpsertParticipant(gid GID, info ParticipantInfo) error {
 // RemoveParticipant deletes a participant record by GID.
 //
 // It reports false when the GID is absent with no generation increment.
-// On removal the generation increments and the hook fires outside the lock.
+// The zero GID is quiet here (treated as absent, reports false) while
+// creation paths fail loudly on zero. On removal the generation increments
+// and the hook fires outside the lock.
 // Removal also clears liveliness so a later rejoin starts from a clean
 // sequence. Endpoints owned by the participant stay retained until their
 // own explicit remove, so a late joiner still replays them.
@@ -889,8 +898,11 @@ func (g *Graph) ReportParticipantAlive(gid GID, info ParticipantInfo, seq uint64
 
 // ReportParticipantDispose records one SPDP dispose announcement.
 //
-// seq must be newer than the stored seq; stale or duplicate disposes are
-// ignored with no increment. A missing entry reports false with no
+// Zero GID plus zero sequence are quiet (treated as absent, report false
+// with no increment) while creation paths (Add plus Upsert plus
+// ReportParticipantAlive) fail loudly on zero because the zero value means
+// unset. seq must be newer than the stored seq; stale or duplicate disposes
+// are ignored with no increment. A missing entry reports false with no
 // increment. An entry without liveliness is removed explicitly. On
 // removal the generation increments once and the hook fires. Endpoints
 // stay retained until their own explicit remove.
@@ -948,37 +960,6 @@ func (g *Graph) SweepExpired(nowNanos int64) int {
 	g.mu.Unlock()
 	fireHook(hook, gen)
 	return len(expired)
-}
-
-// ParticipantExpiry returns the lease expiry for one participant. Staged API
-// for liveliness observability; retained despite no in-repo callers.
-//
-// It reports false when the participant has no liveliness record, which
-// includes locally added participants without an alive report. Every
-// method locks the mutex.
-func (g *Graph) ParticipantExpiry(gid GID) (int64, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	live, ok := g.liveness[gid]
-	if !ok {
-		return 0, false
-	}
-	return live.expiryNanos, true
-}
-
-// ParticipantSequence returns the last accepted discovery sequence. Staged API
-// for liveliness observability; retained despite no in-repo callers.
-//
-// It reports false when no liveliness record exists. Local adds without
-// an alive report have no discovery sequence.
-func (g *Graph) ParticipantSequence(gid GID) (uint64, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	live, ok := g.liveness[gid]
-	if !ok {
-		return 0, false
-	}
-	return live.seq, true
 }
 
 // ReplayRetained replays retained announcements to a late subscriber.

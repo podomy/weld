@@ -38,17 +38,25 @@ package dds
 // against any run of runes and _ against exactly one rune, and is case
 // sensitive. AND binds tighter than OR, NOT binds tightest, and parens
 // group explicitly. AND and OR short-circuit: the right side never evaluates
-// when the left decides the outcome, so a skipped error never surfaces. A
-// bare boolean field or literal reads as a predicate. Keywords are case
-// insensitive, field names are case sensitive. Strings use single quotes
-// with '' as an escaped quote. Integer literals without fraction or exponent
-// that fit int64 compare as exact int64; anything else compares as float64.
-// NaN never matches: any comparison with NaN reports false with no error.
-// Numeric, string, and bool operands never mix in one comparison: mixing
-// yields an eval error, never a silent false. Array and sequence fields are
-// not filterable: decoding skips them to keep later field offsets right,
-// and referencing one yields an eval error. Expressions above 1024 tokens or
-// nested deeper than 32 NOT plus paren levels refuse loudly at compile time.
+// when the left decides the outcome, so a skipped error never surfaces. IN
+// is strict by contrast: every list item evaluates even after a match, so a
+// later item error still fails the sample where AND and OR would have
+// skipped it. A bare boolean field or literal reads as a predicate.
+// Keywords are case insensitive, field names are case sensitive. Strings use
+// single quotes with '' as an escaped quote. Integer literals without
+// fraction or exponent that fit int64 compare as exact int64; anything else
+// compares as float64. NaN never matches: any comparison with NaN reports
+// false with no error. Numeric, string, and bool operands never mix in one
+// comparison: mixing yields an eval error, never a silent false. Array and
+// sequence fields are not filterable: decoding skips them to keep later
+// field offsets right, and referencing one yields an eval error. Expressions
+// above 1024 tokens or nested deeper than 32 NOT plus paren levels refuse
+// loudly at compile time. Reserved word shadowing: ROS field authors must
+// avoid naming fields AND, OR, NOT, BETWEEN, IN, LIKE, TRUE, FALSE, or NULL
+// in any letter case, because the lexer reads those spellings as keywords
+// and a filter cannot address a field shadowed that way; rename the field
+// instead of quoting it, since this subset provides no quoting for field
+// names.
 
 import (
 	"errors"
@@ -1734,8 +1742,13 @@ func isFilterNaN(n filterNum) bool {
 }
 
 // compareFilterOp maps one ordering to one comparison operator result.
+//
+// The parser constrains op to the six comparison kinds, so the default is
+// unreachable by construction. It fails loudly instead of returning a
+// quiet ordering so a future caller passing a logic or LIKE kind cannot
+// silently read as greater-or-equal.
 func compareFilterOp(op filterTokenKind, cmp int) bool {
-	switch op { //nolint:exhaustive // default treats greater-or-equal as the ordering fallback for comparison operators
+	switch op { //nolint:exhaustive // default panics loudly on non-comparison ops unreachable by construction
 	case tokEq:
 		return cmp == 0
 	case tokNe:
@@ -1749,7 +1762,7 @@ func compareFilterOp(op filterTokenKind, cmp int) bool {
 	case tokGe:
 		return cmp >= 0
 	default:
-		return cmp >= 0
+		panic(fmt.Sprintf("dds: content filter invalid comparison op %d", int(op)))
 	}
 }
 
@@ -1790,6 +1803,12 @@ func evalFilterBetween(n betweenNode, fields map[string]filterValue) (bool, erro
 }
 
 // evalFilterIn evaluates one IN list predicate with strict element types.
+//
+// Every list item evaluates even after a match, unlike AND and OR which
+// short-circuit and skip the right side once the outcome is decided. A
+// later item error therefore fails the sample instead of hiding behind an
+// early match. This strictness is relied upon by dashboards that must not
+// miss malformed list entries.
 func evalFilterIn(n inNode, fields map[string]filterValue) (bool, error) {
 	val, err := evalFilterValue(n.field, fields)
 	if err != nil {

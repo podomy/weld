@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -655,8 +656,8 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 		t.Fatalf("gen = %d want 2 after monotonic update", table.Generation())
 	}
 	err = table.HandlePacket(alive1, now.Add(time.Second))
-	if err != nil {
-		t.Fatalf("handle stale alive: %v", err)
+	if !errors.Is(err, dds.ErrStaleSPDP) {
+		t.Fatalf("handle stale alive = %v, want stale reject", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1 after stale", table.Len())
@@ -706,8 +707,8 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	}
 	staleBye := mustMarshalDispose(t, part.GUID(), 0, 2)
 	err = table.HandlePacket(staleBye, now.Add(4*time.Second))
-	if err != nil {
-		t.Fatalf("handle stale dispose: %v", err)
+	if !errors.Is(err, dds.ErrStaleSPDP) {
+		t.Fatalf("handle stale dispose = %v, want stale reject", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1 after stale dispose", table.Len())

@@ -107,6 +107,13 @@ func runActionSendCommand(ctx context.Context, args []string, stdout, stderr io.
 		return 2
 	}
 
+	err = checkActionEndpoints(name)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+
+		return 2
+	}
+
 	err = runActionSend(ctx, name, goal, domain, *timeoutFlag, *cancelAfterFlag, stdout)
 	if err != nil {
 		return handleRunError(err, stderr)
@@ -226,6 +233,10 @@ func subscribeActionFeedback(ctx context.Context, backend transports.Backend, ac
 }
 
 // publishActionGoal retries PublishBytes on ErrNoRoute until timeout or ctx ends.
+//
+// It is the action flavor of publishWithRouteRetry; it diverges from the
+// pub and service wrappers only in its timeout source, the overall goal
+// timeout. Retry, timeout, and cancel semantics stay identical.
 func publishActionGoal(ctx context.Context, backend transports.Backend, out transports.OutgoingMessage, timeout time.Duration) error {
 	return publishWithRouteRetry(ctx, backend, out, timeout)
 }

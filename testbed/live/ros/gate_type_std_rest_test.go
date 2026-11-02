@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
@@ -520,6 +521,9 @@ func verifyRestByteMultiArrayEcho(t *testing.T, echoPath, live string) {
 // a missing echo with healthy peer fails.
 func TestROSTypeStdByteMultiArrayReverse(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain := helpers.MustAllocateDomain(t)
 	ctx, cancel := context.WithTimeout(context.Background(), typeMatrixTestTimeout)
 	defer cancel()
@@ -538,7 +542,9 @@ func TestROSTypeStdByteMultiArrayReverse(t *testing.T) {
 	t.Logf("local byte array codec ok len %d id %s", len(payload), live)
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, restHashByteMultiArray, typeMatrixProbeWait, "std-bytemultiarray-reverse")
 	if err != nil {
-		t.Skipf("matrix hash unavailable for std-bytemultiarray-reverse topic %s, skipping: %v", topic, err)
+		reason := fmt.Sprintf("std-bytemultiarray hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse std-bytemultiarray-reverse topic %s hash %s", topic, typeHash)
 	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "ros-rev-std-bytemultiarray-"+live, "std-bytemultiarray-reverse") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32

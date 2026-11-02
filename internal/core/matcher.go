@@ -172,9 +172,21 @@ func validateLiveliness(p QoSProfile) []string {
 }
 
 // validateDurations rejects negative seconds, nanoseconds at or above one
-// second, and surviving best available sentinels on deadline, lifespan, and
-// lease duration.
+// second, surviving best available sentinels on deadline, lifespan, and
+// lease duration, and huge finite values that would saturate to infinite.
+// Saturation stays as the backstop in TotalNanoseconds, but Validate fails
+// loudly so callers use InfiniteDuration explicitly instead of relying on
+// saturation to masquerade as infinite.
 func validateDurations(p QoSProfile) []string {
+	var problems []string
+	problems = append(problems, validateDurationShape(p)...)
+	problems = append(problems, validateSaturatingDurations(p)...)
+	return problems
+}
+
+// validateDurationShape rejects malformed seconds, nanoseconds, and
+// surviving best available sentinels.
+func validateDurationShape(p QoSProfile) []string {
 	var problems []string
 	if p.Deadline.Seconds < 0 {
 		problems = append(problems, "deadline: negative seconds are malformed")
@@ -206,6 +218,22 @@ func validateDurations(p QoSProfile) []string {
 	return problems
 }
 
+// validateSaturatingDurations rejects huge finite values that would saturate
+// to infinite, so callers use InfiniteDuration explicitly.
+func validateSaturatingDurations(p QoSProfile) []string {
+	var problems []string
+	if isSaturatingToInfinite(p.Deadline) {
+		problems = append(problems, "deadline: huge finite duration saturates to infinite; use InfiniteDuration explicitly")
+	}
+	if isSaturatingToInfinite(p.Lifespan) {
+		problems = append(problems, "lifespan: huge finite duration saturates to infinite; use InfiniteDuration explicitly")
+	}
+	if isSaturatingToInfinite(p.LeaseDuration) {
+		problems = append(problems, "lease duration: huge finite duration saturates to infinite; use InfiniteDuration explicitly")
+	}
+	return problems
+}
+
 // CheckCompatibility applies the shared DDS truth table to an offered
 // publisher profile versus a requested subscription profile.
 //
@@ -220,17 +248,24 @@ func validateDurations(p QoSProfile) []string {
 // local to volatile, equal values, and reverse liveliness. History, depth,
 // lifespan, and the avoidance flag are never checked.
 //
-// Best available sentinel durations skip the error check and warn instead,
-// so unresolved profiles warn rather than error on durations. Unresolved
-// markers (system default, unknown, best available, and any other
-// non concrete enum value) on the RxO policies yield warnings, but only
-// when no error is present. Callers normally resolve with
-// ResolveSystemDefaults and endpoint creation first, so a warning means
-// something skipped that order. Callers should Validate before matching;
-// CheckCompatibility still guards malformed negative deadline and lease
-// durations loudly as errors so skipped validation can never flow silently.
+// Warn-versus-error contract: Validate is the error path for invalid enums,
+// unresolved markers, and malformed durations; CheckCompatibility is the
+// warn path for unresolved markers. Unresolved markers (system default,
+// unknown, best available including duration sentinels, and any other non
+// concrete enum value) on the RxO policies yield warnings, but only when no
+// error is present, so warn never masks an error and error never becomes a
+// warning. Best available sentinel durations skip the error check and warn
+// instead, so unresolved profiles warn rather than error on durations.
+// Lifespan sentinels stay silent by rule and are rejected loudly by Validate
+// instead. Callers normally resolve with ResolveSystemDefaults and endpoint
+// creation first, so a warning means something skipped that order. Callers
+// should Validate before matching; CheckCompatibility still guards malformed
+// negative deadline and lease durations loudly as errors so skipped
+// validation can never flow silently.
 // Matching never silently unmatches: errors are returned loudly and runtime
-// deadline or liveliness loss uses alerts, so facades surface both.
+// deadline or liveliness loss uses alerts, so facades surface both. All
+// entry points that create entities (CreateEndpoint, ResolveServiceQoS)
+// call Validate after resolution, so invalid enums cannot reach the wire.
 func CheckCompatibility(offered, requested QoSProfile) CompatibilityReport {
 	report := CompatibilityReport{Compatible: true}
 	checkNegativeDurations(offered, requested, &report)

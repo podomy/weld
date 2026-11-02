@@ -483,36 +483,6 @@ func startSensorRest2PC2Echo(t *testing.T, ctx context.Context, domain uint32, t
 	})
 }
 
-// sensorRest2LargeAllowEntry pins one temporary payload miss exception.
-//
-// An entry allows a skip only for an exact RosType plus exact RIHS01 Hash
-// while time is before Expiry. Reason names the peer interop cause. The
-// list stays empty so every miss fails.
-type sensorRest2LargeAllowEntry struct {
-	RosType string
-	Hash    string
-	Reason  string
-	Expiry  time.Time
-}
-
-// sensorRest2LargeAllowlist holds temporary exceptions. Empty is strict.
-var sensorRest2LargeAllowlist []sensorRest2LargeAllowEntry
-
-// sensorRest2LargeAllowlisted reports whether a miss may skip.
-//
-// It requires exact type plus exact hash plus unexpired time plus a
-// non-empty reason. Empty list means false so callers fail. It returns
-// the matching entry so callers log entry expiry and reason instead of
-// hardcoded dates.
-func sensorRest2LargeAllowlisted(rosType, hash string, now time.Time) (sensorRest2LargeAllowEntry, bool) {
-	for _, e := range sensorRest2LargeAllowlist {
-		if e.RosType == rosType && e.Hash == hash && e.Reason != "" && now.Before(e.Expiry) {
-			return e, true
-		}
-	}
-	return sensorRest2LargeAllowEntry{}, false
-}
-
 // publishSensorRest2PC2UntilEcho publishes until ros2 echo holds the live ID.
 func publishSensorRest2PC2UntilEcho(ctx context.Context, t *testing.T, backend *dds.Backend, msg transports.OutgoingMessage, echoPath, live string) bool {
 	t.Helper()
@@ -612,9 +582,6 @@ func TestROSTypeSensorPointCloud2Large(t *testing.T) {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // live harness reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("ros echo did not see rest2 large pc2 %q: %v", runID, rerr)
-		}
-		if entry, ok := sensorRest2LargeAllowlisted(sensorRest2PC2RosType, sensorRestHashPointCloud2, time.Now()); ok {
-			t.Skipf("allowlisted live gap %s hash %s reason %s expires %s: ros echo did not see rest2 large pc2 %q", "sensor-pc2-large", entry.Hash, entry.Reason, entry.Expiry.Format("2006-01-02"), runID)
 		}
 		t.Fatalf("ros echo did not see rest2 large pc2 %q, pub ok len %d\necho output:\n%s", runID, len(wire), string(data))
 	}

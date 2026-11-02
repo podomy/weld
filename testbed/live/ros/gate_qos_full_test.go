@@ -313,6 +313,17 @@ func qosFullProbeQoS(ctx context.Context, domain int) ([]string, []string, []str
 	return relVals, durVals, histVals, depthOk, nil
 }
 
+// qosFullBudgetedSkip records one allowlisted product skip with distro pin and expiry.
+//
+// Reason names the Jazzy peer plus the missing value so the skip is
+// actionable. Expiry bounds the allowance to 2027-05-01. It registers
+// then notes via the shared skip budget so AssertNoExcessSkips stays wired.
+func qosFullBudgetedSkip(t *testing.T, reason string) {
+	t.Helper()
+	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
+	helpers.NoteProductSkip(t, t.Name(), reason)
+}
+
 // qosFullRequireProbe skips the test when the peer lacks QoS flags.
 //
 // It returns the probed value lists and depth support for per-case skip
@@ -321,10 +332,10 @@ func qosFullRequireProbe(t *testing.T, ctx context.Context, domain int) ([]strin
 	t.Helper()
 	relVals, durVals, histVals, depthOk, err := qosFullProbeQoS(ctx, domain)
 	if err != nil {
-		t.Skipf("qos full flag probe failed, skipping matrix: %v", err)
+		qosFullBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !depthOk {
-		t.Skipf("ros2 topic pub or echo lacks --qos-depth, skipping full matrix")
+		qosFullBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-depth, distro pin Jazzy")
 	}
 	t.Logf("qos full probed reliability=%v durability=%v history=%v", relVals, durVals, histVals)
 	if !qosFullContainsValue(histVals, "best_available") {
@@ -685,18 +696,21 @@ func qosFullRunReverse(t *testing.T, ctx context.Context, bin string, domain int
 // Core truth for skipped cases stays pinned by TestROSQoSFullCore.
 func qosFullRunLiveCase(t *testing.T, ctx context.Context, bin string, domain int, c qosFullCase, relVals, durVals, histVals []string) {
 	t.Helper()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	facade := core.FacadeAdvertisedQoS()
 	offered, requested, publisher, subscriber, report, err := qosFullBuildReport(c, facade)
 	if err != nil {
-		t.Skipf("case %s: profile mapping unsupported, skipping live with reason: %v", c.name, err)
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, err))
 	}
 	qosFullAssertCore(t, c, offered, requested, publisher, subscriber, report)
 	ok, reason := qosFullCaseSupported(c, relVals, durVals, histVals)
 	if !ok {
-		t.Skipf("case %s: peer lacks flag value, skipping live with reason: %s", c.name, reason)
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks flag value, distro pin Jazzy: %s", c.name, reason))
 	}
 	if !qosFullIsConcreteCase(c) {
-		t.Skipf("case %s: marker value needs resolution, skipping live with reason (core truth pinned above)", c.name)
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: marker value needs resolution on weld-jazzy Jazzy, core truth pinned above", c.name))
 	}
 	compatible := report.Compatible
 	if c.direction == "forward" {
@@ -751,12 +765,18 @@ func qosFullCheckHistoryDepthInvariant(t *testing.T, facade core.QoSProfile) {
 // depth invariance is pinned separately so they never affect matching.
 func TestROSQoSFullCore(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	facade := core.FacadeAdvertisedQoS()
 	for _, c := range qosFullGenerateFullCases() {
 		t.Run(c.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				helpers.AssertNoExcessSkips(t)
+			})
 			offered, requested, publisher, subscriber, report, err := qosFullBuildReport(c, facade)
 			if err != nil {
-				t.Skipf("case %s: profile mapping unsupported, skipping with reason: %v", c.name, err)
+				qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, err))
 			}
 			qosFullAssertCore(t, c, offered, requested, publisher, subscriber, report)
 		})
@@ -775,6 +795,9 @@ func TestROSQoSFullCore(t *testing.T) {
 // or when the flags are unsupported.
 func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosFullTestTimeout)
 	defer cancel()
@@ -819,6 +842,9 @@ func TestROSQoSFullCompatibleDelivers(t *testing.T) {
 // cleanly when no peer is present or when the QoS flags are unsupported.
 func TestROSQoSFullIncompatibleLoud(t *testing.T) {
 	t.Parallel()
+	t.Cleanup(func() {
+		helpers.AssertNoExcessSkips(t)
+	})
 	domain, token := helpers.MustAllocateDomainLease(t)
 	ctx, cancel := context.WithTimeout(context.Background(), qosFullTestTimeout)
 	defer cancel()

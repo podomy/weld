@@ -179,6 +179,12 @@ func runEchoCommand(ctx context.Context, args []string, stdout, stderr io.Writer
 		return 2
 	}
 
+	err = checkEndpoint(*topicFlag, echoParticipant, core.EndpointSubscription)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 2
+	}
+
 	ctx, cancel := withEchoTimeout(ctx, *timeout)
 	defer cancel()
 
@@ -215,6 +221,12 @@ func runPubCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 
 	err = validateTopic(*topicFlag)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		return 2
+	}
+
+	err = checkEndpoint(*topicFlag, pubParticipant, core.EndpointPublisher)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
 		return 2
@@ -326,6 +338,8 @@ func subscribeEchoReader(ctx context.Context, backend transports.Backend, topic 
 // publishWithRouteWait polling. Backends without a generation signal still wait the bounded timeout
 // so late joiner SEDP still settles. The wait is best effort and never fails: timeout or context
 // end returns normally so the take loop still runs with authoritative drop counters and exit codes unchanged.
+// This diverges intentionally from the topic discovery wait, which fails loudly on cancel;
+// echo keeps listening through cancel so the take loop owns the single loud cancel exit.
 func waitForEchoDiscovery(ctx context.Context, backend transports.Backend) {
 	timeout := echoDiscoveryTimeoutVar
 	if timeout <= 0 {
@@ -480,8 +494,11 @@ func runPub(ctx context.Context, topic, text string, domain uint32, stdout io.Wr
 // publishWithRouteWait retries PublishBytes on ErrNoRoute until a route appears or the wait ends.
 //
 // It shares publishWithRouteRetry with service and action verbs so retry,
-// timeout, and cancel semantics stay identical. The wait is bounded by
-// pubRouteRetryTimeout or ctx cancel, whichever ends first.
+// timeout, and cancel semantics stay identical. The three one-line
+// wrappers diverge only in their timeout source: pub uses the fixed
+// pubRouteRetryTimeout, service uses the per-call deadline, and action
+// uses the overall goal timeout. A cancelled context exits 1; the wait
+// never swallows cancel.
 func publishWithRouteWait(ctx context.Context, backend transports.Backend, msg transports.OutgoingMessage) error {
 	return publishWithRouteRetry(ctx, backend, msg, pubRouteRetryTimeout)
 }
@@ -633,8 +650,9 @@ func handleEchoSample(tracker *lossTracker, topic string, msg transports.Incomin
 // Messages on other topics are skipped and counted as drops so parallel
 // shards sharing one domain do not cross-talk. Messages with a mismatched
 // type name are also skipped as drops, including decode failures, so a
-// foreign type on the subscribed topic never fails the run. A cancelled
-// context exits 1 like topic and doctor; a deadline timeout exits cleanly.
+// foreign type on the subscribed topic never fails the run. Exit
+// discipline is unified with topic and doctor: a cancelled context exits
+// 1 through handleRunError while a deadline timeout exits cleanly with 0.
 func echoLoop(ctx context.Context, backend transports.Backend, topic string, stdout, stderr io.Writer) error {
 	tracker := newLossTracker(backend, stderr)
 
@@ -736,6 +754,13 @@ func decodeStringPayload(payload []byte) (string, error) {
 }
 
 // validateTopic rejects empty topics and topics not starting with slash.
+//
+// It runs at the CLI layer before core admission so usage errors exit 2
+// with a weld prefix instead of surfacing late as a runtime failure.
+// Beyond empty and leading slash, it rejects spaces, empty segments,
+// and a trailing slash, mirroring the strict endpoint mapping without
+// importing transport mapping at every call site. Deeper mapping checks
+// still run through checkEndpoint; this gate catches shape errors early.
 func validateTopic(topic string) error {
 	if topic == "" {
 		return errors.New("weld: topic name is empty") //nolint:wrapcheck // new error, nothing to wrap
@@ -743,6 +768,18 @@ func validateTopic(topic string) error {
 
 	if topic[0] != '/' {
 		return fmt.Errorf("weld: topic %q must start with slash", topic)
+	}
+
+	if strings.ContainsAny(topic, " \t\n\r") {
+		return fmt.Errorf("weld: topic %q must not contain whitespace", topic)
+	}
+
+	if strings.Contains(topic, "//") {
+		return fmt.Errorf("weld: topic %q has an empty segment", topic)
+	}
+
+	if len(topic) > 1 && strings.HasSuffix(topic, "/") {
+		return fmt.Errorf("weld: topic %q must not end with slash", topic)
 	}
 
 	return nil

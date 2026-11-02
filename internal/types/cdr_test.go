@@ -522,7 +522,10 @@ func TestCdrBoundedString(t *testing.T) {
 func checkFixedArrayEncode(t *testing.T, cov []float64, le bool) []byte {
 	t.Helper()
 	enc := NewEncoder(le)
-	enc.Align(8)
+	err := enc.Align(8)
+	if err != nil {
+		t.Fatalf("le=%v Align 8 failed: %v", le, err)
+	}
 	start := enc.Len()
 	if start != HeaderSize {
 		t.Fatalf("le=%v fixed array start %d want header size %d (data offset 0 needs no pad)", le, start, HeaderSize)
@@ -1491,11 +1494,17 @@ func TestCdrInvalidAlign(t *testing.T) {
 	enc := NewEncoder(true)
 	enc.WriteUint8(0x01)
 	before := enc.Len()
-	enc.Align(3)
+	err := enc.Align(3)
+	if err == nil {
+		t.Fatal("expected error on invalid align")
+	}
 	if enc.Len() != before {
 		t.Fatalf("invalid Align mutated encoder")
 	}
-	enc.Align(0)
+	err = enc.Align(0)
+	if err == nil {
+		t.Fatal("expected error on invalid align 0")
+	}
 	if enc.Len() != before {
 		t.Fatalf("invalid Align 0 mutated encoder")
 	}
@@ -2077,7 +2086,10 @@ func checkAlignServiceEncode(t *testing.T, le bool, guid [8]byte, seq uint64) []
 	if enc.Len() != ServiceEnvelopeSize {
 		t.Fatalf("le=%v service len %d want %d", le, enc.Len(), ServiceEnvelopeSize)
 	}
-	enc.Align(8)
+	err = enc.Align(8)
+	if err != nil {
+		t.Fatalf("le=%v Align 8 failed: %v", le, err)
+	}
 	if enc.Len() != ServiceEnvelopeSize {
 		t.Fatalf("le=%v align 8 after service gives %d want %d", le, enc.Len(), ServiceEnvelopeSize)
 	}
@@ -2158,5 +2170,41 @@ func TestCdrNeedNegative(t *testing.T) {
 	}
 	if dec.Dropped() != dropsBefore+1 {
 		t.Fatalf("negative need must count a drop")
+	}
+}
+
+// TestCdrCheckSequenceAllocation checks cap plus wire byte layers.
+func TestCdrCheckSequenceAllocation(t *testing.T) {
+	enc := NewEncoder(true)
+	err := enc.WriteSequenceLength(2)
+	if err != nil {
+		t.Fatalf("WriteSequenceLength failed: %v", err)
+	}
+	enc.WriteUint32(1)
+	enc.WriteUint32(2)
+	wire := enc.Bytes()
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		t.Fatalf("NewDecoder failed: %v", err)
+	}
+	n, err := dec.ReadSequenceLength()
+	if err != nil {
+		t.Fatalf("ReadSequenceLength failed: %v", err)
+	}
+	err = dec.CheckSequenceAllocation(n, 4)
+	if err != nil {
+		t.Fatalf("allocation within remaining rejected: %v", err)
+	}
+	err = dec.CheckSequenceAllocation(n, 1<<30)
+	if err == nil {
+		t.Fatal("wide allocation above remaining accepted, want rejection")
+	}
+	err = dec.CheckSequenceAllocation(maxSequenceElements+1, 1)
+	if err == nil {
+		t.Fatal("count above cap accepted, want rejection")
+	}
+	err = dec.CheckSequenceAllocation(1, 0)
+	if err == nil {
+		t.Fatal("zero element size accepted, want rejection")
 	}
 }

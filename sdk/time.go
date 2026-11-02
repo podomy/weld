@@ -90,6 +90,10 @@ type Clock struct {
 // report an error; use SetDomain to reject invalid domains loudly.
 // Negative wall and steady ticks clamp to zero. Sim ticks arrive
 // through SetSimTime.
+//
+// Constructor versus setter contract: constructors clamp because they
+// return no error, while SetDomain and FakeClock.Advance reject invalid
+// input loudly. All other setters clamp to zero for determinism.
 func NewClock(domain Domain, wallNanos, steadyNanos int64) *Clock {
 	if !isValidDomain(domain) {
 		domain = DomainWall
@@ -179,7 +183,9 @@ func (d *Clock) SimNow() (int64, bool) {
 	return d.simNanos, d.simValid
 }
 
-// Now returns the active tick: sim when valid, else steady, else wall.
+// Now returns the active tick: sim when valid else wall for the sim
+// domain, steady for the steady domain, and wall otherwise. A sim domain
+// without a sample falls back to wall, not steady.
 func (d *Clock) Now() int64 {
 	if d == nil {
 		return 0
@@ -316,6 +322,10 @@ func (d *Clock) SetDomain(domain Domain) (Jump, error) {
 }
 
 // SetUseSimTime enables or disables sim time with jump notification.
+//
+// It wraps SetDomain with wall or sim, both always valid, so the
+// SetDomain error branch is defensive and never fires; the fallback
+// return keeps the advertised activation on the impossible path.
 func (d *Clock) SetUseSimTime(enabled bool) Jump {
 	if d == nil {
 		return Jump{SimActive: enabled}
@@ -332,9 +342,12 @@ func (d *Clock) SetUseSimTime(enabled bool) Jump {
 }
 
 // snapshotCallbacksLocked copies callbacks in id order assuming lock held.
+//
+// The result is always non-nil so callers never distinguish nil from
+// empty; an empty group yields an empty slice.
 func (d *Clock) snapshotCallbacksLocked() []JumpCallback {
 	if len(d.callbacks) == 0 {
-		return nil
+		return []JumpCallback{}
 	}
 	ids := make([]uint64, 0, len(d.callbacks))
 	for id := range d.callbacks {
@@ -436,6 +449,9 @@ type FakeClock struct {
 
 // NewFakeClock returns a running fake at startNanos. Negative starts
 // clamp to zero.
+//
+// Like NewClock, the constructor clamps because it returns no error;
+// use Advance to reject backward motion loudly.
 func NewFakeClock(startNanos int64) *FakeClock {
 	if startNanos < 0 {
 		startNanos = 0

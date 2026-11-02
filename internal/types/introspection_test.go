@@ -3,6 +3,7 @@
 package types
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -156,11 +157,14 @@ func TestIntrospectionLazyNestedPatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nested members: %v", err)
 	}
-	if got != inner {
-		t.Fatal("lazy patch did not return registered table")
+	if got == inner {
+		t.Fatal("nested members must return a clone, not the shared table")
 	}
-	if member.Members == nil {
-		t.Fatal("nested pointer was not patched on first call")
+	if got.Namespace != inner.Namespace || got.Name != inner.Name || len(got.Members) != len(inner.Members) {
+		t.Fatal("lazy patch clone content differs from registered table")
+	}
+	if member.Members != inner {
+		t.Fatal("nested pointer was not patched to shared table")
 	}
 }
 
@@ -615,8 +619,14 @@ func TestIntrospectionSelfContainedErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("self patch: %v", err)
 	}
-	if m != cyc {
-		t.Fatal("self patch must return same table")
+	if m == cyc {
+		t.Fatal("self patch must return a clone, not the shared table")
+	}
+	if m.Namespace != cyc.Namespace || m.Name != cyc.Name {
+		t.Fatal("self patch clone content differs")
+	}
+	if cyc.Members[0].Members != cyc {
+		t.Fatal("self patch did not store shared table")
 	}
 	_, err = IsSelfContained(cyc)
 	if err == nil {
@@ -832,8 +842,11 @@ func TestIntrospectionNestedSequenceResize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nested seq lookup: %v", err)
 	}
-	if got != inner {
-		t.Fatal("nested seq did not resolve inner")
+	if got == inner {
+		t.Fatal("nested seq must return a clone, not the shared table")
+	}
+	if got.Namespace != inner.Namespace || got.Name != inner.Name {
+		t.Fatal("nested seq clone content differs")
 	}
 }
 
@@ -986,5 +999,58 @@ func TestIntrospectionCyclePatch(t *testing.T) {
 	}
 	if err := cyc.EnsureNestedPatched(); err == nil {
 		t.Fatal("cycle patch must fail")
+	}
+}
+
+// TestIntrospectionHugeIndex checks overflow indexes fail loudly.
+func TestIntrospectionHugeIndex(t *testing.T) {
+	table := SolidPrimitiveMessageMembers()
+	p := SolidPrimitive{}
+	err := table.Init(&p, MessageInitAll)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	dims := &table.Members[1]
+	err = dims.Resize(&p, 1)
+	if err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	huge := uint(math.MaxInt) + 1
+	_, err = dims.Get(&p, huge)
+	if err == nil {
+		t.Fatal("huge get accepted, want overflow error")
+	}
+	_, err = dims.GetConst(&p, huge)
+	if err == nil {
+		t.Fatal("huge get const accepted, want overflow error")
+	}
+	var out float64
+	err = dims.Fetch(&p, huge, &out)
+	if err == nil {
+		t.Fatal("huge fetch accepted, want overflow error")
+	}
+	err = dims.Assign(&p, huge, float64(1))
+	if err == nil {
+		t.Fatal("huge assign accepted, want overflow error")
+	}
+	err = dims.Resize(&p, huge)
+	if err == nil {
+		t.Fatal("huge resize accepted, want overflow error")
+	}
+}
+
+// TestIntrospectionUnexportedField checks private fields fail loudly.
+func TestIntrospectionUnexportedField(t *testing.T) {
+	type privateHolder struct {
+		lower []int32
+	}
+	h := &privateHolder{lower: []int32{1}}
+	_, _, _, err := arrayDataSlice(h, "lower")
+	if err == nil {
+		t.Fatal("unexported field accepted, want rejection")
+	}
+	_, err = structField(h, "lower")
+	if err == nil {
+		t.Fatal("unexported struct field accepted, want rejection")
 	}
 }

@@ -116,6 +116,13 @@ func runServiceCallCommand(ctx context.Context, args []string, stdout, stderr io
 		return 2
 	}
 
+	err = checkServiceEndpoints(service)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+
+		return 2
+	}
+
 	err = runServiceCall(ctx, service, request, domain, *deadlineFlag, stdout)
 	if err != nil {
 		return handleRunError(err, stderr)
@@ -260,6 +267,10 @@ func subscribeServiceReply(ctx context.Context, backend transports.Backend, serv
 }
 
 // publishServiceRequest retries PublishBytes on ErrNoRoute until deadline or ctx ends.
+//
+// It is the service flavor of publishWithRouteRetry; it diverges from the
+// pub and action wrappers only in its timeout source, the per-call
+// deadline. Retry, timeout, and cancel semantics stay identical.
 func publishServiceRequest(ctx context.Context, backend transports.Backend, out transports.OutgoingMessage, deadline time.Duration) error {
 	return publishWithRouteRetry(ctx, backend, out, deadline)
 }

@@ -37,13 +37,14 @@ type doctorReport struct {
 // Type plus QoS mismatches flow through detectMismatches, so reliable versus
 // best effort and volatile versus transient local pairs raise incompatible
 // error events with their policy kind instead of staying silent. A nil
-// counter allocates a fresh one so events always count.
+// counter allocates a fresh one so events always count. The report holds a
+// non-nil mismatch slice; a clean snapshot yields an empty slice.
 func buildDoctorReport(snap graphSnapshot, counter *core.MismatchCounter) doctorReport {
 	if counter == nil {
 		counter = core.NewMismatchCounter()
 	}
 	summaries := summarizeTopics(snap, true)
-	var mismatches []core.MismatchEvent
+	mismatches := make([]core.MismatchEvent, 0)
 	for _, s := range summaries {
 		found := detectMismatches(s.Name, s.Endpoints)
 		for _, m := range found {
@@ -125,17 +126,17 @@ func formatDoctorReport(report doctorReport) string {
 
 // printDoctorUsage writes doctor help.
 func printDoctorUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, "Usage: weld doctor [--check] [flags]\n\ndoctor: list Weld entities with per topic QoS compatibility\n  weld doctor --domain 42\n  weld doctor --check --domain 42\n\nFlags:\n  --check exit 1 when any mismatch exists, 0 when clean\n  --domain uint DDS domain id, default from ROS_DOMAIN_ID\n") //nolint:errcheck // help output failure is not actionable
+	_, _ = fmt.Fprint(w, "Usage: weld doctor [--check] [flags]\n\ndoctor: list Weld entities with per topic QoS compatibility\n  weld doctor --domain 42\n  weld doctor --check --domain 42\n\nFlags:\n  --check accepted for compatibility; doctor always exits 1 when any mismatch exists, 0 when clean\n  --domain uint DDS domain id, default from ROS_DOMAIN_ID\n") //nolint:errcheck // help output failure is not actionable
 }
 
 // runDoctorCommand parses doctor flags, snapshots discovery, prints topic
 // info display plus metrics, and checks compatibility loudly.
 //
 // The full report always prints to stdout and loud mismatch lines go to
-// stderr, so --check gates on the same output it verifies:
-// --check exits 1 when any mismatch exists and 0 when clean. Compatible
-// Weld pairs (facade reliable plus transient local against standard ROS
-// subscriptions) print explicit none lines with zero metrics.
+// stderr. Doctor follows the single loud rule shared with topic list and
+// info: any mismatch exits 1, a clean snapshot exits 0. The --check flag
+// is accepted for compatibility but no longer gates the exit; it documents
+// the same loud check explicitly.
 func runDoctorCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -144,11 +145,12 @@ func runDoctorCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 		return 0
 	}
 	domainFlag := fs.Uint("domain", uint(defaultDomainID()), "DDS domain id, default from ROS_DOMAIN_ID")
-	checkFlag := fs.Bool("check", false, "exit 1 when any mismatch exists, 0 when clean")
+	checkFlag := fs.Bool("check", false, "accepted for compatibility; doctor always exits 1 on mismatch")
 	err := fs.Parse(args)
 	if err != nil {
 		return 2
 	}
+	_ = *checkFlag
 	if fs.NArg() != 0 {
 		_, _ = fmt.Fprintln(stderr, "weld: doctor takes no positional args") //nolint:errcheck // final error output is best effort
 		return 2
@@ -165,7 +167,7 @@ func runDoctorCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	report := buildDoctorReport(snap, core.NewMismatchCounter())
 	_, _ = fmt.Fprint(stdout, formatDoctorReport(report)) //nolint:errcheck // report output failure is not actionable
 	printTopicMismatches(stderr, report.Mismatches)
-	if *checkFlag && !doctorIsClean(report) {
+	if !doctorIsClean(report) {
 		_, _ = fmt.Fprintf(stderr, "weld: doctor check failed with %d mismatches\n", len(report.Mismatches)) //nolint:errcheck // final error output is best effort
 		return 1
 	}

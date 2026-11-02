@@ -1440,17 +1440,26 @@ func (b *Backend) currentRepairGen() uint64 {
 
 // serveAckSend sends one queued ACKNACK best effort.
 //
-// Failures count a demux error loudly instead of failing silently.
+// Failures count a demux error loudly instead of failing silently, except
+// a missing route which stays best-effort quiet. Backpressure counts
+// loudly via ErrRepairBackpressure.
 func (b *Backend) serveAckSend(task repairTask) {
 	ctx := context.Background()
 	err := b.sendUserAckNack(ctx, task.remote, task.reader, task.base, task.numBits, task.bitmap)
 	if err != nil {
+		if errors.Is(err, ErrNoRoute) {
+			return
+		}
 		b.bumpDemuxError()
 		log.Printf("dds: demux queued ack send: %v", err)
 	}
 }
 
 // serveRepair resends history for one queued ACKNACK.
+//
+// When durability reports ReplayBound 0 the reader would stall waiting for
+// samples the writer will never replay, so a GAP for the NACKed range is
+// sent instead and the reader converges past the gap.
 func (b *Backend) serveRepair(task repairTask) {
 	ctx := context.Background()
 
@@ -1470,10 +1479,79 @@ func (b *Backend) serveRepair(task repairTask) {
 
 	start, first, last, end, ok := b.repairWindow(guid, task.base)
 	if !ok {
+		b.sendBoundZeroGap(ctx, guid, task.base)
 		return
 	}
 
 	serveRepairWindow(b, ctx, guid, start, first, last, end)
+}
+
+// sendBoundZeroGap GAPs the NACKed range when durability replays nothing.
+//
+// It snapshots history bounds under one lock, checks that history exists,
+// the base is not past last, and ReplayBound is 0, then GAPs each seq in
+// the bounded window so the reader advances instead of stalling. Other
+// no-repair cases (no history or caught up) return without sending.
+func (b *Backend) sendBoundZeroGap(ctx context.Context, guid WriterGUID, base uint64) {
+	first, last, end, ok := b.boundZeroWindow(guid, base)
+	if !ok {
+		return
+	}
+	b.sendGapRange(ctx, guid, first, last, base, end)
+}
+
+// boundZeroWindow computes the GAP window when ReplayBound is 0.
+//
+// It reports false when no history exists, the base is past last, or the
+// bound is not 0 so the caller sends nothing.
+func (b *Backend) boundZeroWindow(guid WriterGUID, base uint64) (uint64, uint64, uint64, bool) {
+	first, last := b.repairHistoryBounds(guid)
+	if last == 0 || base == 0 || base > last {
+		return 0, 0, 0, false
+	}
+	bound := ReplayBound(last, uint64(userHistoryDepth), sedpDurabilityTransientLocal, WeldDurabilityServiceQoS())
+	if bound != 0 {
+		return 0, 0, 0, false
+	}
+	end := base + userRepairWindow - 1
+	if end > last || end < base {
+		end = last
+	}
+	return first, last, end, true
+}
+
+// sendGapRange emits one GAP per seq from base through end.
+func (b *Backend) sendGapRange(ctx context.Context, guid WriterGUID, first, last, base, end uint64) {
+	for seq := base; ; seq++ {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if !b.sendOneBoundZeroGap(ctx, guid, seq, first, last) {
+			return
+		}
+		if seq == end {
+			break
+		}
+		if seq == ^uint64(0) {
+			break
+		}
+	}
+}
+
+// sendOneBoundZeroGap sends one GAP and reports whether to continue.
+func (b *Backend) sendOneBoundZeroGap(ctx context.Context, guid WriterGUID, seq, first, last uint64) bool {
+	msg, err := b.buildGapMessage(guid, seq, first, last)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux repair bound-zero gap build: %v", err)
+		return false
+	}
+	if err = b.sendUserControl(ctx, msg); err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux repair bound-zero gap send: %v", err)
+		return false
+	}
+	return true
 }
 
 // serveRepairWindow sends one bounded repair window with pacing.
@@ -1530,8 +1608,8 @@ func paceRepair(timer *time.Timer, ctx context.Context) bool {
 
 // repairFromAck queues history repair from base plus GAP for missing in window. It bounds work to
 // userRepairWindow seq. Base 0 and unknown writers are ignored without repair.
-// It queues to the per-backend worker; a full queue reports loudly so demux
-// counts instead of blocking.
+// It queues to the per-backend worker; a full queue reports loudly via
+// ErrRepairBackpressure so demux counts instead of blocking.
 func (b *Backend) repairFromAck(
 	ctx context.Context,
 	writer rtps.EntityID,
@@ -1577,15 +1655,15 @@ func (b *Backend) repairFromAck(
 	case q <- task:
 		return nil
 	default:
-		return fmt.Errorf("dds: repair queue full base %d: %w", base, ErrNoRoute)
+		return fmt.Errorf("dds: repair queue full base %d: %w", base, ErrRepairBackpressure)
 	}
 }
 
 // queueUserAck queues one ACKNACK send through the per-backend worker.
 //
 // It is used by the demux heartbeat path instead of inline sends so a slow
-// peer cannot block demux. A full queue reports loudly so the caller counts
-// a demux error. It self-locks and is safe for concurrent use.
+// peer cannot block demux. A full queue reports ErrRepairBackpressure loudly
+// so the caller counts a demux error. It self-locks and is safe for concurrent use.
 func (b *Backend) queueUserAck(remote WriterGUID, reader rtps.EntityID, base uint64, numBits uint32, bitmap []uint32) error {
 	if base == 0 {
 		return fmt.Errorf("dds: user nack base 0: %w", ErrInvalidFrame)
@@ -1612,7 +1690,7 @@ func (b *Backend) queueUserAck(remote WriterGUID, reader rtps.EntityID, base uin
 	case q <- task:
 		return nil
 	default:
-		return fmt.Errorf("dds: ack queue full base %d: %w", base, ErrNoRoute)
+		return fmt.Errorf("dds: ack queue full base %d: %w", base, ErrRepairBackpressure)
 	}
 }
 
@@ -1807,8 +1885,8 @@ func promptNackBase(seq uint64) uint64 {
 // sendPromptNack queues one best effort ACKNACK for an initial gap.
 //
 // It routes through the per-backend worker so demux never blocks on the
-// socket. A full queue counts loudly via ErrNoRoute; other queue failures
-// also count a demux error.
+// socket. Backpressure counts loudly via ErrRepairBackpressure; a missing
+// route stays best-effort quiet. Other queue failures also count a demux error.
 func (b *Backend) sendPromptNack(
 	remote WriterGUID,
 	base uint64,
@@ -1822,9 +1900,12 @@ func (b *Backend) sendPromptNack(
 		if errors.Is(err, ErrDataPathNotWired) {
 			return
 		}
-		if errors.Is(err, ErrNoRoute) {
+		if errors.Is(err, ErrRepairBackpressure) {
 			b.bumpDemuxError()
 			log.Printf("dds: demux prompt ack queue full: %v", err)
+			return
+		}
+		if errors.Is(err, ErrNoRoute) {
 			return
 		}
 
@@ -1870,19 +1951,14 @@ func (b *Backend) maybePromptNackOnData(
 }
 
 // handleUserAck routes one ACKNACK for a user writer to repair, not to dataCh.
+//
+// The caller decodes once via decodeUserAckNack and shares the result so
+// the sub is not decoded twice.
 func (b *Backend) handleUserAck(
 	ctx context.Context,
-	sub rtps.RawSubmessage,
+	req ackRequest,
 ) {
-	req, err := decodeUserAckNack(sub.Body, sub.Flags)
-	if err != nil {
-		b.bumpDemuxError()
-		log.Printf("dds: demux ack decode: %v", err)
-
-		return
-	}
-
-	err = b.repairFromAck(ctx, req.writer, req.base)
+	err := b.repairFromAck(ctx, req.writer, req.base)
 	if err != nil {
 		b.bumpDemuxError()
 		log.Printf("dds: demux repair: %v", err)
@@ -1890,47 +1966,25 @@ func (b *Backend) handleUserAck(
 }
 
 // handleUserHeartbeat routes one HEARTBEAT for a user writer to ACK, not to dataCh.
+//
+// The caller decodes once via DecodeHeartbeat and shares the result so the
+// sub is not decoded twice.
 func (b *Backend) handleUserHeartbeat(
 	header rtps.Header,
-	sub rtps.RawSubmessage,
+	beat rtps.Heartbeat,
 ) {
-	var drops rtps.Counter
-
-	beat, err := rtps.DecodeHeartbeat(
-		sub.Body,
-		sub.Flags,
-		&drops,
-	)
-	if err != nil {
-		b.bumpDemuxError()
-		log.Printf("dds: demux heartbeat: %v", err)
-
-		return
-	}
-
 	b.ackUserHeartbeat(header, beat)
 }
 
 // handleUserGap routes one GAP for a user writer to skip, not to dataCh. The full
 // gap list applies in order so every contiguous run advances contiguity.
+//
+// The caller decodes once via DecodeGap and shares the result so the sub
+// is not decoded twice.
 func (b *Backend) handleUserGap(
-	sub rtps.RawSubmessage,
 	header rtps.Header,
+	gap rtps.Gap,
 ) {
-	var drops rtps.Counter
-
-	gap, err := rtps.DecodeGap(
-		sub.Body,
-		sub.Flags,
-		&drops,
-	)
-	if err != nil {
-		b.bumpDemuxError()
-		log.Printf("dds: demux gap: %v", err)
-
-		return
-	}
-
 	if !isUserWriterEntity(gap.WriterID) {
 		return
 	}
@@ -1946,6 +2000,8 @@ func (b *Backend) handleUserGap(
 // HEARTBEAT with ACK, GAP with skip, and DATA_FRAG with reassembly to dataCh. It returns true when sub
 // was user control and must not reach dataCh through the DATA path. Malformed
 // control submessages count a demux error loudly instead of skipping silently.
+// Each sub decodes once and the result is shared with the handler so the
+// same bytes are not decoded twice.
 func (b *Backend) handleUserControl(
 	ctx context.Context,
 	header rtps.Header,
@@ -1972,7 +2028,7 @@ func (b *Backend) handleUserControl(
 			return false
 		}
 
-		b.handleUserAck(ctx, sub)
+		b.handleUserAck(ctx, rawReq)
 
 		return true
 	case rtps.SubmessageHeartbeat:
@@ -1994,7 +2050,7 @@ func (b *Backend) handleUserControl(
 			return false
 		}
 
-		b.handleUserHeartbeat(header, sub)
+		b.handleUserHeartbeat(header, beat)
 
 		return true
 	case rtps.SubmessageGap:
@@ -2016,7 +2072,7 @@ func (b *Backend) handleUserControl(
 			return false
 		}
 
-		b.handleUserGap(sub, header)
+		b.handleUserGap(header, gap)
 
 		return true
 	case rtps.SubmessageDataFrag:

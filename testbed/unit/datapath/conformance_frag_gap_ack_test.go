@@ -380,12 +380,8 @@ func TestFragUnknownWriterDropped(t *testing.T) {
 	if !fragTestIsUserWriter(fragTestUserWriter) {
 		t.Fatalf("user writer failed filter, want pass")
 	}
-	dataCh := make(chan dataPathItem, 4)
-	if !fragTestIsUserWriter(frag.WriterID) {
-		if len(dataCh) != 0 {
-			t.Fatalf("dataCh length = %d want 0 after builtin drop", len(dataCh))
-		}
-	}
+	// Real drop is exercised below via TakeFrom with an unknown writer GUID,
+	// which must fail and bump DroppedCount to 1.
 	enc := types.NewEncoder(true)
 	encErr := enc.WriteString("stray")
 	if encErr != nil {

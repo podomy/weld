@@ -624,7 +624,9 @@ func validateWireDuration(d WireDuration, policy WriterPolicyKind) error {
 //
 // It validates before encoding so an invalid WireQoS fails loudly with the
 // refusing policy instead of announcing bad bytes. The error preserves the
-// loud refusal end to end through the SEDP announce path.
+// loud refusal end to end through fallible announce paths. Peer-controlled
+// inputs must flow through this method, never through Params, so malformed
+// peer data returns a loud refusal instead of panicking.
 func (q WireQoS) ValidatedParams() ([]rtps.Param, error) {
 	err := q.Validate()
 	if err != nil {
@@ -649,9 +651,12 @@ func (q WireQoS) ValidatedParams() ([]rtps.Param, error) {
 // site can splice this list in without reordering the old bytes. It
 // validates before encoding and panics loudly on invalid input because a
 // manually constructed invalid WireQoS is a programmer error; production
-// ForwardQoS output always validates. Callers that need an error instead
-// of a panic must use ValidatedParams, which the SEDP announce path uses
-// to preserve the loud refusal end to end.
+// ForwardQoS output always validates. Never call Params with
+// peer-controlled values: peer inputs must use ValidatedParams so malformed
+// wire data returns a loud refusal instead of panicking. No take or data
+// path reaches Params with peer values; only local ForwardQoS offers flow
+// here, while peer wire values flow through ParseWireQoS and
+// CheckWireCompatibility.
 func (q WireQoS) Params() []rtps.Param {
 	params, err := q.ValidatedParams()
 	if err != nil {

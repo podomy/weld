@@ -1232,7 +1232,7 @@ func TestRemoteTableRemove(t *testing.T) {
 	}
 }
 
-// TestRemoteTableStaleIgnored checks stale sequences do not bump.
+// TestRemoteTableStaleIgnored checks stale sequences fail loudly without bumping.
 func TestRemoteTableStaleIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -1249,7 +1249,7 @@ func TestRemoteTableStaleIgnored(t *testing.T) {
 	dup := mustMarshalAlive(t, guid, 0, 5, 10*time.Second)
 	err = table.HandlePacket(dup, now)
 	if err != nil {
-		t.Fatalf("handle dup: %v", err)
+		t.Fatalf("handle dup = %v, want silent duplicate", err)
 	}
 
 	if table.Generation() != 1 {
@@ -1258,8 +1258,8 @@ func TestRemoteTableStaleIgnored(t *testing.T) {
 
 	older := mustMarshalAlive(t, guid, 0, 3, 10*time.Second)
 	err = table.HandlePacket(older, now)
-	if err != nil {
-		t.Fatalf("handle older: %v", err)
+	if !errors.Is(err, ErrStaleSPDP) {
+		t.Fatalf("handle older = %v, want ErrStaleSPDP", err)
 	}
 
 	if table.Generation() != 1 {
@@ -2075,11 +2075,11 @@ func TestMarshalRejectionsTable(t *testing.T) {
 	}
 }
 
-// TestRemoteTableStaleDisposeIgnored checks stale disposes do not bump generation.
+// TestRemoteTableStaleDisposeIgnored checks stale disposes fail loudly without bumping.
 //
 // Dispose ordering matches the alive path: a dispose at or below the stored
-// LastSeq is ignored without bumping generation. Only a newer dispose
-// removes the entry.
+// LastSeq fails with ErrStaleSPDP without bumping generation. Only a newer
+// dispose removes the entry.
 func TestRemoteTableStaleDisposeIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -2099,19 +2099,20 @@ func TestRemoteTableStaleDisposeIgnored(t *testing.T) {
 		seq     uint64
 		wantLen int
 		wantGen uint64
+		wantErr error
 	}{
-		{name: "duplicate dispose", seq: 5, wantLen: 1, wantGen: 1},
-		{name: "older dispose", seq: 3, wantLen: 1, wantGen: 1},
-		{name: "newer dispose removes", seq: 6, wantLen: 0, wantGen: 2},
-		{name: "dispose missing stays", seq: 6, wantLen: 0, wantGen: 2},
+		{name: "duplicate dispose", seq: 5, wantLen: 1, wantGen: 1, wantErr: nil},
+		{name: "older dispose", seq: 3, wantLen: 1, wantGen: 1, wantErr: ErrStaleSPDP},
+		{name: "newer dispose removes", seq: 6, wantLen: 0, wantGen: 2, wantErr: nil},
+		{name: "dispose missing stays", seq: 6, wantLen: 0, wantGen: 2, wantErr: nil},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			bye := mustMarshalDispose(t, guid, 0, tc.seq)
 			err := table.HandlePacket(bye, base)
-			if err != nil {
-				t.Fatalf("handle dispose %d: %v", tc.seq, err)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("handle dispose %d = %v, want %v", tc.seq, err, tc.wantErr)
 			}
 
 			if table.Len() != tc.wantLen {
@@ -2236,5 +2237,68 @@ func TestSPDPPadSkipped(t *testing.T) {
 
 	if ann.BuiltinEndpointQos != 0 {
 		t.Fatalf("default builtin QoS = %d, want 0", ann.BuiltinEndpointQos)
+	}
+}
+
+// TestSPDPInfoDstUnicastMismatch pins unicast INFO_DST enforcement.
+//
+// A datagram naming another participant in INFO_DST drops loudly through
+// HandlePacketUnicast, while the transport-agnostic HandlePacket stays
+// unenforced for multicast group sockets.
+func TestSPDPInfoDstUnicastMismatch(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0x1C)
+	var local GUIDPrefix
+	for i := range local {
+		local[i] = 0x2C + byte(i)
+	}
+
+	alive := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+
+	err := checkSPDPInfoDstUnicast(alive, local)
+	if err != nil {
+		t.Fatalf("no INFO_DST check = %v, want nil", err)
+	}
+
+	header, subs, err := rtps.DecodeMessage(alive, nil)
+	if err != nil {
+		t.Fatalf("decode alive: %v", err)
+	}
+
+	var other GUIDPrefix
+	for i := range other {
+		other[i] = 0x3C + byte(i)
+	}
+
+	dst := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: rtps.FlagLittleEndian, Body: append([]byte(nil), other[:]...)}
+	msg, err := rtps.EncodeMessage(header, append([]rtps.RawSubmessage{dst}, subs...))
+	if err != nil {
+		t.Fatalf("encode INFO_DST: %v", err)
+	}
+
+	err = checkSPDPInfoDstUnicast(msg, local)
+	if !errors.Is(err, ErrInvalidSPDP) {
+		t.Fatalf("mismatch check = %v, want ErrInvalidSPDP", err)
+	}
+
+	table := NewRemoteTable(nil)
+	now := time.Unix(9000, 0).UTC()
+	err = table.HandlePacketUnicast(msg, now, local)
+	if !errors.Is(err, ErrInvalidSPDP) {
+		t.Fatalf("unicast handle = %v, want ErrInvalidSPDP", err)
+	}
+
+	if table.Len() != 0 {
+		t.Fatalf("len = %d, want 0 after INFO_DST drop", table.Len())
+	}
+
+	err = table.HandlePacket(msg, now)
+	if err != nil {
+		t.Fatalf("multicast-path handle = %v, want nil (INFO_DST unenforced)", err)
+	}
+
+	if table.Len() != 1 {
+		t.Fatalf("len = %d, want 1 after unenforced multicast install", table.Len())
 	}
 }

@@ -328,3 +328,49 @@ func TestParamsNodeValidation(t *testing.T) {
 		t.Fatalf("node stderr = %q, want weld prefix", stderr)
 	}
 }
+
+// TestParamsNameMatchesStoreRule pins that the CLI gate matches the
+// dds.MemoryStore shape rule exactly: hyphens, leading digits, and long
+// names pass because the store allows them, while empty, spaces, slashes,
+// and dot shape errors exit 2.
+func TestParamsNameMatchesStoreRule(t *testing.T) {
+	allowed := []string{"my-param", "1abc", strings.Repeat("a", 300)}
+	for _, name := range allowed {
+		store := paramsTestStore()
+		code, _, stderr := paramsRun([]string{"declare", "--type", "string", name, "v"}, store)
+		if code != 0 {
+			t.Fatalf("allowed %q code = %d, want 0: %q", name, code, stderr)
+		}
+	}
+	rejected := []string{"a b", "a/b", ".lead", "trail.", "a..b"}
+	for _, name := range rejected {
+		store := paramsTestStore()
+		code, _, stderr := paramsRun([]string{"declare", "--type", "string", name, "v"}, store)
+		if code != 2 {
+			t.Fatalf("rejected %q code = %d, want 2", name, code)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(stderr), "weld:") {
+			t.Fatalf("rejected %q stderr = %q, want weld prefix", name, stderr)
+		}
+	}
+}
+
+// TestParamsCancelledPrefix pins that a cancelled context exits 1 with a
+// weld prefix for greppability.
+func TestParamsCancelledPrefix(t *testing.T) {
+	store := paramsTestStore()
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runParamsCommand(cancelled, []string{"list"}, &stdout, &stderr, store)
+	if code != 1 {
+		t.Fatalf("cancelled code = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("cancelled stdout = %q, want empty", stdout.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(stderr.String()), "weld:") {
+		t.Fatalf("cancelled stderr = %q, want weld prefix", stderr.String())
+	}
+}

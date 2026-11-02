@@ -386,7 +386,7 @@ weld-jazzy peer (see testbed/live/helpers/helpers.go:444).
 Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 Only one run per domain and topic at a time.
 Parallel live tests allocate exclusive domains 70 through 101
-(testbed/live/helpers/domainpool.go:196 for AllocateDomainLease, :474 for MustAllocateDomain); fixed numbers stay reserved: 42
+(testbed/live/helpers/domainpool.go:196 for AllocateDomainLease, :464 for MustAllocateDomain); fixed numbers stay reserved: 42
 for the canonical ROS peer, 48 for SPDP, 47 for the serial
 single-entrypoint gate, 43 plus 44 for the Humble plus Rolling distro
 matrix, 55 for large payloads (46 abandoned, no host-container

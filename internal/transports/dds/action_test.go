@@ -284,11 +284,19 @@ func checkCancelScopeEmpty(t *testing.T, empty dds.GoalID) {
 	if got != dds.CancelScopeBefore {
 		t.Fatalf("empty plus stamp = %v, want before", got)
 	}
-	if _, err := dds.ClassifyCancelRequest(empty, -1, 0); err == nil {
+	scope, err := dds.ClassifyCancelRequest(empty, -1, 0)
+	if err == nil {
 		t.Fatalf("negative sec succeeded, want error")
 	}
-	if _, err := dds.ClassifyCancelRequest(empty, 0, 1000000000); err == nil {
+	if scope != dds.CancelScopeInvalid {
+		t.Fatalf("negative sec scope = %v, want invalid", scope)
+	}
+	scope, err = dds.ClassifyCancelRequest(empty, 0, 1000000000)
+	if err == nil {
 		t.Fatalf("nsec 1e9 succeeded, want error")
+	}
+	if scope != dds.CancelScopeInvalid {
+		t.Fatalf("nsec 1e9 scope = %v, want invalid", scope)
 	}
 }
 
@@ -309,8 +317,12 @@ func checkCancelScopeSingle(t *testing.T, single dds.GoalID) {
 	if got != dds.CancelScopeSingleAndBefore {
 		t.Fatalf("single plus stamp = %v, want single_and_before", got)
 	}
-	if _, err := dds.ClassifyCancelRequest(single, 1, 1000000000); err == nil {
+	scope, err := dds.ClassifyCancelRequest(single, 1, 1000000000)
+	if err == nil {
 		t.Fatalf("nsec above cap succeeded, want error")
+	}
+	if scope != dds.CancelScopeInvalid {
+		t.Fatalf("nsec above cap scope = %v, want invalid", scope)
 	}
 }
 
@@ -327,6 +339,31 @@ func TestActionCancelScope(t *testing.T) {
 	}
 	if err := dds.ValidateCancelCode(9); !errors.Is(err, dds.ErrActionInvalidCancel) {
 		t.Fatalf("cancel 9 = %v, want ErrActionInvalidCancel", err)
+	}
+}
+
+// TestActionCancelScopeErrorPinsInvalid pins the ignored-error contract.
+func TestActionCancelScopeErrorPinsInvalid(t *testing.T) {
+	t.Parallel()
+	var empty dds.GoalID
+	scope, err := dds.ClassifyCancelRequest(empty, -1, 0)
+	if err == nil {
+		t.Fatalf("negative sec succeeded, want error")
+	}
+	if !errors.Is(err, dds.ErrActionInvalidGoal) {
+		t.Fatalf("negative sec err = %v, want ErrActionInvalidGoal", err)
+	}
+	if scope != dds.CancelScopeInvalid {
+		t.Fatalf("error scope = %v, want invalid", scope)
+	}
+	if scope.String() != "invalid" {
+		t.Fatalf("error scope string = %q, want invalid", scope.String())
+	}
+	if scope == dds.CancelScopeAll {
+		t.Fatalf("error scope equals CancelScopeAll, must not reuse valid scope")
+	}
+	if dds.CancelScopeInvalid.String() != "invalid" {
+		t.Fatalf("invalid string = %q, want invalid", dds.CancelScopeInvalid.String())
 	}
 }
 

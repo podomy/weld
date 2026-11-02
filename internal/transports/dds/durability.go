@@ -538,7 +538,9 @@ type DurabilityServiceResult struct {
 //
 // Every mismatch carries a distinct reason string so wiring can surface
 // which bound failed. Cleanup delay requests must not exceed the offer,
-// with an infinite offer satisfying any request. History kinds outside
+// with an infinite offer satisfying any non-negative request; a negative
+// delay on either side mismatches fail-closed before the infinite
+// short-circuit. History kinds outside
 // keep-last (0) and keep-all (1) mismatch loudly on either side instead
 // of passing as compatible. Keep-all history requests need a keep-all
 // offer. Keep-last depth requests must not exceed a keep-last offer; a
@@ -548,7 +550,8 @@ type DurabilityServiceResult struct {
 // unchanged. A negative depth on either side is malformed and mismatches
 // instead of reading as unstated. Each resource limit request must not
 // exceed the offer, where unlimited (-1) needs unlimited and unstated
-// (0) imposes no constraint on either side.
+// (0) imposes no constraint on either side; a limit below -1 on either
+// side is malformed and mismatches fail-closed.
 // checkDurabilityServiceHistory checks history kind plus depth compat.
 //
 // Unknown kinds on either side mismatch loudly instead of passing as
@@ -641,9 +644,15 @@ func mismatch(format string, args ...any) DurabilityServiceResult {
 }
 
 // cleanupDelaySatisfies reports whether the offered cleanup delay meets
-// the request. An infinite offer satisfies anything; an infinite request
+// the request. A negative delay on either side is malformed and fails
+// closed before the infinite short-circuit, mirroring the depth rule. An
+// infinite offer satisfies any non-negative request; an infinite request
 // needs an infinite offer; else compare seconds then fraction.
 func cleanupDelaySatisfies(offered, requested DurabilityServiceQoS) bool {
+	if offered.CleanupDelaySec < 0 || requested.CleanupDelaySec < 0 {
+		return false
+	}
+
 	if isInfiniteCleanupDelay(offered) {
 		return true
 	}
@@ -675,10 +684,20 @@ func formatCleanupDelay(q DurabilityServiceQoS) string {
 
 // checkResourceLimit checks one requested limit against the offer.
 //
+// A limit below -1 on either side is malformed and mismatches fail-closed,
+// mirroring the HistoryDepth rule, even when the other side is unstated.
 // Unstated (0) on either side imposes no constraint. Unlimited (-1)
 // requested needs unlimited offered. Else the request must not exceed a
 // positive offer. It returns the mismatch reason or empty when satisfied.
 func checkResourceLimit(name string, offered, requested int32) string {
+	if offered < durabilityServiceUnlimited {
+		return fmt.Sprintf("durability_service: offered %s %d is malformed", name, offered)
+	}
+
+	if requested < durabilityServiceUnlimited {
+		return fmt.Sprintf("durability_service: requested %s %d is malformed", name, requested)
+	}
+
 	if offered == 0 || requested == 0 {
 		return ""
 	}

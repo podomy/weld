@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRunLaunchForwarding checks CLI argv appends with last wins.
@@ -139,5 +140,27 @@ func TestRunLaunchUsage(t *testing.T) {
 	}
 	if cancelledOut.Len() != 0 {
 		t.Fatalf("cancelled must print nothing to stdout, have %q", cancelledOut.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(cancelledErr.String()), "weld:") {
+		t.Fatalf("cancelled stderr = %q, want weld prefix", cancelledErr.String())
+	}
+}
+
+// TestRunLaunchDeadlinePrefix pins that a deadline exceeded context exits 1
+// with a weld prefix for greppability.
+func TestRunLaunchDeadlinePrefix(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1))
+	defer cancel()
+	var out bytes.Buffer
+	var errBuf bytes.Buffer
+	code := runLaunchCommand(expired, []string{"--node", "x"}, &out, &errBuf)
+	if code != 1 {
+		t.Fatalf("deadline code = %d, want 1", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("deadline stdout = %q, want empty", out.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(errBuf.String()), "weld:") {
+		t.Fatalf("deadline stderr = %q, want weld prefix", errBuf.String())
 	}
 }

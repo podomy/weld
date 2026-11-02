@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -201,6 +202,28 @@ func plainNackNextBase(st *plainNackState, seq uint64) uint64 {
 	return base
 }
 
+// capPlainNackLocked ensures plainNack stays bounded.
+//
+// Caller holds r.mu for write. When the table holds livelyTrackerCap
+// entries and the key is unseen, it evicts one arbitrary writer loudly so
+// writer churn cannot grow the table without bound.
+func (r *DataReceiver) capPlainNackLocked(except WriterGUID) {
+	if _, seen := r.plainNack[except]; seen {
+		return
+	}
+
+	if len(r.plainNack) < livelyTrackerCap {
+		return
+	}
+
+	for victim := range r.plainNack {
+		delete(r.plainNack, victim)
+		log.Printf("dds: plain nack table full evict guid=%x", victim)
+
+		return
+	}
+}
+
 // notePlainSample tracks one plain vendor sample and NACKs gaps best effort.
 //
 // First sight of a writer at seq K above 1 means 1 through K minus 1
@@ -210,9 +233,17 @@ func plainNackNextBase(st *plainNackState, seq uint64) uint64 {
 // NACK send failures only bump demux errors. The high-water lastNacked
 // advances only after a successful send, and a nil sender never advances
 // it, so failed or disabled NACKs do not mask the gap. Unparseable seq
-// skips tracking. It self-locks and is safe for concurrent use.
+// skips tracking. Insertion gates on matched writers: unknown GUIDs with
+// no confirmed SEDP remote or provisional placeholder skip tracking
+// without growing plainNack, consistent with isMatchedWriter. New keys
+// hold livelyTrackerCap with oldest-eviction plus loud log. It self-locks
+// and is safe for concurrent use.
 func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq uint64) {
 	if seq == 0 {
+		return
+	}
+
+	if !r.isMatchedWriter(guid) {
 		return
 	}
 
@@ -223,6 +254,7 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 
 	st, ok := r.plainNack[guid]
 	if !ok {
+		r.capPlainNackLocked(guid)
 		st = &plainNackState{}
 		r.plainNack[guid] = st
 	}
@@ -385,7 +417,8 @@ func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHook
 // contract holds without re-subscribing. Reconfiguration updates existing
 // writers in place through Reconfigure so a lease or kind change applies
 // without resetting outage history. Explicit nil writer lists only store
-// the config.
+// the config. Explicit installs hold livelyTrackerCap with eviction like
+// the lazy path so bulk installs cannot grow the map without bound.
 func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.LivelinessPolicy, lease core.Duration, writers []WriterGUID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -405,6 +438,10 @@ func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.Live
 			existing.Reconfigure(kind, lease)
 
 			continue
+		}
+
+		if len(r.lively) >= livelyTrackerCap {
+			r.evictLivelyLocked()
 		}
 
 		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), kind, lease, time.Now().UnixNano())

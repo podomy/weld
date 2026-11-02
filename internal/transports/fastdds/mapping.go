@@ -977,6 +977,8 @@ type Backend struct {
 	cfg Config
 	// domainID is the resolved domain from DomainConfig.
 	domainID uint32
+	// participant is the last joined participant name.
+	participant string
 	// joined is true after a successful JoinDiscovery.
 	joined bool
 	// closed is true after the first Close.
@@ -1060,6 +1062,14 @@ func (b *Backend) Joined() bool {
 	return b.joined
 }
 
+// Participant returns the joined participant name.
+func (b *Backend) Participant() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	return b.participant
+}
+
 // Closed reports whether Close has been called.
 func (b *Backend) Closed() bool {
 	b.mu.RLock()
@@ -1090,8 +1100,10 @@ func (b *Backend) DiscoveryTransport() (DiscoveryTransport, error) {
 // JoinDiscovery marks the backend joined without dialing FastDDS.
 //
 // It honors ctx cancellation, reports ErrBackendClosed after Close, and
-// is idempotent: a second join returns nil without changing state.
-func (b *Backend) JoinDiscovery(ctx context.Context, _ transports.DiscoveryInfo) error {
+// is idempotent: a second join returns nil without changing state. The
+// participant name is recorded on the first join like the mqtt and zenoh
+// backends; the network path still reports ErrFastDDSNotImplemented.
+func (b *Backend) JoinDiscovery(ctx context.Context, info transports.DiscoveryInfo) error {
 	err := ctx.Err()
 	if err != nil {
 		return fmt.Errorf("fastdds: join discovery: %w", err)
@@ -1104,6 +1116,11 @@ func (b *Backend) JoinDiscovery(ctx context.Context, _ transports.DiscoveryInfo)
 		return fmt.Errorf("fastdds: join discovery after close: %w", transports.ErrBackendClosed)
 	}
 
+	if b.joined {
+		return nil
+	}
+
+	b.participant = info.ParticipantName
 	b.joined = true
 
 	return nil

@@ -350,23 +350,30 @@ func resolveSubscriberBestAvailable(out *QoSProfile, visible []Peer) {
 	}
 }
 
+// normalizeFoldInput maps one peer duration to its fold value.
+//
+// Unspecified, best available sentinels, malformed negative seconds, and
+// nanoseconds at or above one second all count as infinite (no constraint),
+// so malformed peers stay quiet instead of skewing the extremum.
+func normalizeFoldInput(eff Duration) Duration {
+	if eff.IsUnspecified() || IsBestAvailableDuration(eff) || eff.Seconds < 0 || eff.Nanoseconds >= nanosPerSecond {
+		return InfiniteDuration()
+	}
+
+	return eff
+}
+
 // minDurationFold folds one duration field across visible peers taking the
 // minimum.
 //
-// Unspecified, best available sentinels, and malformed negative seconds all
-// count as infinite (no constraint), so malformed peers stay quiet instead
-// of skewing the extremum. An infinite fold result normalizes back to
-// unspecified, so a mixed default plus finite peer set collapses to the
-// finite minimum on the offer side. Zero peers means all default, hence
-// unspecified.
+// An infinite fold result normalizes back to unspecified, so a mixed
+// default plus finite peer set collapses to the finite minimum on the
+// offer side. Zero peers means all default, hence unspecified.
 func minDurationFold(peers []Peer, get func(QoSProfile) Duration) Duration {
 	best := InfiniteDuration()
 	set := false
 	for _, peer := range peers {
-		eff := get(peer.Profile)
-		if eff.IsUnspecified() || IsBestAvailableDuration(eff) || eff.Seconds < 0 {
-			eff = InfiniteDuration()
-		}
+		eff := normalizeFoldInput(get(peer.Profile))
 		if !set {
 			best = eff
 			set = true
@@ -385,20 +392,15 @@ func minDurationFold(peers []Peer, get func(QoSProfile) Duration) Duration {
 // maxDurationFold folds one duration field across visible peers taking the
 // maximum.
 //
-// Unspecified, best available sentinels, and malformed negative seconds all
-// count as infinite (no constraint), so malformed peers stay quiet instead
-// of skewing the extremum. An infinite fold result normalizes back to
-// unspecified, so a mixed default plus finite peer set collapses to default
-// on the request side because a default publisher cannot satisfy a finite
-// request. Zero peers means all default, hence unspecified.
+// An infinite fold result normalizes back to unspecified, so a mixed
+// default plus finite peer set collapses to default on the request side
+// because a default publisher cannot satisfy a finite request. Zero peers
+// means all default, hence unspecified.
 func maxDurationFold(peers []Peer, get func(QoSProfile) Duration) Duration {
 	best := InfiniteDuration()
 	set := false
 	for _, peer := range peers {
-		eff := get(peer.Profile)
-		if eff.IsUnspecified() || IsBestAvailableDuration(eff) || eff.Seconds < 0 {
-			eff = InfiniteDuration()
-		}
+		eff := normalizeFoldInput(get(peer.Profile))
 		if !set {
 			best = eff
 			set = true

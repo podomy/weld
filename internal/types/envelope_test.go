@@ -367,22 +367,6 @@ func checkServiceEmptyDecode(t *testing.T, guid [8]byte, le bool) {
 	}
 }
 
-// checkServiceEmptyPad verifies remaining pad bytes are zero.
-//
-//nolint:unused // helper kept to document empty service pad invariant alongside decode checks
-func checkServiceEmptyPad(t *testing.T, dec *Decoder) {
-	t.Helper()
-	for dec.Remaining() > 0 {
-		b, err := dec.ReadUint8()
-		if err != nil {
-			t.Fatalf("pad read failed: %v", err)
-		}
-		if b != 0x00 {
-			t.Fatalf("pad byte 0x%02x want zero", b)
-		}
-	}
-}
-
 func TestCdrServiceEmptyEncoderEqualsMarshal(t *testing.T) {
 	var guid [8]byte
 	for i := range guid {

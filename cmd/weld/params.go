@@ -44,18 +44,16 @@ func validateParamsNode(node string) error {
 // validateParamsName rejects bad parameter names at the CLI layer before
 // the store fails late.
 //
-// It mirrors the store ValidateParamName charset rules so usage errors
-// exit 2 with a weld prefix instead of surfacing as runtime failures:
-// non-empty, at most 255 bytes, dot-separated segments each matching
-// [A-Za-z_][A-Za-z0-9_]*, no spaces or slashes, no leading or trailing
-// dots, and no empty segments. The store still enforces the same rules
-// as defense in depth.
+// It mirrors the dds.MemoryStore validateParamName shape rule so usage
+// errors exit 2 with a weld prefix instead of surfacing as runtime
+// failures: non-empty, no spaces or slashes, no leading or trailing dots,
+// and no empty segments. The store still enforces the same rules as
+// defense in depth. Hyphens, leading digits, and long names pass here
+// because the store allows them; the sdk config charset and 255 byte rule
+// does not apply to this verb.
 func validateParamsName(name string) error {
 	if name == "" {
 		return errors.New("weld: parameter name is empty") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	if len(name) > 255 {
-		return fmt.Errorf("weld: parameter name %q exceeds 255 bytes", name)
 	}
 	if strings.ContainsAny(name, " \t\n\r/") {
 		return fmt.Errorf("weld: parameter name %q has spaces or slashes", name)
@@ -65,27 +63,6 @@ func validateParamsName(name string) error {
 	}
 	if strings.Contains(name, "..") {
 		return fmt.Errorf("weld: parameter name %q has an empty segment", name)
-	}
-	for segment := range strings.SplitSeq(name, ".") {
-		err := validateParamsSegment(segment)
-		if err != nil {
-			return fmt.Errorf("weld: parameter name %q: %w", name, err)
-		}
-	}
-	return nil
-}
-
-// validateParamsSegment checks one dot-separated parameter name segment.
-func validateParamsSegment(segment string) error {
-	if segment == "" {
-		return errors.New("weld: empty name segment") //nolint:wrapcheck // new error, nothing to wrap
-	}
-	for i := range len(segment) {
-		c := segment[i]
-		ok := c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9')
-		if !ok {
-			return fmt.Errorf("weld: bad character %q in segment %q", c, segment)
-		}
 	}
 	return nil
 }
@@ -442,7 +419,7 @@ func dispatchParamsVerb(verb string, rest []string, stdout, stderr io.Writer, st
 func runParamsCommand(ctx context.Context, args []string, stdout, stderr io.Writer, store *dds.MemoryStore) int {
 	err := ctx.Err()
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		_, _ = fmt.Fprintln(stderr, "weld: "+oneLine(err)) //nolint:errcheck // final error output is best effort
 		return 1
 	}
 	if len(args) == 0 {

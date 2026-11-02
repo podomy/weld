@@ -320,7 +320,10 @@ func TestWildcardBindIsUnspecified(t *testing.T) {
 		t.Fatalf("AnyIPv4 %v is not unspecified", parsed)
 	}
 	ctx := context.Background()
-	conn, err := rtps.DialUnicast(ctx, 86)
+	// Domain 26 sits outside every live range (fixed 42 through 48, 55,
+	// ephemeral 60 through 69, pooled 70 through 101) and outside the
+	// unit probe block, so the bind never collides with parallel live suites.
+	conn, err := rtps.DialUnicast(ctx, 26)
 	if err != nil {
 		t.Fatalf("dial unicast: %v", err)
 	}

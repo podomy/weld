@@ -912,17 +912,6 @@ func (b *Backend) SubscribeService(ctx context.Context, service, idlBase string,
 	return nil
 }
 
-// PublishService publishes one service request or reply sample.
-//
-// service is the ROS service name and idlBase is the IDL base without
-// suffix. The client role publishes requests and the server role
-// publishes replies. The payload must already carry the service header
-// plus GUID plus sequence from the Encode helpers and a valid XCDR1
-// header so CycloneDDS accepts it as plain DATA. The writer is declared
-// through the service endpoint path and announced synchronously before
-// DATA so single shot callers do not exit before matching. Empty routes
-// report ErrNoRoute for retry loops. Non plain payloads fail loudly
-// instead of falling back to framed topics.
 // servicePublishTarget resolves the DDS topic, type, and request flag for
 // one service publish role. The reply topic serves the server role and the
 // request topic serves the client role. Unknown roles fail loudly instead
@@ -956,6 +945,81 @@ func resolveServicePublishEndpoint(snap publishSnapshot, service, ddsTopic, ddsT
 	return ep, idlName, nil
 }
 
+// servicePreparePublishLocked declares and announces one service writer.
+//
+// It resolves the writer endpoint, rejects non plain payloads, snapshots
+// routes, announces once, and aligns the shared publisher. The caller must
+// hold b.publishMu for write and must unlock on return. Route misses map to
+// routeError so callers retry with backoff.
+func servicePreparePublishLocked(ctx context.Context, b *Backend, snap publishSnapshot, service, ddsTopic, ddsType string, isRequest bool, typeHash string, payload []byte) (SEDPEndpoint, WriterGUID, transports.OutgoingMessage, error) {
+	ep, idlName, err := resolveServicePublishEndpoint(snap, service, ddsTopic, ddsType, isRequest, typeHash)
+	if err != nil {
+		return SEDPEndpoint{}, WriterGUID{}, transports.OutgoingMessage{}, err
+	}
+	if !isPlainCDRSample(payload, idlName) {
+		return SEDPEndpoint{}, WriterGUID{}, transports.OutgoingMessage{}, fmt.Errorf("dds: publish service payload not plain for %q: %w", idlName, ErrServiceInvalidPacket)
+	}
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		return SEDPEndpoint{}, WriterGUID{}, transports.OutgoingMessage{}, routeError(service, snap.domain, ErrNoRoute)
+	}
+	writer := b.writerForPublish(snap, ep)
+	if ep.ID != (SEDPGUID{}) {
+		err = b.announceWriterOnce(ctx, ep)
+		if err != nil {
+			if errors.Is(err, ErrNoRoute) {
+				return SEDPEndpoint{}, WriterGUID{}, transports.OutgoingMessage{}, routeError(service, snap.domain, err)
+			}
+			return SEDPEndpoint{}, WriterGUID{}, transports.OutgoingMessage{}, err
+		}
+		b.alignPublisherGUID(snap.publisher, writer)
+	}
+	msg := outgoingForService(service, idlName, payload)
+	return ep, writer, msg, nil
+}
+
+// publishServiceAfterWait waits for peer matching then sends one service sample.
+//
+// It runs without publishMu across waits, then re-locks to re-snapshot
+// routes and re-align before sending so concurrent publishes cannot flap
+// the shared GUID while waits never block them.
+func publishServiceAfterWait(ctx context.Context, b *Backend, snap publishSnapshot, service string, ep SEDPEndpoint, writer WriterGUID, msg transports.OutgoingMessage) error {
+	b.waitForMatchingReader(ctx, ep)
+	err := b.pauseForPeerProcessing(ctx)
+	if err != nil {
+		return err
+	}
+	b.publishMu.Lock()
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		b.publishMu.Unlock()
+		return routeError(service, snap.domain, ErrNoRoute)
+	}
+	if ep.ID != (SEDPGUID{}) {
+		b.alignPublisherGUID(snap.publisher, writer)
+	}
+	err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+	b.publishMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// PublishService publishes one service request or reply sample.
+//
+// service is the ROS service name and idlBase is the IDL base without
+// suffix. The client role publishes requests and the server role
+// publishes replies. The payload must already carry the service header
+// plus GUID plus sequence from the Encode helpers and a valid XCDR1
+// header so CycloneDDS accepts it as plain DATA. The writer is declared
+// through the service endpoint path and announced synchronously before
+// DATA so single shot callers do not exit before matching. Empty routes
+// report ErrNoRoute for retry loops. Non plain payloads fail loudly
+// instead of falling back to framed topics. It holds publishMu for
+// declare plus announce plus align, releases across waits, then re-locks
+// plus re-snapshots plus re-aligns before sending so concurrent service
+// plus topic publishes cannot flap the shared GUID and sequence.
 func (b *Backend) PublishService(ctx context.Context, service, idlBase string, role ServiceRole, payload []byte, typeHash string) error {
 	snap, err := b.loadPublishSnapshot(ctx)
 	if err != nil {
@@ -969,27 +1033,14 @@ func (b *Backend) PublishService(ctx context.Context, service, idlBase string, r
 	if err != nil {
 		return err
 	}
-	ep, idlName, err := resolveServicePublishEndpoint(snap, service, ddsTopic, ddsType, isRequest, typeHash)
+	b.publishMu.Lock()
+	ep, writer, msg, err := servicePreparePublishLocked(ctx, b, snap, service, ddsTopic, ddsType, isRequest, typeHash, payload)
 	if err != nil {
+		b.publishMu.Unlock()
 		return err
 	}
-	if !isPlainCDRSample(payload, idlName) {
-		return fmt.Errorf("dds: publish service payload not plain for %q: %w", idlName, ErrServiceInvalidPacket)
-	}
-	if snap.routeCount == 0 && len(b.snapshotRoutes()) == 0 {
-		return routeError(service, snap.domain, ErrNoRoute)
-	}
-	writer := b.writerForPublish(snap, ep)
-	msg := outgoingForService(service, idlName, payload)
-	err = b.announceWriterForPublish(ctx, msg, ep, writer, snap)
-	if err != nil {
-		return err
-	}
-	ports := b.snapshotRoutes()
-	if len(ports) == 0 {
-		return routeError(service, snap.domain, ErrNoRoute)
-	}
-	err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+	b.publishMu.Unlock()
+	err = publishServiceAfterWait(ctx, b, snap, service, ep, writer, msg)
 	if err != nil {
 		return err
 	}

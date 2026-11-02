@@ -119,6 +119,26 @@ func (systemClock) After(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 
+// backendNow returns the backend clock time, defaulting to wall-clock.
+//
+// It reads b.clock without taking b.mu; callers that already hold b.mu
+// must read b.clock directly to avoid re-locking. A nil clock means the
+// backend was built without live state in tests, so wall-clock stays
+// intentional there. Pacing timers with time.NewTimer keep wall-clock
+// intentionally because they pace sends, not leases; only lease, sweep,
+// FirstSeen, and announce resend times use this source.
+func (b *Backend) backendNow() time.Time {
+	b.mu.RLock()
+	clock := b.clock
+	b.mu.RUnlock()
+
+	if clock != nil {
+		return clock.Now()
+	}
+
+	return time.Now()
+}
+
 // UDPPeer abstracts a wildcard UDP peer for discovery transport.
 type UDPPeer interface {
 	// Write sends bytes to the peer.
@@ -951,6 +971,9 @@ func (b *Backend) installLiveLocked(
 	b.receiver = NewDataReceiver()
 	b.receiver.SetSEDPIndex(sedpIdx)
 	b.receiver.SetNackSender(b.sendPlainNack)
+	if b.clock != nil {
+		b.receiver.now = b.clock.Now
+	}
 	b.publisher = publisher
 	b.pubGUID = pubGUID
 	b.spdpCh = make(chan []byte, demuxQueueDepth)
@@ -2113,7 +2136,9 @@ func (b *Backend) nextRTPSSeqFor(guid WriterGUID) (uint64, error) {
 // publish has advanced past the failed seq, so a failed send may be retried
 // with the same sequence and the only-on-success contract holds for the
 // single-flight case. Concurrent successes keep their gaps instead of
-// corrupting the counter.
+// corrupting the counter. Claiming at MaxUint64 leaves the global at Max
+// because nothing advances past the ceiling, so rollback restores the
+// per-writer next without decrementing the global.
 func (b *Backend) rollbackSeqFor(guid WriterGUID, seq uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2121,9 +2146,6 @@ func (b *Backend) rollbackSeqFor(guid WriterGUID, seq uint64) {
 	if seq == ^uint64(0) {
 		if b.rtpsSeqByWriter[guid] == 0 {
 			b.rtpsSeqByWriter[guid] = seq
-			if b.rtpsSeq != 0 && b.rtpsSeq != FirstSequenceNumber {
-				b.rtpsSeq--
-			}
 		}
 
 		return
@@ -2360,13 +2382,22 @@ func (b *Backend) sendFragTerminalHeartbeat(ctx context.Context, uni *rtps.Unica
 // fragSendMaxEntries plus fragMaxBytes with a fragSendTimeout sweep
 // mirroring the inbound reassembler: expired entries drop loudly and a full
 // table evicts the oldest entry loudly instead of growing without limit.
+// The entry timestamp comes from the backend clock so fake-clock tests
+// control sweep; pacing timers elsewhere keep wall-clock intentionally.
 func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) {
+	b.accumulateFragSendAt(guid, seq, fragNum, total, fragmentSize, sampleSize, data, b.backendNow())
+}
+
+// accumulateFragSendAt buffers one fragment with an explicit now.
+//
+// It shares the bounded-table rules used by accumulateFragSend so tests
+// pin timeout sweep with a fake clock without touching wall-clock.
+func (b *Backend) accumulateFragSendAt(guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte, now time.Time) {
 	b.mu.Lock()
 
 	if b.fragSend == nil {
 		b.fragSend = make(map[fragKey]*fragSendEntry)
 	}
-	now := time.Now()
 	expired := b.sweepFragSendLocked(now)
 	key := fragKey{guid: guid, seq: seq}
 	entry, ok := b.fragSend[key]
@@ -2803,7 +2834,7 @@ func (b *Backend) spdpListenLoop(ctx context.Context) {
 // ignored. Table sweep runs when the interval elapses sharing one clock
 // reading for update plus sweep.
 func (b *Backend) spdpSingleParseLoop(ctx context.Context, remotes *RemoteTable, sweep time.Duration) {
-	lastSweep := time.Now()
+	lastSweep := b.backendNow()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -2820,7 +2851,7 @@ func (b *Backend) spdpSingleParseLoop(ctx context.Context, remotes *RemoteTable,
 		data, err := b.receiveSpdpBytes(child, ch)
 		cancel()
 
-		now := time.Now()
+		now := b.backendNow()
 
 		if err == nil {
 			b.handleSpdpBytesOnce(data, domain, local, now)
@@ -2911,7 +2942,9 @@ func (b *Backend) sortedRoutesSnapshot() []int {
 // sequence continuity: SerializeSEDPDATA consumes one sequence per
 // sample from the writer stream, and CycloneDDS holds seq 2 until seq 1
 // arrives, so a seq 1 dropped for no route would stall matching until
-// expiry.
+// expiry. Resend timing uses the backend clock so fake-clock tests control
+// it; the poll ticker itself keeps wall-clock intentionally because it paces
+// sends, not leases.
 func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error {
 	if idx == nil {
 		return fmt.Errorf("dds: sedp announce nil index: %w", ErrSEDPInvalidEndpoint)
@@ -2936,7 +2969,7 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 		return err
 	}
 
-	lastSend := time.Now()
+	lastSend := b.backendNow()
 
 	ticker := time.NewTicker(sedpAnnouncePollInterval)
 	defer ticker.Stop()
@@ -2970,13 +3003,17 @@ func (b *Backend) announceInitial(ctx context.Context, sender *sedpSender, local
 }
 
 // announceTick checks routes and announces when endpoints or routes change.
+//
+// Resend timing uses the backend clock via backendNow so fake-clock tests
+// control it; the caller passes lastSend from the same source.
 func (b *Backend) announceTick(ctx context.Context, sender *sedpSender, idx *SEDPIndex, lastLocals []SEDPEndpoint, lastRoutes []int, lastSend time.Time) ([]SEDPEndpoint, []int, time.Time, error) {
 	currentLocals := idx.LocalEndpoints()
 	currentRoutes := b.sortedRoutesSnapshot()
 	if len(currentRoutes) == 0 {
 		return currentLocals, currentRoutes, lastSend, nil
 	}
-	if sedpShouldSkipResend(lastLocals, currentLocals, lastRoutes, currentRoutes, lastSend) {
+	now := b.backendNow()
+	if sedpShouldSkipResendAt(lastLocals, currentLocals, lastRoutes, currentRoutes, lastSend, now) {
 		return lastLocals, lastRoutes, lastSend, nil
 	}
 	err := sedpAnnounceSnapshot(ctx, sender, currentLocals)
@@ -2987,12 +3024,16 @@ func (b *Backend) announceTick(ctx context.Context, sender *sedpSender, idx *SED
 
 		return lastLocals, lastRoutes, lastSend, sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
 	}
-	return currentLocals, currentRoutes, time.Now(), nil
+	return currentLocals, currentRoutes, now, nil
 }
 
-// sedpShouldSkipResend reports whether the periodic resend can be skipped.
-func sedpShouldSkipResend(lastLocals, currentLocals []SEDPEndpoint, lastRoutes, currentRoutes []int, lastSend time.Time) bool {
-	return sedpEndpointsSlicesEqual(lastLocals, currentLocals) && slices.Equal(lastRoutes, currentRoutes) && time.Since(lastSend) < sedpAnnounceResendInterval
+// sedpShouldSkipResendAt reports whether the periodic resend can be skipped at now.
+//
+// It shares the equality checks for resend timing so fake-clock tests pin
+// resend exactly without touching wall-clock. Production passes now from
+// the backend clock; pacing timers elsewhere keep wall-clock intentionally.
+func sedpShouldSkipResendAt(lastLocals, currentLocals []SEDPEndpoint, lastRoutes, currentRoutes []int, lastSend, now time.Time) bool {
+	return sedpEndpointsSlicesEqual(lastLocals, currentLocals) && slices.Equal(lastRoutes, currentRoutes) && now.Sub(lastSend) < sedpAnnounceResendInterval
 }
 
 // sedpListenLoop receives SEDP samples until the run context ends.
@@ -3479,26 +3520,16 @@ func (b *Backend) ackSedpHeartbeat(ctx context.Context, header rtps.Header, sub 
 // It reports false for replays (nonzero count at or below the last count
 // with no new last sequence) so replayed heartbeats draw no ACK. Last and
 // Count only move forward, so delayed heartbeats never reopen old ranges.
+// Table eviction logs after unlock so logging never holds the backend lock.
 func (b *Backend) noteSedpHeartbeatBound(remote WriterGUID, beat rtps.Heartbeat) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.sedpHeartbeatLast == nil {
-		b.sedpHeartbeatLast = make(map[WriterGUID]uint64)
-	}
-	if b.sedpHeartbeatCount == nil {
-		b.sedpHeartbeatCount = make(map[WriterGUID]int32)
-	}
-
-	if _, seen := b.sedpHeartbeatLast[remote]; !seen {
-		if _, seenCount := b.sedpHeartbeatCount[remote]; !seenCount {
-			b.capSedpHeartbeatLocked(remote)
-		}
-	}
-
+	evicted, haveEvicted := b.prepareSedpHeartbeatTableLocked(remote)
 	lastCount := b.sedpHeartbeatCount[remote]
 	lastLast := b.sedpHeartbeatLast[remote]
-	if beat.Count != 0 && lastCount != 0 && beat.Count <= lastCount && beat.LastSequence <= lastLast {
+	if isSedpHeartbeatReplay(beat, lastCount, lastLast) {
+		b.mu.Unlock()
+		logSedpHeartbeatEvict(evicted, haveEvicted)
+
 		return false
 	}
 
@@ -3509,7 +3540,45 @@ func (b *Backend) noteSedpHeartbeatBound(remote WriterGUID, beat rtps.Heartbeat)
 		b.sedpHeartbeatCount[remote] = beat.Count
 	}
 
+	b.mu.Unlock()
+	logSedpHeartbeatEvict(evicted, haveEvicted)
+
 	return true
+}
+
+// prepareSedpHeartbeatTableLocked ensures heartbeat tables exist and caps them.
+//
+// The caller must hold b.mu for write. It returns the evicted guid for the
+// caller to log after unlock.
+func (b *Backend) prepareSedpHeartbeatTableLocked(remote WriterGUID) (WriterGUID, bool) {
+	if b.sedpHeartbeatLast == nil {
+		b.sedpHeartbeatLast = make(map[WriterGUID]uint64)
+	}
+	if b.sedpHeartbeatCount == nil {
+		b.sedpHeartbeatCount = make(map[WriterGUID]int32)
+	}
+
+	if _, seen := b.sedpHeartbeatLast[remote]; !seen {
+		if _, seenCount := b.sedpHeartbeatCount[remote]; !seenCount {
+			evicted, haveEvicted := b.capSedpHeartbeatLocked(remote)
+
+			return evicted, haveEvicted
+		}
+	}
+
+	return WriterGUID{}, false
+}
+
+// isSedpHeartbeatReplay reports whether a heartbeat replays known state.
+func isSedpHeartbeatReplay(beat rtps.Heartbeat, lastCount int32, lastLast uint64) bool {
+	return beat.Count != 0 && lastCount != 0 && beat.Count <= lastCount && beat.LastSequence <= lastLast
+}
+
+// logSedpHeartbeatEvict logs one table eviction after unlock.
+func logSedpHeartbeatEvict(evicted WriterGUID, haveEvicted bool) {
+	if haveEvicted {
+		log.Printf("dds: sedp heartbeat table full evict guid=%x", evicted)
+	}
 }
 
 // routeDiscoveryData enqueues one DATA submessage to SPDP or SEDP when builtin.
@@ -4129,8 +4198,18 @@ func (b *Backend) HasRemoteEndpoint(topic string) bool {
 // timeout it still returns so the caller sends best-effort for Weld-to-Weld
 // peers that never announce readers. Context cancellation aborts early.
 // A single stopped timer with Reset paces polls instead of a fresh timer
-// per tick.
+// per tick. Deadline timing uses the backend clock so fake-clock tests
+// control it; the 20ms poll ticker keeps wall-clock intentionally because
+// it paces polls, not leases.
 func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) {
+	b.waitForMatchingReaderAt(ctx, ep, b.backendNow())
+}
+
+// waitForMatchingReaderAt polls with an explicit start time for tests.
+//
+// It shares the matching and poll rules used by waitForMatchingReader so
+// fake-clock tests pin timeout without touching wall-clock.
+func (b *Backend) waitForMatchingReaderAt(ctx context.Context, ep SEDPEndpoint, now time.Time) {
 	if b.hasMatchingRemoteReader(ep) {
 		return
 	}
@@ -4138,8 +4217,8 @@ func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) {
 	timer := newStoppedTimer()
 	defer timer.Stop()
 
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := now.Add(1 * time.Second)
+	for b.backendNow().Before(deadline) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -4591,10 +4670,18 @@ func (b *Backend) dispatchPublish(
 
 // preparePublishLocked declares one writer and snapshots its route.
 //
-// The caller must hold publishMu for write and must unlock on return. It
-// declares the SEDP writer, snapshots routes, resolves the DATA writer,
-// announces once, and aligns the publisher. It returns the endpoint,
-// writer, ports, and whether the sample needs plain interop waits.
+// The caller must hold publishMu for write on entry and must keep it held
+// across the framed send in dispatchPublish; dispatchPublish unlocks after
+// PublishTo returns. Holding the lock across prepare plus send keeps
+// single-flight ordering for the shared Publisher GUID plus sequence so
+// concurrent topics cannot interleave find plus align plus PublishTo and
+// emit A under writer B. The plain path is the exception: dispatchPublish
+// unlocks before waitForMatchingReader plus pauseForPeerProcessing, then
+// re-locks and re-snapshots routes plus re-aligns before sending so waits
+// never block concurrent topics. It declares the SEDP writer, snapshots
+// routes, resolves the DATA writer, announces once, and aligns the
+// publisher. It returns the endpoint, writer, ports, and whether the sample
+// needs plain interop waits.
 func (b *Backend) preparePublishLocked(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot) (SEDPEndpoint, WriterGUID, []int, bool, error) {
 	ep, err := b.declarePublishWriter(snap.sedp, msg)
 	if err != nil {
@@ -4665,43 +4752,6 @@ func (b *Backend) writerForPublish(snap publishSnapshot, ep SEDPEndpoint) Writer
 	}
 
 	return snap.publisher.GUID()
-}
-
-// announceWriterForPublish sends synchronous SEDP plus matching wait for interop writers.
-func (b *Backend) announceWriterForPublish(
-	ctx context.Context,
-	msg transports.OutgoingMessage,
-	ep SEDPEndpoint,
-	writer WriterGUID,
-	snap publishSnapshot,
-) error {
-	if ep.ID == (SEDPGUID{}) {
-		return nil
-	}
-
-	err := b.announceWriterOnce(ctx, ep)
-	if err != nil {
-		if errors.Is(err, ErrNoRoute) {
-			return routeError(msg.TopicName, snap.domain, err)
-		}
-
-		return err
-	}
-
-	b.alignPublisherGUID(snap.publisher, writer)
-
-	if !isPlainCDRSample(msg.Payload, msg.TypeName) {
-		return nil
-	}
-
-	b.waitForMatchingReader(ctx, ep)
-
-	err = b.pauseForPeerProcessing(ctx)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // PublishBytes publishes one serialized message through the data path.

@@ -184,11 +184,13 @@ func LeaseRxOInputs(offered, requested QoSProfile) (Duration, Duration) {
 //
 // Unspecified, infinite, best available sentinel, and negative malformed
 // inputs count as no constraint, matching the matcher rule that a
-// requested unspecified or infinite always flows and matching never
-// compares magnitudes beyond default. Both unconstrained yields
-// unspecified, which never expires. One finite side yields that side. Two
-// finite sides yield the minimum so a dead writer turns stale at the
-// earliest promise. Malformed negative stays quiet here and fails loudly
+// requested unspecified or infinite always flows, an offered default cannot
+// satisfy a finite request, and a requested lease shorter than the offered
+// lease fails while a shorter offered lease satisfies a longer request.
+// Both unconstrained yields unspecified, which never expires. One finite
+// side yields that side. Two finite sides yield the minimum so a dead
+// writer turns stale at the earliest promise. Malformed negative and
+// nanoseconds at or above one second stay quiet here and fail loudly
 // in Validate instead of skewing the fold.
 func EffectiveLeaseDuration(offered, requested Duration) Duration {
 	offeredFree := livelinessNoConstraint(offered)

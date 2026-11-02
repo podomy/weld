@@ -10,6 +10,13 @@ import (
 
 // TestRunClosersFirstError pins that teardown returns the first error while
 // still running every closer.
+//
+// Node.Close first-error has no dedicated test by construction:
+// takeClosersLocked only collects Publisher, Subscription, ServiceServer,
+// and ServiceClient Close methods, all of which are infallible and return
+// nil. runClosers first-error coverage above is the meaningful pin; a
+// Node.Close failure injection would require a failing closer type that
+// the plumbing does not admit.
 func TestRunClosersFirstError(t *testing.T) {
 	firstErr := newTestBoomError("first")
 	secondErr := newTestBoomError("second")

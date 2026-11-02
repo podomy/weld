@@ -493,7 +493,7 @@ func (s *ActionServer) PublishFeedback(goalID string, payload []byte, nowNanos i
 // It serves in flight goals and retained terminal results, so a client
 // that attaches after publication still reads history. Payloads are deep
 // copied. Expired results error as timed out and are evicted. Unknown IDs
-// error.
+// error. Each read sweeps all expired results, not only the queried ID.
 func (s *ActionServer) FeedbackSnapshot(goalID string, nowNanos int64) ([]FeedbackSample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,16 +505,21 @@ func (s *ActionServer) FeedbackSnapshot(goalID string, nowNanos int64) ([]Feedba
 	}
 	res, ok := s.results[goalID]
 	if !ok {
+		s.purgeExpiredLocked(nowNanos)
 		return nil, fmt.Errorf("core: action %q: unknown goal %q for feedback", s.name, goalID)
 	}
 	if s.isExpiredLocked(res, nowNanos) {
 		delete(s.results, goalID)
+		s.purgeExpiredLocked(nowNanos)
 		return nil, fmt.Errorf("core: action %q: feedback for goal %q timed out", s.name, goalID)
 	}
+	s.purgeExpiredLocked(nowNanos)
 	return copyFeedback(res.feedback), nil
 }
 
 // FeedbackLost returns the drop count for one goal and whether it exists.
+//
+// Each read sweeps all expired results, not only the queried ID.
 func (s *ActionServer) FeedbackLost(goalID string, nowNanos int64) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -526,12 +531,15 @@ func (s *ActionServer) FeedbackLost(goalID string, nowNanos int64) (uint64, bool
 	}
 	res, ok := s.results[goalID]
 	if !ok {
+		s.purgeExpiredLocked(nowNanos)
 		return 0, false
 	}
 	if s.isExpiredLocked(res, nowNanos) {
 		delete(s.results, goalID)
+		s.purgeExpiredLocked(nowNanos)
 		return 0, false
 	}
+	s.purgeExpiredLocked(nowNanos)
 	return res.lost, true
 }
 
@@ -575,6 +583,7 @@ func (s *ActionServer) CompleteGoal(goalID string, status GoalStatus, result []b
 // acceptance: a goal accepted at T0 and completed at T1 expires at T1
 // plus the result timeout. Expired entries are evicted and report a
 // timeout. In flight goals report not complete. Unknown IDs error.
+// Each read sweeps all expired results, not only the queried ID.
 func (s *ActionServer) GetResult(goalID string, nowNanos int64) ([]byte, GoalStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -586,12 +595,15 @@ func (s *ActionServer) GetResult(goalID string, nowNanos int64) ([]byte, GoalSta
 	}
 	res, ok := s.results[goalID]
 	if !ok {
+		s.purgeExpiredLocked(nowNanos)
 		return nil, GoalUnknown, fmt.Errorf("core: action %q: unknown goal %q for result", s.name, goalID)
 	}
 	if s.isExpiredLocked(res, nowNanos) {
 		delete(s.results, goalID)
+		s.purgeExpiredLocked(nowNanos)
 		return nil, GoalUnknown, fmt.Errorf("core: action %q: result for goal %q timed out", s.name, goalID)
 	}
+	s.purgeExpiredLocked(nowNanos)
 	return append([]byte(nil), res.payload...), res.status, nil
 }
 
@@ -664,7 +676,8 @@ func (s *ActionServer) PendingGoalID() (string, bool) {
 //
 // Retained results report their terminal status until the result timeout
 // expires from completion; expired entries are evicted and report false.
-// Unknown IDs report false.
+// Unknown IDs report false. Each read sweeps all expired results, not
+// only the queried ID.
 func (s *ActionServer) GoalStatusOf(goalID string, nowNanos int64) (GoalStatus, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -676,12 +689,15 @@ func (s *ActionServer) GoalStatusOf(goalID string, nowNanos int64) (GoalStatus, 
 	}
 	res, ok := s.results[goalID]
 	if !ok {
+		s.purgeExpiredLocked(nowNanos)
 		return GoalUnknown, false
 	}
 	if s.isExpiredLocked(res, nowNanos) {
 		delete(s.results, goalID)
+		s.purgeExpiredLocked(nowNanos)
 		return GoalUnknown, false
 	}
+	s.purgeExpiredLocked(nowNanos)
 	return res.status, true
 }
 

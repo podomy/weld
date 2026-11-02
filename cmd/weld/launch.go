@@ -109,7 +109,7 @@ func buildLaunchFinal(forwarded launch.NodeOptions, cfg launchFlagConfig, stderr
 func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	err := ctx.Err()
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		_, _ = fmt.Fprintln(stderr, "weld: "+oneLine(err)) //nolint:errcheck // final error output is best effort
 		return 1
 	}
 	if isHelpRequest(args) {
@@ -132,7 +132,7 @@ func runLaunchCommand(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	err = ctx.Err()
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
+		_, _ = fmt.Fprintln(stderr, "weld: "+oneLine(err)) //nolint:errcheck // final error output is best effort
 		return 1
 	}
 	printLaunchResult(stdout, fqn, forwarded.Remaps, dump, sdfPath)

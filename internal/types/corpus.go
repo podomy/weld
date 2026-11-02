@@ -63,8 +63,9 @@
 //     topological order and Header-first field order, then run
 //     go test ./internal/types/ -run TestCorpus -count=1.
 //
-// OPEN ITEM: bounded strings have no corpus fixture, so bounded string
-// support stays gated as unproven until an external fixture proves it.
+// OPEN ITEM: no external ROS corpus entry exercises bounded strings,
+// the in-repo BoundedStringHolder covers the plumbing path only, so
+// bounded string support stays gated pending external corpus coverage.
 package types
 
 // CorpusKind names the IDL definition kind for a corpus entry.

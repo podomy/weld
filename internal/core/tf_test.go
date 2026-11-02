@@ -4,6 +4,7 @@
 package core
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +29,8 @@ func TestTF(t *testing.T) {
 	t.Run("reverse inverse", checkTFReverseInverse)
 	t.Run("lookup timeout", checkTFLookupTimeout)
 	t.Run("lookup frozen clock", checkTFLookupFrozenClock)
+	t.Run("lookup huge timeout rejects", checkTFLookupHugeTimeout)
+	t.Run("compose missing edge names route", checkTFComposeMissingEdge)
 	t.Run("jump clears dynamics", checkTFJumpClearsDynamics)
 	t.Run("dynamic bound", checkTFDynamicBound)
 	t.Run("concurrent store lookup", checkTFConcurrentStoreLookup)
@@ -717,5 +720,45 @@ func checkTFLookupFrozenClock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("frozen buffer clock livelocked past wall bound")
+	}
+}
+
+// checkTFLookupHugeTimeout pins saturating timeouts fail fast on a frozen clock.
+func checkTFLookupHugeTimeout(t *testing.T) {
+	t.Helper()
+	store := NewTFStore()
+	clock := NewClockState(ClockWall, 1000, 1000)
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.LookupWithTimeout("map", "odom", 0, math.MaxInt64, clock)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("huge timeout must fail")
+		}
+		if !strings.Contains(err.Error(), "saturates to infinite") {
+			t.Fatalf("huge timeout must name saturation, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("huge timeout livelocked past fast rejection")
+	}
+	_, err := store.LookupWithTimeout("map", "odom", 0, math.MaxInt64-1, clock)
+	if err == nil || !strings.Contains(err.Error(), "saturates to infinite") {
+		t.Fatalf("sentinel timeout must fail fast, got %v", err)
+	}
+}
+
+// checkTFComposeMissingEdge pins the fallback error names the missing edge.
+func checkTFComposeMissingEdge(t *testing.T) {
+	t.Helper()
+	path := []tfEdge{{key: tfKey{parent: "map", child: "odom"}, forward: true}}
+	_, err := tfComposePath(map[tfKey][]TransformStamped{}, map[tfKey]TransformStamped{}, path, 0)
+	if err == nil {
+		t.Fatal("missing sample must fail")
+	}
+	if !strings.Contains(err.Error(), `"map"`) || !strings.Contains(err.Error(), `"odom"`) {
+		t.Fatalf("missing edge must name route, got %v", err)
 	}
 }

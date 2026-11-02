@@ -891,3 +891,38 @@ func TestLoanStaleSliceReuse(t *testing.T) {
 	stale := checkLoanReturnZeroes(t, pool)
 	checkLoanRecycledReuse(t, pool, stale)
 }
+
+// TestLoanBorrowAppendIsolation pins capped capacity so append allocates.
+func TestLoanBorrowAppendIsolation(t *testing.T) {
+	t.Parallel()
+	pool, err := NewLoanPool(2, 64)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	loan, err := pool.Borrow(loanEligibleTable(), 4)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer func() {
+		err := loan.Return()
+		if err != nil {
+			t.Errorf("return: %v", err)
+		}
+	}()
+	view, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	if cap(view) != len(view) {
+		t.Fatalf("cap %d differs from len %d, want capped view", cap(view), len(view))
+	}
+	copy(view, []byte{0x01, 0x02, 0x03, 0x04})
+	appended := append(view, 0xFF) //nolint:gocritic // test intentionally appends to a different slice to prove isolation
+	appended[0] = 0xAA
+	if view[0] != 0x01 {
+		t.Fatalf("view byte 0 = %#02x after append mutation, want isolation", view[0])
+	}
+	if len(appended) != 5 {
+		t.Fatalf("appended len = %d, want 5", len(appended))
+	}
+}

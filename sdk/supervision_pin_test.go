@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/sdk"
 )
@@ -197,5 +198,170 @@ func checkPartialRuns(t *testing.T, ran map[string]int, group *sdk.SerialGroup, 
 	}
 	if ran["last"] != 0 {
 		t.Fatalf("last runs = %d, want 0", ran["last"])
+	}
+}
+
+// waitSerialSignal waits for a start signal with a loud timeout.
+func waitSerialSignal(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not start", label)
+	}
+}
+
+// assertSerialBlocked pins that done stays pending for a short window,
+// proving serialization instead of concurrent completion.
+func assertSerialBlocked(t *testing.T, done <-chan error, label string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s completed concurrently: %v", label, err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// waitSerialDone waits for lifecycle completion with a loud timeout.
+func waitSerialDone(t *testing.T, done <-chan error, label string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not complete", label)
+	}
+}
+
+// TestSerialActivateVsDetachSerialized pins that Activate and Detach
+// serialize on opMu: Detach blocks while Activate runs callbacks instead
+// of removing concurrently.
+func TestSerialActivateVsDetachSerialized(t *testing.T) {
+	group, err := sdk.NewSerialGroup("activate-detach")
+	if err != nil {
+		t.Fatalf("new group: %v", err)
+	}
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	err = group.Attach(sdk.SerialEntity{
+		Name: "blocker",
+		Activate: func() error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach blocker: %v", err)
+	}
+	err = group.Attach(sdk.SerialEntity{
+		Name: "victim",
+		Activate: func() error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach victim: %v", err)
+	}
+	err = group.Configure()
+	if err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	activateDone := make(chan error, 1)
+	go func() {
+		activateDone <- group.Activate()
+	}()
+	waitSerialSignal(t, started, "activate")
+	detachDone := make(chan error, 1)
+	go func() {
+		detachDone <- group.Detach("victim")
+	}()
+	assertSerialBlocked(t, detachDone, "detach during activate")
+	close(release)
+	waitSerialDone(t, activateDone, "activate")
+	waitSerialDone(t, detachDone, "detach after activate")
+	if group.Len() != 1 {
+		t.Fatalf("len = %d, want 1 after detach", group.Len())
+	}
+	if !group.IsActive() {
+		t.Fatalf("group not active after serialized activate")
+	}
+}
+
+// TestSerialShutdownDuringDetachSerialized pins that Shutdown serializes
+// with Detach and excludes the detaching name: Shutdown blocks while
+// Detach runs Deactivate, then completes without running Shutdown on the
+// detached victim.
+func TestSerialShutdownDuringDetachSerialized(t *testing.T) {
+	group, err := sdk.NewSerialGroup("shutdown-detach")
+	if err != nil {
+		t.Fatalf("new group: %v", err)
+	}
+	release := make(chan struct{})
+	deactivateStarted := make(chan struct{}, 1)
+	victimShutdowns := &atomic.Int32{}
+	keeperShutdowns := &atomic.Int32{}
+	err = group.Attach(sdk.SerialEntity{
+		Name: "keeper",
+		Shutdown: func() error {
+			keeperShutdowns.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach keeper: %v", err)
+	}
+	err = group.Attach(sdk.SerialEntity{
+		Name: "victim",
+		Deactivate: func() error {
+			select {
+			case deactivateStarted <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+		Shutdown: func() error {
+			victimShutdowns.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("attach victim: %v", err)
+	}
+	err = group.Configure()
+	if err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	err = group.Activate()
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	detachDone := make(chan error, 1)
+	go func() {
+		detachDone <- group.Detach("victim")
+	}()
+	waitSerialSignal(t, deactivateStarted, "detach deactivate")
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- group.Shutdown()
+	}()
+	assertSerialBlocked(t, shutdownDone, "shutdown during detach")
+	close(release)
+	waitSerialDone(t, detachDone, "detach")
+	waitSerialDone(t, shutdownDone, "shutdown after detach")
+	if victimShutdowns.Load() != 0 {
+		t.Fatalf("victim shutdown runs = %d, want 0 excluded", victimShutdowns.Load())
+	}
+	if keeperShutdowns.Load() != 1 {
+		t.Fatalf("keeper shutdown runs = %d, want 1", keeperShutdowns.Load())
+	}
+	if group.Len() != 1 {
+		t.Fatalf("len = %d, want 1 after detach", group.Len())
 	}
 }

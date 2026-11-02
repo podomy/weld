@@ -467,3 +467,52 @@ func TestSecurityMalformedBenignStaysCompatible(t *testing.T) {
 		t.Fatalf("benign discovery must pass, got %v", err)
 	}
 }
+
+// TestSecurityMalformedValueSubstringStaysCompatible pins whole-name matching.
+func TestSecurityMalformedValueSubstringStaysCompatible(t *testing.T) {
+	t.Parallel()
+
+	good := secTestPropList(t, "dds.sec.auth.identity_ca", "see dds.sec.access.governance here")
+	malformed := append(append([]byte(nil), good...), 0xFF)
+	params := []rtps.Param{{ID: PIDPropertyList, Value: malformed}}
+
+	info, warnings := ExtractSecurityInfo(params)
+	if len(warnings) == 0 {
+		t.Fatalf("value-substring malformed list must warn")
+	}
+
+	if info.Classification != SecurityCompatibleUnknown {
+		t.Fatalf("value-substring class %q, want CompatibleUnknown", info.Classification)
+	}
+
+	err := CheckProtectedDiscovery(info)
+	if err != nil {
+		t.Fatalf("value-substring discovery must pass, got %v", err)
+	}
+
+	longKey := secTestPropList(t, "dds.sec.access.governance_extra", "file:material")
+	longMalformed := append(append([]byte(nil), longKey...), 0xFF)
+	longParams := []rtps.Param{{ID: PIDPropertyList, Value: longMalformed}}
+
+	longInfo, longWarnings := ExtractSecurityInfo(longParams)
+	if len(longWarnings) == 0 {
+		t.Fatalf("long-key malformed list must warn")
+	}
+
+	if longInfo.Classification != SecurityCompatibleUnknown {
+		t.Fatalf("long-key class %q, want CompatibleUnknown", longInfo.Classification)
+	}
+
+	realList := secTestPropList(t, "dds.sec.access.governance", "file:gov.p7s")
+	realMalformed := append(append([]byte(nil), realList...), 0xFF)
+	realParams := []rtps.Param{{ID: PIDPropertyList, Value: realMalformed}}
+
+	realInfo, realWarnings := ExtractSecurityInfo(realParams)
+	if len(realWarnings) == 0 {
+		t.Fatalf("real hard-require malformed list must warn")
+	}
+
+	if realInfo.Classification != SecurityRequiresCrypto {
+		t.Fatalf("real class %q, want RequiresCrypto", realInfo.Classification)
+	}
+}

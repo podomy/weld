@@ -376,6 +376,38 @@ func TestDetectMismatchesSorted(t *testing.T) {
 	}
 }
 
+// TestDetectMismatchesCollidingGID pins that sorting compares publisher then
+// subscriber separately. Pub a plus sub bc collides with pub ab plus sub c
+// under concatenated compare (both abc) but must order a before ab.
+func TestDetectMismatchesCollidingGID(t *testing.T) {
+	eps := []topicEndpoint{
+		newTopicEndpointWithQoS("a", "/chatter", "t", "h", false, topicTestBestEffort()),
+		newTopicEndpointWithQoS("ab", "/chatter", "t", "h", false, topicTestBestEffort()),
+		newTopicEndpointWithQoS("bc", "/chatter", "t", "h", true, topicTestQoS()),
+		newTopicEndpointWithQoS("c", "/chatter", "t", "h", true, topicTestQoS()),
+	}
+	got := detectMismatches("/chatter", eps)
+	if len(got) == 0 {
+		t.Fatalf("colliding mismatches missing")
+	}
+	first := -1
+	second := -1
+	for i, m := range got {
+		if m.Publisher == "a" && m.Subscriber == "bc" && first < 0 {
+			first = i
+		}
+		if m.Publisher == "ab" && m.Subscriber == "c" && second < 0 {
+			second = i
+		}
+	}
+	if first < 0 || second < 0 {
+		t.Fatalf("colliding pairs missing in %+v", got)
+	}
+	if first >= second {
+		t.Fatalf("colliding order wrong: (a,bc) at %d, (ab,c) at %d, want a before ab", first, second)
+	}
+}
+
 // TestFormatTopicList checks counts plus types plus hashes appear.
 func TestFormatTopicList(t *testing.T) {
 	summaries := []topicSummary{

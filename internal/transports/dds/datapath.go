@@ -496,6 +496,11 @@ type DataReceiver struct {
 	lost  uint64
 	drops uint64
 	sedp  *SEDPIndex
+	// now supplies FirstSeen times for provisional endpoints. It defaults to
+	// time.Now and tests may replace it with a fake clock. Wall-clock stays
+	// intentional for pacing timers elsewhere; only provisional expiry and
+	// FirstSeen use this source.
+	now func() time.Time
 	// provisional holds opportunistic endpoints for unknown writers.
 	//
 	// Each entry is tagged Provisional true with its FirstSeen time. It never
@@ -622,7 +627,20 @@ func NewDataReceiver() *DataReceiver {
 		last:         make(map[WriterGUID]uint64),
 		provisional:  make(map[WriterGUID]ProvisionalEndpoint),
 		reasonCounts: make(map[DropReason]uint64),
+		now:          time.Now,
 	}
+}
+
+// receiverNow returns the provisional clock, defaulting to wall-clock.
+//
+// It never returns nil so callers stay fake-clock controllable in tests
+// while production keeps time.Now without extra branches.
+func (r *DataReceiver) receiverNow() func() time.Time {
+	if r != nil && r.now != nil {
+		return r.now
+	}
+
+	return time.Now
 }
 
 // SetSEDPIndex installs the SEDP index for plain CDR topic resolution.
@@ -809,7 +827,21 @@ func (r *DataReceiver) evictStaleProvisionalLocked(now time.Time) {
 }
 
 // ensureProvisional returns the stored provisional for an unknown writer.
+//
+// It uses the receiver now-source for FirstSeen and stale sweep so tests
+// may inject a fake clock without changing Take or Subscribe signatures.
+// Production keeps wall-clock via time.Now. Callers that hold a backend
+// clock should set the receiver now-source from that clock at join.
 func (r *DataReceiver) ensureProvisional(guid WriterGUID, qos ProvisionalQoS, hasQoS bool) (ProvisionalEndpoint, bool) {
+	return r.ensureProvisionalAt(guid, qos, hasQoS, r.receiverNow()())
+}
+
+// ensureProvisionalAt installs a provisional record with an explicit now.
+//
+// It shares the SEDP precedence and never-overwrite rules used by
+// ensureProvisional so fake-clock tests pin FirstSeen exactly without
+// touching wall-clock.
+func (r *DataReceiver) ensureProvisionalAt(guid WriterGUID, qos ProvisionalQoS, hasQoS bool, now time.Time) (ProvisionalEndpoint, bool) {
 	if _, ok := r.remoteForGUID(guid); ok {
 		r.mu.Lock()
 		delete(r.provisional, guid)
@@ -829,12 +861,12 @@ func (r *DataReceiver) ensureProvisional(guid WriterGUID, qos ProvisionalQoS, ha
 		return existing, true
 	}
 
-	r.evictStaleProvisionalLocked(time.Now())
+	r.evictStaleProvisionalLocked(now)
 
 	ep := ProvisionalEndpoint{
 		GUID:        guid,
 		Provisional: true,
-		FirstSeen:   time.Now(),
+		FirstSeen:   now,
 	}
 
 	if hasQoS {
@@ -1511,14 +1543,16 @@ func (r *DataReceiver) countPlainDrop(guid WriterGUID, cause error, op string) e
 
 // trackSequenceLocked records one sequence for best effort ordering.
 //
-// The caller must hold mu. The zero value is not usable: use NewDataReceiver.
-// The nil map guards allocation so a zero value does not panic, but callers
-// must still use NewDataReceiver for correct drop and lost accounting. The
-// first sample from a GUID is accepted with no lost count. A gap adds the
-// skipped count to lost and accepts the current frame. A duplicate or old
-// sequence counts a drop and returns ErrStaleSequence. Distinct writers stay
-// bounded by maxTrackedWriters with loud eviction so writer churn cannot
-// grow take state without limit.
+// The caller must hold mu for write. The zero value is not usable: use
+// NewDataReceiver. The nil map guards allocation so a zero value does not
+// panic, but callers must still use NewDataReceiver for correct drop and
+// lost accounting. The first sample from a GUID is accepted with no lost
+// count. A gap adds the skipped count to lost and accepts the current frame.
+// A duplicate or old sequence counts a drop and returns ErrStaleSequence.
+// Distinct writers stay bounded by maxTrackedWriters with loud eviction so
+// writer churn cannot grow take state without limit. Eviction logs after a
+// temporary unlock so logging never holds the receiver lock; the function
+// re-locks before return so the caller still holds mu on return.
 func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
 	if r.last == nil {
 		r.last = make(map[WriterGUID]uint64)
@@ -1535,9 +1569,12 @@ func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
 				delete(r.lively, victim)
 				delete(r.provisional, victim)
 				r.drops++
+				r.last[guid] = seq
+				r.mu.Unlock()
 				log.Printf("dds: take table full evict guid=%x", victim)
+				r.mu.Lock()
 
-				break
+				return nil
 			}
 		}
 		r.last[guid] = seq

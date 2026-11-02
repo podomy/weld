@@ -459,13 +459,22 @@ func checkGraphConcurrent(t *testing.T) {
 	t.Helper()
 	g := NewGraph()
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes := 0
 	for i := range 8 {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
 			gid := sampleGID(byte(40 + n)) //nolint:gosec // G115 safe: n is 0..7 so 40+n is 40..47 fits byte
 			info := sampleEntityInfo()
-			_ = g.UpsertWriter(gid, info) //nolint:errcheck // valid sample info never fails, final drain assertion verifies
+			err := g.UpsertWriter(gid, info)
+			if err != nil {
+				t.Errorf("UpsertWriter %d: %v", n, err)
+				return
+			}
+			mu.Lock()
+			successes++
+			mu.Unlock()
 			_, _ = g.Writer(gid)
 			_ = g.WriterCount()
 			_ = g.Writers()
@@ -474,6 +483,11 @@ func checkGraphConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if successes != 8 {
+		t.Fatalf("concurrent upserts must all succeed, got %d", successes)
+	}
 	if g.WriterCount() != 0 {
 		t.Fatalf("concurrent writers must drain, got %d", g.WriterCount())
 	}

@@ -1441,6 +1441,79 @@ func TestBackendSnoopAnnouncementRoutes(t *testing.T) {
 	checkSnoopDispose(t, backend, guid, domain, local)
 }
 
+// TestBackendSnoopTombstoneBlocksStaleRoute pins the tombstone route gate.
+//
+// After a dispose removes the route, a stale alive at or below the
+// tombstone sequence must not reinstall routes even though no table entry
+// exists; only a newer alive reinstalls. The test mirrors the live path:
+// snoop installs routes while HandlePacket advances the table, so the
+// dispose leaves a tombstone the route gate consults.
+func TestBackendSnoopTombstoneBlocksStaleRoute(t *testing.T) {
+	clearBackendEnv(t)
+
+	backend, err := NewBackend(DefaultSidecarConfig())
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	const domain uint32 = 26
+
+	local, err := NewLocalParticipant(domain, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+
+	// Mirror a joined backend: snoop installs routes while the table
+	// advances generations, exactly like the live demux plus listen loop.
+	backend.remotes = NewRemoteTable(nil)
+
+	snoop := func(t *testing.T, packet []byte) {
+		t.Helper()
+		if _, keep := backend.snoopAnnouncement(packet, domain, local); !keep {
+			t.Fatalf("snoop keep is false, want true")
+		}
+		if err := backend.remotes.HandlePacket(packet, time.Now()); err != nil {
+			t.Fatalf("table handle: %v", err)
+		}
+	}
+
+	var guid GUID
+	guid.Prefix[0] = 0xCC
+	guid.Prefix[1] = 0xDD
+	guid.EntityID = [4]byte{0x00, 0x00, 0x01, 0xC1}
+
+	alive := mustMarshalAliveBackend(t, guid, domain, 5)
+	snoop(t, alive)
+	assertRoutePresent(t, backend, guid.Prefix)
+
+	dispose, err := MarshalDisposePacket(guid, domain, 6)
+	if err != nil {
+		t.Fatalf("dispose packet: %v", err)
+	}
+	snoop(t, dispose)
+	assertRouteAbsent(t, backend, guid.Prefix)
+
+	stale := mustMarshalAliveBackend(t, guid, domain, 5)
+	if _, keep := backend.snoopAnnouncement(stale, domain, local); !keep {
+		t.Fatalf("stale keep is false, want true (snoop keeps, table rejects)")
+	}
+	if err := backend.remotes.HandlePacket(stale, time.Now()); !errors.Is(err, ErrStaleSPDP) {
+		t.Fatalf("stale table handle = %v, want ErrStaleSPDP", err)
+	}
+	assertRouteAbsent(t, backend, guid.Prefix)
+
+	newer := mustMarshalAliveBackend(t, guid, domain, 7)
+	snoop(t, newer)
+	assertRoutePresent(t, backend, guid.Prefix)
+}
+
 // TestBackendGenerationBumps checks discovery plus SPDP plus SEDP counters.
 func TestBackendGenerationBumps(t *testing.T) {
 	backend := newTestBackend(t, DefaultSidecarConfig())

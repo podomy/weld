@@ -2446,3 +2446,126 @@ func TestSPDPDisposeTombstoneUniformWindow(t *testing.T) {
 		t.Fatalf("sweep reaped refreshed tombstone early, want 0")
 	}
 }
+
+// TestParseNewestDATASelectsHighestSequence pins multi-DATA newest selection.
+//
+// A datagram carrying two SPDP DATA samples with sequences 5 and 9 must
+// parse as sequence 9: every DATA validates, prefix mismatches drop loudly,
+// and only the highest sequence wins.
+func TestParseNewestDATASelectsHighestSequence(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0xC1)
+	lease := 10 * time.Second
+	pktFive := mustMarshalAlive(t, guid, 0, 5, lease)
+	pktNine := mustMarshalAlive(t, guid, 0, 9, lease)
+
+	var drops rtps.Counter
+	hdr, rawsFive, err := rtps.DecodeMessage(pktFive, &drops)
+	if err != nil {
+		t.Fatalf("decode five: %v", err)
+	}
+
+	_, rawsNine, err := rtps.DecodeMessage(pktNine, &drops)
+	if err != nil {
+		t.Fatalf("decode nine: %v", err)
+	}
+
+	combined, err := rtps.EncodeMessage(hdr, append(append([]rtps.RawSubmessage(nil), rawsFive...), rawsNine...))
+	if err != nil {
+		t.Fatalf("encode combined: %v", err)
+	}
+
+	ann := mustParse(t, combined)
+	if ann.Sequence != 9 {
+		t.Fatalf("sequence = %d, want 9 newest", ann.Sequence)
+	}
+}
+
+// TestPatchDualInlinePayloadLocators pins patching both sections.
+//
+// A DATA sample carrying unicast locators in inline QoS and in the payload
+// must patch both to the new port without touching other bytes.
+func TestPatchDualInlinePayloadLocators(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0xC2)
+	domainRaw := domainRawBytes(0)
+	advertise := rtps.AdvertiseIPv4()
+	locatorOld := rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, 10001, advertise)
+
+	guidParam := rtps.Param{ID: rtps.PIDParticipantGUID, Value: guidBytes(guid)}
+	domainParam := rtps.Param{ID: pidDomainID, Value: append([]byte(nil), domainRaw[:]...)}
+	leaseSec, leaseNano, err := durationToParts(10 * time.Second)
+	if err != nil {
+		t.Fatalf("lease parts: %v", err)
+	}
+
+	var leaseRaw [8]byte
+	binary.LittleEndian.PutUint32(leaseRaw[0:4], leaseSec)
+	binary.LittleEndian.PutUint32(leaseRaw[4:8], leaseNano)
+	leaseParam := rtps.Param{ID: rtps.PIDParticipantLeaseDuration, Value: append([]byte(nil), leaseRaw[:]...)}
+	metaParam := rtps.Param{ID: rtps.PIDMetatrafficUnicastLocator, Value: locatorOld}
+	inlineParams := []rtps.Param{guidParam, domainParam, leaseParam, metaParam}
+
+	payloadParams := []rtps.Param{guidParam, domainParam, leaseParam, metaParam}
+	payloadEnc, err := encodeSPDPParams(payloadParams)
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+
+	inlineQoS := make([]rtps.Parameter, 0, len(inlineParams))
+	for _, p := range inlineParams {
+		inlineQoS = append(inlineQoS, rtps.Parameter(p))
+	}
+
+	data := rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       rtps.EntitySPDPWriter,
+		SequenceNumber: 11,
+		InlineQoS:      inlineQoS,
+		Payload:        payloadEnc,
+	}
+
+	sub, err := data.Submessage(true)
+	if err != nil {
+		t.Fatalf("data submessage: %v", err)
+	}
+
+	hdr := rtps.DefaultHeader([12]byte(guid.Prefix))
+	packet, err := rtps.EncodeMessage(hdr, []rtps.RawSubmessage{sub})
+	if err != nil {
+		t.Fatalf("encode message: %v", err)
+	}
+
+	patched := patchSPDPLocatorPorts(packet, 23456)
+	ann := mustParse(t, patched)
+
+	if len(ann.Ports) != 2 {
+		t.Fatalf("patched ports = %v, want 2 dual entries", ann.Ports)
+	}
+
+	for i, port := range ann.Ports {
+		if port != 23456 {
+			t.Fatalf("patched port %d = %d, want 23456", i, port)
+		}
+	}
+}
+
+// TestCheckSPDPInfoDstShortBodyDrops pins loud short INFO_DST handling.
+func TestCheckSPDPInfoDstShortBodyDrops(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0xC3)
+	hdr := rtps.DefaultHeader([12]byte(guid.Prefix))
+	shortBody := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	data, err := rtps.EncodeMessage(hdr, []rtps.RawSubmessage{{ID: rtps.SubmessageInfoDst, Flags: 0x01, Body: shortBody}})
+	if err != nil {
+		t.Fatalf("encode short INFO_DST: %v", err)
+	}
+
+	err = checkSPDPInfoDstUnicast(data, guid.Prefix)
+	if !errors.Is(err, ErrInvalidSPDP) {
+		t.Fatalf("short INFO_DST err = %v, want ErrInvalidSPDP", err)
+	}
+}

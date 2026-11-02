@@ -556,3 +556,62 @@ func TestDurabilityServiceCompatRejectsNegativeDepth(t *testing.T) {
 		t.Fatalf("swapped reason %q misses history depth", swapped.Reason)
 	}
 }
+
+// TestDurabilityServiceCompatRejectsMalformedLimits pins limits below -1 as mismatch.
+func TestDurabilityServiceCompatRejectsMalformedLimits(t *testing.T) {
+	t.Parallel()
+
+	offered := DefaultDurabilityServiceQoS()
+	offered.MaxSamples = 10
+	requested := DefaultDurabilityServiceQoS()
+	requested.MaxSamples = -5
+	result := CheckDurabilityServiceCompat(offered, requested)
+	if result.Compatible {
+		t.Fatalf("requested max_samples -5 vs offered 10 compatible, want mismatch")
+	}
+	if !strings.Contains(result.Reason, "max_samples") {
+		t.Fatalf("reason %q misses max_samples", result.Reason)
+	}
+
+	bothBadOffered := DefaultDurabilityServiceQoS()
+	bothBadOffered.MaxSamples = -5
+	bothBadRequested := DefaultDurabilityServiceQoS()
+	bothBadRequested.MaxSamples = -5
+	both := CheckDurabilityServiceCompat(bothBadOffered, bothBadRequested)
+	if both.Compatible {
+		t.Fatalf("requested -5 vs offered -5 compatible, want mismatch")
+	}
+	if !strings.Contains(both.Reason, "max_samples") {
+		t.Fatalf("both reason %q misses max_samples", both.Reason)
+	}
+}
+
+// TestDurabilityServiceCompatRejectsNegativeCleanupDelay pins negative delay as mismatch.
+func TestDurabilityServiceCompatRejectsNegativeCleanupDelay(t *testing.T) {
+	t.Parallel()
+
+	infinite := DefaultDurabilityServiceQoS()
+	infinite.CleanupDelaySec = int32(durabilityServiceInfiniteSec)
+	infinite.CleanupDelayFrac = durabilityServiceInfiniteFrac
+	negative := DefaultDurabilityServiceQoS()
+	negative.CleanupDelaySec = -5
+	result := CheckDurabilityServiceCompat(infinite, negative)
+	if result.Compatible {
+		t.Fatalf("infinite offer vs requested delay -5 compatible, want mismatch")
+	}
+	if !strings.Contains(result.Reason, "service_cleanup_delay") {
+		t.Fatalf("reason %q misses service_cleanup_delay", result.Reason)
+	}
+
+	bothNegativeOffered := DefaultDurabilityServiceQoS()
+	bothNegativeOffered.CleanupDelaySec = -5
+	bothNegativeRequested := DefaultDurabilityServiceQoS()
+	bothNegativeRequested.CleanupDelaySec = -5
+	both := CheckDurabilityServiceCompat(bothNegativeOffered, bothNegativeRequested)
+	if both.Compatible {
+		t.Fatalf("equal negative delays compatible, want mismatch")
+	}
+	if !strings.Contains(both.Reason, "service_cleanup_delay") {
+		t.Fatalf("both reason %q misses service_cleanup_delay", both.Reason)
+	}
+}

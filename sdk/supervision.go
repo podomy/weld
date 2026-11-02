@@ -63,11 +63,22 @@ type serialEntry struct {
 // Cleanup, or Shutdown; the caller must drive the lifecycle explicitly
 // before Close. Close stays idempotent and a second Close is a quiet
 // success. Empty query results are always non-nil slices.
+//
+// Lifecycle serialization contract: Attach, Detach, Configure, Activate,
+// Deactivate, Cleanup, and Shutdown are serialized by opMu held across
+// each whole operation including callbacks. Concurrent callers block until
+// the in-flight operation completes, so callbacks never run concurrently
+// across lifecycle operations. Detaching names are excluded from Configure,
+// Activate, Deactivate, Cleanup, and Shutdown snapshots so Detach owns its
+// Deactivate exactly once. Entity callbacks must not reenter lifecycle
+// operations; no in-repo caller does so and reentry would deadlock on opMu.
 type SerialGroup struct {
 	// mu guards entries plus lifecycle flags.
 	mu sync.Mutex
 	// runMu serializes concurrent SpinOnce callers.
 	runMu sync.Mutex
+	// opMu serializes lifecycle operations including callbacks.
+	opMu sync.Mutex
 	// name identifies the group.
 	name string
 	// entries holds attached entities in attach order.
@@ -183,7 +194,8 @@ func (g *SerialGroup) IsClosed() bool {
 // callbacks before inserting. When it moves backward (true to false via
 // Cleanup, Deactivate, or Shutdown), Attach fails loudly without
 // inserting because it cannot un-run callbacks; the caller retries after
-// the lifecycle settles.
+// the lifecycle settles. Attach holds opMu across the whole operation
+// including callbacks so concurrent lifecycle operations serialize.
 func (g *SerialGroup) Attach(e SerialEntity) error {
 	if g == nil {
 		return errors.New("sdk: serial group attach on nil group") //nolint:wrapcheck // new error, nothing to wrap
@@ -191,6 +203,8 @@ func (g *SerialGroup) Attach(e SerialEntity) error {
 	if e.Name == "" {
 		return fmt.Errorf("sdk: serial group %q attach with empty entity name", g.name)
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	snap, err := g.snapshotAttach(e.Name)
 	if err != nil {
 		return err
@@ -333,9 +347,10 @@ func checkAttachBackward(g *SerialGroup, name string, ranConfigure, ranActivate 
 // Detach removes an entity by name. When active, Deactivate runs first,
 // exactly once: the first Detach marks detaching under the lock, runs
 // Deactivate outside the lock, then removes under the lock. A concurrent
-// Detach for the same name sees the mark and fails without running
+// Detach for the same name blocks on opMu then fails without running
 // Deactivate again. A failing Deactivate leaves the entry present for
-// retry and clears the mark.
+// retry and clears the mark. Detach holds opMu across the whole operation
+// including the callback.
 func (g *SerialGroup) Detach(name string) error {
 	if g == nil {
 		return errors.New("sdk: serial group detach on nil group") //nolint:wrapcheck // new error, nothing to wrap
@@ -343,6 +358,8 @@ func (g *SerialGroup) Detach(name string) error {
 	if name == "" {
 		return fmt.Errorf("sdk: serial group %q detach with empty entity name", g.name)
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
 	idx := findSerialIndex(g.entries, name)
 	if idx < 0 {
@@ -388,11 +405,15 @@ func (g *SerialGroup) Detach(name string) error {
 // until the caller retries Configure to completion before Activate.
 // Retrying reruns from the first entity in order, so Configure callbacks
 // should tolerate a second run after a partial failure. Callback order
-// stays forward in attach order.
+// stays forward in attach order. Configure holds opMu across the whole
+// operation including callbacks and skips detaching names so a concurrent
+// Detach owns its lifecycle exactly once.
 func (g *SerialGroup) Configure() error {
 	if g == nil {
 		return errors.New("sdk: serial group configure on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
@@ -407,7 +428,7 @@ func (g *SerialGroup) Configure() error {
 		return fmt.Errorf("sdk: serial group %q configure already in progress", g.name)
 	}
 	g.configuring = true
-	entities := copySerialEntities(g.entries)
+	entities := copySerialEntitiesExcluding(g.entries, g.detaching)
 	g.mu.Unlock()
 	for i := range entities {
 		err := callSerialCallback(entities[i].Configure)
@@ -437,11 +458,15 @@ func (g *SerialGroup) Configure() error {
 // did not. IsActive stays false and SpinOnce stays idle until the caller
 // retries Activate to completion. Retrying reruns from the first entity
 // in order. Drive order is Configure before Activate. Callback order
-// stays forward in attach order.
+// stays forward in attach order. Activate holds opMu across the whole
+// operation including callbacks and skips detaching names so a concurrent
+// Detach owns its lifecycle exactly once.
 func (g *SerialGroup) Activate() error {
 	if g == nil {
 		return errors.New("sdk: serial group activate on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
@@ -460,7 +485,7 @@ func (g *SerialGroup) Activate() error {
 		return fmt.Errorf("sdk: serial group %q activate already in progress", g.name)
 	}
 	g.activating = true
-	entities := copySerialEntities(g.entries)
+	entities := copySerialEntitiesExcluding(g.entries, g.detaching)
 	g.mu.Unlock()
 	for i := range entities {
 		err := callSerialCallback(entities[i].Activate)
@@ -490,11 +515,14 @@ func (g *SerialGroup) Activate() error {
 // while earlier entities did not. IsActive stays true until the caller
 // retries Deactivate to completion before Cleanup. Detach in flight for
 // one name is skipped here because that Detach owns its Deactivate
-// exactly once. Callback order stays reverse in attach order.
+// exactly once. Callback order stays reverse in attach order. Deactivate
+// holds opMu across the whole operation including callbacks.
 func (g *SerialGroup) Deactivate() error {
 	if g == nil {
 		return errors.New("sdk: serial group deactivate on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
 	if !g.active {
 		g.mu.Unlock()
@@ -521,11 +549,15 @@ func (g *SerialGroup) Deactivate() error {
 // Entities after the failure in reverse order already ran Cleanup while
 // earlier entities did not. IsConfigured stays true until the caller
 // retries Cleanup to completion. Drive order is Deactivate before
-// Cleanup. Callback order stays reverse in attach order.
+// Cleanup. Callback order stays reverse in attach order. Cleanup holds
+// opMu across the whole operation including callbacks and skips detaching
+// names so a concurrent Detach owns its lifecycle exactly once.
 func (g *SerialGroup) Cleanup() error {
 	if g == nil {
 		return errors.New("sdk: serial group cleanup on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
 	if !g.configured {
 		g.mu.Unlock()
@@ -535,7 +567,7 @@ func (g *SerialGroup) Cleanup() error {
 		g.mu.Unlock()
 		return fmt.Errorf("sdk: serial group %q cleanup while active; deactivate first", g.name)
 	}
-	entities := copySerialEntities(g.entries)
+	entities := copySerialEntitiesExcluding(g.entries, g.detaching)
 	g.mu.Unlock()
 	for _, entity := range slices.Backward(entities) {
 		err := callSerialCallback(entity.Cleanup)
@@ -557,12 +589,17 @@ func (g *SerialGroup) Cleanup() error {
 // ran Shutdown while earlier entities did not. The caller retries
 // Shutdown to completion before Close. Shutdown is terminal teardown and
 // runs even when inactive. Callback order stays reverse in attach order.
+// Shutdown holds opMu across the whole operation including callbacks and
+// skips detaching names so a concurrent Detach owns its lifecycle exactly
+// once.
 func (g *SerialGroup) Shutdown() error {
 	if g == nil {
 		return errors.New("sdk: serial group shutdown on nil group") //nolint:wrapcheck // new error, nothing to wrap
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	g.mu.Lock()
-	entities := copySerialEntities(g.entries)
+	entities := copySerialEntitiesExcluding(g.entries, g.detaching)
 	g.mu.Unlock()
 	for _, entity := range slices.Backward(entities) {
 		err := callSerialCallback(entity.Shutdown)
@@ -689,15 +726,6 @@ func findSerialIndex(entries []*serialEntry, name string) int {
 		}
 	}
 	return -1
-}
-
-// copySerialEntities copies entity values in attach order.
-func copySerialEntities(entries []*serialEntry) []SerialEntity {
-	out := make([]SerialEntity, len(entries))
-	for i := range entries {
-		out[i] = entries[i].entity
-	}
-	return out
 }
 
 // copySerialEntitiesExcluding copies entity values in attach order while

@@ -27,7 +27,6 @@
 package dds
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -453,7 +452,7 @@ func applySecurityPropertyFoldEndian(info *SecurityInfo, value []byte, littleEnd
 	info.PropertyListPresent = true
 	props, err := ParseSecurityPropertyListEndian(value, littleEndian)
 	if err != nil {
-		if hint, ok := securityRawCryptoHint(value); ok {
+		if hint, ok := securityRawCryptoHintEndian(value, littleEndian); ok {
 			info.Properties[hint] = "malformed-fail-closed"
 		}
 		return fmt.Errorf("dds: security property list: %w", err)
@@ -475,22 +474,82 @@ func mergeSecurityProperties(dst, src map[string]string) {
 //
 // A malformed list cannot decode, so the parsed map stays empty and the
 // peer would otherwise read as CompatibleUnknown. When the raw bytes
-// still carry a governance, permissions, or crypto key, the list must
-// fail closed as RequiresCrypto instead of downgrading. It returns the
-// matched key for a fail-closed marker, or false when no hard-require
-// marker is present.
+// still carry a governance, permissions, or crypto key as a whole property
+// name, the list must fail closed as RequiresCrypto instead of downgrading.
+// It returns the matched key for a fail-closed marker, or false when no
+// hard-require marker is present.
+//
+// Only whole property names count: names are parsed best-effort in CDR
+// order and compared by full equality (crypto by prefix), so a
+// hard-require substring inside a benign value or a longer key with a
+// hard-require prefix like governance_extra never misclassifies as
+// RequiresCrypto.
 func securityRawCryptoHint(value []byte) (string, bool) {
-	for key := range securityHardRequireKeys {
-		if bytes.Contains(value, []byte(key)) {
-			return key, true
-		}
+	if hint, ok := securityRawCryptoHintEndian(value, true); ok {
+		return hint, true
 	}
 
-	if bytes.Contains(value, []byte("dds.sec.crypto.")) {
-		return "dds.sec.crypto.malformed-fail-closed", true
+	hint, ok := securityRawCryptoHintEndian(value, false)
+	if ok {
+		return hint, true
 	}
 
 	return "", false
+}
+
+// securityRawCryptoHintEndian checks best-effort decoded names for a hard-require marker.
+func securityRawCryptoHintEndian(value []byte, littleEndian bool) (string, bool) {
+	names := securityPropertyNamesBestEffort(value, littleEndian)
+
+	for _, name := range names {
+		if securityHardRequireKeys[name] {
+			return name, true
+		}
+	}
+
+	for _, name := range names {
+		if strings.HasPrefix(name, "dds.sec.crypto.") {
+			return "dds.sec.crypto.malformed-fail-closed", true
+		}
+	}
+
+	return "", false
+}
+
+// securityPropertyNamesBestEffort extracts property names in CDR order until first failure.
+func securityPropertyNamesBestEffort(value []byte, littleEndian bool) []string {
+	if len(value) < 4 {
+		return nil
+	}
+
+	count := min(securityUint32(value[:4], littleEndian), securityMaxProperties)
+
+	var names []string
+
+	off := 4
+
+	for range count {
+		name, next, err := securityReadString(value, off, littleEndian)
+		if err != nil {
+			break
+		}
+
+		names = append(names, name)
+
+		_, next, err = securityReadString(value, next, littleEndian)
+		if err != nil {
+			break
+		}
+
+		next = securitySkipPropagateOptional(value, next, littleEndian)
+		off = next
+
+		if off >= len(value) {
+			break
+		}
+	}
+
+	return names
 }
 
 // securityMarkersSeen reports whether any info PID was sighted.

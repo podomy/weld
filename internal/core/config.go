@@ -283,6 +283,8 @@ type ParamDescriptor struct {
 	// Description documents the parameter for describe output.
 	Description string
 	// ReadOnly rejects Set after Declare while still allowing Declare.
+	// Equal-value writes succeed as no-ops with an empty event and no
+	// version bump, even on read-only parameters.
 	ReadOnly bool
 	// HasIntegerRange enables IntegerMin and IntegerMax for integers.
 	HasIntegerRange bool
@@ -1288,6 +1290,10 @@ func (s *ConfigStore) History() []ConfigHistoryEntry {
 }
 
 // HistorySince returns entries with version above since, oldest first.
+//
+// Validator and hook registration bumps Version without appending history,
+// so gaps in the version sequence cover only non-data bumps; every data
+// version carries at least one history entry.
 func (s *ConfigStore) HistorySince(since uint64) []ConfigHistoryEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1326,7 +1332,10 @@ func cloneEvent(e ConfigEvent) ConfigEvent {
 
 // Watch subscribes to future events. The returned version is the current
 // store version; HistorySince replays anything missed within the retained
-// window only, which holds the last configHistoryLimit entries. The channel
+// window only, which holds the last configHistoryLimit entries. Validator
+// and hook registration bumps Version without broadcasting, so a Watch
+// version may advance without a matching event; HistorySince gaps cover
+// only those non-data bumps. The channel
 // is buffered and never blocks the store: a full channel evicts its oldest
 // event and counts the eviction in BroadcastDrops. Call cancel to unsubscribe;
 // cancel closes the channel. Consumers must tolerate non-monotonic event
@@ -1427,6 +1436,8 @@ func (s *ConfigStore) SetAtomically(updates map[string]ParamValue) (ConfigEvent,
 // one versioned event. Unknown names auto-declare only when the store
 // allows undeclared parameters. Validators run outside the write lock
 // against a read snapshot; a concurrent mutation aborts loudly.
+// Equal-value writes are no-ops even on read-only parameters: they succeed
+// with an empty event and no version bump.
 func (s *ConfigStore) SetWithSource(updates map[string]ParamValue, source string) (ConfigEvent, error) {
 	if source == "" {
 		return ConfigEvent{}, errors.New("core: config: source is empty") //nolint:wrapcheck // new error, nothing to wrap
@@ -1731,7 +1742,9 @@ func (s *ConfigStore) prepareBatchLocked(
 
 // prepareSingleEntryLocked validates one remapped entry and appends its
 // change plus hooks plus validators. Equal stored values skip with no
-// change, so no-op writes never bump the version. The caller holds the
+// change, so no-op writes never bump the version. The equal check runs
+// before read-only enforcement, so equal-value writes to read-only
+// parameters succeed as no-ops. The caller holds the
 // write lock.
 func (s *ConfigStore) prepareSingleEntryLocked(name string, newValue ParamValue, descs map[string]ParamDescriptor, autoDeclare bool, changes *[]ConfigChange, hooks *[]hookCall, pending *[]pendingValidator) error {
 	entry, ok := s.params[name]
@@ -1877,7 +1890,9 @@ func (s *ConfigStore) trimHistoryLocked() {
 // per-watcher nonblocking send; a full channel evicts its oldest event and
 // counts loudly in BroadcastDrops, and a second full send drops loudly.
 // The evicted range stays available through HistorySince within the retained
-// window only. Never sends on a
+// window only. Only data batches broadcast; validator and hook registration
+// bumps Version without broadcasting, so HistorySince gaps cover only those
+// non-data bumps. Never sends on a
 // closed channel because cancel deletes under the store write lock then
 // closes under the watcher mutex, while broadcast sends only while holding
 // that same watcher mutex with closed false (generation-checked delivery).

@@ -120,16 +120,22 @@ func (b *Bus) unregisterService(service string, owner *ServiceServer) {
 	delete(b.services, service)
 }
 
-// lookupService returns the handler for a service name.
-func (b *Bus) lookupService(service string) (ServiceHandler, bool) {
+// lookupService returns the handler plus owner for a service name.
+//
+// The caller must recheck owner isClosed after lookup to linearize
+// against a concurrent Close: lookup alone does not prevent the server
+// from closing before the handler runs. Returning the owner lets the
+// caller fail with ErrNoSuchService when the server closed between lookup
+// and recheck instead of succeeding on a gone server.
+func (b *Bus) lookupService(service string) (ServiceHandler, *ServiceServer, bool) {
 	if b == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	rec, ok := b.services[service]
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	return rec.handler, true
+	return rec.handler, rec.owner, true
 }

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
@@ -116,11 +117,17 @@ func TestBackendBuildFragMessageRoundTrip(t *testing.T) {
 }
 
 // TestBackendFragBounds checks 32MiB cap and fragment count bounds.
+//
+//nolint:cyclop // test pins single, split, plan, and slice breadth in one run, splitting would obscure intent
 func TestBackendFragBounds(t *testing.T) {
 	t.Parallel()
 
-	if fragSingleMax != 65535-20 {
-		t.Fatalf("single max = %d, want %d", fragSingleMax, 65535-20)
+	if fragNeedsSplit(uint32(fragSingleMax)) {
+		t.Fatalf("needs split at single max %d returned true, want false", fragSingleMax)
+	}
+
+	if !fragNeedsSplit(uint32(fragSingleMax + 1)) {
+		t.Fatalf("needs split above single max returned false, want true")
 	}
 
 	if fragSendSize == 0 {
@@ -137,9 +144,26 @@ func TestBackendFragBounds(t *testing.T) {
 		t.Fatalf("fragment size = %d, want %d", fragmentSize, fragSendSize)
 	}
 
-	wantTotal := (uint64(sampleSize) + uint64(fragmentSize) - 1) / uint64(fragmentSize)
-	if uint64(total) != wantTotal {
-		t.Fatalf("total = %d, want %d", total, wantTotal)
+	if uint64(total)*uint64(fragmentSize) < uint64(sampleSize) {
+		t.Fatalf("total %d times size %d below sample %d", total, fragmentSize, sampleSize)
+	}
+
+	if total > 1 && uint64(total-1)*uint64(fragmentSize) >= uint64(sampleSize) {
+		t.Fatalf("total %d not minimal for sample %d with size %d", total, sampleSize, fragmentSize)
+	}
+
+	singleSize := uint32(fragSingleMax)
+	singleFragSize, singleTotal, err := planFragSend(singleSize)
+	if err != nil {
+		t.Fatalf("plan single max %d: %v", singleSize, err)
+	}
+
+	if singleFragSize != fragSendSize {
+		t.Fatalf("single max fragment size = %d, want %d", singleFragSize, fragSendSize)
+	}
+
+	if uint64(singleTotal)*uint64(singleFragSize) < uint64(singleSize) {
+		t.Fatalf("single max total %d times size %d below sample %d", singleTotal, singleFragSize, singleSize)
 	}
 
 	_, _, err = planFragSend(uint32(maxPayloadLen + 1))
@@ -223,7 +247,7 @@ func TestBackendPlainFragNoRouteKeepsSeq(t *testing.T) {
 
 // TestBackendFragOrderedSameSeq checks fragments emit in order with one seq.
 //
-//nolint:cyclop // ordered-emit test asserts sequence, order, and count in one run
+//nolint:cyclop,gocognit // ordered-emit test asserts sequence, order, and count in one run
 func TestBackendFragOrderedSameSeq(t *testing.T) {
 	t.Parallel()
 
@@ -279,6 +303,15 @@ func TestBackendFragOrderedSameSeq(t *testing.T) {
 		if err != nil {
 			t.Fatalf("write frag %d: %v", fragNum, err)
 		}
+	}
+
+	stored, ok := backend.repairHistory.load(backend.pubGUID, seq)
+	if !ok {
+		t.Fatalf("repair history missing seq %d after %d frags, want stored", seq, total)
+	}
+
+	if !bytes.Equal(stored, payload) {
+		t.Fatalf("repair history length %d differs from want %d", len(stored), len(payload))
 	}
 
 	reasm := newFragReassembler(nil)
@@ -373,5 +406,42 @@ func TestBackendSendPlainFragsAdvancesOnce(t *testing.T) {
 
 	if after != before {
 		t.Fatalf("seq moved %d to %d on failed frag, want stable", before, after)
+	}
+}
+
+// TestAccumulateFragSendAtUsesFakeClock checks sweep follows explicit now.
+func TestAccumulateFragSendAtUsesFakeClock(t *testing.T) {
+	t.Parallel()
+
+	backend := newFragUnitBackend(t)
+	backend.fragSend = make(map[fragKey]*fragSendEntry)
+	guid := backend.pubGUID
+	fake := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	payload := []byte{1, 2, 3, 4}
+	backend.accumulateFragSendAt(guid, 11, 1, 1, uint16(len(payload)), uint32(len(payload)), payload, fake) //nolint:gosec // G115: 4-byte test payload fits uint16 and uint32
+
+	backend.mu.RLock()
+	_, ok := backend.fragSend[fragKey{guid: guid, seq: 11}]
+	backend.mu.RUnlock()
+
+	if !ok {
+		t.Fatalf("frag send entry missing at fake now, want stored")
+	}
+
+	expired := fake.Add(fragSendTimeout + time.Second)
+	backend.accumulateFragSendAt(guid, 12, 1, 1, uint16(len(payload)), uint32(len(payload)), payload, expired) //nolint:gosec // G115: 4-byte test payload fits uint16 and uint32
+
+	backend.mu.RLock()
+	_, stillOld := backend.fragSend[fragKey{guid: guid, seq: 11}]
+	_, haveNew := backend.fragSend[fragKey{guid: guid, seq: 12}]
+	backend.mu.RUnlock()
+
+	if stillOld {
+		t.Fatalf("expired entry still present after fake sweep, want evicted")
+	}
+
+	if !haveNew {
+		t.Fatalf("new entry missing after fake sweep, want stored")
 	}
 }

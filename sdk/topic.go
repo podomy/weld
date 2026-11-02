@@ -286,16 +286,18 @@ func (s *Subscription) Len() int {
 // deliver queues one bus sample with drop oldest overflow.
 //
 // Channel and lock discipline: deliver holds mu for the closed check and
-// all channel steps. The two send probes and the eviction are
-// non-blocking so a concurrent Next that freed space is observed without
-// wedging. Next receives without holding mu so a blocked receiver never
-// wedges deliver or Close. Close sets closed under mu then closes the
-// channel after unlocking, so no send races a close. The overflow path
-// rechecks with a second non-blocking send before evicting so a
-// concurrent Next that freed space does not count a lost drop. Lost
-// increments only when an oldest sample is actually evicted. The final
-// send never blocks because the eviction just freed one slot, or the
-// channel already had space when no eviction was needed.
+// all channel steps. Probes and eviction are non-blocking so a concurrent
+// Next that freed space is observed without wedging. Next receives without
+// holding mu so a blocked receiver never wedges deliver or Close. Close
+// sets closed under mu then closes the channel after unlocking, so no send
+// races a close. The overflow path loops probe then conditional evict: each
+// iteration first probes for space, then rechecks length while still holding
+// mu, then evicts only when still full. A concurrent Next that freed space
+// between probe and evict is observed via the length recheck or the evict
+// default branch, so no lost drop is counted without an actual eviction.
+// Lost increments only when an oldest sample is actually evicted. The loop
+// always makes progress because concurrent delivers are serialized by mu
+// and Next only frees space.
 func (s *Subscription) deliver(payload []byte) {
 	if s == nil {
 		return
@@ -306,22 +308,22 @@ func (s *Subscription) deliver(payload []byte) {
 		return
 	}
 	owned := copyBytes(payload)
-	select {
-	case s.ch <- owned:
-		return
-	default:
+	for {
+		select {
+		case s.ch <- owned:
+			return
+		default:
+		}
+		if len(s.ch) < cap(s.ch) {
+			continue
+		}
+		select {
+		case <-s.ch:
+			s.lost.Add(1)
+		default:
+			continue
+		}
 	}
-	select {
-	case s.ch <- owned:
-		return
-	default:
-	}
-	select {
-	case <-s.ch:
-		s.lost.Add(1)
-	default:
-	}
-	s.ch <- owned
 }
 
 // Next waits for one sample or context end and returns an owned copy.

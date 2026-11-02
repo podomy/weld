@@ -4,7 +4,9 @@
 package dds
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
@@ -531,6 +533,8 @@ func TestEvictedSeqYieldsGapWithLostAccounting(t *testing.T) {
 }
 
 // TestPromptNackOnInitialGapBounded checks prompt NACK caps retries and bounds base.
+//
+//nolint:cyclop // test pins prompt, base, queue, and data breadth in one run, splitting would obscure intent
 func TestPromptNackOnInitialGapBounded(t *testing.T) {
 	t.Parallel()
 
@@ -545,6 +549,8 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 		routes:        make(map[GUIDPrefix][]int),
 		remoteTrack:   make(map[WriterGUID]*remoteTracker),
 		dataCh:        make(chan dataItem, demuxQueueDepth),
+		repairQueue:   make(chan repairTask, repairQueueDepth),
+		repairGen:     7,
 	}
 
 	var remotePrefix [12]byte
@@ -568,6 +574,28 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 
 	if got := promptNackCountForTest(backend, remote); got != userPromptNackMaxAttempts {
 		t.Fatalf("prompt count = %d, want cap %d no storm", got, userPromptNackMaxAttempts)
+	}
+
+	if got := len(backend.repairQueue); got != userPromptNackMaxAttempts {
+		t.Fatalf("repair queue = %d, want %d queued ACKs, not swallowed", got, userPromptNackMaxAttempts)
+	}
+
+	queued := <-backend.repairQueue
+	if queued.gen != backend.repairGen {
+		t.Fatalf("queued gen = %d, want %d", queued.gen, backend.repairGen)
+	}
+
+	if queued.kind != repairTaskAck {
+		t.Fatalf("queued kind = %d, want ack", queued.kind)
+	}
+
+	if queued.base != FirstSequenceNumber {
+		t.Fatalf("queued base = %d, want %d", queued.base, FirstSequenceNumber)
+	}
+
+	// Drain remaining queued prompts so the later seen-writer check starts clean.
+	for len(backend.repairQueue) > 0 {
+		<-backend.repairQueue
 	}
 
 	if got := promptNackBase(5); got != FirstSequenceNumber {
@@ -607,5 +635,119 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 
 	if got := backend.demuxErrorCount(); got != 0 {
 		t.Fatalf("demux errors = %d, want 0 best effort", got)
+	}
+}
+
+// TestRepairHistoryByteBudgetEvictsOldest checks byte overfill evicts plus accounting.
+func TestRepairHistoryByteBudgetEvictsOldest(t *testing.T) {
+	t.Parallel()
+
+	history := newUserHistory()
+	guid := testNackGUID(0xAA)
+
+	payload := bytes.Repeat([]byte{0xAB}, 16<<20)
+	const samples = 5
+
+	for seq := uint64(1); seq <= samples; seq++ {
+		history.store(guid, seq, payload)
+	}
+
+	if got := history.totalBytes(); got > userHistoryMaxBytes {
+		t.Fatalf("history bytes = %d above budget %d", got, userHistoryMaxBytes)
+	}
+
+	if _, ok := history.load(guid, 1); ok {
+		t.Fatalf("seq 1 present after byte overfill, want evicted")
+	}
+
+	stored, ok := history.load(guid, samples)
+	if !ok {
+		t.Fatalf("seq %d missing after byte overfill, want retained", samples)
+	}
+
+	if len(stored) != len(payload) {
+		t.Fatalf("retained length = %d, want %d", len(stored), len(payload))
+	}
+
+	if first := history.first(guid); first <= 1 {
+		t.Fatalf("first = %d after byte evict, want above 1", first)
+	}
+}
+
+// TestRollbackSeqForMaxRestoresExactly checks Max claim rollback keeps global.
+func TestRollbackSeqForMaxRestoresExactly(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{
+		rtpsSeqByWriter: map[WriterGUID]uint64{},
+		rtpsSeq:         ^uint64(0),
+	}
+	guid := testNackGUID(0xBB)
+	backend.rtpsSeqByWriter[guid] = 0
+
+	backend.rollbackSeqFor(guid, ^uint64(0))
+
+	if got := backend.rtpsSeqByWriter[guid]; got != ^uint64(0) {
+		t.Fatalf("per-writer = %d, want Max after rollback", got)
+	}
+
+	backend.mu.RLock()
+	global := backend.rtpsSeq
+	backend.mu.RUnlock()
+
+	if global != ^uint64(0) {
+		t.Fatalf("global = %d, want Max, not Max-1", global)
+	}
+}
+
+// TestEnsureProvisionalUsesFakeClock checks FirstSeen follows the receiver clock.
+func TestEnsureProvisionalUsesFakeClock(t *testing.T) {
+	t.Parallel()
+
+	fake := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	receiver := NewDataReceiver()
+	receiver.now = func() time.Time {
+		return fake
+	}
+
+	var guid WriterGUID
+	guid[0] = 0xCC
+
+	prov, ok := receiver.ensureProvisional(guid, ProvisionalQoS{}, false)
+	if !ok {
+		t.Fatalf("provisional not installed, want ok")
+	}
+
+	if !prov.FirstSeen.Equal(fake) {
+		t.Fatalf("FirstSeen = %v, want %v fake clock", prov.FirstSeen, fake)
+	}
+
+	later := fake.Add(time.Hour)
+	receiver.now = func() time.Time {
+		return later
+	}
+
+	again, ok := receiver.ensureProvisional(guid, ProvisionalQoS{}, false)
+	if !ok {
+		t.Fatalf("provisional missing on second call, want ok")
+	}
+
+	if !again.FirstSeen.Equal(fake) {
+		t.Fatalf("FirstSeen moved to %v, want stable %v", again.FirstSeen, fake)
+	}
+}
+
+// TestSedpShouldSkipResendAtUsesFakeClock checks resend timing with explicit now.
+func TestSedpShouldSkipResendAtUsesFakeClock(t *testing.T) {
+	t.Parallel()
+
+	fake := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	if !sedpShouldSkipResendAt(nil, nil, nil, nil, fake, fake.Add(500*time.Millisecond)) {
+		t.Fatalf("skip within interval returned false, want true")
+	}
+
+	if sedpShouldSkipResendAt(nil, nil, nil, nil, fake, fake.Add(2*time.Second)) {
+		t.Fatalf("skip past interval returned true, want false")
 	}
 }

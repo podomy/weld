@@ -31,6 +31,7 @@ func TestAction(t *testing.T) {
 	t.Run("validation", checkActionValidation)
 	t.Run("backward jump", checkActionBackwardJump)
 	t.Run("feedback overflow", checkActionFeedbackOverflow)
+	t.Run("sweep expired on unrelated read", checkActionSweepExpired)
 }
 
 // newActiveServer returns an activated server for tests.
@@ -638,5 +639,41 @@ func checkActionFeedbackOverflow(t *testing.T) {
 	}
 	if snap[0].Payload[0] != 1 {
 		t.Fatalf("overflow must drop oldest, got first %d", snap[0].Payload[0])
+	}
+}
+
+// checkActionSweepExpired pins reads sweep expired results beyond the queried ID.
+func checkActionSweepExpired(t *testing.T) {
+	t.Helper()
+	srv, err := NewActionServer("/navigate_to_pose", ClockWall, 1000)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srv.Activate(0)
+	err = srv.AcceptGoal("g1", 0, ClockWall, 0)
+	if err != nil {
+		t.Fatalf("accept g1: %v", err)
+	}
+	err = srv.CompleteGoal("g1", GoalSucceeded, []byte("a"), 0)
+	if err != nil {
+		t.Fatalf("complete g1: %v", err)
+	}
+	err = srv.AcceptGoal("g2", 0, ClockWall, 10)
+	if err != nil {
+		t.Fatalf("accept g2: %v", err)
+	}
+	err = srv.CompleteGoal("g2", GoalSucceeded, []byte("b"), 500)
+	if err != nil {
+		t.Fatalf("complete g2: %v", err)
+	}
+	_, _, err = srv.GetResult("g2", 1000)
+	if err != nil {
+		t.Fatalf("live g2 must flow at 1000: %v", err)
+	}
+	srv.mu.Lock()
+	_, stillThere := srv.results["g1"]
+	srv.mu.Unlock()
+	if stillThere {
+		t.Fatal("reading live g2 must sweep expired g1")
 	}
 }

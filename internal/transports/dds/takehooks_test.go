@@ -234,6 +234,7 @@ func TestTakeHooksPlainNackLateJoinRequestsBaseOne(t *testing.T) {
 
 	var guid WriterGUID
 	guid[0] = 0xF1
+	recv.ensureProvisional(guid, ProvisionalQoS{}, false)
 
 	ctx := context.Background()
 	recv.notePlainSample(ctx, guid, 7)
@@ -266,6 +267,7 @@ func TestTakeHooksPlainNackGapAdvancesOnce(t *testing.T) {
 
 	var guid WriterGUID
 	guid[0] = 0xF2
+	recv.ensureProvisional(guid, ProvisionalQoS{}, false)
 
 	ctx := context.Background()
 	recv.notePlainSample(ctx, guid, 1)
@@ -295,6 +297,7 @@ func TestTakeHooksPlainNackNoSenderSkips(t *testing.T) {
 
 	var guid WriterGUID
 	guid[0] = 0xF3
+	recv.ensureProvisional(guid, ProvisionalQoS{}, false)
 
 	recv.notePlainSample(ctx, guid, 42)
 
@@ -349,5 +352,161 @@ func TestTakeHooksDeadlineMissedDrops(t *testing.T) {
 
 	if !errors.Is(rej.err, ErrDeadlineMissed) {
 		t.Fatalf("deadline error %v misses ErrDeadlineMissed", rej.err)
+	}
+}
+
+// TestTakeHooksPlainNackGatesUnmatched pins matched gating for plain NACK.
+//
+// A sample from an unknown writer with no SEDP remote or provisional must
+// not create plainNack state or send a NACK, consistent with isMatchedWriter.
+func TestTakeHooksPlainNackGatesUnmatched(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+
+	var sent []uint64
+	recv.SetNackSender(func(_ context.Context, _ WriterGUID, base uint64) error {
+		sent = append(sent, base)
+		return nil
+	})
+
+	var guid WriterGUID
+	guid[0] = 0xF9
+
+	ctx := context.Background()
+	recv.notePlainSample(ctx, guid, 7)
+
+	if len(sent) != 0 {
+		t.Fatalf("unmatched NACKs = %v, want none", sent)
+	}
+
+	recv.mu.RLock()
+	_, seen := recv.plainNack[guid]
+	recv.mu.RUnlock()
+
+	if seen {
+		t.Fatalf("unmatched plainNack stored, want gate skip")
+	}
+}
+
+// TestTakeHooksPlainNackFailedSendKeepsLastNacked pins no advance on failure.
+//
+// A failed NACK send must not advance lastNacked: the high-water moves only
+// after a successful send so a later gap still repairs from the old base.
+func TestTakeHooksPlainNackFailedSendKeepsLastNacked(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+
+	var guid WriterGUID
+	guid[0] = 0xFA
+	recv.ensureProvisional(guid, ProvisionalQoS{}, false)
+
+	fail := errors.New("nack send fail")
+	recv.SetNackSender(func(_ context.Context, _ WriterGUID, _ uint64) error {
+		return fail //nolint:wrapcheck // test sender returns sentinel directly
+	})
+
+	ctx := context.Background()
+	recv.notePlainSample(ctx, guid, 5)
+
+	if got := recv.DropReasonCount(DropReasonNackSendFailed); got != 1 {
+		t.Fatalf("nack failures = %d, want 1", got)
+	}
+
+	recv.mu.RLock()
+	st := recv.plainNack[guid]
+	recv.mu.RUnlock()
+
+	if st == nil {
+		t.Fatalf("plainNack missing after failed send")
+	}
+
+	if st.lastNacked != 0 {
+		t.Fatalf("lastNacked = %d, want 0 after failed send", st.lastNacked)
+	}
+}
+
+// TestTakeHooksLazyGateSkipsUnmatched pins lazy tracker gating.
+//
+// Snapshot hooks for an unknown writer with a liveliness contract but no
+// matched remote must not install a tracker.
+func TestTakeHooksLazyGateSkipsUnmatched(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	recv.SetLivelinessTrackerForTopic("/gated", core.LivelinessAutomatic, core.NewDuration(10, 0), nil)
+
+	var guid WriterGUID
+	guid[0] = 0xFB
+
+	snap := recv.snapshotTakeHooks("/gated", guid)
+	if snap.tracker != nil {
+		t.Fatalf("unmatched tracker installed, want gate skip")
+	}
+
+	recv.mu.RLock()
+	_, seen := recv.lively[guid]
+	recv.mu.RUnlock()
+
+	if seen {
+		t.Fatalf("unmatched lively stored, want gate skip")
+	}
+}
+
+// TestTakeHooksLivelyCapEvicts pins bounded lazy tracker creation.
+func TestTakeHooksLivelyCapEvicts(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	recv.SetLivelinessTrackerForTopic("/capped", core.LivelinessAutomatic, core.NewDuration(10, 0), nil)
+
+	for i := range livelyTrackerCap + 5 {
+		var guid WriterGUID
+		guid[0] = byte(i)
+		guid[1] = byte(i >> 8)
+		guid[2] = 0xC1
+		recv.ensureProvisional(guid, ProvisionalQoS{}, false)
+		snap := recv.snapshotTakeHooks("/capped", guid)
+		if snap.tracker == nil {
+			t.Fatalf("matched tracker missing at %d", i)
+		}
+	}
+
+	recv.mu.RLock()
+	n := len(recv.lively)
+	recv.mu.RUnlock()
+
+	if n > livelyTrackerCap {
+		t.Fatalf("lively len = %d, want at most %d", n, livelyTrackerCap)
+	}
+}
+
+// TestSetLivelinessTrackerForTopicCapEvicts pins explicit cap enforcement.
+//
+// Bulk installs through the explicit writer list must hold the same cap as
+// the lazy path with eviction instead of unbounded growth.
+func TestSetLivelinessTrackerForTopicCapEvicts(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+
+	writers := make([]WriterGUID, 0, livelyTrackerCap+5)
+	for i := range livelyTrackerCap + 5 {
+		var guid WriterGUID
+		guid[0] = byte(i)
+		guid[1] = byte(i >> 8)
+		guid[2] = 0xD1
+		writers = append(writers, guid)
+	}
+
+	recv.SetLivelinessTrackerForTopic("/explicit", core.LivelinessAutomatic, core.NewDuration(10, 0), writers)
+
+	recv.mu.RLock()
+	n := len(recv.lively)
+	recv.mu.RUnlock()
+
+	if n > livelyTrackerCap {
+		t.Fatalf("explicit lively len = %d, want at most %d", n, livelyTrackerCap)
 	}
 }

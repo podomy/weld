@@ -33,6 +33,14 @@ import (
 // where 64 evicted the first sample before NACK; window stays 64 to bound work.
 const userHistoryDepth = 100
 
+// userHistoryMaxBytes bounds total buffered repair bytes across writers.
+//
+// Entries stay capped at 100 per writer, but 100 full 32MiB samples per
+// writer would hold unbounded memory under churn. The byte budget evicts
+// the oldest seq loudly when a new sample would push the table past 64MiB,
+// mirroring fragMaxBytes discipline for the fragment tables.
+const userHistoryMaxBytes = 64 << 20
+
 // userRepairWindow caps seq scanned per ACKNACK to bound work. Larger gaps converge over later ACKs.
 const userRepairWindow = 64
 
@@ -85,10 +93,12 @@ func newUserHistory() *userHistory {
 
 // store copies payload for guid and seq.
 //
-// It evicts oldest when depth is passed. It also bounds distinct writers
-// by maxTrackedWriters with loud eviction so writer churn cannot grow the
-// table without limit. A nil receiver is a no-op for tests that build Backend
-// without live state.
+// It evicts oldest when depth is passed and evicts oldest seqs when the
+// byte budget is passed. It also bounds distinct writers by
+// maxTrackedWriters with loud eviction so writer churn cannot grow the
+// table without limit. Byte evictions log loudly after unlock so logging
+// never holds the history lock, mirroring the frag byte discipline. A nil
+// receiver is a no-op for tests that build Backend without live state.
 func (h *userHistory) store(
 	guid WriterGUID,
 	seq uint64,
@@ -105,7 +115,6 @@ func (h *userHistory) store(
 	cp := append([]byte(nil), payload...)
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if h.payloads == nil {
 		h.payloads = make(map[WriterGUID]map[uint64][]byte)
@@ -114,10 +123,12 @@ func (h *userHistory) store(
 		h.order = make(map[WriterGUID][]uint64)
 	}
 
+	var evictedWriter WriterGUID
+	haveEvictedWriter := false
+
 	if _, seen := h.payloads[guid]; !seen {
 		if len(h.payloads) >= maxTrackedWriters {
-			h.evictOldestWriterLocked(guid)
-			log.Printf("dds: repair history table full evict oldest for guid=%x", guid)
+			evictedWriter, haveEvictedWriter = h.evictOldestWriterLocked(guid)
 		}
 	}
 
@@ -141,6 +152,18 @@ func (h *userHistory) store(
 		old := h.order[guid][0]
 		h.order[guid] = h.order[guid][1:]
 		delete(bySeq, old)
+	}
+
+	byteEvicted := h.makeRoomForHistoryLocked(uint64(len(cp)))
+
+	h.mu.Unlock()
+
+	if haveEvictedWriter {
+		log.Printf("dds: repair history table full evict oldest for guid=%x evicted=%x", guid, evictedWriter)
+	}
+
+	for _, evicted := range byteEvicted {
+		log.Printf("dds: repair history bytes evict guid=%x seq=%d", evicted.guid, evicted.seq)
 	}
 }
 
@@ -253,8 +276,9 @@ func (h *userHistory) writers() []WriterGUID {
 // evictOldestWriterLocked drops one writer when over cap.
 //
 // The caller must hold h.mu. It deletes the first writer found that is not
-// the current guid so the new writer always fits. The caller logs loudly.
-func (h *userHistory) evictOldestWriterLocked(except WriterGUID) {
+// the current guid so the new writer always fits. It returns the evicted
+// guid for the caller to log after unlock so logging never holds the lock.
+func (h *userHistory) evictOldestWriterLocked(except WriterGUID) (WriterGUID, bool) {
 	for guid := range h.payloads {
 		if guid == except {
 			continue
@@ -262,7 +286,7 @@ func (h *userHistory) evictOldestWriterLocked(except WriterGUID) {
 		delete(h.payloads, guid)
 		delete(h.order, guid)
 
-		return
+		return guid, true
 	}
 	for guid := range h.order {
 		if guid == except {
@@ -271,8 +295,149 @@ func (h *userHistory) evictOldestWriterLocked(except WriterGUID) {
 		delete(h.payloads, guid)
 		delete(h.order, guid)
 
-		return
+		return guid, true
 	}
+
+	return WriterGUID{}, false
+}
+
+// historyEvict names one evicted repair sample for logging after unlock.
+type historyEvict struct {
+	guid WriterGUID
+	seq  uint64
+}
+
+// historyBytesLocked returns total buffered repair bytes under lock.
+//
+// The caller must hold h.mu.
+func (h *userHistory) historyBytesLocked() uint64 {
+	var total uint64
+	for _, bySeq := range h.payloads {
+		for _, payload := range bySeq {
+			total += uint64(len(payload))
+		}
+	}
+
+	return total
+}
+
+// historyCountLocked returns total buffered samples under lock.
+//
+// The caller must hold h.mu.
+func (h *userHistory) historyCountLocked() int {
+	count := 0
+	for _, bySeq := range h.payloads {
+		count += len(bySeq)
+	}
+
+	return count
+}
+
+// totalBytes returns total buffered repair bytes.
+//
+// It self-locks and is safe for concurrent use. A nil receiver returns 0.
+func (h *userHistory) totalBytes() uint64 {
+	if h == nil {
+		return 0
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.historyBytesLocked()
+}
+
+// evictOldestHistorySeqLocked drops the oldest seq from the largest writer.
+//
+// The caller must hold h.mu. It picks the writer holding the most bytes so
+// a single large writer cannot starve others and a new small sample does
+// not evict itself when old writers hold the budget. It returns the evicted
+// sample for loud logging after unlock.
+func (h *userHistory) evictOldestHistorySeqLocked() (historyEvict, bool) {
+	victim, have := h.largestHistoryWriterLocked()
+	if !have {
+		return historyEvict{}, false
+	}
+
+	if len(h.order[victim]) == 0 {
+		return h.evictUnorderedHistoryLocked(victim)
+	}
+
+	old := h.order[victim][0]
+	h.order[victim] = append([]uint64(nil), h.order[victim][1:]...)
+	if bySeq, ok := h.payloads[victim]; ok {
+		delete(bySeq, old)
+		if len(bySeq) == 0 {
+			delete(h.payloads, victim)
+			delete(h.order, victim)
+		}
+	} else {
+		delete(h.order, victim)
+	}
+
+	return historyEvict{guid: victim, seq: old}, true
+}
+
+// largestHistoryWriterLocked returns the writer holding the most bytes.
+//
+// The caller must hold h.mu.
+func (h *userHistory) largestHistoryWriterLocked() (WriterGUID, bool) {
+	var (
+		victim  WriterGUID
+		have    bool
+		largest uint64
+	)
+
+	for guid, bySeq := range h.payloads {
+		var sum uint64
+		for _, payload := range bySeq {
+			sum += uint64(len(payload))
+		}
+		if !have || sum > largest {
+			victim, largest, have = guid, sum, true
+		}
+	}
+
+	return victim, have
+}
+
+// evictUnorderedHistoryLocked drops one sample when order is missing.
+//
+// The caller must hold h.mu. It covers the defensive case where payloads
+// exist without order entries.
+func (h *userHistory) evictUnorderedHistoryLocked(victim WriterGUID) (historyEvict, bool) {
+	bySeq := h.payloads[victim]
+	for seq := range bySeq {
+		delete(bySeq, seq)
+		if len(bySeq) == 0 {
+			delete(h.payloads, victim)
+			delete(h.order, victim)
+		}
+
+		return historyEvict{guid: victim, seq: seq}, true
+	}
+	delete(h.payloads, victim)
+	delete(h.order, victim)
+
+	return historyEvict{guid: victim}, true
+}
+
+// makeRoomForHistoryLocked evicts oldest seqs to fit the byte budget.
+//
+// The caller must hold h.mu. It returns evicted samples for loud logging
+// after unlock so logging never holds the history lock, mirroring the frag
+// byte discipline.
+func (h *userHistory) makeRoomForHistoryLocked(_ uint64) []historyEvict {
+	var evicted []historyEvict
+	for h.historyBytesLocked() > userHistoryMaxBytes && h.historyCountLocked() > 0 {
+		oldest, ok := h.evictOldestHistorySeqLocked()
+		if !ok {
+			break
+		}
+		evicted = append(evicted, oldest)
+	}
+
+	return evicted
 }
 
 // ackRequest is one decoded user ACKNACK.
@@ -665,12 +830,13 @@ func (t *remoteTracker) skipTo(seq uint64) {
 //
 // The caller must hold b.mu for write. When the table holds
 // maxTrackedWriters entries and the new writer is unseen, it evicts one
-// arbitrary writer loudly so writer churn cannot grow the table without
-// limit. Lease expiry via sweepExpiredRoutes runs separately; this bounds
+// arbitrary writer and bumps demuxErrors. It returns the evicted guid for
+// the caller to log after unlock so logging never holds the backend lock.
+// Lease expiry via sweepExpiredRoutes runs separately; this bounds
 // active writers.
-func (b *Backend) capRemoteTrackLocked(except WriterGUID) {
+func (b *Backend) capRemoteTrackLocked(except WriterGUID) (WriterGUID, bool) {
 	if len(b.remoteTrack) < maxTrackedWriters {
-		return
+		return WriterGUID{}, false
 	}
 	for guid := range b.remoteTrack {
 		if guid == except {
@@ -678,19 +844,21 @@ func (b *Backend) capRemoteTrackLocked(except WriterGUID) {
 		}
 		delete(b.remoteTrack, guid)
 		b.demuxErrors++
-		log.Printf("dds: remote track table full evict guid=%x", guid)
 
-		return
+		return guid, true
 	}
+
+	return WriterGUID{}, false
 }
 
 // capSedpHighSeqLocked ensures sedpHighSeq stays bounded.
 //
-// The caller must hold b.mu for write. It evicts one arbitrary writer
-// loudly when over cap, mirroring capRemoteTrackLocked.
-func (b *Backend) capSedpHighSeqLocked(except WriterGUID) {
+// The caller must hold b.mu for write. It evicts one arbitrary writer and
+// bumps demuxErrors when over cap, returning the evicted guid for the
+// caller to log after unlock, mirroring capRemoteTrackLocked.
+func (b *Backend) capSedpHighSeqLocked(except WriterGUID) (WriterGUID, bool) {
 	if len(b.sedpHighSeq) < maxTrackedWriters {
-		return
+		return WriterGUID{}, false
 	}
 	for guid := range b.sedpHighSeq {
 		if guid == except {
@@ -698,19 +866,21 @@ func (b *Backend) capSedpHighSeqLocked(except WriterGUID) {
 		}
 		delete(b.sedpHighSeq, guid)
 		b.demuxErrors++
-		log.Printf("dds: sedp high seq table full evict guid=%x", guid)
 
-		return
+		return guid, true
 	}
+
+	return WriterGUID{}, false
 }
 
 // capSedpHeartbeatLocked ensures heartbeat bound tables stay bounded.
 //
 // The caller must hold b.mu for write. It evicts one arbitrary writer from
-// both last and count tables loudly when either is over cap.
-func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) {
+// both last and count tables and bumps demuxErrors when either is over cap,
+// returning the evicted guid for the caller to log after unlock.
+func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) (WriterGUID, bool) {
 	if len(b.sedpHeartbeatLast) < maxTrackedWriters && len(b.sedpHeartbeatCount) < maxTrackedWriters {
-		return
+		return WriterGUID{}, false
 	}
 	for guid := range b.sedpHeartbeatLast {
 		if guid == except {
@@ -719,9 +889,8 @@ func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) {
 		delete(b.sedpHeartbeatLast, guid)
 		delete(b.sedpHeartbeatCount, guid)
 		b.demuxErrors++
-		log.Printf("dds: sedp heartbeat table full evict guid=%x", guid)
 
-		return
+		return guid, true
 	}
 	for guid := range b.sedpHeartbeatCount {
 		if guid == except {
@@ -730,16 +899,18 @@ func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) {
 		delete(b.sedpHeartbeatLast, guid)
 		delete(b.sedpHeartbeatCount, guid)
 		b.demuxErrors++
-		log.Printf("dds: sedp heartbeat table full evict guid=%x", guid)
 
-		return
+		return guid, true
 	}
+
+	return WriterGUID{}, false
 }
 
 // noteRemoteData records one outer seq per remote writer for NACK base.
 //
 // It tracks contiguity, not highest seen, so the ACK base names the
-// first missing sample instead of skipping silent gaps.
+// first missing sample instead of skipping silent gaps. Table eviction
+// logs after unlock so logging never holds the backend lock.
 func (b *Backend) noteRemoteData(
 	guid WriterGUID,
 	seq uint64,
@@ -749,20 +920,27 @@ func (b *Backend) noteRemoteData(
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.remoteTrack == nil {
 		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
+	var evicted WriterGUID
+	haveEvicted := false
+
 	tracker, ok := b.remoteTrack[guid]
 	if !ok {
-		b.capRemoteTrackLocked(guid)
+		evicted, haveEvicted = b.capRemoteTrackLocked(guid)
 		tracker = &remoteTracker{}
 		b.remoteTrack[guid] = tracker
 	}
 
 	tracker.observe(seq)
+	b.mu.Unlock()
+
+	if haveEvicted {
+		log.Printf("dds: remote track table full evict guid=%x", evicted)
+	}
 }
 
 // remoteBase returns next wanted seq for a remote writer: first missing,
@@ -792,25 +970,34 @@ func (b *Backend) remoteBase(
 // instead of the full history. A nil map is allocated on first use under
 // mu. Zero sequences are ignored. Updates are monotonic so duplicate
 // retransmits keep the same high and the next heartbeat re-NACKs the same
-// range instead of advancing past unseen samples.
+// range instead of advancing past unseen samples. Table eviction logs after
+// unlock so logging never holds the backend lock.
 func (b *Backend) noteSedpSeq(guid WriterGUID, seq uint64) {
 	if seq == 0 {
 		return
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.sedpHighSeq == nil {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
 	}
 
+	var evicted WriterGUID
+	haveEvicted := false
+
 	if _, seen := b.sedpHighSeq[guid]; !seen {
-		b.capSedpHighSeqLocked(guid)
+		evicted, haveEvicted = b.capSedpHighSeqLocked(guid)
 	}
 
 	if seq > b.sedpHighSeq[guid] {
 		b.sedpHighSeq[guid] = seq
+	}
+
+	b.mu.Unlock()
+
+	if haveEvicted {
+		log.Printf("dds: sedp high seq table full evict guid=%x", evicted)
 	}
 }
 
@@ -883,6 +1070,7 @@ func filterNonZeroSeqs(seqs []uint64) []uint64 {
 // repeats forever. Updates are monotonic and zero is ignored, which keeps
 // re-NACKs idempotent and bounded when GAPs repeat. Sequences apply in
 // increasing order so every contiguous run from the decoded list advances.
+// Table eviction logs after unlock so logging never holds the backend lock.
 func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 	filtered := filterNonZeroSeqs(seqs)
 	if len(filtered) == 0 {
@@ -890,7 +1078,6 @@ func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	maxAllowed, hasBound := b.sedpGapBoundLocked(guid)
 
@@ -898,8 +1085,11 @@ func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
 	}
 
+	var evicted WriterGUID
+	haveEvicted := false
+
 	if _, seen := b.sedpHighSeq[guid]; !seen {
-		b.capSedpHighSeqLocked(guid)
+		evicted, haveEvicted = b.capSedpHighSeqLocked(guid)
 	}
 
 	for _, gapStart := range filtered {
@@ -909,6 +1099,12 @@ func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 		if gapStart > b.sedpHighSeq[guid] {
 			b.sedpHighSeq[guid] = gapStart
 		}
+	}
+
+	b.mu.Unlock()
+
+	if haveEvicted {
+		log.Printf("dds: sedp high seq table full evict guid=%x", evicted)
 	}
 }
 
@@ -959,7 +1155,8 @@ func planSedpNack(base, last uint64) ([]uint32, uint32, bool) {
 //
 // The caller decodes the full GAP list via Gap.SkippedSequences so every
 // contiguous run advances contiguity, not just GapStart. Zero entries are
-// ignored and sequences apply in increasing order.
+// ignored and sequences apply in increasing order. Table eviction logs
+// after unlock so logging never holds the backend lock.
 func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
 	filtered := filterNonZeroSeqs(seqs)
 	if len(filtered) == 0 {
@@ -971,9 +1168,12 @@ func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
 		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
+	var evicted WriterGUID
+	haveEvicted := false
+
 	tracker, ok := b.remoteTrack[guid]
 	if !ok {
-		b.capRemoteTrackLocked(guid)
+		evicted, haveEvicted = b.capRemoteTrackLocked(guid)
 		tracker = &remoteTracker{}
 		b.remoteTrack[guid] = tracker
 	}
@@ -984,6 +1184,10 @@ func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
 
 	receiver := b.receiver
 	b.mu.Unlock()
+
+	if haveEvicted {
+		log.Printf("dds: remote track table full evict guid=%x", evicted)
+	}
 
 	if receiver != nil {
 		for _, seq := range filtered {
@@ -1342,28 +1546,37 @@ func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader
 }
 
 // shouldRateLimitFallback reports whether one fallback broadcast should drop.
+//
+// Table eviction logs after unlock so logging never holds the backend lock.
 func (b *Backend) shouldRateLimitFallback(remote WriterGUID, now time.Time) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.remoteTrack == nil {
 		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
+	var evicted WriterGUID
+	haveEvicted := false
+
 	tracker, ok := b.remoteTrack[remote]
 	if !ok {
-		b.capRemoteTrackLocked(remote)
+		evicted, haveEvicted = b.capRemoteTrackLocked(remote)
 		tracker = &remoteTracker{}
 		b.remoteTrack[remote] = tracker
 	}
 
-	if !tracker.lastFallback.IsZero() && now.Sub(tracker.lastFallback) < fallbackAckInterval {
-		return true
+	limited := !tracker.lastFallback.IsZero() && now.Sub(tracker.lastFallback) < fallbackAckInterval
+	if !limited {
+		tracker.lastFallback = now
 	}
 
-	tracker.lastFallback = now
+	b.mu.Unlock()
 
-	return false
+	if haveEvicted {
+		log.Printf("dds: remote track table full evict guid=%x", evicted)
+	}
+
+	return limited
 }
 
 // sendUserControl fanouts one control datagram to all routes best effort.
@@ -1927,20 +2140,23 @@ func (b *Backend) readerEntityForWriter(guid WriterGUID) rtps.EntityID {
 // heartbeats by Count, and never regresses the Last bound. ACK sends queue
 // through the per-backend worker so demux never blocks on the socket.
 // heartbeatTrackerFor returns the contiguity tracker for a remote writer,
-// allocating it under the backend lock. The caller must hold b.mu for write.
-func (b *Backend) heartbeatTrackerFor(remote WriterGUID) *remoteTracker {
+// allocating it under the backend lock. The caller must hold b.mu for write
+// and logs any table eviction after unlock.
+func (b *Backend) heartbeatTrackerFor(remote WriterGUID) (*remoteTracker, WriterGUID, bool) {
 	if b.remoteTrack == nil {
 		b.remoteTrack = make(map[WriterGUID]*remoteTracker)
 	}
 
 	tracker, ok := b.remoteTrack[remote]
 	if !ok {
-		b.capRemoteTrackLocked(remote)
+		evicted, haveEvicted := b.capRemoteTrackLocked(remote)
 		tracker = &remoteTracker{}
 		b.remoteTrack[remote] = tracker
+
+		return tracker, evicted, haveEvicted
 	}
 
-	return tracker
+	return tracker, WriterGUID{}, false
 }
 
 // heartbeatIsReplay reports whether a heartbeat is a replay of already
@@ -1993,12 +2209,16 @@ func (b *Backend) ackUserHeartbeat(
 	copy(remote[12:16], beat.WriterID[:])
 
 	b.mu.Lock()
-	tracker := b.heartbeatTrackerFor(remote)
+	tracker, evicted, haveEvicted := b.heartbeatTrackerFor(remote)
 	replay := heartbeatIsReplay(beat, tracker)
 	if !replay {
 		recordHeartbeatBound(beat, tracker)
 	}
 	b.mu.Unlock()
+
+	if haveEvicted {
+		log.Printf("dds: remote track table full evict guid=%x", evicted)
+	}
 
 	if replay {
 		return

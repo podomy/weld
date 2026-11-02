@@ -387,9 +387,12 @@ type SEDPReceiver interface {
 // SEDPIndex tracks local endpoints and remote observations.
 //
 // Generation counts remote mutations only: each upsert that adds or
-// changes an entry and each remove that deletes one bumps the counter
-// and fires the change hook outside the lock. Local declares do not
-// affect the generation. Use NewSEDPIndex. It is safe for concurrent use.
+// changes an entry and each single remove bumps the counter once and
+// fires the change hook outside the lock. Batch removals in Sweep,
+// ExpireProvisional, and ExpirePendingEvictions bump once per call, and
+// hidden state such as lastSeq, hbLast, hbCount, writerHigh, and
+// pendingEvict never bumps alone. Local declares do not affect the
+// generation. Use NewSEDPIndex. It is safe for concurrent use.
 type SEDPIndex struct {
 	mu         sync.Mutex
 	prefix     SEDPGUIDPrefix
@@ -424,6 +427,127 @@ type SEDPIndex struct {
 // immediate: ten seconds of silence already exceed any in-flight window.
 // A package var (not const) so tests shrink the window deterministically.
 var sedpEvictGracePeriod = 5 * time.Second
+
+// sedpAuxCap bounds auxiliary discovery maps under writer churn.
+//
+// It mirrors livelyTrackerCap so discovery churn stays bounded without
+// trusting unauthenticated GUIDs: at cap one entry is evicted loudly to
+// make room. It covers hbLast, hbCount, writerHigh, and pendingEvict.
+// lastSeq stays gated on matched endpoints instead of capped, and remotes
+// stay the authoritative matched set. Insert paths sweep nothing because
+// these maps carry no TTL; eviction is oldest-first where order exists
+// and arbitrary otherwise, always with a loud log.
+const sedpAuxCap = 1024
+
+// sedpEvictOldestPendingLocked drops the earliest pending prefix to hold the cap.
+//
+// Caller holds idx.mu and inserts a new prefix not yet present. It deletes
+// the entry with the smallest deadline loudly so writer churn cannot grow
+// pendingEvict without bound. It is a no-op when under cap.
+func (idx *SEDPIndex) sedpEvictOldestPendingLocked() {
+	var (
+		oldest SEDPGUIDPrefix
+		have   bool
+		best   time.Time
+	)
+
+	for prefix, at := range idx.pendingEvict {
+		if !have || at.Before(best) {
+			oldest = prefix
+			best = at
+			have = true
+		}
+	}
+
+	if !have {
+		return
+	}
+
+	delete(idx.pendingEvict, oldest)
+	log.Printf("dds: sedp pending table full evict prefix=%x", oldest)
+}
+
+// sedpCapHeartbeatLocked ensures heartbeat bound tables stay bounded.
+//
+// Caller holds idx.mu for write. When both tables hold sedpAuxCap entries
+// and the key is unseen, it evicts one arbitrary writer loudly from both
+// tables so writer churn cannot grow the bounds without limit.
+func (idx *SEDPIndex) sedpCapHeartbeatLocked(except sedpWriterKey) {
+	_, seenLast := idx.hbLast[except]
+	_, seenCount := idx.hbCount[except]
+	if seenLast || seenCount {
+		return
+	}
+
+	if len(idx.hbLast) < sedpAuxCap && len(idx.hbCount) < sedpAuxCap {
+		return
+	}
+
+	for key := range idx.hbLast {
+		if key == except {
+			continue
+		}
+
+		delete(idx.hbLast, key)
+		delete(idx.hbCount, key)
+		log.Printf("dds: sedp heartbeat table full evict writer=%x", key.writer)
+
+		return
+	}
+
+	for key := range idx.hbCount {
+		if key == except {
+			continue
+		}
+
+		delete(idx.hbLast, key)
+		delete(idx.hbCount, key)
+		log.Printf("dds: sedp heartbeat table full evict writer=%x", key.writer)
+
+		return
+	}
+}
+
+// sedpCapWriterHighLocked ensures writerHigh stays bounded.
+//
+// Caller holds idx.mu for write. When the table holds sedpAuxCap entries
+// and the key is unseen, it evicts one arbitrary writer loudly.
+func (idx *SEDPIndex) sedpCapWriterHighLocked(except sedpWriterKey) {
+	if _, seen := idx.writerHigh[except]; seen {
+		return
+	}
+
+	if len(idx.writerHigh) < sedpAuxCap {
+		return
+	}
+
+	for key := range idx.writerHigh {
+		if key == except {
+			continue
+		}
+
+		delete(idx.writerHigh, key)
+		log.Printf("dds: sedp writer high table full evict writer=%x", key.writer)
+
+		return
+	}
+}
+
+// sedpHasPrefixLocked reports whether one prefix has any remote endpoint.
+//
+// Caller holds idx.mu. It scans remotes for the prefix so the lastSeq gate
+// can admit sequences for known participants without trusting random
+// prefixes. The scan stays bounded because remotes stays the authoritative
+// set and auxiliary maps stay capped.
+func (idx *SEDPIndex) sedpHasPrefixLocked(prefix SEDPGUIDPrefix) bool {
+	for id := range idx.remotes {
+		if id.Prefix == prefix {
+			return true
+		}
+	}
+
+	return false
+}
 
 // NewSEDPIndex returns an SEDP index for one participant prefix and domain.
 func NewSEDPIndex(prefix SEDPGUIDPrefix, domain uint32) (*SEDPIndex, error) {
@@ -764,7 +888,6 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 	if keyed {
 		entity = KeyedUserEntity(idx.next, isReader)
 	}
-	idx.next++
 
 	id := SEDPGUID{Prefix: idx.prefix, Entity: entity}
 
@@ -772,6 +895,8 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 	if exists {
 		return SEDPEndpoint{}, fmt.Errorf("dds: sedp declare duplicate entity: %w", ErrSEDPInvalidEndpoint)
 	}
+
+	idx.next++
 
 	wireOffer, err := sedpTranslateDeclareOffer(rosTopic, publisherName, subscriberName, profile)
 	if err != nil {
@@ -879,6 +1004,10 @@ func (idx *SEDPIndex) RemoteEndpoints() []SEDPEndpoint {
 // The input is always stored as confirmed: Provisional is cleared and
 // FirstSeen is reset because SEDP QoS, type, and hash are authoritative.
 // Promotion of a provisional placeholder therefore bumps generation.
+// Caller must validate the endpoint prefix against the RTPS header prefix
+// before calling: UpsertRemote installs any prefix it is given and never
+// checks header binding itself, so ingest paths enforce the binding and
+// direct callers must do the same.
 func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
 	err := sedpValidateRemote(ep)
 	if err != nil {
@@ -960,8 +1089,12 @@ func (idx *SEDPIndex) RemoveRemote(id SEDPGUID) bool {
 // SchedulePrefixEvict defers SEDP remote removal for one participant prefix.
 //
 // SPDP dispose removes routes at once but in-flight user DATA may still
-// take, so endpoint removal waits out sedpEvictGracePeriod. A re-announce
-// cancels through UpsertRemote. It never removes anything itself.
+// take, so endpoint removal waits out sedpEvictGracePeriod. The first
+// dispose starts the clock: duplicate disposes never re-arm the deadline,
+// so the grace window stays bounded from first sight. Expiry processing
+// deletes the entry. A genuinely new participant re-announces with a
+// higher sequence and cancels through UpsertRemote. It never removes
+// anything itself.
 func (idx *SEDPIndex) SchedulePrefixEvict(prefix SEDPGUIDPrefix, now time.Time) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -970,14 +1103,29 @@ func (idx *SEDPIndex) SchedulePrefixEvict(prefix SEDPGUIDPrefix, now time.Time) 
 		idx.pendingEvict = make(map[SEDPGUIDPrefix]time.Time)
 	}
 
+	if _, seen := idx.pendingEvict[prefix]; seen {
+		return
+	}
+
+	if len(idx.pendingEvict) >= sedpAuxCap {
+		idx.sedpEvictOldestPendingLocked()
+	}
+
 	idx.pendingEvict[prefix] = now.Add(sedpEvictGracePeriod)
 }
 
 // ExpirePendingEvictions removes SEDP remotes whose dispose grace elapsed.
 //
 // It returns the count removed. Prefixes re-announced since scheduling
-// were cancelled by UpsertRemote and survive. It self-locks and is safe
-// for concurrent use.
+// were cancelled by UpsertRemote and survive. It holds the index lock
+// across collect and remove so an UpsertRemote between pending delete and
+// endpoint removal cannot lose a re-announced endpoint: the upsert either
+// cancels before the hold and survives, or blocks until after and
+// reinstalls. Generation bumps once per call like Sweep and
+// ExpireProvisional, not per endpoint; hidden state such as lastSeq
+// deletions never bumps alone. The change hook fires once with the new
+// generation and the remove hook fires per removed GUID. It self-locks
+// and is safe for concurrent use.
 func (idx *SEDPIndex) ExpirePendingEvictions(now time.Time) int {
 	idx.mu.Lock()
 
@@ -988,24 +1136,60 @@ func (idx *SEDPIndex) ExpirePendingEvictions(now time.Time) int {
 		}
 	}
 
+	if len(due) == 0 {
+		idx.mu.Unlock()
+
+		return 0
+	}
+
+	dueSet := make(map[SEDPGUIDPrefix]struct{}, len(due))
 	for _, prefix := range due {
+		dueSet[prefix] = struct{}{}
 		delete(idx.pendingEvict, prefix)
 	}
 
-	idx.mu.Unlock()
-
-	removed := 0
-	for _, prefix := range due {
-		for _, ep := range idx.RemoteEndpoints() {
-			if ep.ID.Prefix == prefix {
-				if idx.RemoveRemote(ep.ID) {
-					removed++
-				}
-			}
+	var removedIDs []SEDPGUID
+	for id := range idx.remotes {
+		if _, ok := dueSet[id.Prefix]; ok {
+			delete(idx.remotes, id)
+			delete(idx.lastSeq, id)
+			removedIDs = append(removedIDs, id)
 		}
 	}
 
-	return removed
+	if len(removedIDs) == 0 {
+		idx.mu.Unlock()
+
+		return 0
+	}
+
+	slices.SortFunc(removedIDs, func(a, b SEDPGUID) int {
+		if a.Prefix != b.Prefix {
+			return bytes.Compare(a.Prefix[:], b.Prefix[:])
+		}
+
+		return bytes.Compare(a.Entity[:], b.Entity[:])
+	})
+
+	idx.generation++
+
+	gen := idx.generation
+	hook := idx.onChange
+	removeHook := idx.onRemove
+
+	idx.mu.Unlock()
+
+	if hook != nil {
+		hook(gen)
+	}
+
+	if removeHook != nil {
+		for _, id := range removedIDs {
+			removeHook(id)
+		}
+	}
+
+	return len(removedIDs)
 }
 
 // ProvisionalInstall installs a datapath fast-path placeholder by GUID.
@@ -1297,13 +1481,13 @@ func sedpHeaderPrefix(data []byte) (SEDPGUIDPrefix, error) {
 // sedpCheckInfoDstUnicast enforces INFO_DST on unicast ingress.
 //
 // It shares the walk with the SPDP helper and the backend demux through
-// rtps.ClassifyUnicastInfoDst so all three agree: absent or unknown
-// processes normally, mismatch or malformed bodies drop loudly with
-// ErrSEDPInfoDst. Undecodable datagrams return nil so the caller flows
-// to the normal decode path, which counts the failure. Multicast ingress
-// must never call this helper: group sockets carry every sender, so
-// per-sender identity has no meaning there and enforcement would drop
-// valid peers.
+// rtps.ClassifyUnicastInfoDst so all three agree: absent, zero-length, or
+// all-zero INFO_DST processes normally, mismatch or short non-empty bodies
+// drop loudly with ErrSEDPInfoDst. Undecodable datagrams classify as
+// absent and return nil so the caller flows to the normal decode path,
+// which counts the failure. Multicast ingress must never call this
+// helper: group sockets carry every sender, so per-sender identity has no
+// meaning there and enforcement would drop valid peers.
 func sedpCheckInfoDstUnicast(data []byte, local SEDPGUIDPrefix) error {
 	var want [12]byte
 	copy(want[:], local[:])
@@ -1363,6 +1547,7 @@ func (idx *SEDPIndex) sedpHeartbeatNote(key sedpWriterKey, count int32, last uin
 	if sedpHeartbeatReplay(count, last, lastCount, lastLast) {
 		return false
 	}
+	idx.sedpCapHeartbeatLocked(key)
 	if count == 0 {
 		return sedpNoteZeroHeartbeat(idx.hbLast, key, last)
 	}
@@ -1381,6 +1566,7 @@ func (idx *SEDPIndex) sedpHeartbeatNote(key sedpWriterKey, count int32, last uin
 // each step clamps to last plus one so a crafted GAP cannot jump past
 // announced history. When no bound is known, each step caps at the current
 // high plus sedpGapNoBoundCap (64, one repair window). Zeros are ignored.
+// New writer keys hold sedpAuxCap with oldest-eviction plus loud log.
 // It self-locks and is safe for concurrent use.
 func (idx *SEDPIndex) sedpApplyGapList(key sedpWriterKey, seqs []uint64) {
 	filtered := make([]uint64, 0, len(seqs))
@@ -1402,6 +1588,7 @@ func (idx *SEDPIndex) sedpApplyGapList(key sedpWriterKey, seqs []uint64) {
 	if idx.hbLast == nil {
 		idx.hbLast = make(map[sedpWriterKey]uint64)
 	}
+	idx.sedpCapWriterHighLocked(key)
 	bound, hasBound := idx.hbLast[key]
 	for _, seq := range filtered {
 		seq = sedpClampGapSeq(seq, bound, hasBound, idx.writerHigh[key])
@@ -1789,13 +1976,24 @@ func (idx *SEDPIndex) sedpStaleCheck(id SEDPGUID, seq uint64) bool {
 // sedpStoreSeq records seq after a successful upsert.
 //
 // Zero never advances lastSeq. Smaller or equal sequences never regress
-// the high. It self-locks and is safe for concurrent use.
+// the high. Insertion gates on matched endpoints: exact GUIDs in remotes,
+// GUIDs already tracked, prefixes with any remote, or prefixes with a
+// pending eviction store; random prefixes for never-seen GUIDs skip
+// without growing the map, consistent with the take-path matched-writer
+// gate. It self-locks and is safe for concurrent use.
 func (idx *SEDPIndex) sedpStoreSeq(id SEDPGUID, seq uint64) {
 	if seq == 0 {
 		return
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	if _, ok := idx.remotes[id]; !ok {
+		if _, ok := idx.lastSeq[id]; !ok {
+			if _, ok := idx.pendingEvict[id.Prefix]; !ok && !idx.sedpHasPrefixLocked(id.Prefix) {
+				return
+			}
+		}
+	}
 	if idx.lastSeq == nil {
 		idx.lastSeq = make(map[SEDPGUID]uint64)
 	}
@@ -1808,7 +2006,8 @@ func (idx *SEDPIndex) sedpStoreSeq(id SEDPGUID, seq uint64) {
 //
 // The key is the header prefix plus the DATA writer entity so GAP clamping
 // has a bound even before any heartbeat arrives. Zero sequences are
-// ignored. It self-locks and is safe for concurrent use.
+// ignored. New keys hold sedpAuxCap with oldest-eviction plus loud log.
+// It self-locks and is safe for concurrent use.
 func (idx *SEDPIndex) sedpNoteWriterHigh(prefix SEDPGUIDPrefix, body []byte, _ uint8, seq uint64) {
 	if seq == 0 {
 		return
@@ -1827,6 +2026,7 @@ func (idx *SEDPIndex) sedpNoteWriterHigh(prefix SEDPGUIDPrefix, body []byte, _ u
 	if idx.writerHigh == nil {
 		idx.writerHigh = make(map[sedpWriterKey]uint64)
 	}
+	idx.sedpCapWriterHighLocked(key)
 	if seq > idx.writerHigh[key] {
 		idx.writerHigh[key] = seq
 	}
@@ -2362,6 +2562,9 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 // when the userdata carries none; ListenLoop stamps the local domain.
 // Builtin endpoint QoS and XTypes TypeObject are optional and stored
 // when present. Vendor PIDs such as 0x8003 and 0x800c are tolerated.
+// Sequence zero rejection is ingest-only: this parser never gates on the
+// DATA sequence, so a seq-0 sample decodes here and only the ingest path
+// rejects it without installing.
 func ParseSEDPDATA(data []byte) (SEDPEndpoint, error) {
 	body, flags, err := sedpFindEndpointDATA(data)
 	if err != nil {
@@ -3521,7 +3724,15 @@ func sedpValidateMarshalEndpoint(ep SEDPEndpoint) error {
 }
 
 // sedpEntityFor builds a user entity id above the builtin range.
+//
+// Counters above 0xFFFFFF panic loudly instead of truncating silently,
+// matching KeyedUserEntity, so a caller passing a wider counter never
+// mints a colliding id.
 func sedpEntityFor(counter uint32, isReader bool) SEDPEntityID {
+	if counter > sedpUserEntityMax {
+		panic(fmt.Sprintf("dds: sedp entity counter %#x above 24 bits", counter))
+	}
+
 	kind := sedpUserWriterKind
 	if isReader {
 		kind = sedpUserReaderKind

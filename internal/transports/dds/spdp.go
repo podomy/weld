@@ -1180,8 +1180,9 @@ func patchSPDPLocatorPorts(packet []byte, port uint16) []byte {
 //
 // It requires the SPDP writer id, then patches inline QoS locators when
 // present plus payload locators when DataPresent carries a parameter list,
-// so datagrams with both sections patch both. Bounds failures leave the
-// body unchanged.
+// so datagrams with both sections patch both. Payload starts after the
+// inline list when both are present. Bounds failures leave the body
+// unchanged.
 func patchSPDPDataLocators(body []byte, flags uint8, littleEndian bool, port uint16) {
 	if len(body) < 20 {
 		return
@@ -1191,20 +1192,62 @@ func patchSPDPDataLocators(body []byte, flags uint8, littleEndian bool, port uin
 		return
 	}
 
+	payloadOff := 20
 	if flags&rtps.DataFlagInlineQoS != 0 {
 		patchInlineLocators(body[20:], littleEndian, port)
+		end := inlineListEnd(body[20:], littleEndian)
+		if end < 0 {
+			return
+		}
+		payloadOff = 20 + end
 	}
 
 	if flags&rtps.DataFlagDataPresent == 0 {
 		return
 	}
 
-	payload := body[20:]
+	if len(body) <= payloadOff {
+		return
+	}
+
+	payload := body[payloadOff:]
 	if len(payload) < spdpEncapSize || !isParameterListEncap(payload[:spdpEncapSize]) {
 		return
 	}
 
 	patchInlineLocators(payload[spdpEncapSize:], littleEndian, port)
+}
+
+// inlineListEnd returns the length of one inline QoS list including its sentinel.
+//
+// It walks ID plus length headers in the given order with 4 byte padding.
+// Truncation returns -1 so the caller leaves the body unchanged.
+func inlineListEnd(list []byte, littleEndian bool) int {
+	off := 0
+
+	for len(list)-off >= 4 {
+		id, length := readParamHeader(list[off:], littleEndian)
+		if id == rtps.ParamSentinel {
+			return off + 4
+		}
+
+		off += 4
+
+		if len(list)-off < length {
+			return -1
+		}
+
+		off += length
+
+		pad := padLen(length)
+		if len(list)-off < pad {
+			return -1
+		}
+
+		off += pad
+	}
+
+	return -1
 }
 
 // isParameterListEncap reports whether raw is a PL_CDR parameter list
@@ -1640,13 +1683,13 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 // checkSPDPInfoDstUnicast enforces INFO_DST on unicast ingress.
 //
 // It shares the walk with the SEDP helper and the backend demux through
-// rtps.ClassifyUnicastInfoDst so all three agree: absent or unknown
-// processes normally, mismatch or malformed bodies drop loudly with
-// ErrInvalidSPDP. Parse failures return nil so the caller flows to the
-// normal decode path, which counts the failure. Multicast ingress must
-// never call this helper: group sockets carry every sender, so
-// per-sender identity has no meaning there and enforcement would drop
-// valid peers.
+// rtps.ClassifyUnicastInfoDst so all three agree: absent, zero-length, or
+// all-zero INFO_DST processes normally, mismatch or short non-empty bodies
+// drop loudly with ErrInvalidSPDP. Undecodable datagrams classify as
+// absent and return nil so the caller flows to the normal decode path,
+// which counts the failure. Multicast ingress must never call this helper:
+// group sockets carry every sender, so per-sender identity has no meaning
+// there and enforcement would drop valid peers.
 func checkSPDPInfoDstUnicast(data []byte, local GUIDPrefix) error {
 	var want [12]byte
 	copy(want[:], local[:])

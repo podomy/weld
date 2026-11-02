@@ -34,7 +34,8 @@ package dds
 //
 // Notes on the subset: comparisons work on scalar numeric, string, and bool
 // fields including nested dotted paths such as header.frame_id. BETWEEN is
-// inclusive on both ends. IN holds one or more operands. LIKE matches %
+// inclusive on both ends. Numerals require a leading digit: leading-dot
+// forms like .5 fail compile, write 0.5 instead. IN holds one or more operands. LIKE matches %
 // against any run of runes and _ against exactly one rune, and is case
 // sensitive. AND binds tighter than OR, NOT binds tightest, and parens
 // group explicitly. AND and OR short-circuit: the right side never evaluates
@@ -1826,6 +1827,10 @@ func compareFilterOp(op filterTokenKind, cmp int) bool {
 }
 
 // evalFilterBetween evaluates one inclusive BETWEEN predicate.
+//
+// Bounds compare with Ge and Le, so BETWEEN is an approximation that skips
+// the lossy int/float equality error that = and <> raise above 2^53:
+// ordering keeps float comparison while equality would fail loudly.
 func evalFilterBetween(n betweenNode, fields map[string]filterValue) (bool, error) {
 	val, err := evalFilterValue(n.field, fields)
 	if err != nil {

@@ -4,9 +4,12 @@
 package dds
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
 )
 
@@ -445,4 +448,131 @@ func TestDeclareServiceEndpoint(t *testing.T) {
 	if _, err := idx.DeclareServiceEndpoint(true, "/add_two_ints", "bad", true, "", nil); err == nil {
 		t.Fatalf("bad idl succeeded, want error")
 	}
+}
+
+// serviceConcurrentPayload builds one plain service request payload.
+func serviceConcurrentPayload(t *testing.T) []byte {
+	t.Helper()
+	var guid [8]byte
+	for i := range guid {
+		guid[i] = byte(i + 1)
+	}
+	wire, err := MarshalServiceRequest(nil, guid, 1, true)
+	if err != nil {
+		t.Fatalf("marshal service: %v", err)
+	}
+	return wire
+}
+
+// checkWriterContiguity asserts one writer holds exactly want seqs 1 through want.
+func checkWriterContiguity(t *testing.T, b *Backend, guid WriterGUID, want uint64) {
+	t.Helper()
+	b.mu.RLock()
+	next := b.rtpsSeqByWriter[guid]
+	history := b.repairHistory
+	b.mu.RUnlock()
+	if next != FirstSequenceNumber+want {
+		t.Fatalf("writer %x next = %d, want %d", guid, next, FirstSequenceNumber+want)
+	}
+	for seq := uint64(1); seq <= want; seq++ {
+		payload, ok := history.load(guid, seq)
+		if !ok {
+			t.Fatalf("writer %x missing seq %d", guid, seq)
+		}
+		if len(payload) == 0 {
+			t.Fatalf("writer %x seq %d empty payload", guid, seq)
+		}
+	}
+}
+
+// runConcurrentPublishes runs service plus topic publishes and fails on any error.
+func runConcurrentPublishes(t *testing.T, first *Backend, servicePayload []byte, serviceCount, topicCount int) {
+	t.Helper()
+	var wg sync.WaitGroup
+	errCh := make(chan error, serviceCount+topicCount)
+	for range serviceCount {
+		wg.Go(func() {
+			err := first.PublishService(context.Background(), "/svc", "std_srvs__srv__Trigger", ServiceRoleClient, servicePayload, "")
+			errCh <- err
+		})
+	}
+	for range topicCount {
+		wg.Go(func() {
+			err := first.PublishBytes(context.Background(), transports.OutgoingMessage{
+				TopicName: "/chatter",
+				TypeName:  "std_msgs__msg__String",
+				Payload:   []byte{0xFF, 0xFF, 0xFF, 0xFF},
+			})
+			errCh <- err
+		})
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent publish: %v", err)
+		}
+	}
+}
+
+// findConcurrentWriters resolves the service plus topic writer GUIDs.
+func findConcurrentWriters(t *testing.T, first *Backend) (WriterGUID, WriterGUID) {
+	t.Helper()
+	if first.publisher.GUID() != first.publisherGUID() {
+		t.Fatalf("publisher GUID %x diverges from pubGUID %x", first.publisher.GUID(), first.publisherGUID())
+	}
+	var serviceGUID, topicGUID WriterGUID
+	foundService := false
+	foundTopic := false
+	for _, ep := range first.sedp.LocalEndpoints() {
+		if ep.IsReader {
+			continue
+		}
+		guid := writerGUIDFromEndpoint(ep.ID)
+		switch ep.DDSTopic {
+		case "rq/svcRequest":
+			serviceGUID = guid
+			foundService = true
+		case "rt/chatter":
+			topicGUID = guid
+			foundTopic = true
+		}
+	}
+	if !foundService {
+		t.Fatalf("service writer rq/svcRequest missing")
+	}
+	if !foundTopic {
+		t.Fatalf("topic writer rt/chatter missing")
+	}
+	return serviceGUID, topicGUID
+}
+
+// TestPublishServiceConcurrentPinsContiguity checks concurrent service plus topic publishes.
+func TestPublishServiceConcurrentPinsContiguity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode skips live UDP discovery")
+	}
+	const domain uint32 = 77
+	first := newLiveBackend(t, domain, "svc-concurrent-a")
+	defer func() {
+		err := first.Close()
+		if err != nil {
+			t.Errorf("close first: %v", err)
+		}
+	}()
+	second := newLiveBackend(t, domain, "svc-concurrent-b")
+	defer func() {
+		err := second.Close()
+		if err != nil {
+			t.Errorf("close second: %v", err)
+		}
+	}()
+	waitForRoutes(t, first, second)
+	const serviceCount = 8
+	const topicCount = 8
+	servicePayload := serviceConcurrentPayload(t)
+	runConcurrentPublishes(t, first, servicePayload, serviceCount, topicCount)
+	serviceGUID, topicGUID := findConcurrentWriters(t, first)
+	checkWriterContiguity(t, first, serviceGUID, serviceCount)
+	checkWriterContiguity(t, first, topicGUID, topicCount)
 }

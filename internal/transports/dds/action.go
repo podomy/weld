@@ -358,8 +358,11 @@ type CancelScope int
 
 // Cancel scopes per the empty goal plus zero stamp policy.
 const (
+	// CancelScopeInvalid is the zero value returned with an error.
+	// Callers must not use the scope when err is non-nil.
+	CancelScopeInvalid CancelScope = iota
 	// CancelScopeAll cancels every goal when ID is empty and stamp is zero.
-	CancelScopeAll CancelScope = iota
+	CancelScopeAll
 	// CancelScopeBefore cancels goals accepted at or before the stamp.
 	CancelScopeBefore
 	// CancelScopeSingle cancels one goal ID regardless of stamp.
@@ -371,6 +374,8 @@ const (
 // String renders the cancel scope in lowercase form.
 func (s CancelScope) String() string {
 	switch s {
+	case CancelScopeInvalid:
+		return "invalid"
 	case CancelScopeAll:
 		return "all"
 	case CancelScopeBefore:
@@ -387,14 +392,15 @@ func (s CancelScope) String() string {
 // ClassifyCancelRequest maps goal ID plus stamp to its cancel scope.
 //
 // It requires sec >= 0 and nsec < 1e9. Out of range stamps fail loudly
-// with ErrActionInvalidGoal instead of classifying.
+// with ErrActionInvalidGoal and return CancelScopeInvalid. Callers must
+// not use the scope when err is non-nil; check err first.
 func ClassifyCancelRequest(goal GoalID, sec int32, nsec uint32) (CancelScope, error) {
 	if sec < 0 {
-		return CancelScopeAll, fmt.Errorf("dds: cancel stamp sec %d below 0: %w", sec, ErrActionInvalidGoal)
+		return CancelScopeInvalid, fmt.Errorf("dds: cancel stamp sec %d below 0: %w", sec, ErrActionInvalidGoal)
 	}
 
 	if nsec >= 1000000000 {
-		return CancelScopeAll, fmt.Errorf("dds: cancel stamp nsec %d above 999999999: %w", nsec, ErrActionInvalidGoal)
+		return CancelScopeInvalid, fmt.Errorf("dds: cancel stamp nsec %d above 999999999: %w", nsec, ErrActionInvalidGoal)
 	}
 
 	empty := goal.IsZero()

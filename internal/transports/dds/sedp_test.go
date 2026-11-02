@@ -3591,3 +3591,346 @@ func TestSEDPReannounceCancelsGraceEvict(t *testing.T) {
 		t.Fatalf("remotes = %d, want 1 after cancel", n)
 	}
 }
+
+// TestSEDPExpirePendingUpsertSurvives pins the TOCTOU hold across expiry.
+//
+// Scheduling eviction, re-announcing the same prefix, then expiring past
+// the deadline must keep the remote: UpsertRemote cancels the pending
+// entry, and ExpirePendingEvictions holds the lock across collect and
+// remove so no window drops a re-announced endpoint.
+func TestSEDPExpirePendingUpsertSurvives(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xE5)
+	peer := mustSEDPIndexWithPrefix(t, 0xE6)
+	writer := mustSEDPWriter(t, peer, "/toctou", "RIHS01_toctou")
+
+	err := local.UpsertRemote(writer)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	base := time.Now()
+	local.SchedulePrefixEvict(writer.ID.Prefix, base)
+
+	err = local.UpsertRemote(writer)
+	if err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+
+	if got := local.ExpirePendingEvictions(base.Add(sedpEvictGracePeriod + time.Second)); got != 0 {
+		t.Fatalf("expired = %d, want 0 after upsert cancel", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 1 {
+		t.Fatalf("remotes = %d, want 1 after cancel", n)
+	}
+}
+
+// TestSEDPDuplicateScheduleDoesNotRearm pins set-if-absent dispose grace.
+//
+// A duplicate dispose must not extend the deadline: scheduling twice then
+// expiring once past the first deadline removes exactly once, and a second
+// expiry removes nothing.
+func TestSEDPDuplicateScheduleDoesNotRearm(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xE7)
+	peer := mustSEDPIndexWithPrefix(t, 0xE8)
+	writer := mustSEDPWriter(t, peer, "/rearm", "RIHS01_rearm")
+
+	err := local.UpsertRemote(writer)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	base := time.Now()
+	local.SchedulePrefixEvict(writer.ID.Prefix, base)
+	local.SchedulePrefixEvict(writer.ID.Prefix, base.Add(3*time.Second))
+
+	if got := local.ExpirePendingEvictions(base.Add(sedpEvictGracePeriod + time.Second)); got != 1 {
+		t.Fatalf("expired = %d, want 1 with no re-arm", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 0 {
+		t.Fatalf("remotes = %d, want 0 after deadline", n)
+	}
+
+	if got := local.ExpirePendingEvictions(base.Add(sedpEvictGracePeriod + 4*time.Second)); got != 0 {
+		t.Fatalf("second expired = %d, want 0", got)
+	}
+}
+
+// TestSEDPExpirePendingSingleBumpBatch pins one generation bump per call.
+//
+// Two remotes under one pending prefix expire together with a single
+// generation bump, one change hook, and one remove hook per GUID,
+// matching Sweep and ExpireProvisional batch accounting.
+func TestSEDPExpirePendingSingleBumpBatch(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xE9)
+	peer := mustSEDPIndexWithPrefix(t, 0xEA)
+	writerOne := mustSEDPWriter(t, peer, "/batchone", "RIHS01_batchone")
+	writerTwo := mustSEDPWriter(t, peer, "/batchtwo", "RIHS01_batchtwo")
+
+	err := local.UpsertRemote(writerOne)
+	if err != nil {
+		t.Fatalf("upsert one: %v", err)
+	}
+
+	err = local.UpsertRemote(writerTwo)
+	if err != nil {
+		t.Fatalf("upsert two: %v", err)
+	}
+
+	var changes int
+	local.SetOnChange(func(_ uint64) {
+		changes++
+	})
+
+	var removed []SEDPGUID
+	local.SetOnRemove(func(id SEDPGUID) {
+		removed = append(removed, id)
+	})
+
+	genBefore := local.Generation()
+	base := time.Now()
+	local.SchedulePrefixEvict(writerOne.ID.Prefix, base)
+
+	if got := local.ExpirePendingEvictions(base.Add(sedpEvictGracePeriod + time.Second)); got != 2 {
+		t.Fatalf("expired = %d, want 2", got)
+	}
+
+	if got := local.Generation(); got != genBefore+1 {
+		t.Fatalf("gen = %d, want %d single bump", got, genBefore+1)
+	}
+
+	if changes != 1 {
+		t.Fatalf("change hooks = %d, want 1", changes)
+	}
+
+	if len(removed) != 2 {
+		t.Fatalf("remove hooks = %d, want 2", len(removed))
+	}
+}
+
+// TestSEDPStoreSeqGatesUnknownPrefix pins matched gating for lastSeq.
+//
+// A sequence for a never-seen prefix must not create tracking state,
+// while a sequence for a known prefix after upsert must record.
+func TestSEDPStoreSeqGatesUnknownPrefix(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xEB)
+	peer := mustSEDPIndexWithPrefix(t, 0xEC)
+	writer := mustSEDPWriter(t, peer, "/gate", "RIHS01_gate")
+
+	err := local.UpsertRemote(writer)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	local.sedpStoreSeq(writer.ID, 7)
+
+	local.mu.Lock()
+	_, seenKnown := local.lastSeq[writer.ID]
+	local.mu.Unlock()
+
+	if !seenKnown {
+		t.Fatalf("known seq not stored, want gated admit")
+	}
+
+	var unknownPrefix SEDPGUIDPrefix
+	for i := range unknownPrefix {
+		unknownPrefix[i] = 0xFF
+	}
+
+	unknown := SEDPGUID{Prefix: unknownPrefix, Entity: writer.ID.Entity}
+	local.sedpStoreSeq(unknown, 9)
+
+	local.mu.Lock()
+	_, seenUnknown := local.lastSeq[unknown]
+	local.mu.Unlock()
+
+	if seenUnknown {
+		t.Fatalf("unknown prefix stored, want gate skip")
+	}
+}
+
+// TestSEDPPendingCapEvictsOldest pins bounded pendingEvict with loud eviction.
+func TestSEDPPendingCapEvictsOldest(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xED)
+	base := time.Now()
+
+	for i := range sedpAuxCap {
+		var prefix SEDPGUIDPrefix
+		binary.BigEndian.PutUint32(prefix[0:4], uint32(i))
+		local.SchedulePrefixEvict(prefix, base.Add(time.Duration(i)*time.Millisecond))
+	}
+
+	local.mu.Lock()
+	n := len(local.pendingEvict)
+	local.mu.Unlock()
+
+	if n != sedpAuxCap {
+		t.Fatalf("pending len = %d, want %d", n, sedpAuxCap)
+	}
+
+	var oldest SEDPGUIDPrefix
+	binary.BigEndian.PutUint32(oldest[0:4], 0)
+	local.SchedulePrefixEvict(oldest, base)
+
+	var newest SEDPGUIDPrefix
+	binary.BigEndian.PutUint32(newest[0:4], uint32(sedpAuxCap+99))
+	local.SchedulePrefixEvict(newest, base.Add(time.Hour))
+
+	local.mu.Lock()
+	_, seenOldest := local.pendingEvict[oldest]
+	_, seenNewest := local.pendingEvict[newest]
+	after := len(local.pendingEvict)
+	local.mu.Unlock()
+
+	if after != sedpAuxCap {
+		t.Fatalf("pending len after = %d, want %d", after, sedpAuxCap)
+	}
+
+	if seenOldest {
+		t.Fatalf("oldest pending still present, want evicted")
+	}
+
+	if !seenNewest {
+		t.Fatalf("newest pending missing, want cap admit")
+	}
+}
+
+// TestSEDPHeartbeatCapEvicts pins bounded heartbeat tables.
+func TestSEDPHeartbeatCapEvicts(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xEE)
+
+	for i := range sedpAuxCap + 5 {
+		var prefix SEDPGUIDPrefix
+		binary.BigEndian.PutUint32(prefix[0:4], uint32(i))
+		binary.BigEndian.PutUint32(prefix[4:8], uint32(i+1))
+		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+		idx.sedpHeartbeatNote(key, int32(i+1), uint64(i+1))
+	}
+
+	idx.mu.Lock()
+	nLast := len(idx.hbLast)
+	nCount := len(idx.hbCount)
+	local := nLast
+	idx.mu.Unlock()
+
+	if local > sedpAuxCap {
+		t.Fatalf("hbLast len = %d, want at most %d", nLast, sedpAuxCap)
+	}
+
+	if nCount > sedpAuxCap {
+		t.Fatalf("hbCount len = %d, want at most %d", nCount, sedpAuxCap)
+	}
+}
+
+// TestSEDPWriterHighCapEvicts pins bounded writerHigh.
+func TestSEDPWriterHighCapEvicts(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xEF)
+
+	for i := range sedpAuxCap + 5 {
+		var prefix SEDPGUIDPrefix
+		binary.BigEndian.PutUint32(prefix[0:4], uint32(5000+i))
+		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+		idx.sedpApplyGapList(key, []uint64{uint64(i + 1)})
+	}
+
+	idx.mu.Lock()
+	n := len(idx.writerHigh)
+	idx.mu.Unlock()
+
+	if n > sedpAuxCap {
+		t.Fatalf("writerHigh len = %d, want at most %d", n, sedpAuxCap)
+	}
+}
+
+// TestSEDPEntityForBoundaryGuards24Bits pins the loud counter guard.
+func TestSEDPEntityForBoundaryGuards24Bits(t *testing.T) {
+	t.Parallel()
+
+	id := sedpEntityFor(sedpUserEntityMax, false)
+	if id == (SEDPEntityID{}) {
+		t.Fatalf("max entity is zero, want valid id")
+	}
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("counter above 24 bits did not panic")
+			}
+		}()
+
+		_ = sedpEntityFor(sedpUserEntityMax+1, false)
+	}()
+}
+
+// TestSEDPDuplicateDeclareKeepsSequence pins check-then-increment stability.
+//
+// A duplicate declare must not burn an entity slot: rewinding next onto an
+// existing entity then declaring again fails without advancing next,
+// matching the service declare path.
+func TestSEDPDuplicateDeclareKeepsSequence(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF0)
+
+	_, err := idx.DeclareWriter("/dup", "std_msgs__msg__String", "h1", nil)
+	if err != nil {
+		t.Fatalf("first declare: %v", err)
+	}
+
+	idx.mu.Lock()
+	rewound := idx.next - 1
+	idx.next = rewound
+	before := idx.next
+	idx.mu.Unlock()
+
+	_, err = idx.DeclareWriter("/dup2", "std_msgs__msg__String", "h2", nil)
+	if err == nil {
+		t.Fatalf("duplicate declare succeeded, want error")
+	}
+
+	idx.mu.Lock()
+	after := idx.next
+	idx.mu.Unlock()
+
+	if after != before {
+		t.Fatalf("next = %d, want %d no burn on duplicate", after, before)
+	}
+}
+
+// TestSEDPCheckInfoDstShortBodyDrops pins loud short INFO_DST handling.
+func TestSEDPCheckInfoDstShortBodyDrops(t *testing.T) {
+	t.Parallel()
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xA1 + byte(i)
+	}
+
+	hdr := rtps.DefaultHeader([12]byte(prefix))
+	shortBody := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	data, err := rtps.EncodeMessage(hdr, []rtps.RawSubmessage{{ID: sedpSubmessageInfoDst, Flags: 0x01, Body: shortBody}})
+	if err != nil {
+		t.Fatalf("encode short INFO_DST: %v", err)
+	}
+
+	err = sedpCheckInfoDstUnicast(data, prefix)
+	if !errors.Is(err, ErrSEDPInfoDst) {
+		t.Fatalf("short INFO_DST err = %v, want ErrSEDPInfoDst", err)
+	}
+}

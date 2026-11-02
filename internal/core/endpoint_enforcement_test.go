@@ -24,6 +24,7 @@ func TestEndpointEnforcement(t *testing.T) {
 	t.Run("compatible transient keeps history", checkCompatibleTransientKeepsHistory)
 	t.Run("deadline lapse keeps delivering", checkDeadlineLapseKeepsDelivering)
 	t.Run("best available resolve once", checkEnforcementResolveOnce)
+	t.Run("malformed nanos folds unconstrained", checkMalformedNanosFoldsUnconstrained)
 }
 
 // enforcementBase returns the resolved default profile used by the gate.
@@ -435,5 +436,22 @@ func checkEnforcementResolveOnce(t *testing.T) {
 	}
 	if !EndpointsCanDeliver(&pub, &endpoint) {
 		t.Fatalf("resolved pair must deliver, got %q", CheckEndpointPair(&pub, &endpoint).Reason())
+	}
+}
+
+// checkMalformedNanosFoldsUnconstrained pins nanos at or above one second as no constraint.
+func checkMalformedNanosFoldsUnconstrained(t *testing.T) {
+	t.Helper()
+	malformed := Duration{Seconds: 1, Nanoseconds: 1000000000}
+	peers := []Peer{{Name: "bad", Profile: QoSProfile{Deadline: malformed, LeaseDuration: malformed}}}
+	if got := minDurationFold(peers, func(p QoSProfile) Duration {
+		return p.Deadline
+	}); got != UnspecifiedDuration() {
+		t.Fatalf("min fold with malformed nanos must yield unspecified, got %v", got)
+	}
+	if got := maxDurationFold(peers, func(p QoSProfile) Duration {
+		return p.Deadline
+	}); got != UnspecifiedDuration() {
+		t.Fatalf("max fold with malformed nanos must yield unspecified, got %v", got)
 	}
 }

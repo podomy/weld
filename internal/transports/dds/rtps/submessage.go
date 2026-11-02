@@ -426,7 +426,10 @@ func checkDataSize(body []byte, drops *Counter) error {
 // DecodeData parses a DATA body with its header flags. Extra flags and
 // the inline QoS offset are ignored for tolerance; parsing is sequential.
 // Contradictory Data plus Key flags drop loudly. Payload aliases the
-// owned body slice.
+// owned body slice. Sequence 0 is accepted here but ignored downstream:
+// datapath, reliability, and SPDP treat 0 as invalid and skip tracking
+// plus repair. A zero sequence counts one drop for dashboards without
+// failing decode.
 func DecodeData(body []byte, flags uint8, drops *Counter) (Data, error) {
 	var out Data
 	err := checkDataSize(body, drops)
@@ -439,6 +442,9 @@ func DecodeData(body []byte, flags uint8, drops *Counter) (Data, error) {
 	}
 	littleEndian := LittleEndian(flags)
 	decodeDataFixed(body, littleEndian, &out)
+	if out.SequenceNumber == 0 {
+		drops.RecordDrop()
+	}
 	rest := body[dataFixedSize:]
 	if flags&DataFlagInlineQoS != 0 {
 		params, remaining, err := decodeDataInline(rest, littleEndian, drops)
@@ -817,7 +823,8 @@ const gapListMaxBits = 4096
 // set. Short bodies and zero gap start drop with a counter increment.
 // A present list must be fully covered by the body length and NumBits must
 // stay under the cap; otherwise the datagram drops loudly instead of
-// trusting declared bits.
+// trusting declared bits. A present list with base at or below GapStart
+// drops loudly as well so SkippedSequences stays sorted without duplicates.
 func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	var out Gap
 	if len(body) < gapMinSize {
@@ -843,6 +850,10 @@ func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	bitsOff := gapMinSize + 8
 	out.GapListBase = seqNumberValue(body[baseOff:baseOff+8], littleEndian)
 	out.NumBits = uint32Value(body[bitsOff:bitsOff+wordSize], littleEndian)
+	if out.NumBits > 0 && out.GapListBase <= out.GapStart {
+		drops.RecordDrop()
+		return Gap{}, fmt.Errorf("rtps: gap base %d at or below start %d", out.GapListBase, out.GapStart)
+	}
 	if out.NumBits > gapListMaxBits {
 		drops.RecordDrop()
 		return out, fmt.Errorf("rtps: gap bits %d above %d", out.NumBits, gapListMaxBits)

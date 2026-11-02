@@ -191,7 +191,9 @@ func CanLoanType(m *types.MessageMembers) (bool, string) {
 // Non-eligible types are refused loudly with ErrLoanNotEligible before any
 // storage is touched. An empty pool allocates instead of blocking and an
 // oversize request allocates an exact-size buffer that is never recycled,
-// so the pool stays uniform. The returned handle must be Returned exactly
+// so the pool stays uniform. The exposed view caps capacity at size with
+// a full slice expression so append allocates instead of corrupting pooled
+// storage later reused. The returned handle must be Returned exactly
 // once.
 func (p *LoanPool) Borrow(m *types.MessageMembers, size int) (*Loan, error) {
 	if p == nil {
@@ -218,12 +220,12 @@ func (p *LoanPool) Borrow(m *types.MessageMembers, size int) (*Loan, error) {
 		p.free = p.free[:len(p.free)-1]
 		p.mu.Unlock()
 		p.hits.Add(1)
-		return &Loan{pool: p, full: full, buf: full[:size], pooled: true, valid: true}, nil
+		return &Loan{pool: p, full: full, buf: full[:size:size], pooled: true, valid: true}, nil
 	}
 	p.mu.Unlock()
 	p.fallbacks.Add(1)
 	full := make([]byte, p.bufSize)
-	return &Loan{pool: p, full: full, buf: full[:size], pooled: true, valid: true}, nil
+	return &Loan{pool: p, full: full, buf: full[:size:size], pooled: true, valid: true}, nil
 }
 
 // recycle stores one backing store or drops it when the pool is full.

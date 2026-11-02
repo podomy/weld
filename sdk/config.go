@@ -330,7 +330,7 @@ type storeEntry struct {
 // Broadcast never sends on a channel the cancel path can close: cancel
 // deletes from the map under the store write lock then closes under the
 // watcher mutex, while broadcast sends only while holding that same watcher
-// mutex with closed false (generation-checked delivery).
+// mutex with closed false.
 type sdkWatcher struct {
 	// mu guards closed plus ch during send versus close.
 	mu sync.Mutex
@@ -338,8 +338,6 @@ type sdkWatcher struct {
 	ch chan Event
 	// closed is true after cancel; broadcast skips closed watchers.
 	closed bool
-	// gen pins the Watch id for generation-checked delivery.
-	gen uint64
 }
 
 // Store is a versioned parameter store with schema, validation, atomic
@@ -662,15 +660,11 @@ func (s *Store) Watch() (uint64, <-chan Event, func()) {
 	id := s.nextWatch
 	s.nextWatch++
 	ch := make(chan Event, configWatchBuffer)
-	s.watchers[id] = &sdkWatcher{ch: ch, gen: id}
+	s.watchers[id] = &sdkWatcher{ch: ch}
 	cancel := func() {
 		s.mu.Lock()
 		w, ok := s.watchers[id]
 		if !ok {
-			s.mu.Unlock()
-			return
-		}
-		if w.gen != id {
 			s.mu.Unlock()
 			return
 		}
@@ -943,7 +937,7 @@ func (s *Store) trimHistoryLocked() {
 // counts loudly in BroadcastDrops. Never sends on a closed channel because
 // cancel deletes under the store write lock then closes under the watcher
 // mutex, while broadcast sends only while holding that same watcher mutex
-// with closed false (generation-checked delivery).
+// with closed false.
 func (s *Store) broadcast(event Event) {
 	s.mu.RLock()
 	watchers := make([]*sdkWatcher, 0, len(s.watchers))

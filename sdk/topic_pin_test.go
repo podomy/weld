@@ -103,3 +103,79 @@ func TestTopicDeliverNextLostRace(t *testing.T) {
 	received = drainRaceRemainder(ctx, sub, received)
 	checkRaceAccounting(t, received, sub.Len(), published, sub.Lost())
 }
+
+// TestTopicDeliverOverflowExact pins deterministic single-threaded overflow
+// with exact lost counts. Depth 2 plus 5 sequential publishes must leave
+// the last 2 samples queued and count exactly 3 lost drops.
+func TestTopicDeliverOverflowExact(t *testing.T) {
+	ctx := context.Background()
+	pub, sub := newOverflowFixture(t)
+	publishOverflowFixture(t, ctx, pub, 5)
+	checkOverflowCounts(t, sub, 3, 2)
+	checkOverflowOrder(t, ctx, sub, []string{"msg-3", "msg-4"})
+	checkOverflowCounts(t, sub, 3, 0)
+}
+
+// newOverflowFixture returns a depth 2 publisher plus subscription.
+func newOverflowFixture(t *testing.T) (*sdk.Publisher, *sdk.Subscription) {
+	t.Helper()
+	bus := sdk.NewBus()
+	node, err := sdk.NewNode("overflow-node", bus)
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	t.Cleanup(func() {
+		cerr := node.Close()
+		if cerr != nil {
+			t.Errorf("close node: %v", cerr)
+		}
+	})
+	qos := sdk.DefaultQoS()
+	qos.Depth = 2
+	pub, err := node.NewPublisher("/overflow", "std_msgs/msg/String", qos)
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	sub, err := node.NewSubscription("/overflow", "std_msgs/msg/String", qos)
+	if err != nil {
+		t.Fatalf("new subscription: %v", err)
+	}
+	return pub, sub
+}
+
+// publishOverflowFixture publishes count sequential samples.
+func publishOverflowFixture(t *testing.T, ctx context.Context, pub *sdk.Publisher, count int) {
+	t.Helper()
+	for i := range count {
+		payload := fmt.Appendf(nil, "msg-%d", i)
+		err := pub.Publish(ctx, payload)
+		if err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+}
+
+// checkOverflowCounts pins exact lost plus queued counts.
+func checkOverflowCounts(t *testing.T, sub *sdk.Subscription, wantLost uint64, wantLen int) {
+	t.Helper()
+	if got := sub.Lost(); got != wantLost {
+		t.Fatalf("lost = %d, want %d", got, wantLost)
+	}
+	if got := sub.Len(); got != wantLen {
+		t.Fatalf("len = %d, want %d", got, wantLen)
+	}
+}
+
+// checkOverflowOrder drains want in order without changing lost.
+func checkOverflowOrder(t *testing.T, ctx context.Context, sub *sdk.Subscription, want []string) {
+	t.Helper()
+	for _, w := range want {
+		msg, err := sub.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if string(msg) != w {
+			t.Fatalf("msg = %q, want %q", string(msg), w)
+		}
+	}
+}

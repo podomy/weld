@@ -100,7 +100,7 @@ func SplitNanos(nanos int64) (int32, uint32) {
 // JoinNanos joins seconds plus nanoseconds into one tick exactly.
 //
 // It inverts SplitNanos: JoinNanos(1234, 0) returns 1234000000000 on every
-// peer. Values beyond max int64 saturate to max int64. Negative seconds
+// peer. Sec is int32 so the total never overflows int64. Negative seconds
 // and nanoseconds at or above one second are rejected as malformed instead
 // of carrying silently.
 func JoinNanos(sec int32, nsec uint32) (int64, error) {
@@ -111,9 +111,6 @@ func JoinNanos(sec int32, nsec uint32) (int64, error) {
 		return 0, fmt.Errorf("core: join nanos: nanoseconds %d above one second", nsec)
 	}
 	total := int64(sec)*nanosPerSecond + int64(nsec)
-	if total < 0 {
-		return math.MaxInt64, nil
-	}
 	return total, nil
 }
 

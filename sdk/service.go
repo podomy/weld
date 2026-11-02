@@ -147,6 +147,20 @@ type serviceResult struct {
 	err error
 }
 
+// lookupServiceChecked returns the handler when the server is present and
+// not closed. It linearizes against Close via the owner recheck so a Close
+// before the recheck reports gone instead of succeeding.
+func (c *ServiceClient) lookupServiceChecked() (ServiceHandler, bool) {
+	handler, owner, ok := c.node.bus.lookupService(c.service)
+	if !ok {
+		return nil, false
+	}
+	if owner.isClosed() {
+		return nil, false
+	}
+	return handler, true
+}
+
 // Call routes one request to the server and returns one reply.
 //
 // It copies the request at ingress, applies the default timeout when ctx
@@ -161,7 +175,10 @@ type serviceResult struct {
 // ignores ctx therefore accumulates orphaned goroutines: handlers must
 // honor ctx and return on Done, and callers must keep per-call deadlines
 // tight, or timeouts can grow goroutines without bound. This is a handler
-// liveness contract, not a silent queue.
+// liveness contract, not a silent queue. Linearizability point is lookup
+// plus owner recheck: the call linearizes at the recheck, so a Close
+// before the recheck fails with ErrNoSuchService while a Close after the
+// recheck may still succeed.
 func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	if c == nil {
 		return nil, errors.New("sdk: call on nil service client") //nolint:wrapcheck // new error, nothing to wrap
@@ -173,24 +190,17 @@ func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, err)
 	}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrServiceClientGone)
+	err = c.reserveCallSlot()
+	if err != nil {
+		return nil, err
 	}
-	if c.inflight >= maxServiceInflight {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("sdk: service call on %q inflight %d at cap %d: %w", c.service, c.inflight, maxServiceInflight, ErrServiceInflightExceeded)
-	}
-	c.inflight++
-	c.mu.Unlock()
 	if c.node.IsClosed() {
 		c.finishCall()
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrServiceClientGone)
 	}
 	eff, cancel := withServiceTimeout(ctx)
 	defer cancel()
-	handler, ok := c.node.bus.lookupService(c.service)
+	handler, ok := c.lookupServiceChecked()
 	if !ok {
 		c.finishCall()
 		return nil, fmt.Errorf("sdk: service call on %q: %w", c.service, ErrNoSuchService)
@@ -214,6 +224,20 @@ func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 		}
 		return res.reply, nil
 	}
+}
+
+// reserveCallSlot claims one inflight slot or reports the refusal.
+func (c *ServiceClient) reserveCallSlot() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("sdk: service call on %q: %w", c.service, ErrServiceClientGone)
+	}
+	if c.inflight >= maxServiceInflight {
+		return fmt.Errorf("sdk: service call on %q inflight %d at cap %d: %w", c.service, c.inflight, maxServiceInflight, ErrServiceInflightExceeded)
+	}
+	c.inflight++
+	return nil
 }
 
 // finishCall releases one inflight slot.

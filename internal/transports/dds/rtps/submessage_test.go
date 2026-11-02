@@ -5,6 +5,7 @@ package rtps_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -610,6 +611,7 @@ func TestDecodeSubmessageErrors(t *testing.T) {
 
 	cases := []rtps.RawSubmessage{
 		{ID: rtps.SubmessageData, Flags: 0x05, Body: []byte{0x01}},
+		{ID: rtps.SubmessageDataFrag, Flags: 0x01, Body: []byte{0x01}},
 		{ID: rtps.SubmessageInfoTS, Flags: 0x01, Body: []byte{0x01}},
 		{ID: rtps.SubmessageHeartbeat, Flags: 0x01, Body: []byte{0x01}},
 		{ID: rtps.SubmessageGap, Flags: 0x01, Body: []byte{0x01}},
@@ -675,5 +677,224 @@ func TestDecodeSubmessageHeartbeatGap(t *testing.T) {
 	}
 	if drops.Count() != 0 {
 		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// gapBaseBody builds a GAP body with the given start, base, and bits.
+func gapBaseBody(start, base uint64, numBits uint32) []byte {
+	body := []byte{
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0xC2,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0xFF, 0xFF, 0xFF, 0xFF,
+	}
+	putGapSeq(body[8:16], start)
+	putGapSeq(body[16:24], base)
+	putGapNumBits(body[24:28], numBits)
+	return body
+}
+
+// putGapSeq stores one sequence as high word then low word little endian.
+func putGapSeq(dst []byte, v uint64) {
+	binary.LittleEndian.PutUint32(dst[0:4], uint32(v>>32))
+	binary.LittleEndian.PutUint32(dst[4:8], uint32(v)) //nolint:gosec // G115: low word truncation is the RTPS layout
+}
+
+// putGapNumBits stores one bit count little endian.
+func putGapNumBits(dst []byte, v uint32) {
+	binary.LittleEndian.PutUint32(dst, v)
+}
+
+// TestGapBaseAtOrBelowStartRejects pins loud reject for unsorted lists.
+func TestGapBaseAtOrBelowStartRejects(t *testing.T) {
+	t.Parallel()
+
+	for _, base := range []uint64{10, 5, 0} {
+		body := gapBaseBody(10, base, 1)
+		var drops rtps.Counter
+		if _, err := rtps.DecodeGap(body, 0x01, &drops); err == nil {
+			t.Fatalf("base %d with start 10 succeeded, want error", base)
+		}
+		if drops.Count() != 1 {
+			t.Fatalf("base %d drops = %d, want 1", base, drops.Count())
+		}
+		var subDrops rtps.Counter
+		raw := rtps.RawSubmessage{ID: rtps.SubmessageGap, Flags: 0x01, Body: body}
+		if _, err := rtps.DecodeSubmessage(raw, &subDrops); err == nil {
+			t.Fatalf("dispatcher base %d succeeded, want error", base)
+		}
+		if subDrops.Count() != 1 {
+			t.Fatalf("dispatcher base %d drops = %d, want 1", base, subDrops.Count())
+		}
+	}
+
+	good := gapBaseBody(10, 11, 1)
+	var drops rtps.Counter
+	gap, err := rtps.DecodeGap(good, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("base 11 with start 10: %v", err)
+	}
+	if gap.GapStart != 10 || gap.GapListBase != 11 {
+		t.Fatalf("gap = %+v, want start 10 base 11", gap)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// TestDataSeqZeroCountsDrop pins the accepted but ignored zero contract.
+func TestDataSeqZeroCountsDrop(t *testing.T) {
+	t.Parallel()
+
+	zero := testData()
+	zero.SequenceNumber = 0
+	body, err := zero.Body(true)
+	if err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	var drops rtps.Counter
+	decoded, err := rtps.DecodeData(body, 0x05, &drops)
+	if err != nil {
+		t.Fatalf("decode seq 0: %v, want accept", err)
+	}
+	if decoded.SequenceNumber != 0 {
+		t.Fatalf("seq = %d, want 0", decoded.SequenceNumber)
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: 0x05, Body: body}
+	var subDrops rtps.Counter
+	sub, err := rtps.DecodeSubmessage(raw, &subDrops)
+	if err != nil {
+		t.Fatalf("dispatcher seq 0: %v, want accept", err)
+	}
+	if sub.Data == nil || sub.Data.SequenceNumber != 0 {
+		t.Fatalf("dispatcher data = %+v, want seq 0", sub.Data)
+	}
+	if subDrops.Count() != 1 {
+		t.Fatalf("dispatcher drops = %d, want 1", subDrops.Count())
+	}
+}
+
+// validDataFragBody returns a minimal valid DATA_FRAG body little endian.
+func validDataFragBody() []byte {
+	return []byte{
+		0x00, 0x00, 0x1C, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0xC2,
+		0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00,
+		0x01, 0x00,
+		0x05, 0x00,
+		0x05, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x41,
+	}
+}
+
+// knownTypedCase names one dispatcher case with its expected typed field.
+type knownTypedCase struct {
+	name string
+	raw  rtps.RawSubmessage
+	want string
+}
+
+// knownTypedCases builds valid bodies for every known typed ID.
+func knownTypedCases(t *testing.T) []knownTypedCase {
+	t.Helper()
+	dataSub, err := testData().Submessage(true)
+	if err != nil {
+		t.Fatalf("data submessage: %v", err)
+	}
+	stamp := rtps.InfoTS{Valid: true, Seconds: 3, Fraction: 4}
+	beat := rtps.Heartbeat{
+		ReaderID:      rtps.EntityUnknown,
+		WriterID:      rtps.EntitySPDPWriter,
+		FirstSequence: 1,
+		LastSequence:  5,
+		Count:         9,
+	}
+	gapBody := []byte{
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x01, 0x00, 0xC2,
+		0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00,
+	}
+	return []knownTypedCase{
+		{name: "data", raw: rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: dataSub.Flags, Body: dataSub.Body}, want: "data"},
+		{name: "datafrag", raw: rtps.RawSubmessage{ID: rtps.SubmessageDataFrag, Flags: 0x01, Body: validDataFragBody()}, want: "datafrag"},
+		{name: "infots", raw: rtps.RawSubmessage{ID: rtps.SubmessageInfoTS, Flags: stamp.Flags(true), Body: stamp.Encode(true)}, want: "infots"},
+		{name: "heartbeat", raw: rtps.RawSubmessage{ID: rtps.SubmessageHeartbeat, Flags: beat.Flags(true, true, false), Body: beat.Encode(true)}, want: "heartbeat"},
+		{name: "gap", raw: rtps.RawSubmessage{ID: rtps.SubmessageGap, Flags: 0x01, Body: gapBody}, want: "gap"},
+	}
+}
+
+// checkKnownTyped asserts one dispatcher result carries the typed field.
+func checkKnownTyped(t *testing.T, tc knownTypedCase, got rtps.Submessage) {
+	t.Helper()
+	if tc.want == "data" || tc.want == "datafrag" {
+		checkKnownDataTyped(t, tc, got)
+		return
+	}
+	checkKnownControlTyped(t, tc, got)
+}
+
+// checkKnownDataTyped asserts data and datafrag typed fields.
+func checkKnownDataTyped(t *testing.T, tc knownTypedCase, got rtps.Submessage) {
+	t.Helper()
+	if tc.want == "data" {
+		if got.Data == nil {
+			t.Fatalf("data typed is nil, want non-nil")
+		}
+		if got.Raw != nil {
+			t.Fatalf("data raw is set, want typed only")
+		}
+		return
+	}
+	if got.DataFrag == nil {
+		t.Fatalf("datafrag typed is nil, want non-nil")
+	}
+	if got.Raw != nil {
+		t.Fatalf("datafrag raw is set, want typed only")
+	}
+	if got.DataFrag.SequenceNumber != 1 {
+		t.Fatalf("datafrag seq = %d, want 1", got.DataFrag.SequenceNumber)
+	}
+}
+
+// checkKnownControlTyped asserts infots, heartbeat, and gap typed fields.
+func checkKnownControlTyped(t *testing.T, tc knownTypedCase, got rtps.Submessage) {
+	t.Helper()
+	switch tc.want {
+	case "infots":
+		if got.InfoTS == nil {
+			t.Fatalf("infots typed is nil, want non-nil")
+		}
+	case "heartbeat":
+		if got.Heartbeat == nil {
+			t.Fatalf("heartbeat typed is nil, want non-nil")
+		}
+	case "gap":
+		if got.Gap == nil {
+			t.Fatalf("gap typed is nil, want non-nil")
+		}
+	}
+}
+
+// TestDecodeSubmessageKnownTyped asserts typed pointers for known IDs.
+func TestDecodeSubmessageKnownTyped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range knownTypedCases(t) {
+		var drops rtps.Counter
+		got, err := rtps.DecodeSubmessage(tc.raw, &drops)
+		if err != nil {
+			t.Fatalf("%s dispatch: %v", tc.name, err)
+		}
+		checkKnownTyped(t, tc, got)
+		if drops.Count() != 0 {
+			t.Fatalf("%s drops = %d, want 0", tc.name, drops.Count())
+		}
 	}
 }

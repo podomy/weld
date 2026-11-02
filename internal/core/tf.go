@@ -386,15 +386,21 @@ func (s *TFStore) Lookup(target, source string, stampNanos int64) (TransformStam
 // timeout means one attempt with no polling. Positive timeout polls with a
 // short wall pause between attempts and the stop decision stays on the
 // buffer clock, with a wall time safety bound of the same length so a frozen
-// or backward buffer clock cannot livelock. A nil clock is an error. The last
-// lookup error is wrapped with timeout context on expiry so the taxonomy
-// stays visible.
+// or backward buffer clock cannot livelock. A nil clock is an error.
+// Saturating timeouts matching max int64 or max int64 minus one are rejected
+// like service validation rejects infinite and sentinel durations, so a
+// frozen clock with a huge timeout fails fast instead of waiting 292 years.
+// The last lookup error is wrapped with timeout context on expiry so the
+// taxonomy stays visible.
 func (s *TFStore) LookupWithTimeout(target, source string, stampNanos, timeoutNanos int64, clock *ClockState) (TransformStamped, error) {
 	if clock == nil {
 		return TransformStamped{}, fmt.Errorf("core: lookup with timeout %q to %q: clock is nil", target, source)
 	}
 	if timeoutNanos < 0 {
 		return TransformStamped{}, fmt.Errorf("core: lookup with timeout %q to %q: timeout %d must be nonnegative", target, source, timeoutNanos)
+	}
+	if timeoutNanos == math.MaxInt64 || timeoutNanos == math.MaxInt64-1 {
+		return TransformStamped{}, fmt.Errorf("core: lookup with timeout %q to %q: timeout %d saturates to infinite", target, source, timeoutNanos)
 	}
 	got, err := s.Lookup(target, source, stampNanos)
 	if err == nil {
@@ -643,7 +649,8 @@ func tfFindPath(dynamics map[tfKey][]TransformStamped, statics map[tfKey]Transfo
 
 // tfComposePath multiplies the transforms along a found path. Static shadows
 // dynamic as intended precedence: a frame pair carrying both uses the
-// latched static sample and ignores dynamics for that edge.
+// latched static sample and ignores dynamics for that edge. A missing sample
+// on an admitted edge reports the edge key so the route stays debuggable.
 func tfComposePath(dynamics map[tfKey][]TransformStamped, statics map[tfKey]TransformStamped, path []tfEdge, stamp int64) (TransformStamped, error) {
 	result := IdentityTransform()
 	for _, edge := range path {
@@ -661,7 +668,7 @@ func tfComposePath(dynamics map[tfKey][]TransformStamped, statics map[tfKey]Tran
 			}
 		}
 		if !ok {
-			return TransformStamped{}, fmt.Errorf("tf: connectivity loss: no path from %q to %q", "", "")
+			return TransformStamped{}, fmt.Errorf("tf: connectivity loss: no sample for edge %q to %q", edge.key.parent, edge.key.child)
 		}
 		step := sample.Transform
 		if !edge.forward {

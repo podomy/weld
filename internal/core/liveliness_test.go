@@ -81,6 +81,7 @@ func checkLivelinessLeaseBoundaries(t *testing.T) {
 		{"infinite", InfiniteDuration()},
 		{"sentinel", BestAvailableDuration()},
 		{"negative", Duration{Seconds: -1}},
+		{"oversized nanos", Duration{Seconds: 1, Nanoseconds: 2000000000}},
 	} {
 		free := NewLivelinessTracker("/t", "w", LivelinessAutomatic, tc.lease, 0)
 		if got := free.StateAt(1_000_000_000_000); got != LivelinessAlive {

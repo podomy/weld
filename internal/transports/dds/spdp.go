@@ -1516,11 +1516,12 @@ func (t *RemoteTable) TombstoneSeq(prefix GUIDPrefix) (uint64, bool) {
 // sequence deletes the entry and its routes. The delete retains a
 // tombstone with the dispose sequence until now plus maxSPDPLease so the
 // window stays predictable and a stale alive cannot reinstall; Sweep
-// drops the tombstone after expiry so the map stays bounded. A missing
-// entry consults the tombstone with the same duplicate versus stale
-// discipline and never creates a new tombstone, so spoofed disposes
-// cannot grow the map.
-func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(uint64), error) {
+// drops the tombstone after expiry so the map stays bounded. The caller
+// supplies now, matching Sweep and the alive path, so fake clocks stay
+// deterministic. A missing entry consults the tombstone with the same
+// duplicate versus stale discipline and never creates a new tombstone,
+// so spoofed disposes cannot grow the map.
+func (t *RemoteTable) handleDisposeLocked(ann Announcement, now time.Time) (bool, uint64, func(uint64), error) {
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
 		tomb, seen := t.tombstones[ann.GUID.Prefix]
@@ -1537,7 +1538,7 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(
 			return false, 0, nil, fmt.Errorf("dds: spdp stale dispose seq=%d last=%d: %w", ann.Sequence, tomb.seq, ErrStaleSPDP)
 		}
 		tomb.seq = ann.Sequence
-		tomb.expiresAt = time.Now().Add(maxSPDPLease)
+		tomb.expiresAt = now.Add(maxSPDPLease)
 		t.tombstones[ann.GUID.Prefix] = tomb
 
 		return false, 0, nil, nil
@@ -1555,7 +1556,7 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement) (bool, uint64, func(
 	}
 
 	delete(t.entries, ann.GUID.Prefix)
-	t.tombstones[ann.GUID.Prefix] = spdpTombstone{seq: ann.Sequence, expiresAt: time.Now().Add(maxSPDPLease)}
+	t.tombstones[ann.GUID.Prefix] = spdpTombstone{seq: ann.Sequence, expiresAt: now.Add(maxSPDPLease)}
 	t.generation++
 
 	return true, t.generation, t.onChange, nil
@@ -1657,7 +1658,7 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 
 	if !ann.Alive {
 		t.mu.Lock()
-		changed, gen, hook, herr := t.handleDisposeLocked(ann)
+		changed, gen, hook, herr := t.handleDisposeLocked(ann, now)
 		t.mu.Unlock()
 		if herr != nil {
 			return fmt.Errorf("dds: handle packet: %w", herr)

@@ -15,7 +15,8 @@ import (
 func TestBackendSubscribeWithQoSAnnouncesTranslatedOffer(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 96
+	// Domain 34 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 34
 
 	backend := newLiveBackend(t, domain, "qos-sub")
 	defer func() {
@@ -71,7 +72,8 @@ func TestBackendSubscribeWithQoSAnnouncesTranslatedOffer(t *testing.T) {
 func TestBackendSubscribeWithQoSRefusesLoudly(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 97
+	// Domain 35 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 35
 
 	backend := newLiveBackend(t, domain, "qos-refuse")
 	defer func() {
@@ -106,7 +108,8 @@ func TestBackendSubscribeWithQoSRefusesLoudly(t *testing.T) {
 func TestBackendSubscribeWithPartitionsStampsLocals(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 98
+	// Domain 36 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 36
 
 	backend := newLiveBackend(t, domain, "part-sub")
 	defer func() {
@@ -151,7 +154,8 @@ func TestBackendSubscribeWithPartitionsStampsLocals(t *testing.T) {
 func TestBackendSubscribeWithContentFilterHooksTake(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 99
+	// Domain 37 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 37
 
 	backend := newLiveBackend(t, domain, "filter-sub")
 	defer func() {

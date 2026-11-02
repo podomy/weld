@@ -2,13 +2,17 @@
 # Copyright (C) 2026 Podomy.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Serial runner for domain-42 ROS suites.
+# Serial runner for the ROS live suites.
 #
 # Runs the testbed/live/ros package one step at a time to avoid the
-# cross-talk seen when parallel shards share domain 42. Only one run per
+# cross-talk seen when parallel shards share a domain. Only one run per
 # domain and topic at a time is supported, so this script never overlaps
 # two go test invocations. Order is roundtrip, then type matrix splits,
 # then QoS, then liveliness, then distro, then payload.
+#
+# Roundtrip, type matrix, QoS, and payload allocate exclusive pooled
+# domains via MustAllocateDomain; liveliness uses ephemeral 63 plus
+# 65-69; distro uses fixed 42 plus 43 plus 44.
 #
 # The script never starts or stops the fleet. The fleet must already
 # be running. Each live test calls SkipIfNoPeer first, so a stopped peer
@@ -56,10 +60,10 @@ run() {
   sleep "${SETTLE_SECS}"
 }
 
-# 1. Roundtrip on domain 42 plus offline sanity (no peer needed for offline).
+# 1. Roundtrip on pooled domains plus offline sanity (no peer needed for offline).
 run "roundtrip" "^(TestROSForwardWeldEchoSeesROSTalker|TestROSReverseROSEchoSeesWeldPub|TestROSBadDomainRejected|TestROSEmptyPayloadAllowed|TestROSDuplicateStaleDroppedNotFatal)$"
 
-# 2. Type matrix splits on domain 42, one family at a time.
+# 2. Type matrix splits on pooled domains, one family at a time.
 run "type-std" "^(TestROSTypeStd)"
 run "type-builtin" "^(TestROSTypeBuiltin)"
 run "type-geometry" "^(TestROSTypeGeometry)"
@@ -71,10 +75,10 @@ run "type-viz" "^(TestROSTypeVisualization|TestROSTypeViz|TestROSVizExtra)"
 run "type-diag" "^(TestROSTypeDiag|TestROSDiag)"
 run "type-stereo-misc" "^(TestROSTypeStereo|TestROSTypeMisc)"
 
-# 3. QoS on domain 42.
+# 3. QoS on pooled domains.
 run "qos" "^(TestROSQoS)"
 
-# 4. Liveliness on ephemeral domains 65 through 69.
+# 4. Liveliness on ephemeral domains 63 plus 65 through 69.
 run "liveliness" "^(TestROSLiveliness)"
 
 # 5. Distro matrix on domains 42 plus 43 plus 44.

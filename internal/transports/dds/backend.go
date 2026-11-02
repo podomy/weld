@@ -1538,7 +1538,7 @@ func (b *Backend) updateRemoteTableWithAnnouncement(ann Announcement, now time.T
 
 	if !ann.Alive {
 		remotes.mu.Lock()
-		changed, gen, hook, herr := remotes.handleDisposeLocked(ann)
+		changed, gen, hook, herr := remotes.handleDisposeLocked(ann, now)
 		remotes.mu.Unlock()
 		if herr != nil {
 			return

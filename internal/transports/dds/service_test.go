@@ -619,7 +619,10 @@ func TestPublishServiceConcurrentPinsContiguity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode skips live UDP discovery")
 	}
-	const domain uint32 = 77
+	// Domain 33 sits outside every live range (fixed 42-48, ephemeral
+	// 60-69, pooled 70-101) so this loopback bind never collides with
+	// live pooled allocation.
+	const domain uint32 = 33
 	first := newLiveBackend(t, domain, "svc-concurrent-a")
 	defer func() {
 		err := first.Close()

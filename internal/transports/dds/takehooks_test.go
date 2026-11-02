@@ -54,7 +54,7 @@ func TestTakeHooksFilterMissDropsWithReason(t *testing.T) {
 	recv.SetContentFilter("/chatter", filter, desc)
 
 	snap := recv.snapshotTakeHooks("/chatter", WriterGUID{})
-	rej := evalTakeHooks(snap, "/chatter", "hook_test__msg__Hooked", encodeTestString(t, "drop-me"), WriterGUID{}, false)
+	rej := evalTakeHooks(snap, "/chatter", "hook_test__msg__Hooked", encodeTestString(t, "drop-me"), WriterGUID{}, false, time.Now().UnixNano())
 	if rej == nil {
 		t.Fatalf("filter miss passed, want rejection")
 	}
@@ -106,7 +106,7 @@ func TestTakeHooksFilterPassDelivers(t *testing.T) {
 	recv.SetContentFilter("/chatter", filter, desc)
 
 	snap := recv.snapshotTakeHooks("/chatter", WriterGUID{})
-	if rej := evalTakeHooks(snap, "/chatter", "hook_test__msg__Hooked", encodeTestString(t, "keep-me"), WriterGUID{}, false); rej != nil {
+	if rej := evalTakeHooks(snap, "/chatter", "hook_test__msg__Hooked", encodeTestString(t, "keep-me"), WriterGUID{}, false, time.Now().UnixNano()); rej != nil {
 		t.Fatalf("filter pass rejected: %v", rej.err)
 	}
 }
@@ -118,7 +118,7 @@ func TestTakeHooksNoFilterPasses(t *testing.T) {
 	recv := NewDataReceiver()
 
 	snap := recv.snapshotTakeHooks("/chatter", WriterGUID{})
-	if rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "anything"), WriterGUID{}, false); rej != nil {
+	if rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "anything"), WriterGUID{}, false, time.Now().UnixNano()); rej != nil {
 		t.Fatalf("unwatched sample rejected: %v", rej.err)
 	}
 }
@@ -144,7 +144,7 @@ func TestTakeHooksLivelinessExpiredDrops(t *testing.T) {
 	}
 
 	snap := recv.snapshotTakeHooks("/chatter", guid)
-	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "ancient"), guid, false)
+	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "ancient"), guid, false, time.Now().UnixNano())
 	if rej == nil {
 		t.Fatalf("expired writer passed, want drop")
 	}
@@ -176,7 +176,7 @@ func TestTakeHooksLivelinessHoldUncounted(t *testing.T) {
 	recv.SetLivelinessTracker(guid, &tracker)
 
 	snap := recv.snapshotTakeHooks("/chatter", guid)
-	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "stale"), guid, false)
+	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "stale"), guid, false, time.Now().UnixNano())
 	if rej == nil {
 		t.Fatalf("stale writer passed, want hold")
 	}
@@ -211,7 +211,7 @@ func TestTakeHooksAutomaticSampleRevives(t *testing.T) {
 	recv.SetLivelinessTracker(guid, &tracker)
 
 	snap := recv.snapshotTakeHooks("/chatter", guid)
-	if rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "fresh"), guid, false); rej != nil {
+	if rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "fresh"), guid, false, time.Now().UnixNano()); rej != nil {
 		t.Fatalf("automatic fresh sample rejected: %v", rej.err)
 	}
 
@@ -316,7 +316,7 @@ func TestTakeHooksKeyedUnregisteredDrops(t *testing.T) {
 	guid[15] = 0x02
 
 	snap := recv.snapshotTakeHooks("/chatter", guid)
-	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "plain"), guid, true)
+	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "plain"), guid, true, time.Now().UnixNano())
 	if rej == nil {
 		t.Fatalf("unregistered keyed sample passed, want loud drop")
 	}
@@ -341,7 +341,7 @@ func TestTakeHooksDeadlineMissedDrops(t *testing.T) {
 	recv.SetDeadlineTracker("/chatter", &tracker)
 
 	snap := recv.snapshotTakeHooks("/chatter", WriterGUID{})
-	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "late"), WriterGUID{}, false)
+	rej := evalTakeHooks(snap, "/chatter", "std_msgs__msg__String", encodeTestString(t, "late"), WriterGUID{}, false, time.Now().UnixNano())
 	if rej == nil {
 		t.Fatalf("past-deadline sample passed, want drop")
 	}
@@ -480,6 +480,15 @@ func TestTakeHooksLivelyCapEvicts(t *testing.T) {
 	if n > livelyTrackerCap {
 		t.Fatalf("lively len = %d, want at most %d", n, livelyTrackerCap)
 	}
+
+	lastIdx := livelyTrackerCap + 4
+	var last WriterGUID
+	last[0] = byte(lastIdx & 0xFF)
+	last[1] = byte((lastIdx >> 8) & 0xFF)
+	last[2] = 0xC1
+	if snap := recv.snapshotTakeHooks("/capped", last); snap.tracker == nil {
+		t.Fatalf("newest tracker missing, want cap to evict old entries instead of dropping new ones")
+	}
 }
 
 // TestSetLivelinessTrackerForTopicCapEvicts pins explicit cap enforcement.
@@ -508,5 +517,43 @@ func TestSetLivelinessTrackerForTopicCapEvicts(t *testing.T) {
 
 	if n > livelyTrackerCap {
 		t.Fatalf("explicit lively len = %d, want at most %d", n, livelyTrackerCap)
+	}
+
+	lastIdx := livelyTrackerCap + 4
+	var last WriterGUID
+	last[0] = byte(lastIdx & 0xFF)
+	last[1] = byte((lastIdx >> 8) & 0xFF)
+	last[2] = 0xD1
+	if snap := recv.snapshotTakeHooks("/explicit", last); snap.tracker == nil {
+		t.Fatalf("newest explicit tracker missing, want cap to evict old entries instead of dropping new ones")
+	}
+}
+
+// TestTakeHooksEvalUsesReceiverClock pins fake-clock evaluation.
+//
+// The hook chain must timestamp with the receiver clock, not the wall
+// clock, so frozen-clock deployments expire leases by their own time.
+// A deadline anchored in the far future misses only when the fake now
+// advances past it; wall-clock evaluation would report no miss.
+func TestTakeHooksEvalUsesReceiverClock(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	frozen := time.Date(2099, time.January, 2, 3, 4, 5, 0, time.UTC)
+	recv.now = func() time.Time {
+		return frozen
+	}
+	recv.SetDeadlineTrackerForTopic("/clocked", core.NewDuration(10, 0))
+
+	snap := recv.snapshotTakeHooks("/clocked", WriterGUID{})
+	if snap.deadline == nil {
+		t.Fatalf("deadline tracker missing")
+	}
+
+	fakeLate := frozen.Add(time.Hour).UnixNano()
+	if rej := evalTakeHooks(snap, "/clocked", "std_msgs__msg__String", encodeTestString(t, "late"), WriterGUID{}, false, fakeLate); rej == nil {
+		t.Fatalf("late sample passed under fake clock, want deadline miss")
+	} else if rej.reason == nil || *rej.reason != DropReasonDeadlineMissed {
+		t.Fatalf("late reason = %v, want deadline-missed", rej.reason)
 	}
 }

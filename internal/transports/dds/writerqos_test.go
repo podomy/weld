@@ -790,3 +790,21 @@ func TestWriterQoSRawVerdictEquivalence(t *testing.T) {
 		}
 	}
 }
+
+// TestParseWireQoSEndianRejectsBigEndian pins loud BE refusal.
+func TestParseWireQoSEndianRejectsBigEndian(t *testing.T) {
+	t.Parallel()
+
+	q, err := ForwardQoS(writerQoSTestTopic, writerQoSTestPublisher, writerQoSTestSubscriber, writerQoSExplicitKeepAll())
+	if err != nil {
+		t.Fatalf("forward qos: %v", err)
+	}
+	if _, err := ParseWireQoSEndian(q.Params(), true); err != nil {
+		t.Fatalf("LE parse: %v", err)
+	}
+	params := q.Params()
+	_, err = ParseWireQoSEndian(params, false)
+	if !IsWireQoSParseRefusal(err) {
+		t.Fatalf("BE parse = %v, want WireQoSParseRefusal", err)
+	}
+}

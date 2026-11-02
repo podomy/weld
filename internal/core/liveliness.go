@@ -235,7 +235,10 @@ func livelinessNoConstraint(d Duration) bool {
 	if IsBestAvailableDuration(d) {
 		return true
 	}
-	return d.Seconds < 0
+	if d.Seconds < 0 {
+		return true
+	}
+	return d.Nanoseconds >= nanosPerSecond
 }
 
 // LivelinessTracker watches one writer aliveness contract with lease expiry.

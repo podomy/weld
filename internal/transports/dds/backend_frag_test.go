@@ -252,9 +252,11 @@ func TestBackendFragOrderedSameSeq(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	uni, err := rtps.DialUnicast(ctx, 71)
+	// Domain 30 sits outside every live range (fixed 42-48, 55, ephemeral
+	// 60-69, pooled 70-101) so concurrent live suites cannot squat its ports.
+	uni, err := rtps.DialUnicast(ctx, 30)
 	if err != nil {
-		t.Fatalf("dial unicast fixed domain 71: %v", err)
+		t.Fatalf("dial unicast fixed domain 30: %v", err)
 	}
 	defer func() {
 		cerr := uni.Close()
@@ -351,9 +353,10 @@ func TestBackendSendPlainFragsAdvancesOnce(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	uni, err := rtps.DialUnicast(ctx, 72)
+	// Domain 31 sits outside every live range; see the note above.
+	uni, err := rtps.DialUnicast(ctx, 31)
 	if err != nil {
-		t.Fatalf("dial unicast fixed domain 72: %v", err)
+		t.Fatalf("dial unicast fixed domain 31: %v", err)
 	}
 	defer func() {
 		cerr := uni.Close()

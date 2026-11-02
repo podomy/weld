@@ -5,9 +5,11 @@ package dds
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
@@ -151,6 +153,10 @@ func TestServiceRoleTopics(t *testing.T) {
 
 	if got := ep.PublishType(ServiceRoleClient); got != ep.RequestType {
 		t.Fatalf("client publish type = %q", got)
+	}
+
+	if _, _, _, err := servicePublishTarget(ep, ServiceRole(99)); !errors.Is(err, ErrServiceInvalidPacket) {
+		t.Fatalf("invalid role publish = %v, want ErrServiceInvalidPacket", err)
 	}
 }
 
@@ -545,6 +551,67 @@ func findConcurrentWriters(t *testing.T, first *Backend) (WriterGUID, WriterGUID
 		t.Fatalf("topic writer rt/chatter missing")
 	}
 	return serviceGUID, topicGUID
+}
+
+// TestPublishServiceConcurrentNoRouteFailsLoudly pins the service publish
+// lock split without live peers so it runs in short mode.
+//
+// A joined backend with no discovered routes rejects every publish with
+// ErrNoRoute instead of hanging on the waits: concurrent service plus
+// topic publishes must all fail fast with a loud error and never deadlock
+// each other on publishMu.
+func TestPublishServiceConcurrentNoRouteFailsLoudly(t *testing.T) {
+	t.Parallel()
+
+	// Domain 32 sits outside every live range plus the unit probe blocks.
+	const domain uint32 = 32
+	first := newLiveBackend(t, domain, "svc-noroute-a")
+	defer func() {
+		err := first.Close()
+		if err != nil {
+			t.Errorf("close first: %v", err)
+		}
+	}()
+
+	const serviceCount = 4
+	const topicCount = 4
+	servicePayload := serviceConcurrentPayload(t)
+	var wg sync.WaitGroup
+	errCh := make(chan error, serviceCount+topicCount)
+	publish := func(err error) {
+		defer wg.Done()
+		errCh <- err
+	}
+	for range serviceCount {
+		wg.Add(1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			publish(first.PublishService(ctx, "/svc", "std_srvs__srv__Trigger", ServiceRoleClient, servicePayload, ""))
+		}()
+	}
+	for range topicCount {
+		wg.Add(1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			publish(first.PublishBytes(ctx, transports.OutgoingMessage{
+				TopicName: "/chatter",
+				TypeName:  "std_msgs__msg__String",
+				Payload:   []byte{0xFF},
+			}))
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err == nil {
+			t.Fatalf("publish without route succeeded, want loud error")
+		}
+		if !errors.Is(err, ErrNoRoute) && !errors.Is(err, transports.ErrNotJoined) {
+			t.Fatalf("publish without route = %v, want ErrNoRoute", err)
+		}
+	}
 }
 
 // TestPublishServiceConcurrentPinsContiguity checks concurrent service plus topic publishes.

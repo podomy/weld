@@ -3313,6 +3313,50 @@ func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
 	}
 }
 
+// TestSEDPDuplicateReannounceCancelsGraceEvict pins wire-level duplicate cancel.
+//
+// A scheduled dispose eviction must not fire after the same endpoint
+// re-announces at the stored sequence: the duplicate proves liveness even
+// though it installs nothing, mirroring the UpsertRemote cancel path.
+func TestSEDPDuplicateReannounceCancelsGraceEvict(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xF8)
+	peer := mustSEDPIndexWithPrefix(t, 0xF9)
+
+	writer := mustSEDPWriter(t, peer, "/gracewire", "RIHS01_gracewire")
+
+	params := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(writer.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(writer.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
+	}
+
+	firstBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	binary.LittleEndian.PutUint64(firstBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
+	first := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, firstBody)
+	if err := local.ingestSample(first); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	local.SchedulePrefixEvict(writer.ID.Prefix, time.Now())
+
+	secondBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	binary.LittleEndian.PutUint64(secondBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
+	second := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, secondBody)
+	if err := local.ingestSample(second); err != nil {
+		t.Fatalf("duplicate ingest: %v", err)
+	}
+
+	if got := local.ExpirePendingEvictions(time.Now().Add(sedpEvictGracePeriod + time.Second)); got != 0 {
+		t.Fatalf("expired = %d, want 0 after duplicate cancel", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 1 {
+		t.Fatalf("remotes = %d, want 1 after duplicate cancel", n)
+	}
+}
+
 // TestSEDPHeartbeatReplay pins per-writer Count gating with Count==0 single processing.
 func TestSEDPHeartbeatReplay(t *testing.T) {
 	t.Parallel()
@@ -3823,15 +3867,22 @@ func TestSEDPHeartbeatCapEvicts(t *testing.T) {
 	idx.mu.Lock()
 	nLast := len(idx.hbLast)
 	nCount := len(idx.hbCount)
-	local := nLast
+	var newest SEDPGUIDPrefix
+	binary.BigEndian.PutUint32(newest[0:4], uint32(sedpAuxCap+4))
+	binary.BigEndian.PutUint32(newest[4:8], uint32(sedpAuxCap+5))
+	_, lastSeen := idx.hbLast[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriterCyclone}]
 	idx.mu.Unlock()
 
-	if local > sedpAuxCap {
+	if nLast > sedpAuxCap {
 		t.Fatalf("hbLast len = %d, want at most %d", nLast, sedpAuxCap)
 	}
 
 	if nCount > sedpAuxCap {
 		t.Fatalf("hbCount len = %d, want at most %d", nCount, sedpAuxCap)
+	}
+
+	if !lastSeen {
+		t.Fatalf("newest heartbeat key missing, want cap to evict old entries instead of dropping new ones")
 	}
 }
 
@@ -3850,10 +3901,17 @@ func TestSEDPWriterHighCapEvicts(t *testing.T) {
 
 	idx.mu.Lock()
 	n := len(idx.writerHigh)
+	var newest SEDPGUIDPrefix
+	binary.BigEndian.PutUint32(newest[0:4], uint32(5000+sedpAuxCap+4))
+	_, newestSeen := idx.writerHigh[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriterCyclone}]
 	idx.mu.Unlock()
 
 	if n > sedpAuxCap {
 		t.Fatalf("writerHigh len = %d, want at most %d", n, sedpAuxCap)
+	}
+
+	if !newestSeen {
+		t.Fatalf("newest writerHigh key missing, want cap to evict old entries instead of dropping new ones")
 	}
 }
 
@@ -3932,5 +3990,33 @@ func TestSEDPCheckInfoDstShortBodyDrops(t *testing.T) {
 	err = sedpCheckInfoDstUnicast(data, prefix)
 	if !errors.Is(err, ErrSEDPInfoDst) {
 		t.Fatalf("short INFO_DST err = %v, want ErrSEDPInfoDst", err)
+	}
+}
+
+// TestSEDPBigEndianPartitionRefusedLoudly pins BE partition fail-closed behavior.
+func TestSEDPBigEndianPartitionRefusedLoudly(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xFA)
+	peer := mustSEDPIndexWithPrefix(t, 0xFB)
+
+	writer := mustSEDPWriter(t, peer, "/bepart", "RIHS01_bepart")
+
+	params := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeBECDRString(writer.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeBECDRString(writer.TypeDDS)},
+		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
+		{ID: PIDPartition, Value: []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 'A', 0x00}},
+	}
+
+	body := mustSEDPDataBodyOrder(sedpPublicationsWriterCyclone, params, false)
+	raw := mustSEDPMessageOrder(t, writer.ID.Prefix, sedpFlagInlineQoS|sedpFlagDataPresent, body, false)
+
+	err := local.ingestSample(raw)
+	if err == nil {
+		t.Fatal("big-endian partition ingest succeeded, want loud refusal")
+	}
+	if len(local.RemoteEndpoints()) != 0 {
+		t.Fatalf("remotes = %d, want 0 after BE partition refusal", len(local.RemoteEndpoints()))
 	}
 }

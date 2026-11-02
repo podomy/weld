@@ -476,7 +476,9 @@ func TestUnicastReceiveCancel(t *testing.T) {
 func TestMulticastReceiveCancel(t *testing.T) {
 	t.Parallel()
 
-	conn, err := rtps.JoinMulticast(t.Context(), 73)
+	// Domain 27 sits outside every live range (fixed 42-48, 55, ephemeral
+	// 60-69, pooled 70-101) so concurrent live suites cannot pollute it.
+	conn, err := rtps.JoinMulticast(t.Context(), 27)
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
@@ -530,7 +532,8 @@ func TestBackendConnsDoubleClose(t *testing.T) {
 		t.Fatalf("receive after close = %v, want closed", err)
 	}
 
-	multi, err := rtps.JoinMulticast(t.Context(), 75)
+	// Domain 28 sits outside every live range; see the note above.
+	multi, err := rtps.JoinMulticast(t.Context(), 28)
 	if err != nil {
 		t.Fatalf("join multicast: %v", err)
 	}
@@ -575,7 +578,8 @@ func TestBackendConnsSendErrors(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	closeUnicast(t, uni)
-	multi, err := rtps.JoinMulticast(t.Context(), 77)
+	// Domain 29 sits outside every live range; see the note above.
+	multi, err := rtps.JoinMulticast(t.Context(), 29)
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}

@@ -261,6 +261,11 @@ var (
 var sedpWriterSeq sync.Mutex
 
 // sedpWriterSeqLast holds the per writer sequence state.
+//
+// The map is process wide: two SEDPIndex values sharing a participant
+// prefix share one counter. That is safe because production runs one
+// index per backend, and tests must not assert exact sequence values,
+// only contiguity within one publisher stream.
 var sedpWriterSeqLast = map[sedpWriterKey]uint64{}
 
 // sedpWriterKey identifies one builtin SEDP writer stream.
@@ -272,6 +277,10 @@ type sedpWriterKey struct {
 }
 
 // heartbeatCount counts sent SEDP and user DATA HEARTBEAT submessages process wide.
+//
+// Like sedpWriterSeqLast this is intentionally global: heartbeat counts
+// only need process-wide monotonicity for duplicate suppression, never
+// per-writer contiguity, so tests must not assert exact values.
 var heartbeatCount atomic.Int32
 
 // SEDPGUIDPrefix is the 12 byte RTPS participant prefix for SEDP.
@@ -1092,9 +1101,9 @@ func (idx *SEDPIndex) RemoveRemote(id SEDPGUID) bool {
 // take, so endpoint removal waits out sedpEvictGracePeriod. The first
 // dispose starts the clock: duplicate disposes never re-arm the deadline,
 // so the grace window stays bounded from first sight. Expiry processing
-// deletes the entry. A genuinely new participant re-announces with a
-// higher sequence and cancels through UpsertRemote. It never removes
-// anything itself.
+// deletes the entry. Any re-announce cancels the eviction: a duplicate at
+// the stored sequence cancels in ingest, and a newer sequence cancels
+// through UpsertRemote on install. It never removes anything itself.
 func (idx *SEDPIndex) SchedulePrefixEvict(prefix SEDPGUIDPrefix, now time.Time) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -1864,8 +1873,17 @@ func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag
 		ep.DomainID = idx.stampDomain()
 		sedpTracef("ingest stamp domain=%d guid=%s", ep.ID.String())
 	}
-	if idx.sedpStaleCheck(ep.ID, seq) {
-		sedpTracef("ingest stale seq=%d guid=%s", seq, ep.ID.String())
+	idx.mu.Lock()
+	stale, duplicate := idx.ingestStaleCheckLocked(ep.ID, seq)
+	idx.mu.Unlock()
+
+	if stale {
+		if duplicate {
+			sedpTracef("ingest duplicate seq=%d guid=%s evict cancelled", seq, ep.ID.String())
+		} else {
+			sedpTracef("ingest stale seq=%d guid=%s", seq, ep.ID.String())
+		}
+
 		return false, true, nil
 	}
 	err = idx.UpsertRemote(ep)
@@ -1877,6 +1895,24 @@ func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag
 	idx.sedpNoteWriterHigh(ep.ID.Prefix, body, flag, seq)
 	sedpTracef("ingest upsert ok guid=%s ros=%q domain=%d", ep.ID.String(), ep.ROSTopic, ep.DomainID)
 	return true, false, nil
+}
+
+// ingestStaleCheckLocked gates one endpoint DATA on its stored sequence.
+//
+// It holds no lock itself; the caller must hold idx.mu. A duplicate at
+// the stored sequence cancels a scheduled dispose eviction as proof of
+// liveness and reports stale-quiet without reinstalling. Strictly older
+// sequences stay stale without cancelling anything.
+func (idx *SEDPIndex) ingestStaleCheckLocked(id SEDPGUID, seq uint64) (stale, duplicate bool) {
+	last, seen := idx.sedpLastSeqLocked(id)
+	if !seen || seq > last {
+		return false, false
+	}
+	if seq == last {
+		idx.cancelPendingEvictLocked(id.Prefix)
+		return true, true
+	}
+	return true, false
 }
 
 // ingestDispose handles one key-flagged DATA as removal.
@@ -1956,6 +1992,25 @@ func sedpIsUnregister(body []byte, flag uint8) bool {
 	}
 
 	return status&(StatusInfoDisposedFlag|StatusInfoUnregisteredFlag) != 0
+}
+
+// sedpLastSeqLocked reports the stored sequence for one endpoint.
+//
+// The second result reports whether any sequence was recorded. The caller
+// must hold idx.mu; use sedpStaleCheck for the locking form.
+func (idx *SEDPIndex) sedpLastSeqLocked(id SEDPGUID) (uint64, bool) {
+	last, seen := idx.lastSeq[id]
+
+	return last, seen
+}
+
+// cancelPendingEvictLocked drops a scheduled dispose eviction for one prefix.
+//
+// The caller must hold idx.mu. UpsertRemote calls this on every install
+// and ingest calls it on duplicate re-announces, so a live writer always
+// cancels its eviction before expiry.
+func (idx *SEDPIndex) cancelPendingEvictLocked(prefix SEDPGUIDPrefix) {
+	delete(idx.pendingEvict, prefix)
 }
 
 // sedpStaleCheck reports whether seq is a stale replay without storing.
@@ -3137,7 +3192,7 @@ func sedpFieldsOptionals(byID map[uint16][]byte, littleEndian bool, fields *sedp
 // best-effort with trace because unknown vendor PIDs must not break
 // matching.
 func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEndian bool, fields *sedpEndpointWireFields) error {
-	secInfo, secErrs := ExtractSecurityInfo(params)
+	secInfo, secErrs := ExtractSecurityInfoEndian(params, littleEndian)
 	for _, secErr := range secErrs {
 		sedpTracef("parse security skip err=%v", secErr)
 	}
@@ -3149,7 +3204,7 @@ func sedpFieldsExtensions(params []rtps.Param, byID map[uint16][]byte, littleEnd
 		sedpTracef("parse secured peer crypto unavailable err=%v", err)
 	}
 
-	partitionNames, err := FindPartitionParam(params)
+	partitionNames, err := FindPartitionParamEndian(params, littleEndian)
 	if err != nil {
 		return fmt.Errorf("dds: sedp parse fields partitions: %w", err)
 	}

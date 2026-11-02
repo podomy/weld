@@ -74,6 +74,8 @@ func sedpConformDeclareWriter(t *testing.T, idx *dds.SEDPIndex, typeHash string)
 }
 
 // sedpConformDeclareReader declares a reader for the canonical chatter identity.
+//
+//nolint:unparam // test helper keeps explicit type hash param for symmetry with the writer helper across hash cases
 func sedpConformDeclareReader(t *testing.T, idx *dds.SEDPIndex, typeHash string) dds.SEDPEndpoint {
 	t.Helper()
 	ep, err := idx.DeclareReader(sedpConformROSTopic, sedpConformTypeIDL, typeHash, nil)
@@ -1162,5 +1164,40 @@ func TestSEDPConformPadSkipped(t *testing.T) {
 	}
 	if len(back) != 1 || back[0].ID != rtps.PIDTopicName {
 		t.Fatalf("pad decode = %+v, want single topic", back)
+	}
+}
+
+// TestSEDPConformPerWriterSeqStreams pins independent DATA sequences per writer.
+//
+// SEDP sequence numbers run per participant prefix plus writer entity, so a
+// second serialize of the same endpoint advances its own stream while a
+// different writer starts at 1. A dedicated prefix keeps the process-wide
+// counter free of cross-test interleaving.
+func TestSEDPConformPerWriterSeqStreams(t *testing.T) {
+	t.Parallel()
+
+	idx := sedpConformNewIndex(t, 0x2A, sedpConformDomain)
+	writer := sedpConformDeclareWriter(t, idx, sedpConformTypeHash)
+	reader := sedpConformDeclareReader(t, idx, sedpConformTypeHash)
+
+	rawFirst := sedpConformMustSerialize(t, writer)
+	dataFirst := sedpConformFindDATA(t, sedpConformSplit(t, rawFirst))
+	_, lowFirst := sedpConformSeqOf(t, dataFirst.body)
+	if lowFirst != 1 {
+		t.Fatalf("writer first seq = %d, want 1", lowFirst)
+	}
+
+	rawSecond := sedpConformMustSerialize(t, writer)
+	dataSecond := sedpConformFindDATA(t, sedpConformSplit(t, rawSecond))
+	_, lowSecond := sedpConformSeqOf(t, dataSecond.body)
+	if lowSecond != 2 {
+		t.Fatalf("writer second seq = %d, want 2", lowSecond)
+	}
+
+	rawReader := sedpConformMustSerialize(t, reader)
+	dataReader := sedpConformFindDATA(t, sedpConformSplit(t, rawReader))
+	_, lowReader := sedpConformSeqOf(t, dataReader.body)
+	if lowReader != 1 {
+		t.Fatalf("reader first seq = %d, want 1 on its own stream", lowReader)
 	}
 }

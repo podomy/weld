@@ -264,6 +264,21 @@ func checkSetReadOnly(t *testing.T) {
 	if !got.Equal(NewStringParam("map")) {
 		t.Fatalf("read-only set mutated value: %+v", got)
 	}
+
+	before := s.Version()
+	if err := s.Set("frame_id", NewStringParam("map")); err != nil {
+		t.Fatalf("read-only equal set: %v", err)
+	}
+	if got := s.Version(); got != before {
+		t.Fatalf("version = %d, want unchanged %d", got, before)
+	}
+	got, err = s.Get("frame_id")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.Equal(NewStringParam("map")) {
+		t.Fatalf("value changed: %+v", got)
+	}
 }
 
 // checkSetUndeclared pins the allow flag controls auto declare.

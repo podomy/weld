@@ -77,25 +77,25 @@ SEDP
   Pinned by testbed/unit/sedp/conformance_test.go:481.
 - Sequence numbers use per-writer streams keyed on participant prefix plus writer entity (sedpWriterSeqLast);
   encoding is high word then low word per RTPS, pinned by
-  testbed/unit/sedp/conformance_test.go:530.
+  testbed/unit/sedp/conformance_test.go:1174 (TestSEDPConformPerWriterSeqStreams).
 - Every DATA carries HEARTBEATs: publications announce from 0x000002c2
   plus the CycloneDDS variant 0x000003c2, subscriptions from 0x000004c2
   (internal/transports/dds/sedp.go:177-182; announce loop
-  at internal/transports/dds/sedp.go:1006).
+  at internal/transports/dds/sedp.go:1350).
   Heartbeat body is 28 bytes (internal/transports/dds/sedp.go:132-133).
-  Pinned by testbed/unit/sedp/conformance_test.go:604.
+  Pinned by testbed/unit/sedp/conformance_test.go:618 (TestSEDPConformHeartbeatsAppended).
   Announce repeats every 1 s with fresh sequences
   (internal/transports/dds/sedp.go:633).
 - Inline QoS carries reliability kind 2 with infinite blocking,
   history KEEP_LAST depth 100, protocol version 2.1, vendor id 01 10
   (internal/transports/dds/sedp.go:163-174,
-  encode at internal/transports/dds/sedp.go:1774).
+  encode at internal/transports/dds/sedp.go:2434 (sedpEncodeParamListPayload).
   Writers offer transient-local durability; readers request volatile like
   ros2 topic echo, which flows against both volatile talkers (the
   ros2 topic pub default) and transient talkers including their
-  backlog. Pinned by testbed/unit/sedp/conformance_test.go:648
+  backlog. Pinned by testbed/unit/sedp/conformance_test.go:662 (TestSEDPConformReliableHistoryProtocolVendor)
   (writer offer) and TestSEDPReaderRequestsVolatile in
-  internal/transports/dds/sedp_test.go:2693 (reader request).
+  internal/transports/dds/sedp_test.go:2710 (TestSEDPReaderRequestsVolatile).
 - SPDP announces the actually bound unicast ports, not participant-zero
   ports, so a second participant on one host does not divert its
   metatraffic and user DATA to the first participant's socket.
@@ -106,7 +106,7 @@ SEDP
   TestBackendUserMulticastDeliversData.
 - Writer set is 0x000002c2 plus 0x000003c2 plus 0x000004c2
   (internal/transports/dds/sedp.go:177-182).
-  Pinned by testbed/unit/sedp/conformance_test.go:799.
+  Pinned by testbed/unit/sedp/conformance_test.go:813 (TestSEDPConformBuiltinWriters).
 
 Type hashes
 
@@ -407,20 +407,19 @@ testbed/live/cyclone/gate1_spdp_test.go:379 and :421.
   failures.
 - Gate 2 forward green after plain CDR receive plus SEDP fixes; reverse green
   after writer 03c2 plus announce now plus Heartbeat. Forward plain CDR is
-  decodePlainCDR (internal/transports/dds/datapath.go:1075) with String
+  decodePlainCDR (internal/transports/dds/datapath.go:1194) with String
   fallback decodeCycloneChatter
-  (internal/transports/dds/datapath.go:802) and the TakeFrom fallback in
-  DataReceiver.TakeFrom (internal/transports/dds/datapath.go:1322).
+  (internal/transports/dds/datapath.go:921) and the TakeFrom fallback in
+  DataReceiver.TakeFrom (internal/transports/dds/datapath.go:1473).
   Writer 03c2 is sedpPublicationsWriterCyclone
   (internal/transports/dds/sedp.go:177-182), the announce loop is
   SEDPIndex.AnnounceLoop with a 1 s resend interval
-  (internal/transports/dds/sedp.go:1006,
-  internal/transports/dds/sedp.go:139), DATA plus Heartbeat is the backend
-  user heartbeat path (internal/transports/dds/backend.go:591). Checks are
+  (internal/transports/dds/sedp.go:1350), DATA plus Heartbeat is the backend
+  user heartbeat path (internal/transports/dds/backend.go:708). Checks are
   testbed/live/ros/roundtrip_test.go:107 plus
   testbed/live/ros/roundtrip_test.go:160 on allocated pooled domains and the
   parallel equivalents at testbed/live/gates/gate2_test.go:33
-  plus testbed/live/gates/gate2_test.go:102.
+  plus testbed/live/gates/gate2_test.go:107.
 - The SPDP acceptance probe (gate 1, direct UDP) stays separate from the
   ROS String round-trip test (gate 2).
 - Full verified matrix, all PASS live unless noted: full type matrix

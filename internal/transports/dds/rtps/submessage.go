@@ -825,6 +825,8 @@ const gapListMaxBits = 4096
 // stay under the cap; otherwise the datagram drops loudly instead of
 // trusting declared bits. A present list with base at or below GapStart
 // drops loudly as well so SkippedSequences stays sorted without duplicates.
+// Trailing bytes past an empty gap list are ignored for tolerance, matching
+// DecodeHeartbeat: no peer info hides there.
 func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	var out Gap
 	if len(body) < gapMinSize {
@@ -1033,15 +1035,14 @@ const (
 
 // ClassifyUnicastInfoDst walks one datagram for INFO_DST submessages.
 //
-// Non-INFO_DST submessages are skipped. Every INFO_DST is judged: later
-// entries do not override an earlier drop verdict.
+// Non-INFO_DST submessages are skipped. The first decisive entry wins:
+// absent and unknown entries never override a drop, and a drop returns
+// immediately.
 func ClassifyUnicastInfoDst(data []byte, local [12]byte) InfoDstVerdict {
 	_, raws, err := DecodeMessage(data, nil)
 	if err != nil {
 		return InfoDstAbsent
 	}
-
-	verdict := InfoDstAbsent
 
 	for _, raw := range raws {
 		if raw.ID != SubmessageInfoDst {
@@ -1064,5 +1065,5 @@ func ClassifyUnicastInfoDst(data []byte, local [12]byte) InfoDstVerdict {
 		}
 	}
 
-	return verdict
+	return InfoDstAbsent
 }

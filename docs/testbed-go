@@ -6,11 +6,11 @@ Why Go only
 
 Containers already provide CycloneDDS plus ROS Jazzy. Go already encodes and decodes the wire:
 
-- XCDR1 String codec in internal/types/cdr.go:68 (NewEncoder), internal/types/cdr.go:290 (WriteString), internal/types/cdr.go:880 (ReadString).
-- XCDR1 primitives for the ROS type matrix in internal/types/cdr.go:209 (WriteInt32), internal/types/cdr.go:234 (WriteFloat64), internal/types/cdr.go:185 (WriteBool), plus internal/types/cdr.go:617 (NewDecoder) for all takes.
-- SPDP marshal and parse in internal/transports/dds/spdp.go:440 (MarshalAlivePacket) and internal/transports/dds/spdp.go:572 (ParseAnnouncement).
-- SEDP marshal and parse in internal/transports/dds/sedp.go:2282 (SerializeSEDPDATA) and internal/transports/dds/sedp.go:2365 (ParseSEDPDATA).
-- In memory publish and receive path in internal/transports/dds/datapath.go:175 (NewPublisher) and internal/transports/dds/datapath.go:375 (NewDataReceiver).
+- XCDR1 String codec in internal/types/cdr.go:83 (NewEncoder), internal/types/cdr.go:348 (WriteString), internal/types/cdr.go:974 (ReadString).
+- XCDR1 primitives for the ROS type matrix in internal/types/cdr.go:247 (WriteInt32), internal/types/cdr.go:287 (WriteFloat64), internal/types/cdr.go:214 (WriteBool), plus internal/types/cdr.go:709 (NewDecoder) for all takes.
+- SPDP marshal and parse in internal/transports/dds/spdp.go:488 (MarshalAlivePacket) and internal/transports/dds/spdp.go:722 (ParseAnnouncement).
+- SEDP marshal and parse in internal/transports/dds/sedp.go:2482 (SerializeSEDPDATA) and internal/transports/dds/sedp.go:2568 (ParseSEDPDATA).
+- In memory publish and receive path in internal/transports/dds/datapath.go:215 (NewPublisher) and internal/transports/dds/datapath.go:625 (NewDataReceiver).
 
 Adding Python would duplicate that codec and add a second failure surface. Adding clones would duplicate images that testbed/docker-compose.yml:8-12 already defines.
 
@@ -19,7 +19,7 @@ Run without exec hell
 Rules:
 
 - Use os/exec with docker argv plus structured Env. See testbed/live/helpers/helpers.go:218 (DockerArgs) and testbed/live/helpers/helpers.go:368 (ExecRun).
-- No shell inside the container for ros2 calls. testbed/live/helpers/helpers.go:110-115 (ImageEnv) replicates the Jazzy setup as -e flags, so ros2 runs directly as argv. Same pattern in testbed/live/helpers/distro.go:77 (DistroEnv) via testbed/live/helpers/distro.go:110 (DistroDockerArgs).
+- No shell inside the container for ros2 calls. testbed/live/helpers/helpers.go:115-123 (ImageEnv) replicates the Jazzy setup as -e flags, so ros2 runs directly as argv. Same pattern in testbed/live/helpers/distro.go:77 (DistroEnv) via testbed/live/helpers/distro.go:110 (DistroDockerArgs).
 - Never run compose up per test. weld-jazzy already runs with host networking and sleep infinity per testbed/docker-compose.yml. Tests fail fast or skip when it is absent. See testbed/live/helpers/helpers.go:444 (SkipIfNoPeer) and testbed/live/helpers/distro.go:161 (SkipIfNoDistroPeer).
 - Bring the fleet up once: cd testbed && docker compose up -d. Then run Go tests only.
 
@@ -81,17 +81,17 @@ Cyclone SPDP and ROS String checks live in different packages:
 - testbed/live/cyclone/gate1_spdp_test.go:379 (TestCycloneGate1SPDPST0NonLocalPureGo) and testbed/live/cyclone/gate1_spdp_test.go:421 (TestCycloneGate1SPDPST0NonLocalLive) prove SPDP acceptance on an allocated pooled domain with direct UDP only. No ROS topics. No trace files.
 - testbed/live/ros/roundtrip_test.go:107 (TestROSForwardWeldEchoSeesROSTalker) and testbed/live/ros/roundtrip_test.go:160 (TestROSReverseROSEchoSeesWeldPub) prove String payloads on a pooled domain with /chatter-derived per-run topics. No SPDP asserts. Scope is pinned in testbed/live/ros/doc.go.
 - testbed/live/ros/gate_type_matrix_test.go:100 (cases) with tests at testbed/live/ros/gate_type_matrix_test.go:779 proves one live case per type on pooled domains with per-run topics. Each case runs forward (ros2 topic pub to Weld take decoded via NewDecoder) plus reverse (Weld pub to ros2 topic echo). Header types carry the live ID in frame_id (testbed/live/ros/gate_type_matrix_test.go:389), other types use a fixed sentinel (testbed/live/ros/gate_type_matrix_test.go:44) with topic plus domain isolation. Missing ros2 interface show skips cleanly (testbed/live/helpers/live.go:326). A publish with no route fails loudly (testbed/live/helpers/live.go:403-408); backend errors fail (testbed/live/helpers/live.go:379-385).
-- testbed/live/gates/gate1_test.go:32 (TestGate1SPDPAcceptance) and testbed/live/gates/gate2_test.go:33 plus testbed/live/gates/gate2_test.go:102 (forward plus reverse) are the serial single-entrypoint equivalents on allocated domains. Shared helpers live in testbed/live/helpers/helpers.go:218 (DockerArgs).
+- testbed/live/gates/gate1_test.go:32 (TestGate1SPDPAcceptance) and testbed/live/gates/gate2_test.go:33 plus testbed/live/gates/gate2_test.go:107 (forward plus reverse) are the serial single-entrypoint equivalents on allocated domains. Shared helpers live in testbed/live/helpers/helpers.go:218 (DockerArgs).
 
 Do not mix SPDP wire asserts into ROS payload tests. Do not mix String payload asserts into SPDP tests.
 
 Bulletproof checks
 
 - Prove non local by GUID prefix inequality, not by grepping trace. See testbed/live/cyclone/gate1_spdp_test.go:97 (checkGateAnnouncement) and testbed/live/gates/gate1_test.go:32.
-- Decode with ParseAnnouncement and ParseSEDPDATA, not by grepping trace text. See testbed/live/cyclone/gate1_spdp_test.go:205 plus internal/transports/dds/spdp.go:654 (ParseAnnouncement) plus internal/transports/dds/sedp.go:1653 (ParseSEDPDATA). Failures count as deserialization failures with zero tolerance in testbed/live/cyclone/gate1_spdp_test.go:404 and testbed/live/cyclone/gate1_spdp_test.go:447.
+- Decode with ParseAnnouncement and ParseSEDPDATA, not by grepping trace text. See testbed/live/cyclone/gate1_spdp_test.go:205 plus internal/transports/dds/spdp.go:722 (ParseAnnouncement) plus internal/transports/dds/sedp.go:2568 (ParseSEDPDATA). Failures count as deserialization failures with zero tolerance in testbed/live/cyclone/gate1_spdp_test.go:404 and testbed/live/cyclone/gate1_spdp_test.go:447.
 - Bound every docker and weld call with context.WithTimeout, not with the timeout binary. See testbed/live/helpers/helpers.go:368, and testbed/live/ros/roundtrip_test.go:107.
 - Skip when no daemon or no peer is present. Never fail the suite for a missing container. See testbed/live/helpers/helpers.go:444, testbed/live/helpers/distro.go:161.
 
 Status note
 
-Go tests are the canonical live harness, plus testbed/live/serial.sh as the serial runner for the ROS suites. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (internal/transports/dds/datapath.go:1144) plus SEDP fixes; reverse is green after writer 03c2 (internal/transports/dds/sedp.go:177-182) plus announce loop (internal/transports/dds/sedp.go:1157) plus Heartbeat (internal/transports/dds/backend.go). A missed live ID in peer echo fails loudly; backend errors and missing sent: still fail. The type matrix in testbed/live/ros/gate_type_matrix_test.go:100 follows the same rule: local XCDR1 codec proof must pass, a publish with no route fails loudly (testbed/live/helpers/live.go:403-408), and ros2 interface show absence skips cleanly (testbed/live/helpers/live.go:326). Full wire record is in Conformance - /docs/conformance.
+Go tests are the canonical live harness, plus testbed/live/serial.sh as the serial runner for the ROS suites. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (internal/transports/dds/datapath.go:1194) plus SEDP fixes; reverse is green after writer 03c2 (internal/transports/dds/sedp.go:177-182) plus announce loop (internal/transports/dds/sedp.go:1350) plus Heartbeat (internal/transports/dds/backend.go:708). A missed live ID in peer echo fails loudly; backend errors and missing sent: still fail. The type matrix in testbed/live/ros/gate_type_matrix_test.go:100 follows the same rule: local XCDR1 codec proof must pass, a publish with no route fails loudly (testbed/live/helpers/live.go:403-408), and ros2 interface show absence skips cleanly (testbed/live/helpers/live.go:326). Full wire record is in Conformance - /docs/conformance.

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/types"
@@ -65,10 +64,14 @@ func (r *DataReceiver) ClearContentFilter(topic string) {
 //
 // The tracker is consulted on every take from that writer: automatic
 // writers record each sample, and expired writers drop loudly while stale
-// writers hold without counting. A nil tracker clears the entry.
+// writers hold without counting. A nil tracker clears the entry. Inserts
+// hold livelyTrackerCap with arbitrary eviction like the lazy path so
+// bulk explicit registration cannot grow the map without bound; unlike
+// lazy creation, explicit registration trusts the caller and skips the
+// matched-writer gate so trackers can be installed before discovery
+// completes.
 func (r *DataReceiver) SetLivelinessTracker(guid WriterGUID, tracker *core.LivelinessTracker) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.lively == nil {
 		r.lively = make(map[WriterGUID]*core.LivelinessTracker)
@@ -76,11 +79,23 @@ func (r *DataReceiver) SetLivelinessTracker(guid WriterGUID, tracker *core.Livel
 
 	if tracker == nil {
 		delete(r.lively, guid)
+		r.mu.Unlock()
 
 		return
 	}
 
+	var evicted WriterGUID
+	evictedOk := false
+	if _, ok := r.lively[guid]; !ok && len(r.lively) >= livelyTrackerCap {
+		evicted, evictedOk = r.evictLivelyLocked()
+	}
+
 	r.lively[guid] = tracker
+	r.mu.Unlock()
+
+	if evictedOk {
+		log.Printf("dds: lively table full evict guid=%x", evicted)
+	}
 }
 
 // SetDeadlineTracker registers a deadline tracker for one ROS topic.
@@ -202,42 +217,84 @@ func plainNackNextBase(st *plainNackState, seq uint64) uint64 {
 	return base
 }
 
-// capPlainNackLocked ensures plainNack stays bounded.
+// capPlainNackLocked holds the plain NACK table at the lively cap.
 //
-// Caller holds r.mu for write. When the table holds livelyTrackerCap
-// entries and the key is unseen, it evicts one arbitrary writer loudly so
-// writer churn cannot grow the table without bound.
-func (r *DataReceiver) capPlainNackLocked(except WriterGUID) {
+// It returns the evicted writer, if any, for the caller to log after
+// unlocking: logging never holds the receiver lock. The eviction is an
+// arbitrary map entry, not the oldest; the cap bounds memory, not
+// fairness. The caller must hold r.mu.
+func (r *DataReceiver) capPlainNackLocked(except WriterGUID) (WriterGUID, bool) {
 	if _, seen := r.plainNack[except]; seen {
-		return
+		return WriterGUID{}, false
 	}
 
 	if len(r.plainNack) < livelyTrackerCap {
-		return
+		return WriterGUID{}, false
 	}
 
 	for victim := range r.plainNack {
 		delete(r.plainNack, victim)
-		log.Printf("dds: plain nack table full evict guid=%x", victim)
 
-		return
+		return victim, true
+	}
+
+	return WriterGUID{}, false
+}
+
+// plainSampleBaseLocked inserts one plain tracker and computes its NACK base.
+//
+// First sight of a writer at seq K above 1 means 1 through K minus 1
+// were missed, typically a late join: NACK base 1 immediately. Later
+// gaps NACK the new base once per advance, so repair converges without
+// storms. The caller must hold r.mu for write and must have matched the
+// writer under the same lock. It returns the NACK base with the send hook
+// plus any evicted writer for post-unlock logging. A zero base means no
+// NACK: either the sequence needs none or it does not advance the
+// high-water. Insertion gates on matched writers: unknown GUIDs skip
+// tracking without growing plainNack. New keys hold livelyTrackerCap with
+// arbitrary eviction for post-unlock logging.
+func (r *DataReceiver) plainSampleBaseLocked(guid WriterGUID, seq uint64) (uint64, func(ctx context.Context, guid WriterGUID, base uint64) error, WriterGUID, bool) {
+	if r.plainNack == nil {
+		r.plainNack = make(map[WriterGUID]*plainNackState)
+	}
+
+	var victim WriterGUID
+	evicted := false
+	st, ok := r.plainNack[guid]
+	if !ok {
+		victim, evicted = r.capPlainNackLocked(guid)
+		st = &plainNackState{}
+		r.plainNack[guid] = st
+	}
+
+	base := plainNackNextBase(st, seq)
+	if base == 0 || base <= st.lastNacked {
+		return 0, nil, victim, evicted
+	}
+
+	return base, r.nackSender, victim, evicted
+}
+
+// plainSampleAckLocked advances one plain high-water after a send.
+//
+// The caller must hold r.mu for write. Smaller or equal bases never
+// regress the high-water, so reordered sends stay harmless.
+func (r *DataReceiver) plainSampleAckLocked(guid WriterGUID, base uint64) {
+	if current, seen := r.plainNack[guid]; seen && base > current.lastNacked {
+		current.lastNacked = base
 	}
 }
 
 // notePlainSample tracks one plain vendor sample and NACKs gaps best effort.
 //
-// First sight of a writer at seq K above 1 means 1 through K minus 1
-// were missed, typically a late join: NACK base 1 immediately. Later
-// gaps NACK the new base once per advance, so repair converges without
-// storms. Delivery never blocks on this: the sample always flows and
-// NACK send failures only bump demux errors. The high-water lastNacked
-// advances only after a successful send, and a nil sender never advances
-// it, so failed or disabled NACKs do not mask the gap. Unparseable seq
-// skips tracking. Insertion gates on matched writers: unknown GUIDs with
-// no confirmed SEDP remote or provisional placeholder skip tracking
-// without growing plainNack, consistent with isMatchedWriter. New keys
-// hold livelyTrackerCap with oldest-eviction plus loud log. It self-locks
-// and is safe for concurrent use.
+// Delivery never blocks on this: the sample always flows and NACK send
+// failures only bump demux errors. The high-water lastNacked advances only
+// after a successful send, and a nil sender never advances it, so failed or
+// disabled NACKs do not mask the gap. It self-locks and is safe for
+// concurrent use. It delegates locked insert plus base computation to
+// plainSampleBaseLocked so the cyclomatic cost stays under the cap, logs
+// evictions after unlock, sends without holding the receiver lock, then
+// advances the high-water.
 func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq uint64) {
 	if seq == 0 {
 		return
@@ -248,26 +305,19 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 	}
 
 	r.mu.Lock()
-	if r.plainNack == nil {
-		r.plainNack = make(map[WriterGUID]*plainNackState)
-	}
-
-	st, ok := r.plainNack[guid]
-	if !ok {
-		r.capPlainNackLocked(guid)
-		st = &plainNackState{}
-		r.plainNack[guid] = st
-	}
-
-	base := plainNackNextBase(st, seq)
-
-	if base == 0 || base <= st.lastNacked {
+	if !r.isMatchedWriterLocked(guid) {
 		r.mu.Unlock()
 		return
 	}
-
-	send := r.nackSender
+	base, send, victim, evicted := r.plainSampleBaseLocked(guid, seq)
 	r.mu.Unlock()
+	if evicted {
+		log.Printf("dds: plain nack table full evict guid=%x", victim)
+	}
+
+	if base == 0 {
+		return
+	}
 
 	if send == nil {
 		return
@@ -281,9 +331,7 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 	}
 
 	r.mu.Lock()
-	if current, seen := r.plainNack[guid]; seen && base > current.lastNacked {
-		current.lastNacked = base
-	}
+	r.plainSampleAckLocked(guid, base)
 	r.mu.Unlock()
 }
 
@@ -351,13 +399,66 @@ func (r *DataReceiver) isMatchedWriter(guid WriterGUID) bool {
 	return false
 }
 
-// evictLivelyLocked evicts one tracker to hold the cap. Caller holds r.mu.
-func (r *DataReceiver) evictLivelyLocked() {
+// isMatchedWriterLocked reports whether a writer GUID names a known writer.
+//
+// It shares the isMatchedWriter rule without taking r.mu: the caller must
+// hold r.mu for write, so a match observed here cannot change before the
+// caller acts on it. Never call the locking variant while holding the
+// write lock; Go RWMutex read-locking under a held write lock deadlocks.
+func (r *DataReceiver) isMatchedWriterLocked(guid WriterGUID) bool {
+	if _, ok := r.remoteForGUIDLocked(guid); ok {
+		return true
+	}
+	_, ok := r.provisionalForGUIDLocked(guid)
+
+	return ok
+}
+
+// evictLivelyLocked drops one tracker to hold the cap. Caller holds r.mu.
+//
+// Eviction picks an arbitrary entry: the cap bounds memory, not fairness.
+// It returns the evicted writer so the caller logs loudly after unlocking;
+// logging never holds the receiver lock.
+func (r *DataReceiver) evictLivelyLocked() (WriterGUID, bool) {
 	for id := range r.lively {
 		delete(r.lively, id)
 
-		return
+		return id, true
 	}
+
+	return WriterGUID{}, false
+}
+
+// ensureLivelyLocked installs the liveliness tracker for one matched
+// writer when the topic carries a contract, evicting an arbitrary entry
+// on cap since the bound is memory, not fairness.
+//
+// The match is re-checked under the held write lock so a writer removed
+// between the snapshot and this call never installs a tracker. It returns
+// the tracker plus any evicted writer for the caller to log after unlock;
+// logging never holds the receiver lock. The caller supplies nowNanos
+// captured before locking so tracker start times never read shared clock
+// state under the write lock.
+func (r *DataReceiver) ensureLivelyLocked(topic string, guid WriterGUID, cfg livelyConfig, nowNanos int64) (*core.LivelinessTracker, WriterGUID, bool) {
+	if !r.isMatchedWriterLocked(guid) {
+		return nil, WriterGUID{}, false
+	}
+	if r.lively == nil {
+		r.lively = make(map[WriterGUID]*core.LivelinessTracker)
+	}
+	if _, ok := r.lively[guid]; !ok {
+		var evicted WriterGUID
+		evictedOk := false
+		if len(r.lively) >= livelyTrackerCap {
+			evicted, evictedOk = r.evictLivelyLocked()
+		}
+		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), cfg.kind, cfg.lease, nowNanos)
+		r.lively[guid] = &tracker
+		if evictedOk {
+			return &tracker, evicted, true
+		}
+	}
+	return r.lively[guid], WriterGUID{}, false
 }
 
 // snapshotTakeHooks loads one sample's hook state with lazy tracker creation.
@@ -368,28 +469,9 @@ func (r *DataReceiver) evictLivelyLocked() {
 // GUIDs never create trackers, so unauthenticated traffic cannot grow the
 // map without a matching SEDP announce. At cap one entry is evicted to
 // keep the map bounded. Writers discovered after subscribe are still
-// enforced from their first take.
-// ensureLivelyLocked installs the liveliness tracker for one matched
-// writer when the topic carries a contract, evicting oldest on cap.
-// Caller holds the write lock and passes the pre-checked match result;
-// unmatched writers never install.
-func (r *DataReceiver) ensureLivelyLocked(topic string, guid WriterGUID, cfg livelyConfig, matched bool) *core.LivelinessTracker {
-	if !matched {
-		return nil
-	}
-	if r.lively == nil {
-		r.lively = make(map[WriterGUID]*core.LivelinessTracker)
-	}
-	if _, ok := r.lively[guid]; !ok {
-		if len(r.lively) >= livelyTrackerCap {
-			r.evictLivelyLocked()
-		}
-		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), cfg.kind, cfg.lease, time.Now().UnixNano())
-		r.lively[guid] = &tracker
-	}
-	return r.lively[guid]
-}
-
+// enforced from their first take. Lazy creation delegates to
+// ensureLivelyLocked, which evicts an arbitrary entry on cap since the
+// bound is memory, not fairness.
 func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHookSnapshot {
 	r.mu.RLock()
 	snap := takeHookSnapshot{
@@ -402,9 +484,17 @@ func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHook
 
 	if hasCfg && snap.tracker == nil {
 		matched := r.isMatchedWriter(guid)
+		if !matched {
+			return snap
+		}
+		nowNanos := r.receiverNow()().UnixNano()
 		r.mu.Lock()
-		snap.tracker = r.ensureLivelyLocked(topic, guid, cfg, matched)
+		tracker, evicted, evictedOk := r.ensureLivelyLocked(topic, guid, cfg, nowNanos)
+		snap.tracker = tracker
 		r.mu.Unlock()
+		if evictedOk {
+			log.Printf("dds: lively table full evict guid=%x", evicted)
+		}
 	}
 
 	return snap
@@ -417,11 +507,12 @@ func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHook
 // contract holds without re-subscribing. Reconfiguration updates existing
 // writers in place through Reconfigure so a lease or kind change applies
 // without resetting outage history. Explicit nil writer lists only store
-// the config. Explicit installs hold livelyTrackerCap with eviction like
-// the lazy path so bulk installs cannot grow the map without bound.
+// the config. Explicit installs hold livelyTrackerCap with arbitrary
+// eviction like the lazy path so bulk installs cannot grow the map without
+// bound; victims log loudly after unlock, never under the receiver lock.
 func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.LivelinessPolicy, lease core.Duration, writers []WriterGUID) {
+	nowNanos := r.receiverNow()().UnixNano()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.livelyCfg == nil {
 		r.livelyCfg = make(map[string]livelyConfig)
@@ -433,6 +524,7 @@ func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.Live
 		r.lively = make(map[WriterGUID]*core.LivelinessTracker)
 	}
 
+	var evicted []WriterGUID
 	for _, guid := range writers {
 		if existing, ok := r.lively[guid]; ok {
 			existing.Reconfigure(kind, lease)
@@ -441,11 +533,19 @@ func (r *DataReceiver) SetLivelinessTrackerForTopic(topic string, kind core.Live
 		}
 
 		if len(r.lively) >= livelyTrackerCap {
-			r.evictLivelyLocked()
+			if victim, ok := r.evictLivelyLocked(); ok {
+				evicted = append(evicted, victim)
+			}
 		}
 
-		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), kind, lease, time.Now().UnixNano())
+		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), kind, lease, nowNanos)
 		r.lively[guid] = &tracker
+	}
+
+	r.mu.Unlock()
+
+	for _, victim := range evicted {
+		log.Printf("dds: lively table full evict guid=%x", victim)
 	}
 }
 
@@ -479,6 +579,7 @@ func (r *DataReceiver) UnsetLivelinessTrackerForTopic(topic string) {
 // Missed deadlines drop loudly naming the deadline policy. A zero or
 // unspecified deadline disables the check while keeping the tracker.
 func (r *DataReceiver) SetDeadlineTrackerForTopic(topic string, deadline core.Duration) {
+	nowNanos := r.receiverNow()().UnixNano()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -486,7 +587,7 @@ func (r *DataReceiver) SetDeadlineTrackerForTopic(topic string, deadline core.Du
 		r.deadlines = make(map[string]*core.DeadlineTracker)
 	}
 
-	tracker := core.NewDeadlineTracker(topic, "reader", deadline, time.Now().UnixNano())
+	tracker := core.NewDeadlineTracker(topic, "reader", deadline, nowNanos)
 	r.deadlines[topic] = &tracker
 }
 
@@ -511,8 +612,7 @@ func writerGUIDLabel(guid WriterGUID) string {
 // never panics.
 //
 //nolint:unparam // topic documents the sampled topic for call-site symmetry though the snapshot already carries the filter
-func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte, guid WriterGUID, keyed bool) *takeHookReject {
-	now := time.Now().UnixNano()
+func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte, guid WriterGUID, keyed bool, now int64) *takeHookReject {
 	deadlineMissed := assertTakeReceipt(snap, now)
 
 	if snap.filter != nil && snap.filter.filter != nil {

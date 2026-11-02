@@ -762,6 +762,10 @@ func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 // maps to DDS infinite, which core matching treats exactly like the
 // unspecified default. Malformed value lengths refuse loudly with a typed
 // WireQoSParseRefusal naming the policy kind.
+//
+// Wire values are little endian only, matching every peer observed on the
+// wire; use ParseWireQoSEndian to refuse big-endian input loudly instead
+// of mis-decoding it.
 func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	byID := make(map[uint16][]byte, len(params))
 
@@ -809,6 +813,19 @@ func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	}
 
 	return out, nil
+}
+
+// ParseWireQoSEndian decodes observed vendor SEDP QoS params with an explicit byte order.
+//
+// Big-endian peers are refused loudly instead of being mis-decoded as
+// little-endian values; wire values from the only observed peers
+// (little-endian CycloneDDS) decode through ParseWireQoS unchanged.
+func ParseWireQoSEndian(params []rtps.Param, littleEndian bool) (WireQoS, error) {
+	if !littleEndian {
+		return WireQoS{}, &WireQoSParseRefusal{Policy: core.PolicyReliability, Detail: "big-endian SEDP QoS params are not supported"}
+	}
+
+	return ParseWireQoS(params)
 }
 
 // reverseWireDuration maps a wire duration back to a core duration.

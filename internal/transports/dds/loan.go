@@ -491,11 +491,14 @@ func (r *LoanedReceiver) TakeLoaned(frame []byte, m *types.MessageMembers) (*Loa
 		return nil, fmt.Errorf("dds: loaned take topic %q: %w", decoded.ddsTopic, err)
 	}
 	r.inner.mu.Lock()
-	err = r.inner.trackSequenceLocked(decoded.guid, decoded.seq)
+	evicted, evictedOk, err := r.inner.trackSequenceLocked(decoded.guid, decoded.seq)
 	r.inner.mu.Unlock()
 	if err != nil {
 		r.inner.countDrop()
 		return nil, fmt.Errorf("dds: loaned take sequence: %w", err)
+	}
+	if evictedOk {
+		logTakeEvict(evicted)
 	}
 	loan, err := r.pool.Borrow(m, int(decoded.userLen))
 	if err != nil {

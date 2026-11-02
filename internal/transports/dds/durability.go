@@ -139,6 +139,10 @@ func (q DurabilityServiceQoS) Validate() error {
 		return fmt.Errorf("dds: durability service history kind %d: %w", q.HistoryKind, ErrDurabilityService)
 	}
 
+	if q.HistoryDepth < 0 {
+		return fmt.Errorf("dds: durability service negative history depth %d: %w", q.HistoryDepth, ErrDurabilityService)
+	}
+
 	if q.HistoryKind == durabilityServiceHistoryKeepLast && q.HistoryDepth < 1 {
 		return fmt.Errorf("dds: durability service keep last depth %d: %w", q.HistoryDepth, ErrDurabilityService)
 	}
@@ -405,27 +409,12 @@ func ReplayBound(published, writerDepth uint64, durabilityKind uint32, caps Dura
 // samples still caps the grand total. Unstated (0) and unlimited (-1) keep
 // the struct contract. Products saturate at published instead of wrapping,
 // so huge depths never overflow before the published cap applies.
-func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS, instanceCount uint64) uint64 {
-	if instanceCount == 0 {
-		instanceCount = 1
-	}
-
-	if instanceCount == 1 {
-		return replayBoundKeyless(published, writerDepth, durabilityKind, caps)
-	}
-
-	if durabilityKind == sedpDurabilityVolatile {
-		return 0
-	}
-
-	if durabilityKind == sedpDurabilityTransientLocal {
-		return cappedMultiply(resolveWriterDepth(writerDepth), instanceCount, published)
-	}
-
-	if durabilityKind != durabilityKindTransient && durabilityKind != durabilityKindPersistent {
-		return 0
-	}
-
+// multiInstanceBound bounds one replay across an explicit instance count.
+//
+// Unstated (0) and unlimited (-1) keep the struct contract: only positive
+// values constrain. Products saturate at published instead of wrapping,
+// so huge depths never overflow before the published cap applies.
+func multiInstanceBound(published, writerDepth, instanceCount uint64, caps DurabilityServiceQoS) uint64 {
 	perInstance := resolveWriterDepth(writerDepth)
 
 	if caps.HistoryKind == durabilityServiceHistoryKeepLast && caps.HistoryDepth > 0 {
@@ -450,6 +439,34 @@ func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint
 	return bound
 }
 
+func ReplayBoundWithInstances(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS, instanceCount uint64) uint64 {
+	if instanceCount == 0 {
+		instanceCount = 1
+	}
+
+	if instanceCount == 1 {
+		return replayBoundKeyless(published, writerDepth, durabilityKind, caps)
+	}
+
+	if malformedDurabilityCaps(caps) {
+		return 0
+	}
+
+	if durabilityKind == sedpDurabilityVolatile {
+		return 0
+	}
+
+	if durabilityKind == sedpDurabilityTransientLocal {
+		return cappedMultiply(resolveWriterDepth(writerDepth), instanceCount, published)
+	}
+
+	if durabilityKind != durabilityKindTransient && durabilityKind != durabilityKindPersistent {
+		return 0
+	}
+
+	return multiInstanceBound(published, writerDepth, instanceCount, caps)
+}
+
 // cappedMultiply returns min(a times b, limit) without wrapping.
 //
 // When either factor is zero the product is zero. When a exceeds limit
@@ -471,9 +488,26 @@ func cappedMultiply(a, b, limit uint64) uint64 {
 	return product
 }
 
+// malformedDurabilityCaps reports whether peer caps carry values below -1.
+//
+// The struct contract reads 0 as unstated and -1 as unlimited, so only
+// values below -1 are malformed. A malformed peer must constrain replay
+// to nothing instead of reading as unconstrained, so callers fail closed
+// with a zero bound before matching or bounding.
+func malformedDurabilityCaps(caps DurabilityServiceQoS) bool {
+	return caps.HistoryDepth < -1 ||
+		caps.MaxSamples < -1 ||
+		caps.MaxInstances < -1 ||
+		caps.MaxSamplesPerInstance < -1
+}
+
 // replayBoundKeyless is the single-instance bound preserved for keyless topics.
 func replayBoundKeyless(published, writerDepth uint64, durabilityKind uint32, caps DurabilityServiceQoS) uint64 {
 	if durabilityKind == sedpDurabilityVolatile {
+		return 0
+	}
+
+	if malformedDurabilityCaps(caps) {
 		return 0
 	}
 

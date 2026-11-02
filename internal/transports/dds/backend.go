@@ -584,8 +584,10 @@ func (b *Backend) isClosed() bool {
 //
 // It reads clock and intervals directly without locking and adds one
 // WaitGroup count immediately before each go statement. The caller must
-// hold mu so Close blocks until Adds complete. See startLiveLoopsLocked
-// for the live counterpart.
+// hold mu so Close blocks until Adds complete. The sweep loop rides along
+// so provisional placeholders and scheduled dispose evictions expire even
+// though stubs run no heartbeat loop. See startLiveLoopsLocked for the
+// live counterpart.
 func (b *Backend) startStubLoopsLocked(runCtx context.Context) {
 	clock := b.clock
 	spdpInterval := b.spdpInterval
@@ -595,6 +597,8 @@ func (b *Backend) startStubLoopsLocked(runCtx context.Context) {
 	go b.spdpLoop(runCtx, clock, spdpInterval)
 	b.runWG.Add(1)
 	go b.sedpLoop(runCtx, clock, sedpInterval)
+	b.runWG.Add(1)
+	go b.sweepLoop(runCtx)
 }
 
 // snapshotIntervals returns SPDP and SEDP intervals under lock.
@@ -636,6 +640,65 @@ func (b *Backend) startLiveLoopsLocked(runCtx context.Context) {
 // The interval matches the SEDP resend cadence: prompt enough for tests,
 // quiet enough for the fleet.
 const userHeartbeatInterval = 1 * time.Second
+
+// sweepInterval spaces SEDP expiry sweeps on backends without heartbeats.
+//
+// Provisional placeholders and scheduled dispose evictions must expire
+// even on backends that never join discovery; stub backends run no
+// userHeartbeatLoop, so tying expiry there would leak both maps. Live
+// backends sweep the same state on every heartbeat tick through
+// advertiseWriterHistory.
+const sweepInterval = 1 * time.Second
+
+// sweepLoop expires SEDP provisional placeholders plus scheduled dispose
+// evictions until the context ends.
+//
+// It runs on stub backends, which have no userHeartbeatLoop; live
+// backends sweep the same state on every heartbeat tick through
+// advertiseWriterHistory. Each tick snapshots the index without holding
+// backend locks across the SEDP index lock, matching the
+// advertiseWriterHistory discipline. Ticks are best effort and idempotent:
+// with nothing due they change nothing and bump no generation.
+func (b *Backend) sweepLoop(ctx context.Context) {
+	defer b.runWG.Done()
+
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.sweepOnce()
+		}
+	}
+}
+
+// sweepOnce expires one round of SEDP provisional plus pending evictions.
+//
+// It snapshots the index and clock without holding locks across the SEDP
+// index lock, then runs both sweeps. A nil index is a no-op.
+func (b *Backend) sweepOnce() {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	clock := b.clock
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return
+	}
+
+	var now time.Time
+	if clock != nil {
+		now = clock.Now()
+	} else {
+		now = time.Now()
+	}
+
+	sedpIdx.ExpireProvisional(now)
+	sedpIdx.ExpirePendingEvictions(now)
+}
 
 // userHeartbeatLoop advertises retained writer history until context ends.
 //
@@ -858,7 +921,7 @@ func (b *Backend) completeJoin(ctx context.Context, peer UDPPeer) error {
 		return nil
 	}
 
-	runCtx, err := b.installLiveLocked(peer, live, ctx)
+	runCtx, summary, err := b.installLiveLocked(peer, live, ctx)
 	if err != nil {
 		b.mu.Unlock()
 		b.closePeerBestEffort(peer, "install failure")
@@ -870,6 +933,8 @@ func (b *Backend) completeJoin(ctx context.Context, peer UDPPeer) error {
 	b.startLiveLoopsLocked(runCtx)
 	b.startMcastIngressLocked(runCtx)
 	b.mu.Unlock()
+
+	logJoin(summary)
 
 	return nil
 }
@@ -889,6 +954,34 @@ func (b *Backend) installStubLocked(peer UDPPeer, ctx context.Context) context.C
 	return runCtx
 }
 
+// liveJoinSummary reports how multicast receive joined, for logging after unlock.
+type liveJoinSummary struct {
+	domain      uint32
+	joined      bool
+	groupPort   int
+	userPort    int
+	unicastPort int
+}
+
+// logJoin reports the multicast join outcome. Call without holding b.mu.
+func logJoin(summary liveJoinSummary) {
+	if summary.joined {
+		log.Printf(
+			"dds: multicast receive joined on domain %d group port %d user port %d unicast port %d",
+			summary.domain,
+			summary.groupPort,
+			summary.userPort,
+			summary.unicastPort,
+		)
+		return
+	}
+	log.Printf(
+		"dds: multicast receive unavailable, running in send-only unicast-bootstrap mode on domain %d unicast port %d",
+		summary.domain,
+		summary.unicastPort,
+	)
+}
+
 // installLiveLocked wires live sockets plus tables and returns run context.
 //
 // The caller must hold b.mu and must call startStubLoopsLocked plus
@@ -899,12 +992,12 @@ func (b *Backend) installLiveLocked(
 	peer UDPPeer,
 	live *transportPeer,
 	ctx context.Context,
-) (context.Context, error) {
+) (context.Context, liveJoinSummary, error) {
 	domain := b.domainID
 
 	local, err := NewLocalParticipant(domain, DefaultLeaseDuration)
 	if err != nil {
-		return nil, fmt.Errorf("dds: join local participant: %w", err)
+		return nil, liveJoinSummary{}, fmt.Errorf("dds: join local participant: %w", err)
 	}
 
 	// Announce the actually bound unicast ports, not participant-zero
@@ -920,7 +1013,7 @@ func (b *Backend) installLiveLocked(
 
 	sedpIdx, err := NewSEDPIndex(sedpPrefix, domain)
 	if err != nil {
-		return nil, fmt.Errorf("dds: join sedp index: %w", err)
+		return nil, liveJoinSummary{}, fmt.Errorf("dds: join sedp index: %w", err)
 	}
 
 	remotes := NewRemoteTable(nil)
@@ -947,12 +1040,12 @@ func (b *Backend) installLiveLocked(
 
 	publisher, err := NewPublisher(pubGUID, discardWriter{})
 	if err != nil {
-		return nil, fmt.Errorf("dds: join publisher: %w", err)
+		return nil, liveJoinSummary{}, fmt.Errorf("dds: join publisher: %w", err)
 	}
 
 	err = ctx.Err()
 	if err != nil {
-		return nil, fmt.Errorf("dds: join discovery: %w", err)
+		return nil, liveJoinSummary{}, fmt.Errorf("dds: join discovery: %w", err)
 	}
 
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -1004,22 +1097,20 @@ func (b *Backend) installLiveLocked(
 	}
 
 	if mcastRx != nil {
-		log.Printf(
-			"dds: multicast receive joined on domain %d group port %d user port %d unicast port %d",
-			domain,
-			mcastRx.Port(),
-			userMulticastPortOrZero(mcastUserRx),
-			live.uni.LocalPort(),
-		)
-	} else {
-		log.Printf(
-			"dds: multicast receive unavailable, running in send-only unicast-bootstrap mode on domain %d unicast port %d",
-			domain,
-			live.uni.LocalPort(),
-		)
+		return runCtx, liveJoinSummary{
+			domain:      domain,
+			joined:      true,
+			groupPort:   mcastRx.Port(),
+			userPort:    userMulticastPortOrZero(mcastUserRx),
+			unicastPort: live.uni.LocalPort(),
+		}, nil
 	}
 
-	return runCtx, nil
+	return runCtx, liveJoinSummary{
+		domain:      domain,
+		joined:      false,
+		unicastPort: live.uni.LocalPort(),
+	}, nil
 }
 
 // counterLoop runs one discovery counter until the run context ends.

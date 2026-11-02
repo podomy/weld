@@ -188,6 +188,14 @@ func TestDurabilityServiceValidate(t *testing.T) {
 		t.Fatalf("negative cleanup delay validated without error")
 	}
 
+	negativeKeepAllDepth := DefaultDurabilityServiceQoS()
+	negativeKeepAllDepth.HistoryKind = durabilityServiceHistoryKeepAll
+	negativeKeepAllDepth.HistoryDepth = -1
+	err = negativeKeepAllDepth.Validate()
+	if err == nil {
+		t.Fatalf("keep-all negative depth validated without error")
+	}
+
 	badLimit := DefaultDurabilityServiceQoS()
 	badLimit.MaxSamples = -2
 	err = badLimit.Validate()
@@ -613,5 +621,41 @@ func TestDurabilityServiceCompatRejectsNegativeCleanupDelay(t *testing.T) {
 	}
 	if !strings.Contains(both.Reason, "service_cleanup_delay") {
 		t.Fatalf("both reason %q misses service_cleanup_delay", both.Reason)
+	}
+}
+
+// TestDurabilityReplayMalformedCapsFailClosed pins fail-closed replay bounds.
+func TestDurabilityReplayMalformedCapsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	good := DefaultDurabilityServiceQoS()
+	good.HistoryKind = durabilityServiceHistoryKeepLast
+	good.HistoryDepth = 10
+	if got := ReplayBound(100, 10, durabilityKindTransient, good); got == 0 {
+		t.Fatalf("sane caps replay = 0, want positive")
+	}
+
+	bad := good
+	bad.MaxSamples = -5
+	if got := ReplayBound(100, 10, durabilityKindTransient, bad); got != 0 {
+		t.Fatalf("malformed max samples replay = %d, want 0 fail-closed", got)
+	}
+
+	badDepth := good
+	badDepth.HistoryDepth = -5
+	if got := ReplayBound(100, 10, durabilityKindTransient, badDepth); got != 0 {
+		t.Fatalf("malformed depth replay = %d, want 0 fail-closed", got)
+	}
+
+	badMulti := good
+	badMulti.MaxSamplesPerInstance = -5
+	if got := ReplayBoundWithInstances(100, 10, durabilityKindTransient, badMulti, 3); got != 0 {
+		t.Fatalf("malformed per-instance replay = %d, want 0 fail-closed", got)
+	}
+
+	unlimited := good
+	unlimited.MaxSamples = -1
+	if got := ReplayBound(100, 10, durabilityKindTransient, unlimited); got == 0 {
+		t.Fatalf("unlimited -1 replay = 0, want positive (unlimited is not malformed)")
 	}
 }

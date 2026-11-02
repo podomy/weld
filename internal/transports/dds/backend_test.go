@@ -1909,3 +1909,56 @@ func TestBackendAckBaseZeroNoop(t *testing.T) {
 		t.Fatalf("repair base 0: %v", err)
 	}
 }
+
+// sedpTestPrefix returns a fixed SEDP prefix for sweep tests.
+func sedpTestPrefix() SEDPGUIDPrefix {
+	var prefix SEDPGUIDPrefix
+	prefix[0] = 0xE1
+	return prefix
+}
+
+// sedpPeerPrefix returns a distinct SEDP prefix for sweep test peers.
+func sedpPeerPrefix() SEDPGUIDPrefix {
+	var prefix SEDPGUIDPrefix
+	prefix[0] = 0xE2
+	return prefix
+}
+
+// TestBackendSweepOnceExpiresPendingEvict pins the stub-path sweeper unit.
+func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
+	t.Parallel()
+
+	backend := newTestBackend(t, DefaultSidecarConfig())
+	defer func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	local, err := NewSEDPIndex(sedpTestPrefix(), 42)
+	if err != nil {
+		t.Fatalf("new index: %v", err)
+	}
+	backend.mu.Lock()
+	backend.sedp = local
+	backend.mu.Unlock()
+
+	peer, err := NewSEDPIndex(sedpPeerPrefix(), 42)
+	if err != nil {
+		t.Fatalf("new peer index: %v", err)
+	}
+	ep, err := peer.DeclareWriter("/sweep", "std_msgs__msg__String", "RIHS01_sweep", nil)
+	if err != nil {
+		t.Fatalf("declare writer: %v", err)
+	}
+	if err := local.UpsertRemote(ep); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	local.SchedulePrefixEvict(ep.ID.Prefix, time.Now().Add(-2*sedpEvictGracePeriod))
+
+	backend.sweepOnce()
+
+	if n := len(local.RemoteEndpoints()); n != 0 {
+		t.Fatalf("remotes = %d, want 0 after sweep", n)
+	}
+}

@@ -62,6 +62,11 @@ type promptNackKey struct {
 var promptNackMu sync.Mutex
 
 // promptNackCounts tracks prompt NACK attempts per remote writer.
+//
+// The map is process wide and keyed by backend, so parallel tests never
+// collide; entries drop when their backend closes. Counts only bound
+// per-writer prompt NACK storms and carry no wire meaning, so tests must
+// not assert exact values.
 var promptNackCounts = make(map[promptNackKey]int)
 
 // ErrDataFragDropped reports a DATA_FRAG sample rejected without complete reassembly.
@@ -93,8 +98,9 @@ func newUserHistory() *userHistory {
 
 // store copies payload for guid and seq.
 //
-// It evicts oldest when depth is passed and evicts oldest seqs when the
-// byte budget is passed. It also bounds distinct writers by
+// It evicts oldest seqs per writer when depth is passed, and evicts from
+// the largest writer first when the byte budget is passed so one writer
+// cannot starve the others. It also bounds distinct writers by
 // maxTrackedWriters with loud eviction so writer churn cannot grow the
 // table without limit. Byte evictions log loudly after unlock so logging
 // never holds the history lock, mirroring the frag byte discipline. A nil

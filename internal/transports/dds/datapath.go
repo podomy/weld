@@ -496,10 +496,11 @@ type DataReceiver struct {
 	lost  uint64
 	drops uint64
 	sedp  *SEDPIndex
-	// now supplies FirstSeen times for provisional endpoints. It defaults to
-	// time.Now and tests may replace it with a fake clock. Wall-clock stays
-	// intentional for pacing timers elsewhere; only provisional expiry and
-	// FirstSeen use this source.
+	// now supplies FirstSeen times for provisional endpoints, tracker start
+	// times, and take-path evaluation. It defaults to time.Now and tests may
+	// replace it with a fake clock. Wall-clock stays intentional for pacing
+	// timers elsewhere; only provisional expiry, FirstSeen, liveliness and
+	// deadline evaluation use this source.
 	now func() time.Time
 	// provisional holds opportunistic endpoints for unknown writers.
 	//
@@ -663,9 +664,18 @@ func (r *DataReceiver) SetSEDPIndex(idx *SEDPIndex) {
 // instead of attributing it to another writer on the same participant.
 func (r *DataReceiver) remoteForGUID(guid WriterGUID) (SEDPEndpoint, bool) {
 	r.mu.RLock()
-	idx := r.sedp
-	r.mu.RUnlock()
+	defer r.mu.RUnlock()
 
+	return r.remoteForGUIDLocked(guid)
+}
+
+// remoteForGUIDLocked resolves a writer GUID without taking r.mu.
+//
+// The caller must hold r.mu (read or write); use remoteForGUID otherwise.
+// Locking here while holding the write lock would deadlock, so take-hook
+// paths that already hold it must call this variant.
+func (r *DataReceiver) remoteForGUIDLocked(guid WriterGUID) (SEDPEndpoint, bool) {
+	idx := r.sedp
 	if idx == nil {
 		return SEDPEndpoint{}, false
 	}
@@ -778,6 +788,14 @@ func (r *DataReceiver) ProvisionalForGUID(guid WriterGUID) (ProvisionalEndpoint,
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	return r.provisionalForGUIDLocked(guid)
+}
+
+// provisionalForGUIDLocked reads the provisional map without taking r.mu.
+//
+// The caller must hold r.mu (read or write); use ProvisionalForGUID
+// otherwise, and never the locking variant under a held write lock.
+func (r *DataReceiver) provisionalForGUIDLocked(guid WriterGUID) (ProvisionalEndpoint, bool) {
 	ep, ok := r.provisional[guid]
 
 	return ep, ok
@@ -1274,7 +1292,7 @@ func (r *DataReceiver) takeDecoded(
 
 	r.mu.Lock()
 
-	err := r.trackSequenceLocked(decoded.guid, decoded.seq)
+	evicted, evictedOk, err := r.trackSequenceLocked(decoded.guid, decoded.seq)
 	if err != nil {
 		r.mu.Unlock()
 		return empty, fmt.Errorf("dds: take sequence: %w", err)
@@ -1289,7 +1307,11 @@ func (r *DataReceiver) takeDecoded(
 
 	r.mu.Unlock()
 
-	if rej := evalTakeHooks(snap, rosTopic, decoded.typeName, payloadView[:decoded.userLen], decoded.guid, writerGUIDKeyed(decoded.guid)); rej != nil {
+	if evictedOk {
+		logTakeEvict(evicted)
+	}
+
+	if rej := evalTakeHooks(snap, rosTopic, decoded.typeName, payloadView[:decoded.userLen], decoded.guid, writerGUIDKeyed(decoded.guid), r.receiverNow()().UnixNano()); rej != nil {
 		return empty, r.countTakeHookReject(rej)
 	}
 
@@ -1387,7 +1409,7 @@ func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, s
 		r.notePlainSample(ctx, guid, seq)
 	}
 	snap := r.snapshotTakeHooks(msg.TopicName, guid)
-	if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid)); rej != nil {
+	if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid), r.receiverNow()().UnixNano()); rej != nil {
 		return empty, rej, false
 	}
 
@@ -1401,11 +1423,13 @@ func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, s
 // drop inside trackSequenceLocked and report ErrStaleSequence loudly.
 func (r *DataReceiver) trackPlainSequence(guid WriterGUID, seq uint64) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	err := r.trackSequenceLocked(guid, seq)
+	evicted, evictedOk, err := r.trackSequenceLocked(guid, seq)
+	r.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("dds: take from plain sequence: %w", err)
+	}
+	if evictedOk {
+		logTakeEvict(evicted)
 	}
 
 	return nil
@@ -1550,10 +1574,11 @@ func (r *DataReceiver) countPlainDrop(guid WriterGUID, cause error, op string) e
 // count. A gap adds the skipped count to lost and accepts the current frame.
 // A duplicate or old sequence counts a drop and returns ErrStaleSequence.
 // Distinct writers stay bounded by maxTrackedWriters with loud eviction so
-// writer churn cannot grow take state without limit. Eviction logs after a
-// temporary unlock so logging never holds the receiver lock; the function
-// re-locks before return so the caller still holds mu on return.
-func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
+// writer churn cannot grow take state without limit. Eviction never logs
+// under the lock: the evicted writer returns for the caller to log after
+// unlocking.
+func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) (WriterGUID, bool, error) {
+	var none WriterGUID
 	if r.last == nil {
 		r.last = make(map[WriterGUID]uint64)
 	}
@@ -1570,22 +1595,19 @@ func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
 				delete(r.provisional, victim)
 				r.drops++
 				r.last[guid] = seq
-				r.mu.Unlock()
-				log.Printf("dds: take table full evict guid=%x", victim)
-				r.mu.Lock()
 
-				return nil
+				return victim, true, nil
 			}
 		}
 		r.last[guid] = seq
 
-		return nil
+		return none, false, nil
 	}
 
 	if seq <= last {
 		r.drops++
 
-		return fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
+		return none, false, fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
 	}
 
 	if seq > last+1 {
@@ -1594,7 +1616,12 @@ func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
 
 	r.last[guid] = seq
 
-	return nil
+	return none, false, nil
+}
+
+// logTakeEvict records one table eviction after the caller unlocked.
+func logTakeEvict(victim WriterGUID) {
+	log.Printf("dds: take table full evict guid=%x", victim)
 }
 
 // decodedFrame holds one parsed DATA frame.

@@ -308,6 +308,9 @@ func DecodePartitionQoS(value []byte) ([]string, error) {
 	}
 
 	count := int(binary.LittleEndian.Uint32(value[:4]))
+	// The negative check cannot fire on 64 bit platforms where int holds
+	// any uint32, but on 32 bit platforms a huge count narrows to a
+	// negative int and must refuse instead of panicking make below.
 	if count < 0 || count > MaxPartitionCount {
 		return nil, fmt.Errorf("dds: partition count %d above %d: %w", count, MaxPartitionCount, ErrInvalidPartition)
 	}

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strings"
-	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
@@ -49,8 +48,6 @@ import (
 
 // Service wire constants.
 const (
-	// ServiceMatchedReaderWait bounds one response reader wait.
-	ServiceMatchedReaderWait = 100 * time.Millisecond
 	// ServiceSertypeHeaderSize is the 16 byte service header width.
 	ServiceSertypeHeaderSize = types.ServiceHeaderSize
 	// ServiceGUIDSize is the 8 byte service GUID width.
@@ -73,12 +70,8 @@ var (
 	ErrServiceInvalidType = errors.New("dds: invalid service type")
 	// ErrServiceInvalidPacket reports a malformed service packet.
 	ErrServiceInvalidPacket = errors.New("dds: invalid service packet")
-	// ErrServiceNoReader reports no matched response reader after the wait.
-	ErrServiceNoReader = errors.New("dds: no matched response reader")
 	// ErrServiceNotAvailable reports no server for the service.
 	ErrServiceNotAvailable = errors.New("dds: service not available")
-	// ErrServiceHandleMismatch reports a reply for another client handle.
-	ErrServiceHandleMismatch = errors.New("dds: service handle mismatch")
 )
 
 // ServiceRole selects server or client topic direction.
@@ -527,90 +520,6 @@ func RequireServiceAvailable(requestReaders, replyWriters int, wantServiceID str
 	}
 
 	return fmt.Errorf("dds: service %q not available: %w", strings.TrimSpace(wantServiceID), ErrServiceNotAvailable)
-}
-
-// MatchServiceReply validates one reply sample against the client handle.
-//
-// It unmarshals data as a service reply and compares the opaque GUID plus
-// sequence to the want handle. Mismatches report ErrServiceHandleMismatch
-// so the client skips replies for other handles. Context deadline aborts
-// early before parsing.
-func MatchServiceReply(ctx context.Context, data []byte, wantGUID [8]byte, wantSeq uint64, m *types.Metrics) ([]byte, error) {
-	err := ctx.Err()
-	if err != nil {
-		return nil, fmt.Errorf("dds: match service reply: %w", err)
-	}
-
-	payload, guid, seq, _, err := UnmarshalServiceReply(data, m)
-	if err != nil {
-		return nil, err
-	}
-
-	if guid != wantGUID || seq != wantSeq {
-		return nil, fmt.Errorf("dds: service reply handle mismatch: %w", ErrServiceHandleMismatch)
-	}
-
-	return payload, nil
-}
-
-// TakeServiceReply scans samples for the reply matching wantGUID plus wantSeq.
-//
-// It checks the context deadline before each sample and skips samples that
-// fail to parse. When at least one sample parses but none matches, it
-// reports ErrServiceHandleMismatch. When no sample yields a usable reply,
-// it reports ErrServiceNoReader.
-func TakeServiceReply(ctx context.Context, samples [][]byte, wantGUID [8]byte, wantSeq uint64, m *types.Metrics) ([]byte, error) {
-	seenParsed := false
-
-	for _, sample := range samples {
-		err := ctx.Err()
-		if err != nil {
-			return nil, fmt.Errorf("dds: take service reply: %w", err)
-		}
-
-		payload, guid, seq, _, err := UnmarshalServiceReply(sample, m)
-		if err != nil {
-			continue
-		}
-
-		seenParsed = true
-
-		if guid == wantGUID && seq == wantSeq {
-			return payload, nil
-		}
-	}
-
-	if seenParsed {
-		return nil, fmt.Errorf("dds: take service reply no match: %w", ErrServiceHandleMismatch)
-	}
-
-	return nil, fmt.Errorf("dds: take service reply no reply: %w", ErrServiceNoReader)
-}
-
-// WaitServiceMatchedReader polls check until true or the matched wait elapses.
-//
-// It returns nil on match, ErrServiceNoReader on timeout, and the context
-// error on cancel. ServiceMatchedReaderWait bounds one response reader
-// wait so single shot clients do not block past the discovery interval.
-func WaitServiceMatchedReader(ctx context.Context, check func() bool) error {
-	if check() {
-		return nil
-	}
-
-	timer := time.NewTimer(ServiceMatchedReaderWait)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		err := ctx.Err()
-		return fmt.Errorf("dds: wait service reader: %w", err)
-	case <-timer.C:
-		if check() {
-			return nil
-		}
-
-		return fmt.Errorf("dds: wait service reader: %w", ErrServiceNoReader)
-	}
 }
 
 // serviceIDForName derives a ROS-format service ID from a prefix.

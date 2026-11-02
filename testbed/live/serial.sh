@@ -80,7 +80,7 @@ run "liveliness" "^(TestROSLiveliness)"
 # 5. Distro matrix on domains 42 plus 43 plus 44.
 run "distro" "^(TestROSDistroMatrix)"
 
-# 6. Payload fragmentation on isolated domain 46.
+# 6. Payload fragmentation on pooled domains (see MustAllocateDomain).
 run "payload" "^(TestROSLargePayload)"
 
 echo "serial done: $((total - fails))/${total} steps passed, ${fails} failed"

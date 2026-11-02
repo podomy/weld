@@ -506,48 +506,43 @@ func RepoRoot(t *testing.T) string {
 
 // Shared weld build state. The binary builds once per test binary process.
 var (
-	buildWeldOnce sync.Once
-	buildWeldBin  string
-	errBuildWeld  error
+	buildWeldMu  sync.Mutex
+	buildWeldBin string
 )
 
 // BuildWeld builds the weld CLI once per test binary process and returns its path.
 //
 // The CLI lives in its own module, so the build runs with GOWORK=off in
-// cmd/weld with the same flags as a per-test build. Only the first caller
-// builds, bounded by BuildTimeout through that caller context; later
-// callers reuse the same path. The binary lives under os.MkdirTemp, not
+// cmd/weld with the same flags as a per-test build. The build uses
+// context.WithoutCancel plus BuildTimeout so a canceled caller context
+// never caches a failure; failures retry on the next caller while success
+// is cached and reused. The binary lives under os.MkdirTemp, not
 // t.TempDir, because each test TempDir is removed at that test cleanup
 // while later tests still need the binary. Concurrent exec of the finished
-// path is safe because the file is immutable after the once build. The temp dir is one per test binary process and is intentionally left for the OS to reclaim; no cleanup removes it while later tests still run.
+// path is safe because the file is immutable after the build. The temp dir is one per test binary process and is intentionally left for the OS to reclaim; no cleanup removes it while later tests still run.
 func BuildWeld(t *testing.T, ctx context.Context) string {
 	t.Helper()
+	buildWeldMu.Lock()
+	defer buildWeldMu.Unlock()
+	if buildWeldBin != "" {
+		return buildWeldBin
+	}
 	root := RepoRoot(t)
-	buildWeldOnce.Do(func() {
-		buildCtx, cancel := context.WithTimeout(ctx, BuildTimeout)
-		defer cancel()
-		dir, err := os.MkdirTemp("", "weld-live-") //nolint:usetesting // binary must outlive per-test t.TempDir cleanup so later tests reuse it
-		if err != nil {
-			errBuildWeld = fmt.Errorf("helpers: mktemp weld-live: %w", err)
-			return
-		}
-		bin := filepath.Join(dir, "weld")
-		cmd := exec.CommandContext(buildCtx, "go", "build", "-o", bin, ".") //nolint:gosec // live harness builds fixed cmd/weld package
-		cmd.Dir = filepath.Join(root, "cmd", "weld")
-		cmd.Env = append(os.Environ(), "GOWORK=off")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			errBuildWeld = fmt.Errorf("helpers: build weld: %w\n%s", err, string(out))
-			return
-		}
-		buildWeldBin = bin
-	})
-	if errBuildWeld != nil {
-		t.Fatalf("%v", errBuildWeld)
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), BuildTimeout)
+	defer cancel()
+	dir, err := os.MkdirTemp("", "weld-live-") //nolint:usetesting // binary must outlive per-test t.TempDir cleanup so later tests reuse it
+	if err != nil {
+		t.Fatalf("helpers: mktemp weld-live: %v", err)
 	}
-	if buildWeldBin == "" {
-		t.Fatalf("helpers: weld build path empty after success")
+	bin := filepath.Join(dir, "weld")
+	cmd := exec.CommandContext(buildCtx, "go", "build", "-o", bin, ".") //nolint:gosec // live harness builds fixed cmd/weld package
+	cmd.Dir = filepath.Join(root, "cmd", "weld")
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helpers: build weld: %v\n%s", err, string(out))
 	}
+	buildWeldBin = bin
 	return buildWeldBin
 }
 
@@ -691,18 +686,45 @@ func StopCmd(cmd *exec.Cmd) {
 // nor the container shell ever contains the literal pattern as its own
 // command line. It returns nil only when no matching proc remains.
 // A missing proc is success, not an error.
+//
+// A saturated docker daemon can stall the exec itself past the caller
+// timeout without the container ever running the script. That timeout
+// class retries once with a fresh bounded context, since the first
+// attempt may never have signaled anyone. A script exit 1 means the
+// proc survived and fails immediately with no retry.
 func KillAndWaitContainerProc(ctx context.Context, container, pattern string) error {
 	const script = `pkill -f "$WPAT"; for i in $(seq 1 12); do pgrep -f "$WPAT" >/dev/null || exit 0; sleep 0.5; done; pkill -9 -f "$WPAT"; for i in $(seq 1 4); do pgrep -f "$WPAT" >/dev/null || exit 0; sleep 0.5; done; exit 1`
 	args := []string{"exec", "-e", "WPAT=" + pattern, container, "sh", "-c", script}
+	if survived, err := runKillScript(ctx, args, pattern); err != nil {
+		if survived || ctx.Err() == nil {
+			return err
+		}
+		retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer retryCancel()
+		if _, retryErr := runKillScript(retryCtx, args, pattern); retryErr != nil {
+			return fmt.Errorf("helpers: container kill retry failed pattern %q first %w: %w", pattern, err, retryErr)
+		}
+		return nil
+	}
+	return nil
+}
+
+// runKillScript runs one kill-and-verify docker exec.
+//
+// It reports whether the proc survived alongside the error: exit code 1
+// means the proc survived and fails loudly with no retry. Any other
+// error is inconclusive (docker unreachable, daemon stalled) and the
+// caller decides whether to retry.
+func runKillScript(ctx context.Context, args []string, pattern string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness kills only test-owned peer procs
 	if out, err := cmd.CombinedOutput(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return fmt.Errorf("helpers: container proc survived kill pattern %q: %w", pattern, err)
+			return true, fmt.Errorf("helpers: container proc survived kill pattern %q: %w", pattern, err)
 		}
-		return fmt.Errorf("helpers: container kill verify inconclusive pattern %q output %q: %w", pattern, string(out), err)
+		return false, fmt.Errorf("helpers: container kill verify inconclusive pattern %q output %q: %w", pattern, string(out), err)
 	}
-	return nil
+	return false, nil
 }
 
 // KillContainerProc best-effort kills container procs matching pattern.

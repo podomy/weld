@@ -76,6 +76,12 @@ func checkGraphDemangleTopic(t *testing.T) {
 		{"rq/add_two_intsRequest", "/add_two_ints"},
 		{"rr/add_two_intsReply", "/add_two_ints"},
 		{"chatter", "/chatter"},
+		{"myRequest", "/myRequest"},
+		{"myReply", "/myReply"},
+		{"Request", "/Request"},
+		{"Reply", "/Reply"},
+		{"chatterRequest", "/chatterRequest"},
+		{"chatterReply", "/chatterReply"},
 	}
 	for _, tc := range cases {
 		got, err := DemangleTopicName(tc.dds)
@@ -163,10 +169,10 @@ func checkGraphWriterPaths(t *testing.T) {
 		t.Fatalf("Writer topic = %q", got.TopicName)
 	}
 	changed := info
-	changed.TopicType = "std_msgs__msg__String"
+	changed.TopicType = "std_msgs__msg__Int32"
 	err = g.UpsertWriter(gid, changed)
 	if err != nil {
-		t.Fatalf("UpsertWriter identical: %v", err)
+		t.Fatalf("UpsertWriter changed: %v", err)
 	}
 	updated := info
 	updated.TypeHash = "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18"

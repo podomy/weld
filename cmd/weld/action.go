@@ -79,6 +79,18 @@ func runActionSendCommand(ctx context.Context, args []string, stdout, stderr io.
 		return 2
 	}
 
+	goalExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "goal" {
+			goalExplicit = true
+		}
+	})
+	if goalExplicit && *goalFlag == "" {
+		_, _ = fmt.Fprintln(stderr, "weld: action send --goal must not be empty") //nolint:errcheck // final error output is best effort
+
+		return 2
+	}
+
 	name, goal, err := resolveActionSendArgs(*nameFlag, *actionAlias, *goalFlag, fs.Args())
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
@@ -420,9 +432,16 @@ func handlePrefixedActionText(server *core.ActionServer, goalID, action, text st
 }
 
 // isAllowedActionTopic reports whether msg topic belongs to this action.
+//
+// An empty topic never passes the filter. The backend contract always
+// sets TopicName on TakeBytes (see transports.IncomingMessage plus the
+// DDS data path, which maps every frame through ParseTopicName), so no
+// topicless local feedback exists. An empty topic is therefore dropped
+// with a reason instead of being treated as a wildcard that could
+// complete the wrong goal.
 func isAllowedActionTopic(topic, action string, endpoints actionEndpoints, feedbackROS string) bool {
 	if topic == "" {
-		return true
+		return false
 	}
 	if topic == action {
 		return true

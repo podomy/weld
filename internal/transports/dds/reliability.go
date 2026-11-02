@@ -85,7 +85,9 @@ func newUserHistory() *userHistory {
 
 // store copies payload for guid and seq.
 //
-// It evicts oldest when depth is passed. A nil receiver is a no-op for tests that build Backend
+// It evicts oldest when depth is passed. It also bounds distinct writers
+// by maxTrackedWriters with loud eviction so writer churn cannot grow the
+// table without limit. A nil receiver is a no-op for tests that build Backend
 // without live state.
 func (h *userHistory) store(
 	guid WriterGUID,
@@ -104,6 +106,20 @@ func (h *userHistory) store(
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.payloads == nil {
+		h.payloads = make(map[WriterGUID]map[uint64][]byte)
+	}
+	if h.order == nil {
+		h.order = make(map[WriterGUID][]uint64)
+	}
+
+	if _, seen := h.payloads[guid]; !seen {
+		if len(h.payloads) >= maxTrackedWriters {
+			h.evictOldestWriterLocked(guid)
+			log.Printf("dds: repair history table full evict oldest for guid=%x", guid)
+		}
+	}
 
 	bySeq, seen := h.payloads[guid]
 	if !seen {
@@ -185,6 +201,78 @@ func (h *userHistory) last(guid WriterGUID) uint64 {
 	_, last := h.bounds(guid)
 
 	return last
+}
+
+// maxTrackedWriters bounds distinct writers held across per-writer tables.
+//
+// It mirrors provisionalCap so writer churn cannot grow remoteTrack,
+// sedpHighSeq, heartbeat bounds, DataReceiver take state, or repair
+// history without limit. Insert paths sweep expired leases first where a
+// TTL exists, then evict the oldest writer loudly when still over cap.
+const maxTrackedWriters = 1024
+
+// evict drops all history for one writer.
+//
+// It self-locks and is safe for concurrent use. A nil receiver is a no-op.
+func (h *userHistory) evict(guid WriterGUID) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.payloads, guid)
+	delete(h.order, guid)
+}
+
+// writers returns distinct writer GUIDs held in history.
+//
+// It self-locks and is safe for concurrent use. A nil receiver returns nil.
+func (h *userHistory) writers() []WriterGUID {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	out := make([]WriterGUID, 0, len(h.payloads))
+	for guid := range h.payloads {
+		out = append(out, guid)
+	}
+	for guid := range h.order {
+		if !slices.Contains(out, guid) {
+			out = append(out, guid)
+		}
+	}
+
+	return out
+}
+
+// evictOldestWriterLocked drops one writer when over cap.
+//
+// The caller must hold h.mu. It deletes the first writer found that is not
+// the current guid so the new writer always fits. The caller logs loudly.
+func (h *userHistory) evictOldestWriterLocked(except WriterGUID) {
+	for guid := range h.payloads {
+		if guid == except {
+			continue
+		}
+		delete(h.payloads, guid)
+		delete(h.order, guid)
+
+		return
+	}
+	for guid := range h.order {
+		if guid == except {
+			continue
+		}
+		delete(h.payloads, guid)
+		delete(h.order, guid)
+
+		return
+	}
 }
 
 // ackRequest is one decoded user ACKNACK.
@@ -361,7 +449,8 @@ func encodeUserGapBody(
 //
 // The caller is the demux GAP path. Gaps mean the writer will never send the seq, so the receiver
 // advances past it with no lost count, unlike best effort gaps which count missing as lost. Duplicates
-// and old gaps are ignored.
+// and old gaps are ignored. Gaps for unseen writers are ignored so the first sample keeps
+// first-seen-no-lost instead of counting the gap prefix as lost.
 func (r *DataReceiver) ApplyGap(
 	guid WriterGUID,
 	gapStart uint64,
@@ -383,8 +472,6 @@ func (r *DataReceiver) ApplyGap(
 
 	last, seen := r.last[guid]
 	if !seen {
-		r.last[guid] = gapStart
-
 		return
 	}
 
@@ -574,6 +661,81 @@ func (t *remoteTracker) skipTo(seq uint64) {
 	}
 }
 
+// capRemoteTrackLocked ensures remoteTrack stays bounded.
+//
+// The caller must hold b.mu for write. When the table holds
+// maxTrackedWriters entries and the new writer is unseen, it evicts one
+// arbitrary writer loudly so writer churn cannot grow the table without
+// limit. Lease expiry via sweepExpiredRoutes runs separately; this bounds
+// active writers.
+func (b *Backend) capRemoteTrackLocked(except WriterGUID) {
+	if len(b.remoteTrack) < maxTrackedWriters {
+		return
+	}
+	for guid := range b.remoteTrack {
+		if guid == except {
+			continue
+		}
+		delete(b.remoteTrack, guid)
+		b.demuxErrors++
+		log.Printf("dds: remote track table full evict guid=%x", guid)
+
+		return
+	}
+}
+
+// capSedpHighSeqLocked ensures sedpHighSeq stays bounded.
+//
+// The caller must hold b.mu for write. It evicts one arbitrary writer
+// loudly when over cap, mirroring capRemoteTrackLocked.
+func (b *Backend) capSedpHighSeqLocked(except WriterGUID) {
+	if len(b.sedpHighSeq) < maxTrackedWriters {
+		return
+	}
+	for guid := range b.sedpHighSeq {
+		if guid == except {
+			continue
+		}
+		delete(b.sedpHighSeq, guid)
+		b.demuxErrors++
+		log.Printf("dds: sedp high seq table full evict guid=%x", guid)
+
+		return
+	}
+}
+
+// capSedpHeartbeatLocked ensures heartbeat bound tables stay bounded.
+//
+// The caller must hold b.mu for write. It evicts one arbitrary writer from
+// both last and count tables loudly when either is over cap.
+func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) {
+	if len(b.sedpHeartbeatLast) < maxTrackedWriters && len(b.sedpHeartbeatCount) < maxTrackedWriters {
+		return
+	}
+	for guid := range b.sedpHeartbeatLast {
+		if guid == except {
+			continue
+		}
+		delete(b.sedpHeartbeatLast, guid)
+		delete(b.sedpHeartbeatCount, guid)
+		b.demuxErrors++
+		log.Printf("dds: sedp heartbeat table full evict guid=%x", guid)
+
+		return
+	}
+	for guid := range b.sedpHeartbeatCount {
+		if guid == except {
+			continue
+		}
+		delete(b.sedpHeartbeatLast, guid)
+		delete(b.sedpHeartbeatCount, guid)
+		b.demuxErrors++
+		log.Printf("dds: sedp heartbeat table full evict guid=%x", guid)
+
+		return
+	}
+}
+
 // noteRemoteData records one outer seq per remote writer for NACK base.
 //
 // It tracks contiguity, not highest seen, so the ACK base names the
@@ -595,6 +757,7 @@ func (b *Backend) noteRemoteData(
 
 	tracker, ok := b.remoteTrack[guid]
 	if !ok {
+		b.capRemoteTrackLocked(guid)
 		tracker = &remoteTracker{}
 		b.remoteTrack[guid] = tracker
 	}
@@ -640,6 +803,10 @@ func (b *Backend) noteSedpSeq(guid WriterGUID, seq uint64) {
 
 	if b.sedpHighSeq == nil {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
+	}
+
+	if _, seen := b.sedpHighSeq[guid]; !seen {
+		b.capSedpHighSeqLocked(guid)
 	}
 
 	if seq > b.sedpHighSeq[guid] {
@@ -689,14 +856,11 @@ func (b *Backend) applySedpGap(guid WriterGUID, gapStart uint64) {
 	b.applySedpGaps(guid, []uint64{gapStart})
 }
 
-// applySedpGaps advances SEDP tracking for each skipped sequence.
+// filterNonZeroSeqs drops zero sequences and sorts the rest.
 //
-// Why: a GAP means the writer will never send the seq, so the next
-// heartbeat must not NACK it or the peer retransmits nothing and the NACK
-// repeats forever. Updates are monotonic and zero is ignored, which keeps
-// re-NACKs idempotent and bounded when GAPs repeat. Sequences apply in
-// increasing order so every contiguous run from the decoded list advances.
-func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
+// It shares GAP list filtering so SEDP and user gap paths apply every
+// contiguous run in increasing order without repeating zero checks.
+func filterNonZeroSeqs(seqs []uint64) []uint64 {
 	filtered := make([]uint64, 0, len(seqs))
 	for _, seq := range seqs {
 		if seq == 0 {
@@ -705,25 +869,37 @@ func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 		filtered = append(filtered, seq)
 	}
 	if len(filtered) == 0 {
-		return
+		return nil
 	}
 	slices.Sort(filtered)
+
+	return filtered
+}
+
+// applySedpGaps advances SEDP tracking for each skipped sequence.
+//
+// Why: a GAP means the writer will never send the seq, so the next
+// heartbeat must not NACK it or the peer retransmits nothing and the NACK
+// repeats forever. Updates are monotonic and zero is ignored, which keeps
+// re-NACKs idempotent and bounded when GAPs repeat. Sequences apply in
+// increasing order so every contiguous run from the decoded list advances.
+func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
+	filtered := filterNonZeroSeqs(seqs)
+	if len(filtered) == 0 {
+		return
+	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	var maxAllowed uint64
-	hasBound := false
-	if last, ok := b.sedpHeartbeatLast[guid]; ok && last != 0 {
-		maxAllowed = last + 1
-		if maxAllowed == 0 {
-			maxAllowed = ^uint64(0)
-		}
-		hasBound = true
-	}
+	maxAllowed, hasBound := b.sedpGapBoundLocked(guid)
 
 	if b.sedpHighSeq == nil {
 		b.sedpHighSeq = make(map[WriterGUID]uint64)
+	}
+
+	if _, seen := b.sedpHighSeq[guid]; !seen {
+		b.capSedpHighSeqLocked(guid)
 	}
 
 	for _, gapStart := range filtered {
@@ -734,6 +910,25 @@ func (b *Backend) applySedpGaps(guid WriterGUID, seqs []uint64) {
 			b.sedpHighSeq[guid] = gapStart
 		}
 	}
+}
+
+// sedpGapBoundLocked returns the heartbeat clamp for one writer.
+//
+// The caller must hold b.mu. It caps GAP advances at last heartbeat Last
+// plus one so delayed GAPs never reopen ranges the heartbeat already
+// closed.
+func (b *Backend) sedpGapBoundLocked(guid WriterGUID) (uint64, bool) {
+	last, ok := b.sedpHeartbeatLast[guid]
+	if !ok || last == 0 {
+		return 0, false
+	}
+
+	maxAllowed := last + 1
+	if maxAllowed == 0 {
+		maxAllowed = ^uint64(0)
+	}
+
+	return maxAllowed, true
 }
 
 // planSedpNack computes a bounded NACK bitmap for base through last.
@@ -766,17 +961,10 @@ func planSedpNack(base, last uint64) ([]uint32, uint32, bool) {
 // contiguous run advances contiguity, not just GapStart. Zero entries are
 // ignored and sequences apply in increasing order.
 func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
-	filtered := make([]uint64, 0, len(seqs))
-	for _, seq := range seqs {
-		if seq == 0 {
-			continue
-		}
-		filtered = append(filtered, seq)
-	}
+	filtered := filterNonZeroSeqs(seqs)
 	if len(filtered) == 0 {
 		return
 	}
-	slices.Sort(filtered)
 
 	b.mu.Lock()
 	if b.remoteTrack == nil {
@@ -785,6 +973,7 @@ func (b *Backend) applyRemoteGaps(guid WriterGUID, seqs []uint64) {
 
 	tracker, ok := b.remoteTrack[guid]
 	if !ok {
+		b.capRemoteTrackLocked(guid)
 		tracker = &remoteTracker{}
 		b.remoteTrack[guid] = tracker
 	}
@@ -1163,6 +1352,7 @@ func (b *Backend) shouldRateLimitFallback(remote WriterGUID, now time.Time) bool
 
 	tracker, ok := b.remoteTrack[remote]
 	if !ok {
+		b.capRemoteTrackLocked(remote)
 		tracker = &remoteTracker{}
 		b.remoteTrack[remote] = tracker
 	}
@@ -1745,6 +1935,7 @@ func (b *Backend) heartbeatTrackerFor(remote WriterGUID) *remoteTracker {
 
 	tracker, ok := b.remoteTrack[remote]
 	if !ok {
+		b.capRemoteTrackLocked(remote)
 		tracker = &remoteTracker{}
 		b.remoteTrack[remote] = tracker
 	}

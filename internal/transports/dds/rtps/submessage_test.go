@@ -541,6 +541,7 @@ func TestUnknownSubmessageSkipSweep(t *testing.T) {
 		rtps.SubmessageGap:       true,
 		rtps.SubmessageInfoTS:    true,
 		rtps.SubmessageData:      true,
+		rtps.SubmessageDataFrag:  true,
 	}
 	for id := range 256 {
 		raw := rtps.RawSubmessage{ID: uint8(id), Flags: 0x01, Body: []byte{0x01, 0x02, 0x03, 0x04}}

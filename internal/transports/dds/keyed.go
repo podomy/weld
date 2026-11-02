@@ -122,8 +122,13 @@ func EndpointKeyed(ep SEDPEndpoint) bool {
 // The counter layout mirrors sedpEntityFor: the 24 bit counter renders
 // big endian and the kind goes last. Writers take kind 0x02 and readers
 // take kind 0x07. SEDP declaration takes this entity through the future
-// keyed declare path; this helper only mints the id.
+// keyed declare path; this helper only mints the id. Counters above
+// 0xFFFFFF panic loudly instead of truncating silently, so a caller
+// passing a wider counter never mints a colliding id.
 func KeyedUserEntity(counter uint32, isReader bool) SEDPEntityID {
+	if counter > 0xFFFFFF {
+		panic(fmt.Sprintf("dds: keyed entity counter %#x above 24 bits", counter))
+	}
 	kind := keyedUserWriterKind
 	if isReader {
 		kind = keyedUserReaderKind

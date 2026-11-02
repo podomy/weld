@@ -437,6 +437,11 @@ func checkDisposePacket(t *testing.T, dispose []byte, domain uint32) {
 
 // checkStaleDispose proves old sequence dispose does not remove.
 // checkStaleDispose proves old sequence dispose does not remove on one allocated domain.
+//
+// The table holds a tombstone at dispose seq 2 from checkDisposeTable, so
+// the seq 1 alive is a stale regression and must fail loudly without
+// reinstalling, and the seq 1 dispose is older than the tombstone and
+// must fail loudly too. Only a same-sequence duplicate stays silent.
 func checkStaleDispose(t *testing.T, announcer *dds.LocalParticipant, table *dds.RemoteTable, alive []byte, domain uint32) {
 	t.Helper()
 	stale, err := dds.MarshalDisposePacket(announcer.GUID(), domain, 1)
@@ -444,15 +449,18 @@ func checkStaleDispose(t *testing.T, announcer *dds.LocalParticipant, table *dds
 		t.Fatalf("marshal stale dispose: %v", err)
 	}
 	err = table.HandlePacket(alive, time.Now())
-	if err != nil {
-		t.Fatalf("rehandle alive: %v", err)
+	if !errors.Is(err, dds.ErrStaleSPDP) {
+		t.Fatalf("rehandle alive = %v, want stale reject", err)
+	}
+	if table.Len() != 0 {
+		t.Fatalf("table len after stale alive = %d, want 0", table.Len())
 	}
 	err = table.HandlePacket(stale, time.Now())
-	if err != nil {
-		t.Fatalf("handle stale dispose = %v, want silent duplicate", err)
+	if !errors.Is(err, dds.ErrStaleSPDP) {
+		t.Fatalf("handle stale dispose = %v, want stale reject", err)
 	}
-	if table.Len() != 1 {
-		t.Fatalf("table len after stale dispose = %d, want 1", table.Len())
+	if table.Len() != 0 {
+		t.Fatalf("table len after stale dispose = %d, want 0", table.Len())
 	}
 }
 

@@ -27,6 +27,7 @@
 package dds
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -348,23 +349,48 @@ func ExtractSecurityInfoEndian(params []rtps.Param, littleEndian bool) (Security
 // PID presence is recorded even when the value is malformed so
 // classification stays fail-closed: a malformed secured peer never reads
 // as unsecured. Malformed masks keep zero attributes but keep the presence
-// flag; malformed property lists keep the list flag with no properties.
+// flag; malformed property lists keep the list flag with no properties
+// unless the raw bytes carry a hard-require governance, permissions, or
+// crypto marker, in which case a fail-closed marker is planted so the
+// peer classifies as RequiresCrypto instead of CompatibleUnknown.
+// applySecurityMask folds one security attributes mask into the record.
+//
+// Presence is recorded before the value parses so a malformed mask keeps
+// the fail-closed presence flag with zero attributes.
+func applySecurityMask(present *bool, attrs *uint32, value []byte, parse func([]byte) (uint32, error), label string) error {
+	*present = true
+	mask, err := parse(value)
+	if err != nil {
+		return fmt.Errorf("dds: security %s: %w", label, err)
+	}
+	*attrs = mask
+	return nil
+}
+
+// applySecurityPropertyFold folds one property list into the record.
+//
+// The list flag is recorded before parsing; a malformed list carrying a
+// hard-require marker plants a fail-closed marker so classification stays
+// RequiresCrypto.
+func applySecurityPropertyFold(info *SecurityInfo, value []byte, parse func([]byte) (map[string]string, error)) error {
+	info.PropertyListPresent = true
+	props, err := parse(value)
+	if err != nil {
+		if hint, ok := securityRawCryptoHint(value); ok {
+			info.Properties[hint] = "malformed-fail-closed"
+		}
+		return fmt.Errorf("dds: security property list: %w", err)
+	}
+	mergeSecurityProperties(info.Properties, props)
+	return nil
+}
+
 func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 	switch p.ID {
 	case PIDParticipantSecurityInfo:
-		info.HasParticipantSecurityInfo = true
-		mask, err := parseSecurityAttributes(p.Value)
-		if err != nil {
-			return fmt.Errorf("dds: security participant info: %w", err)
-		}
-		info.ParticipantSecurityAttributes = mask
+		return applySecurityMask(&info.HasParticipantSecurityInfo, &info.ParticipantSecurityAttributes, p.Value, parseSecurityAttributes, "participant info")
 	case PIDEndpointSecurityInfo:
-		info.HasEndpointSecurityInfo = true
-		mask, err := parseSecurityAttributes(p.Value)
-		if err != nil {
-			return fmt.Errorf("dds: security endpoint info: %w", err)
-		}
-		info.EndpointSecurityAttributes = mask
+		return applySecurityMask(&info.HasEndpointSecurityInfo, &info.EndpointSecurityAttributes, p.Value, parseSecurityAttributes, "endpoint info")
 	case PIDIdentityToken:
 		info.IdentityTokenPresent = true
 	case PIDPermissionsToken:
@@ -374,12 +400,7 @@ func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 	case PIDIdentityStatusToken:
 		info.IdentityStatusPresent = true
 	case PIDPropertyList:
-		info.PropertyListPresent = true
-		props, err := ParseSecurityPropertyList(p.Value)
-		if err != nil {
-			return fmt.Errorf("dds: security property list: %w", err)
-		}
-		mergeSecurityProperties(info.Properties, props)
+		return applySecurityPropertyFold(info, p.Value, ParseSecurityPropertyList)
 	default:
 		return nil
 	}
@@ -392,22 +413,14 @@ func applySecurityParam(info *SecurityInfo, p rtps.Param) error {
 // fail-closed even when the value cannot decode. Masks and property lists
 // decode in the given byte order so SEDP threads one endianness flag
 // consistently across durability, partition, and security decoders.
+// A malformed property list carrying a hard-require marker plants a
+// fail-closed marker so classification stays RequiresCrypto.
 func applySecurityParamEndian(info *SecurityInfo, p rtps.Param, littleEndian bool) error {
 	switch p.ID {
 	case PIDParticipantSecurityInfo:
-		info.HasParticipantSecurityInfo = true
-		mask, err := parseSecurityAttributesEndian(p.Value, littleEndian)
-		if err != nil {
-			return fmt.Errorf("dds: security participant info: %w", err)
-		}
-		info.ParticipantSecurityAttributes = mask
+		return applySecurityMaskEndian(&info.HasParticipantSecurityInfo, &info.ParticipantSecurityAttributes, p.Value, littleEndian, parseSecurityAttributesEndian, "participant info")
 	case PIDEndpointSecurityInfo:
-		info.HasEndpointSecurityInfo = true
-		mask, err := parseSecurityAttributesEndian(p.Value, littleEndian)
-		if err != nil {
-			return fmt.Errorf("dds: security endpoint info: %w", err)
-		}
-		info.EndpointSecurityAttributes = mask
+		return applySecurityMaskEndian(&info.HasEndpointSecurityInfo, &info.EndpointSecurityAttributes, p.Value, littleEndian, parseSecurityAttributesEndian, "endpoint info")
 	case PIDIdentityToken:
 		info.IdentityTokenPresent = true
 	case PIDPermissionsToken:
@@ -417,15 +430,35 @@ func applySecurityParamEndian(info *SecurityInfo, p rtps.Param, littleEndian boo
 	case PIDIdentityStatusToken:
 		info.IdentityStatusPresent = true
 	case PIDPropertyList:
-		info.PropertyListPresent = true
-		props, err := ParseSecurityPropertyListEndian(p.Value, littleEndian)
-		if err != nil {
-			return fmt.Errorf("dds: security property list: %w", err)
-		}
-		mergeSecurityProperties(info.Properties, props)
+		return applySecurityPropertyFoldEndian(info, p.Value, littleEndian)
 	default:
 		return nil
 	}
+	return nil
+}
+
+// applySecurityMaskEndian folds one mask with explicit endianness into the record.
+func applySecurityMaskEndian(present *bool, attrs *uint32, value []byte, littleEndian bool, parse func([]byte, bool) (uint32, error), label string) error {
+	*present = true
+	mask, err := parse(value, littleEndian)
+	if err != nil {
+		return fmt.Errorf("dds: security %s: %w", label, err)
+	}
+	*attrs = mask
+	return nil
+}
+
+// applySecurityPropertyFoldEndian folds one property list with explicit endianness.
+func applySecurityPropertyFoldEndian(info *SecurityInfo, value []byte, littleEndian bool) error {
+	info.PropertyListPresent = true
+	props, err := ParseSecurityPropertyListEndian(value, littleEndian)
+	if err != nil {
+		if hint, ok := securityRawCryptoHint(value); ok {
+			info.Properties[hint] = "malformed-fail-closed"
+		}
+		return fmt.Errorf("dds: security property list: %w", err)
+	}
+	mergeSecurityProperties(info.Properties, props)
 	return nil
 }
 
@@ -436,6 +469,28 @@ func mergeSecurityProperties(dst, src map[string]string) {
 			dst[key] = value
 		}
 	}
+}
+
+// securityRawCryptoHint scans raw property-list bytes for a hard-require marker.
+//
+// A malformed list cannot decode, so the parsed map stays empty and the
+// peer would otherwise read as CompatibleUnknown. When the raw bytes
+// still carry a governance, permissions, or crypto key, the list must
+// fail closed as RequiresCrypto instead of downgrading. It returns the
+// matched key for a fail-closed marker, or false when no hard-require
+// marker is present.
+func securityRawCryptoHint(value []byte) (string, bool) {
+	for key := range securityHardRequireKeys {
+		if bytes.Contains(value, []byte(key)) {
+			return key, true
+		}
+	}
+
+	if bytes.Contains(value, []byte("dds.sec.crypto.")) {
+		return "dds.sec.crypto.malformed-fail-closed", true
+	}
+
+	return "", false
 }
 
 // securityMarkersSeen reports whether any info PID was sighted.

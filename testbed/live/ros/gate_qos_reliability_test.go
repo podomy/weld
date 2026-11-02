@@ -141,7 +141,6 @@ func relSupported(ctx context.Context, domain int) (bool, error) {
 // relBudgetedSkip records one allowlisted product skip with distro pin and expiry.
 func relBudgetedSkip(t *testing.T, reason string) {
 	t.Helper()
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 

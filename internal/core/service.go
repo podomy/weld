@@ -327,6 +327,7 @@ type ServiceClient struct {
 	traceHook    ServiceTraceHook
 	timeouts     uint64
 	gone         uint64
+	cancelled    uint64
 }
 
 // NewServiceClient returns an empty client tracker.
@@ -525,7 +526,8 @@ func (c *ServiceClient) ExpireCalls(nowNanos int64) []ServiceCallKey {
 //
 // Transports poll this alongside ExpireCalls so per request context
 // deadlines error one call even when the fake timeout clock has not moved.
-// A nil Done channel never cancels.
+// Removals count in CancelledCount so cancellations stay observable. A nil
+// Done channel never cancels.
 func (c *ServiceClient) CollectCancelled() []ServiceCallKey {
 	if c == nil {
 		return nil
@@ -540,6 +542,7 @@ func (c *ServiceClient) CollectCancelled() []ServiceCallKey {
 		delete(c.pending, key)
 		out = append(out, key)
 	}
+	c.cancelled += uint64(len(out))
 	return out
 }
 
@@ -584,6 +587,16 @@ func (c *ServiceClient) GoneCount() uint64 {
 	return c.gone
 }
 
+// CancelledCount returns the monotonic count of calls removed by CollectCancelled.
+func (c *ServiceClient) CancelledCount() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cancelled
+}
+
 // ServiceRequest is one server side request awaiting dispatch.
 type ServiceRequest struct {
 	// Service is the ROS service name.
@@ -626,6 +639,7 @@ type ServiceServer struct {
 	emptyTakes   uint64
 	timeouts     uint64
 	gone         uint64
+	cancelled    uint64
 }
 
 // NewServiceServer returns an empty server tracker.
@@ -749,11 +763,12 @@ func (s *ServiceServer) TakeRequest() (ServiceRequest, bool) {
 
 // Reply sends one response for an active request.
 //
-// The key must match a taken request exactly; queued but not yet taken
-// requests cannot reply. On success the entry leaves active and response
-// sent emits with sequence and client GUID when introspection is enabled.
-// A send to a missing request maps to a timeout style error with service
-// name context because the reader is not ready.
+// The key must match a taken request exactly. A reply for a queued but not
+// yet taken request returns ErrServiceNoRequest so callers can switch on it.
+// On success the entry leaves active and response sent emits with sequence
+// and client GUID when introspection is enabled. A send to a missing request
+// with no queued entry maps to a timeout style error with service name
+// context because the reader is not ready.
 func (s *ServiceServer) Reply(service string, client [8]byte, seq uint64) error {
 	if s == nil {
 		return errors.New("core: reply service request: nil server") //nolint:wrapcheck // new error, nothing to wrap
@@ -761,11 +776,22 @@ func (s *ServiceServer) Reply(service string, client [8]byte, seq uint64) error 
 	if service == "" {
 		return errors.New("core: reply service request: service name is empty") //nolint:wrapcheck // new error, nothing to wrap
 	}
-	return finishServiceEntry(&s.mu, s.active, service, client, seq, func() (bool, ServiceTraceHook) {
-		return s.traceEnabled, s.traceHook
-	}, func(ServiceCallKey) error {
-		return fmt.Errorf("core: reply service request on %q seq %d: reader not ready: %w", service, seq, ErrServiceTimeout)
-	}, s.emitServerTrace, ServiceTraceResponseSent)
+	key := ServiceCallKey{Service: service, Client: client, Sequence: seq}
+	s.mu.Lock()
+	if _, ok := s.active[key]; ok {
+		delete(s.active, key)
+		enabled := s.traceEnabled
+		hook := s.traceHook
+		s.mu.Unlock()
+		s.emitServerTrace(ServiceTrace{Service: service, Client: client, Sequence: seq, Kind: ServiceTraceResponseSent}, enabled, hook)
+		return nil
+	}
+	_, queued := s.queuedIndex[key]
+	s.mu.Unlock()
+	if queued {
+		return fmt.Errorf("core: reply service request on %q seq %d: no pending request: %w", service, seq, ErrServiceNoRequest)
+	}
+	return fmt.Errorf("core: reply service request on %q seq %d: reader not ready: %w", service, seq, ErrServiceTimeout)
 }
 
 // FailClientGone errors exactly one queued or active request for a gone client.
@@ -849,6 +875,7 @@ func (s *ServiceServer) ExpireRequests(nowNanos int64) []ServiceCallKey {
 //
 // A nil Done channel never cancels. Transports poll this alongside
 // ExpireRequests so gone clients with canceled contexts error one call.
+// Removals count in CancelledCount so cancellations stay observable.
 func (s *ServiceServer) CollectCancelled() []ServiceCallKey {
 	if s == nil {
 		return nil
@@ -876,6 +903,7 @@ func (s *ServiceServer) CollectCancelled() []ServiceCallKey {
 		delete(s.active, key)
 		out = append(out, key)
 	}
+	s.cancelled += uint64(len(out))
 	return out
 }
 
@@ -927,4 +955,14 @@ func (s *ServiceServer) GoneCount() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gone
+}
+
+// CancelledCount returns the monotonic count of requests removed by CollectCancelled.
+func (s *ServiceServer) CancelledCount() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelled
 }

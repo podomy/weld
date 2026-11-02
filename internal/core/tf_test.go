@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestTF covers the topic split, latched statics, lookup taxonomy, and jump
@@ -26,6 +27,7 @@ func TestTF(t *testing.T) {
 	t.Run("multi hop compose", checkTFMultiHopCompose)
 	t.Run("reverse inverse", checkTFReverseInverse)
 	t.Run("lookup timeout", checkTFLookupTimeout)
+	t.Run("lookup frozen clock", checkTFLookupFrozenClock)
 	t.Run("jump clears dynamics", checkTFJumpClearsDynamics)
 	t.Run("dynamic bound", checkTFDynamicBound)
 	t.Run("concurrent store lookup", checkTFConcurrentStoreLookup)
@@ -691,4 +693,29 @@ func checkTFConcurrentStoreLookup(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// checkTFLookupFrozenClock pins wall bounded polling when the buffer clock
+// never advances. A frozen buffer clock must still time out via the wall
+// safety bound instead of livelocking.
+func checkTFLookupFrozenClock(t *testing.T) {
+	t.Helper()
+	store := NewTFStore()
+	clock := NewClockState(ClockWall, 1000, 1000)
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.LookupWithTimeout("map", "odom", 0, 20000000, clock)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("frozen clock lookup must time out")
+		}
+		if !strings.Contains(err.Error(), "timed out after 20000000 ns") {
+			t.Fatalf("frozen timeout must carry taxonomy, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("frozen buffer clock livelocked past wall bound")
+	}
 }

@@ -26,7 +26,9 @@ Rules:
 Commands:
 
   go test ./testbed/unit/... -count=1
-  go test -tags live -timeout 60m ./testbed/live/... -count=1
+  go test -timeout 60m ./testbed/live/... -count=1
+
+Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 
 Live runs need -timeout 60m: the default 10m package timeout fires mid-suite with the peer present. The ros package holds 204 top-level tests and QoS cases budget 30m each (see testbed/live/ros/gate_qos_full_test.go:37); raise the timeout further if the ros matrix still exceeds it.
 
@@ -39,10 +41,10 @@ Per-package matrix (unit first, then live by package):
   go test ./testbed/unit/sedp/... -count=1
   go test ./testbed/unit/spdp/... -count=1
 
-  go test -tags live ./testbed/live/gates/... -count=1
-  go test -tags live ./testbed/live/cyclone/... -count=1
-  go test -tags live -timeout 60m ./testbed/live/ros/... -count=1
-  go test -tags live ./testbed/live/cli/... -count=1
+  go test ./testbed/live/gates/... -count=1
+  go test ./testbed/live/cyclone/... -count=1
+  go test -timeout 60m ./testbed/live/ros/... -count=1
+  go test ./testbed/live/cli/... -count=1
 
 Skip-when-absent rule: every live test calls SkipIfNoPeer first and type
 matrix tests also call SkipIfNoTypeInterface. A missing docker daemon, a
@@ -64,7 +66,7 @@ no route fails loudly after the local codec passes
 
 Domain split
 
-- Pooled domains 70 through 101 host the ROS type matrix on per-run topics, allocated via MustAllocateDomain (testbed/live/helpers/domainpool.go:241). String round trip on /chatter-derived per-run topics lives in testbed/live/ros/roundtrip_test.go (forward at :107, reverse at :160). The extended matrix for Int32 plus Float64 plus Bool plus geometry plus sensor is pinned in testbed/live/ros/gate_type_matrix_test.go:100 (cases) with tests at testbed/live/ros/gate_type_matrix_test.go:779 and reuses pooled domains with per-run topic isolation.
+- Pooled domains 70 through 101 host the ROS type matrix on per-run topics, allocated via MustAllocateDomain (testbed/live/helpers/domainpool.go:474, AllocateDomainLease at :196). String round trip on /chatter-derived per-run topics lives in testbed/live/ros/roundtrip_test.go (forward at :107, reverse at :160). The extended matrix for Int32 plus Float64 plus Bool plus geometry plus sensor is pinned in testbed/live/ros/gate_type_matrix_test.go:100 (cases) with tests at testbed/live/ros/gate_type_matrix_test.go:779 and reuses pooled domains with per-run topic isolation.
 - SPDP acceptance runs on allocated exclusive domains, not fixed 48. Pinned in testbed/live/cyclone/gate1_spdp_test.go (announcement check at :97, pure-Go acceptance at :379, live acceptance at :421).
 - Domain 47 is the serial single-entrypoint live gate in testbed/live/helpers/helpers.go:41 (LiveDomain); the pool never hands out 47. The serial file split is testbed/live/serial.sh.
 - Domains 43 and 44 are the distro matrix: Humble on 43 (testbed/live/helpers/distro.go:46-52), Rolling on 44 (testbed/live/helpers/distro.go:54-60).
@@ -92,4 +94,4 @@ Bulletproof checks
 
 Status note
 
-Go tests are the canonical live harness, plus testbed/live/serial.sh as the serial runner for the ROS suites. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (internal/transports/dds/datapath.go:1075) plus SEDP fixes; reverse is green after writer 03c2 (internal/transports/dds/sedp.go:160-162) plus announce loop (internal/transports/dds/sedp.go:1006) plus Heartbeat (internal/transports/dds/backend.go:591). A missed live ID in peer echo fails loudly; backend errors and missing sent: still fail. The type matrix in testbed/live/ros/gate_type_matrix_test.go:100 follows the same rule: local XCDR1 codec proof must pass, a publish with no route fails loudly (testbed/live/helpers/live.go:403-408), and ros2 interface show absence skips cleanly (testbed/live/helpers/live.go:326). Full wire record is in Conformance - /docs/conformance.
+Go tests are the canonical live harness, plus testbed/live/serial.sh as the serial runner for the ROS suites. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (internal/transports/dds/datapath.go:1075) plus SEDP fixes; reverse is green after writer 03c2 (internal/transports/dds/sedp.go:177-182) plus announce loop (internal/transports/dds/sedp.go:1006) plus Heartbeat (internal/transports/dds/backend.go:591). A missed live ID in peer echo fails loudly; backend errors and missing sent: still fail. The type matrix in testbed/live/ros/gate_type_matrix_test.go:100 follows the same rule: local XCDR1 codec proof must pass, a publish with no route fails loudly (testbed/live/helpers/live.go:403-408), and ros2 interface show absence skips cleanly (testbed/live/helpers/live.go:326). Full wire record is in Conformance - /docs/conformance.

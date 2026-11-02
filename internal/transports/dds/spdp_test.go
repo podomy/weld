@@ -1511,21 +1511,16 @@ func TestSPDPInterfacesCompile(t *testing.T) {
 	}
 }
 
-// TestRemoteTableConcurrentAccess checks thread safety under race.
-func TestRemoteTableConcurrentAccess(t *testing.T) {
-	t.Parallel()
+// spdpPair holds one alive/dispose pair for the concurrent race test.
+type spdpPair struct {
+	prefix GUIDPrefix
+	alive  []byte
+	bye    []byte
+}
 
-	table := NewRemoteTable(nil)
-	base := time.Unix(9000, 0).UTC()
-
-	var wg sync.WaitGroup
-
-	type spdpPair struct {
-		prefix GUIDPrefix
-		alive  []byte
-		bye    []byte
-	}
-
+// spdpConcurrentPairs builds 8 distinct alive/dispose pairs for the race.
+func spdpConcurrentPairs(t *testing.T) []spdpPair {
+	t.Helper()
 	fills := []byte{0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7}
 	pairs := make([]spdpPair, 0, len(fills))
 
@@ -1536,6 +1531,14 @@ func TestRemoteTableConcurrentAccess(t *testing.T) {
 
 		pairs = append(pairs, spdpPair{prefix: guid.Prefix, alive: alive, bye: bye})
 	}
+
+	return pairs
+}
+
+// spdpRaceAliveDispose races alive plus dispose plus reads for all pairs.
+func spdpRaceAliveDispose(t *testing.T, table *RemoteTable, base time.Time, pairs []spdpPair) {
+	t.Helper()
+	var wg sync.WaitGroup
 
 	for _, pair := range pairs {
 		wg.Go(func() {
@@ -1558,6 +1561,50 @@ func TestRemoteTableConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	if got := table.Len(); got != 0 {
+		t.Fatalf("len = %d, want 0 after concurrent dispose", got)
+	}
+
+	if got := table.Generation(); got != 16 {
+		t.Fatalf("gen = %d, want 16 after 8 alive plus 8 dispose", got)
+	}
+}
+
+// spdpCheckTombstoneDiscipline pins stale-alive reject plus dup-dispose nil.
+func spdpCheckTombstoneDiscipline(t *testing.T, table *RemoteTable, base time.Time, pairs []spdpPair) {
+	t.Helper()
+	for _, pair := range pairs {
+		if _, ok := table.Get(pair.prefix); ok {
+			t.Fatalf("prefix %x present, want removed", pair.prefix)
+		}
+
+		err := table.HandlePacket(pair.alive, base)
+		if !errors.Is(err, ErrStaleSPDP) {
+			t.Fatalf("stale alive reinstall = %v, want ErrStaleSPDP", err)
+		}
+
+		err = table.HandlePacket(pair.bye, base)
+		if err != nil {
+			t.Fatalf("duplicate dispose = %v, want nil", err)
+		}
+	}
+
+	if got := table.Generation(); got != 16 {
+		t.Fatalf("gen = %d, want 16 after duplicate discipline", got)
+	}
+}
+
+// TestRemoteTableConcurrentAccess checks thread safety under race.
+func TestRemoteTableConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	base := time.Unix(9000, 0).UTC()
+
+	pairs := spdpConcurrentPairs(t)
+	spdpRaceAliveDispose(t, table, base, pairs)
+	spdpCheckTombstoneDiscipline(t, table, base, pairs)
 }
 
 // spdpLoopReceiver blocks until a packet is queued or ctx ends.
@@ -2135,9 +2182,12 @@ func TestRemoteTableStaleDisposeIgnored(t *testing.T) {
 func TestSPDPManualLivelinessGolden(t *testing.T) {
 	t.Parallel()
 
-	raw := rtps.EncodeParams([]rtps.Param{
+	raw, err := rtps.EncodeParams([]rtps.Param{
 		{ID: rtps.PIDParticipantManualLivelinessCount, Value: []byte{0x05, 0x00, 0x00, 0x00}},
 	})
+	if err != nil {
+		t.Fatalf("encode manual: %v", err)
+	}
 
 	want := []byte{0x34, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
 	if !bytes.Equal(raw, want) {
@@ -2162,9 +2212,12 @@ func TestSPDPManualLivelinessGolden(t *testing.T) {
 func TestSPDPBuiltinEndpointQosGolden(t *testing.T) {
 	t.Parallel()
 
-	raw := rtps.EncodeParams([]rtps.Param{
+	raw, err := rtps.EncodeParams([]rtps.Param{
 		{ID: rtps.PIDBuiltinEndpointQos, Value: []byte{0x00, 0x00, 0x00, 0x00}},
 	})
+	if err != nil {
+		t.Fatalf("encode builtin qos: %v", err)
+	}
 
 	want := []byte{0x77, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
 	if !bytes.Equal(raw, want) {
@@ -2191,7 +2244,10 @@ func TestSPDPVendorPreservation(t *testing.T) {
 		{ID: rtps.PIDVendorCycloneReceiveBufferSize, Value: []byte{0x00, 0x00, 0x10, 0x00}},
 	}
 
-	raw := rtps.EncodeParams(params)
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode vendor: %v", err)
+	}
 	back, err := rtps.DecodeParams(raw)
 	if err != nil {
 		t.Fatalf("decode vendor: %v", err)

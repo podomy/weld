@@ -35,7 +35,9 @@ Canonical Go gates with no shell:
 
   go test ./testbed/unit/... -count=1
 
-  go test -tags live -timeout 60m ./testbed/live/... -count=1
+  go test -timeout 60m ./testbed/live/... -count=1
+
+Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 
 Live runs need -timeout 60m: the default 10m package timeout fires mid-suite with the peer present. The ros package holds 204 top-level tests and QoS cases budget 30m each (see testbed/live/ros/gate_qos_full_test.go:37); raise the timeout further if the ros matrix still exceeds it.
 
@@ -48,10 +50,10 @@ Per-package matrix (unit first, then live by package):
   go test ./testbed/unit/sedp/... -count=1
   go test ./testbed/unit/spdp/... -count=1
 
-  go test -tags live ./testbed/live/gates/... -count=1
-  go test -tags live ./testbed/live/cyclone/... -count=1
-  go test -tags live -timeout 60m ./testbed/live/ros/... -count=1
-  go test -tags live ./testbed/live/cli/... -count=1
+  go test ./testbed/live/gates/... -count=1
+  go test ./testbed/live/cyclone/... -count=1
+  go test -timeout 60m ./testbed/live/ros/... -count=1
+  go test ./testbed/live/cli/... -count=1
 
 Skip-when-absent rule: every live test calls SkipIfNoPeer first and type
 matrix tests also call SkipIfNoTypeInterface. A missing docker daemon, a
@@ -86,19 +88,19 @@ Domain split (see Testbed Go - /docs/testbed-go):
 - 47: serial single-entrypoint live gate (testbed/live/helpers/helpers.go:41, LiveDomain; the pool never hands out 47). Serial file split is testbed/live/serial.sh. Gate 0 offline at testbed/live/gates/gate0_test.go:41, gate 1 at testbed/live/gates/gate1_test.go:32, gate 2 forward at testbed/live/gates/gate2_test.go:33 and reverse at testbed/live/gates/gate2_test.go:102.
 - 43 plus 44: distro matrix. Humble on 43 (testbed/live/helpers/distro.go:46-52), Rolling on 44 (testbed/live/helpers/distro.go:54-60), Jazzy canonical on 42 (testbed/live/helpers/distro.go:38-44).
 - 60 through 69: ephemeral isolation. ROS liveliness uses 65 through 69 (testbed/live/ros/gate_liveliness_test.go:35-39) plus per-process CLI isolation in 60 through 69, so ephemeral runs never hear pooled or fixed gate domains (testbed/live/helpers/helpers.go:50-53).
-- 70 through 101: pooled exclusive domains for parallel live tests, allocated via testbed/live/helpers/domainpool.go (MustAllocateDomain at :241) with per-process flock locks and per-run live IDs (testbed/live/helpers/helpers.go:131).
+- 70 through 101: pooled exclusive domains for parallel live tests, allocated via testbed/live/helpers/domainpool.go (AllocateDomainLease at :196, MustAllocateDomain at :474) with per-process flock locks and per-run live IDs (testbed/live/helpers/helpers.go:131).
 
 Only one run per domain and topic at a time. Every live run uses one per-run live ID for payload isolation and reuses that ID for start plus assert. See testbed/live/helpers/helpers.go:131.
 
-Residue purge: allocating a pooled domain first cleans that domain on every fleet container (testbed/live/helpers/domainpool.go:350). A ros2 daemon whose command line names the domain is killed, then every ros2 topic pub or echo whose container environ says ROS_DOMAIN_ID=<domain> is killed; each kill is verified and escalated to SIGKILL, and a survivor fails the allocation instead of handing out a dirty domain.
+Residue purge: allocating a pooled domain first cleans that domain on every fleet container (testbed/live/helpers/domainpool.go:351). A ros2 daemon whose command line names the domain is killed, then every ros2 topic pub or echo whose container environ says ROS_DOMAIN_ID=<domain> is killed; each kill is verified and escalated to SIGKILL, and a survivor fails the allocation instead of handing out a dirty domain.
 
-A leftover peer is not harmless. It joins discovery on the reused domain, so its user DATA reaches take loops and fails loudly as provisional decode errors, and even a daemon with no topics counts as a route and breaks CLI route-wait isolation. Parallel suites hold other domains, so the environ match never disturbs them. The topic command line carries no domain, which is why the check reads /proc environ instead of matching argv. Crash residue older than 15 minutes is still reaped fleet-wide as a backup.
+A leftover peer is not harmless. It joins discovery on the reused domain, so its user DATA reaches take loops and fails loudly as provisional decode errors, and even a daemon with no topics counts as a route and breaks CLI route-wait isolation. Parallel suites hold other domains, so the environ match never disturbs them. The topic command line carries no domain, which is why the check reads /proc environ instead of matching argv. Crash residue older than 15 minutes is still reaped for the same domain as a backup.
 
 Kill discipline: never run bare host pkill -f, because the host command line contains the pattern and matches itself. Kills run inside the container via docker exec with the pattern in an env var, and death is verified with pgrep before proceeding (testbed/live/helpers/helpers.go:694).
 
 Gates
 
-Canonical Go entrypoint is go test -tags live -timeout 60m ./testbed/live/... -count=1.
+Canonical Go entrypoint is go test -timeout 60m ./testbed/live/... -count=1. CI plus hook stay offline and live runs are manual via serial.sh with fleet up.
 
 - Gate 0 is offline via plain go test with no shell: port math for domains 42, 47, and 48 plus a Marshal and Parse SPDP round trip plus a launch corpus presence pin. See testbed/live/gates/gate0_test.go:41 and testbed/live/gates/gate0_test.go:150. The launch argument corpus is testbed/unit/launch/conformance_test.go:199 with fixtures such as testbed/unit/launch/shared_nodes.yaml and expected dumps such as testbed/unit/launch/shared_nav.expected.
 - Gate 1 is live SPDP acceptance via direct RTPS with no trace grep: join the allocated domain SPDP multicast group, decode with ParseAnnouncement, and prove non-local receipt by GUID prefix inequality. It pins RTPS 2.1, vendor 01 10, unknown reader DATA, and zero deserialization failures. See testbed/live/gates/gate1_test.go:32 and testbed/live/cyclone/gate1_spdp_test.go:379.
@@ -123,4 +125,4 @@ Current status
 
 The wire path is live: cmd/weld publishes and echoes std_msgs/String through the backend in internal/transports/dds, and the gates above check it end to end.
 
-Gate record: gate 0 green; gate 1 green (about 900 non-local SPDP ST0 NEW rows, bes 3f, zero deserialization failures); gate 2 forward green after plain CDR receive plus SEDP fixes and reverse green after writer 03c2 plus announce now plus Heartbeat. Forward plain CDR is in internal/transports/dds/datapath.go:746 with String fallback at internal/transports/dds/datapath.go:479 and the TakeFrom fallback at internal/transports/dds/datapath.go:887. SEDP writer 03c2 is in internal/transports/dds/sedp.go:149-157, announce loop is in internal/transports/dds/sedp.go:633, DATA plus Heartbeat is in internal/transports/dds/backend.go:1347. The Go testbed mirrors this: go test ./testbed/unit/... runs offline, go test -tags live ./testbed/live/... runs the domain 47 round trip. See Conformance - /docs/conformance for the wire record.
+Gate record: gate 0 green; gate 1 green (about 900 non-local SPDP ST0 NEW rows, bes 3f, zero deserialization failures); gate 2 forward green after plain CDR receive plus SEDP fixes and reverse green after writer 03c2 plus announce now plus Heartbeat. Forward plain CDR is in internal/transports/dds/datapath.go:746 with String fallback at internal/transports/dds/datapath.go:479 and the TakeFrom fallback at internal/transports/dds/datapath.go:887. SEDP writer 03c2 is in internal/transports/dds/sedp.go:177-182, announce loop is in internal/transports/dds/sedp.go:633, DATA plus Heartbeat is in internal/transports/dds/backend.go:1347. The Go testbed mirrors this: go test ./testbed/unit/... runs offline, go test ./testbed/live/... runs the domain 47 round trip. Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector. See Conformance - /docs/conformance for the wire record.

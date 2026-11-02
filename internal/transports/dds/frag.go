@@ -52,6 +52,14 @@ const fragSendSize uint16 = 16384
 // cannot grow without limit under writer churn.
 const fragSendMaxEntries = 16
 
+// fragMaxBytes bounds total buffered fragment bytes per table.
+//
+// Entries stay capped at 16, but 16 full 32MiB samples would hold 512MiB.
+// The byte budget evicts the oldest entry loudly when a new sample would
+// push either table past 64MiB, keeping memory bounded under churn while
+// keeping the entry cap for small samples.
+const fragMaxBytes = 64 << 20
+
 // fragSendTimeout bounds one outbound fragmented sample lifetime.
 //
 // Entries older than the timeout sweep on the next accumulate, mirroring
@@ -243,6 +251,14 @@ func copyFragRun(entry *fragEntry, frag rtps.DataFrag) error {
 		return fmt.Errorf("dds: datafrag run without entry: %w", ErrInvalidFrame)
 	}
 
+	if frag.FragmentsInSubmessage == 0 {
+		return fmt.Errorf("dds: datafrag run empty: %w", ErrInvalidFrame)
+	}
+
+	if uint64(frag.FragmentStartingNum)+uint64(frag.FragmentsInSubmessage)-1 > uint64(entry.total) {
+		return fmt.Errorf("dds: datafrag run %d plus %d above total %d: %w", frag.FragmentStartingNum, frag.FragmentsInSubmessage, entry.total, ErrInvalidFrame)
+	}
+
 	offInPayload := uint64(0)
 	for i := range uint64(frag.FragmentsInSubmessage) {
 		fragNum := uint64(frag.FragmentStartingNum) + i
@@ -267,6 +283,74 @@ func copyFragRun(entry *fragEntry, frag rtps.DataFrag) error {
 	return nil
 }
 
+// fragBytesLocked returns total buffered bytes under lock.
+//
+// The caller must hold f.mu.
+func (f *fragReassembler) fragBytesLocked() uint64 {
+	var total uint64
+	for _, entry := range f.entries {
+		if entry != nil {
+			total += uint64(entry.sampleSize)
+		}
+	}
+
+	return total
+}
+
+// evictOldestFragLocked drops the oldest entry under lock.
+//
+// The caller must hold f.mu. It returns the evicted key and true when an
+// entry was dropped.
+func (f *fragReassembler) evictOldestFragLocked() (fragKey, bool) {
+	var (
+		oldestKey fragKey
+		oldest    time.Time
+		first     = true
+	)
+	for key, entry := range f.entries {
+		var t time.Time
+		if entry != nil {
+			t = entry.firstSeen
+		}
+		if first || t.Before(oldest) {
+			oldestKey, oldest, first = key, t, false
+		}
+	}
+	if first {
+		return fragKey{}, false
+	}
+	delete(f.entries, oldestKey)
+
+	return oldestKey, true
+}
+
+// makeRoomForFragLocked evicts entries to fit one new sample.
+//
+// The caller must hold f.mu. It returns evicted keys for loud logging after
+// unlock so logging never holds the reassembler lock.
+func (f *fragReassembler) makeRoomForFragLocked(sampleSize uint32) []fragKey {
+	var evicted []fragKey
+	for f.fragBytesLocked()+uint64(sampleSize) > fragMaxBytes && len(f.entries) > 0 {
+		oldest, ok := f.evictOldestFragLocked()
+		if !ok {
+			break
+		}
+		evicted = append(evicted, oldest)
+	}
+
+	return evicted
+}
+
+// logFragBytesEvictions logs byte-budget evictions after unlock.
+//
+// It runs without the reassembler lock so eviction logging never blocks the
+// data path.
+func logFragBytesEvictions(dropped []fragKey) {
+	for _, droppedKey := range dropped {
+		log.Printf("dds: datafrag bytes evict guid=%x seq=%d", droppedKey.guid, droppedKey.seq)
+	}
+}
+
 // add stores one fragment run and returns the complete payload when done.
 func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool, error) {
 	if f == nil {
@@ -277,27 +361,42 @@ func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool
 		return nil, false, err
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	key := fragKey{guid: guid, seq: frag.SequenceNumber}
 	entry, seen := f.entries[key]
+	var evicted []fragKey
 	if !seen {
 		if len(f.entries) >= f.maxEntries {
+			f.mu.Unlock()
+
 			return nil, false, fmt.Errorf("dds: datafrag table full: %w", ErrDataFragDropped)
 		}
+		evicted = f.makeRoomForFragLocked(frag.SampleSize)
 		entry = makeFragEntry(frag.SampleSize, frag.FragmentSize, total, f.now())
 		f.entries[key] = entry
 	} else if entry.sampleSize != frag.SampleSize || entry.fragmentSize != frag.FragmentSize {
+		f.mu.Unlock()
+		logFragBytesEvictions(evicted)
+
 		return nil, false, fmt.Errorf("dds: datafrag inconsistent sample: %w", ErrDataFragDropped)
 	}
 	err = copyFragRun(entry, frag)
 	if err != nil {
+		f.mu.Unlock()
+		logFragBytesEvictions(evicted)
+
 		return nil, false, err
 	}
 	if entry.receivedCount != entry.total {
+		f.mu.Unlock()
+		logFragBytesEvictions(evicted)
+
 		return nil, false, nil
 	}
 	out := append([]byte(nil), entry.buf...)
 	delete(f.entries, key)
+	f.mu.Unlock()
+	logFragBytesEvictions(evicted)
+
 	return out, true, nil
 }
 

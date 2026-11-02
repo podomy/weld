@@ -583,7 +583,6 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
 		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix forward %s topic %s hash %s", tc.Label, topic, typeHash)
@@ -641,7 +640,6 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	stopTalker()
 	t.Logf("weld take did not see %s payload hash %s (known interop gap), local codec ok", tc.Label, typeHash)
 	reason := "weld take misses " + tc.Label + " user DATA but local codec ok, known interop gap forward matrix"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
@@ -698,7 +696,6 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
 		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse %s topic %s hash %s", tc.Label, topic, typeHash)
@@ -741,7 +738,6 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	stopEcho()
 	t.Logf("ros2 topic echo did not see %s payload %q hash %s (known interop gap), pub ok\necho output:\n%s", tc.Label, want, typeHash, string(data))
 	reason := "ros echo misses " + tc.Label + " user DATA but pub ok, known interop gap reverse matrix"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 

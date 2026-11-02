@@ -502,6 +502,9 @@ func checkServiceClientCancelled(t *testing.T) {
 	if client.PendingCount() != 1 {
 		t.Fatalf("cancel must leave one, got %d", client.PendingCount())
 	}
+	if got := client.CancelledCount(); got != 1 {
+		t.Fatalf("cancelled count must be 1, got %d", got)
+	}
 	deadlineCtx, deadlineCancel := context.WithCancel(context.Background())
 	deadlineCancel()
 	err = client.BeginCall(deadlineCtx, "/svc", serviceTestGUID(), 3, UnspecifiedDuration())
@@ -644,8 +647,8 @@ func checkServiceServerReply(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 	err = server.Reply("/svc", guid, 1)
-	if !errors.Is(err, ErrServiceTimeout) {
-		t.Fatalf("reply before take must be reader not ready timeout, got %v", err)
+	if !errors.Is(err, ErrServiceNoRequest) {
+		t.Fatalf("reply before take must be no request, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "/svc") {
 		t.Fatalf("reply timeout must carry service name, got %q", err.Error())
@@ -783,6 +786,9 @@ func checkServiceServerCancelled(t *testing.T) {
 	if len(cancelled) != 1 || cancelled[0].Sequence != 1 {
 		t.Fatalf("cancel must collect active seq 1, got %+v", cancelled)
 	}
+	if got := server.CancelledCount(); got != 1 {
+		t.Fatalf("cancelled count must be 1, got %d", got)
+	}
 	queuedCtx, queuedCancel := context.WithCancel(context.Background())
 	err = server.EnqueueRequest(queuedCtx, "/svc", serviceTestGUID(), 3, UnspecifiedDuration())
 	if err != nil {
@@ -798,6 +804,9 @@ func checkServiceServerCancelled(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("cancel must collect queued seq 3, got %+v", cancelled)
+	}
+	if got := server.CancelledCount(); got != 2 {
+		t.Fatalf("cancelled count must be 2, got %d", got)
 	}
 }
 

@@ -235,7 +235,7 @@ func MarshalServiceReply(payload []byte, guid [8]byte, seq uint64, littleEndian 
 
 // UnmarshalServiceRequest validates one request packet and splits the parts.
 //
-// It checks the 4 byte header plus 20 byte prefix length before parsing.
+// It checks the 20 byte envelope including header before parsing.
 // The returned payload aliases the input after the prefix, including pad
 // tail. Short, empty, and bad header input reports ErrServiceInvalidPacket
 // or ErrTruncated. The GUID is opaque and never swapped.
@@ -244,8 +244,8 @@ func UnmarshalServiceRequest(data []byte, m *types.Metrics) ([]byte, [8]byte, ui
 
 	payload, gotGUID, seq, le, err := types.UnmarshalServiceMessage(data, m)
 	if err != nil {
-		if errors.Is(err, ErrTruncated) {
-			return nil, guid, 0, false, fmt.Errorf("dds: service request parse: %w", err)
+		if len(data) < types.ServiceEnvelopeSize || errors.Is(err, ErrTruncated) {
+			return nil, guid, 0, false, fmt.Errorf("dds: service request parse: %w", errors.Join(err, ErrTruncated))
 		}
 
 		return nil, guid, 0, false, fmt.Errorf("dds: service request parse: %w", errors.Join(err, ErrServiceInvalidPacket))
@@ -293,15 +293,16 @@ func ParseServiceIDHex(s string) ([8]byte, error) {
 
 // parseServiceIDROS validates a dot-separated ROS service ID.
 //
-// ROS formats 16 bytes as dot-separated lowercase hex pairs such as
-// 1.10.9a.9c... The dots are stripped and the 32 hex digits must decode
-// to 16 bytes. Plain 16 digit hex (the legacy 8 byte form) is rejected
-// here; use ParseServiceIDHex for that form.
+// ROS formats 20 bytes as dot-separated lowercase hex pairs such as
+// 1.10.9a.9c... The dots are stripped and the 40 hex digits must decode
+// to 20 bytes. The legacy 16 byte form with 32 hex digits stays accepted
+// for backward compatibility. Plain 16 digit hex (the legacy 8 byte form)
+// is rejected here; use ParseServiceIDHex for that form.
 func parseServiceIDROS(s string) error {
 	trimmed := strings.TrimSpace(s)
 	stripped := strings.ReplaceAll(trimmed, ".", "")
-	if len(stripped) != 32 {
-		return fmt.Errorf("dds: service id %q hex length %d want 32: %w", s, len(stripped), ErrServiceInvalidName)
+	if len(stripped) != 40 && len(stripped) != 32 {
+		return fmt.Errorf("dds: service id %q hex length %d want 40 or 32: %w", s, len(stripped), ErrServiceInvalidName)
 	}
 	_, err := hex.DecodeString(stripped)
 	if err != nil {
@@ -495,45 +496,137 @@ func CheckServiceAvailable(
 		return false
 	}
 
-	want := strings.TrimSpace(wantServiceID)
+	want := strings.ToLower(strings.TrimSpace(wantServiceID))
 	if want == "" {
 		return true
 	}
 
 	for _, id := range readerIDs {
-		if strings.TrimSpace(id) == want {
+		if strings.ToLower(strings.TrimSpace(id)) == want {
 			return true
 		}
 	}
 
 	for _, id := range writerIDs {
-		if strings.TrimSpace(id) == want {
+		if strings.ToLower(strings.TrimSpace(id)) == want {
 			return true
 		}
-	}
-
-	if len(readerIDs) == 0 && len(writerIDs) == 0 {
-		return true
 	}
 
 	return false
 }
 
+// RequireServiceAvailable reports ErrServiceNotAvailable when no server matches.
+//
+// It wraps CheckServiceAvailable so callers get a loud sentinel instead of
+// a boolean. Counts plus want ID plus advertised IDs follow the same
+// strict rule: a present want ID must match an advertised ID.
+func RequireServiceAvailable(requestReaders, replyWriters int, wantServiceID string, readerIDs, writerIDs []string) error {
+	if CheckServiceAvailable(requestReaders, replyWriters, wantServiceID, readerIDs, writerIDs) {
+		return nil
+	}
+
+	return fmt.Errorf("dds: service %q not available: %w", strings.TrimSpace(wantServiceID), ErrServiceNotAvailable)
+}
+
+// MatchServiceReply validates one reply sample against the client handle.
+//
+// It unmarshals data as a service reply and compares the opaque GUID plus
+// sequence to the want handle. Mismatches report ErrServiceHandleMismatch
+// so the client skips replies for other handles. Context deadline aborts
+// early before parsing.
+func MatchServiceReply(ctx context.Context, data []byte, wantGUID [8]byte, wantSeq uint64, m *types.Metrics) ([]byte, error) {
+	err := ctx.Err()
+	if err != nil {
+		return nil, fmt.Errorf("dds: match service reply: %w", err)
+	}
+
+	payload, guid, seq, _, err := UnmarshalServiceReply(data, m)
+	if err != nil {
+		return nil, err
+	}
+
+	if guid != wantGUID || seq != wantSeq {
+		return nil, fmt.Errorf("dds: service reply handle mismatch: %w", ErrServiceHandleMismatch)
+	}
+
+	return payload, nil
+}
+
+// TakeServiceReply scans samples for the reply matching wantGUID plus wantSeq.
+//
+// It checks the context deadline before each sample and skips samples that
+// fail to parse. When at least one sample parses but none matches, it
+// reports ErrServiceHandleMismatch. When no sample yields a usable reply,
+// it reports ErrServiceNoReader.
+func TakeServiceReply(ctx context.Context, samples [][]byte, wantGUID [8]byte, wantSeq uint64, m *types.Metrics) ([]byte, error) {
+	seenParsed := false
+
+	for _, sample := range samples {
+		err := ctx.Err()
+		if err != nil {
+			return nil, fmt.Errorf("dds: take service reply: %w", err)
+		}
+
+		payload, guid, seq, _, err := UnmarshalServiceReply(sample, m)
+		if err != nil {
+			continue
+		}
+
+		seenParsed = true
+
+		if guid == wantGUID && seq == wantSeq {
+			return payload, nil
+		}
+	}
+
+	if seenParsed {
+		return nil, fmt.Errorf("dds: take service reply no match: %w", ErrServiceHandleMismatch)
+	}
+
+	return nil, fmt.Errorf("dds: take service reply no reply: %w", ErrServiceNoReader)
+}
+
+// WaitServiceMatchedReader polls check until true or the matched wait elapses.
+//
+// It returns nil on match, ErrServiceNoReader on timeout, and the context
+// error on cancel. ServiceMatchedReaderWait bounds one response reader
+// wait so single shot clients do not block past the discovery interval.
+func WaitServiceMatchedReader(ctx context.Context, check func() bool) error {
+	if check() {
+		return nil
+	}
+
+	timer := time.NewTimer(ServiceMatchedReaderWait)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		return fmt.Errorf("dds: wait service reader: %w", err)
+	case <-timer.C:
+		if check() {
+			return nil
+		}
+
+		return fmt.Errorf("dds: wait service reader: %w", ErrServiceNoReader)
+	}
+}
+
 // serviceIDForName derives a ROS-format service ID from a prefix.
 //
-// The ID matches the rmw_cyclonedds_cpp wire form: the 12 byte
-// participant GUID prefix plus 4 bytes derived from the service name,
-// formatted as dot-separated hex pairs like
-// 1.10.9a.9c.bc.6.94.20.76.2d.69.93.0.0.0.8. Reader plus writer for one
-// service share the ID so rmw pairs both halves to one service;
-// distinct services map to distinct IDs.
+// The ID carries the 12 byte participant GUID prefix plus 8 bytes of
+// FNV64a over the service name, formatted as dot-separated lowercase hex
+// pairs. Reader plus writer for one service share the ID so rmw pairs
+// both halves to one service; distinct services map to distinct IDs. The
+// 64 bit hash replaces the legacy 32 bit form to cut collision risk.
 func serviceIDForName(prefix SEDPGUIDPrefix, service string) string {
-	h := fnv.New32a()
+	h := fnv.New64a()
 	_, _ = h.Write([]byte(service)) //nolint:errcheck // hash writes never fail
-	var raw [16]byte
+	var raw [20]byte
 	copy(raw[:12], prefix[:])
-	binary.BigEndian.PutUint32(raw[12:], h.Sum32())
-	parts := make([]string, 0, 16)
+	binary.BigEndian.PutUint64(raw[12:], h.Sum64())
+	parts := make([]string, 0, len(raw))
 	for _, b := range raw {
 		parts = append(parts, strings.ToLower(hex.EncodeToString([]byte{b})))
 	}
@@ -613,11 +706,11 @@ func (idx *SEDPIndex) DeclareServiceEndpoint(isReader bool, serviceName, idlName
 		return SEDPEndpoint{}, fmt.Errorf("dds: service declare entity space exhausted: %w", ErrSEDPInvalidEndpoint)
 	}
 	entity := sedpEntityFor(idx.next, isReader)
-	idx.next++
 	id := SEDPGUID{Prefix: idx.prefix, Entity: entity}
 	if _, exists := idx.locals[id]; exists {
 		return SEDPEndpoint{}, fmt.Errorf("dds: service declare duplicate entity: %w", ErrSEDPInvalidEndpoint)
 	}
+	idx.next++
 	ep := SEDPEndpoint{
 		ID:                 id,
 		ROSTopic:           rosBack,
@@ -736,7 +829,7 @@ func (b *Backend) DeclareServiceWriter(ctx context.Context, service, idlBase str
 	if err != nil {
 		return fmt.Errorf("dds: declare service writer: %w", err)
 	}
-	err = b.announceWriterOnce(ctx, ep)
+	err = b.announceEndpointOnce(ctx, ep)
 	if err != nil {
 		if errors.Is(err, ErrNoRoute) {
 			return nil
@@ -744,6 +837,15 @@ func (b *Backend) DeclareServiceWriter(ctx context.Context, service, idlBase str
 		return err
 	}
 	return nil
+}
+
+// announceEndpointOnce sends one SEDP announcement for ep before DATA.
+//
+// The name covers readers and writers. It forwards to announceWriterOnce
+// so behavior stays identical. SubscribeService announces readers through
+// this path, so the writer-only name misleads review.
+func (b *Backend) announceEndpointOnce(ctx context.Context, ep SEDPEndpoint) error {
+	return b.announceWriterOnce(ctx, ep)
 }
 
 // SubscribeService declares a local service reader for one role.
@@ -800,7 +902,7 @@ func (b *Backend) SubscribeService(ctx context.Context, service, idlBase string,
 	if err != nil {
 		return fmt.Errorf("dds: subscribe service declare reader: %w", err)
 	}
-	err = b.announceWriterOnce(ctx, ep)
+	err = b.announceEndpointOnce(ctx, ep)
 	if err != nil {
 		if errors.Is(err, ErrNoRoute) {
 			return nil
@@ -822,14 +924,36 @@ func (b *Backend) SubscribeService(ctx context.Context, service, idlBase string,
 // report ErrNoRoute for retry loops. Non plain payloads fail loudly
 // instead of falling back to framed topics.
 // servicePublishTarget resolves the DDS topic, type, and request flag for
-// one service publish role. The reply topic serves every role except the
-// client, which publishes on the request topic.
-func servicePublishTarget(eps ServiceEndpoints, role ServiceRole) (ddsTopic, ddsType string, isRequest bool) {
-	if role == ServiceRoleClient {
-		return eps.RequestTopic, eps.RequestType, true
+// one service publish role. The reply topic serves the server role and the
+// request topic serves the client role. Unknown roles fail loudly instead
+// of defaulting to the server reply path.
+func servicePublishTarget(eps ServiceEndpoints, role ServiceRole) (ddsTopic, ddsType string, isRequest bool, err error) {
+	switch role {
+	case ServiceRoleClient:
+		return eps.RequestTopic, eps.RequestType, true, nil
+	case ServiceRoleServer:
+		return eps.ReplyTopic, eps.ResponseType, false, nil
+	default:
+		return "", "", false, fmt.Errorf("dds: service publish role %d: %w", int(role), ErrServiceInvalidPacket)
 	}
+}
 
-	return eps.ReplyTopic, eps.ResponseType, false
+// resolveServicePublishEndpoint demangles the service type and resolves or
+// declares the local service writer endpoint for one publish.
+func resolveServicePublishEndpoint(snap publishSnapshot, service, ddsTopic, ddsType string, isRequest bool, typeHash string) (SEDPEndpoint, string, error) {
+	idlName, err := DemangleTypeName(ddsType)
+	if err != nil {
+		return SEDPEndpoint{}, "", fmt.Errorf("dds: publish service demangle: %w", err)
+	}
+	hash := sedpTypeHashForIDL(idlName, typeHash)
+	ep, ok := snap.sedp.findLocalServiceWriter(ddsTopic, ddsType, idlName, hash)
+	if !ok {
+		ep, err = snap.sedp.DeclareServiceEndpoint(false, service, idlName, isRequest, hash, nil)
+		if err != nil {
+			return SEDPEndpoint{}, "", fmt.Errorf("dds: publish service declare writer: %w", err)
+		}
+	}
+	return ep, idlName, nil
 }
 
 func (b *Backend) PublishService(ctx context.Context, service, idlBase string, role ServiceRole, payload []byte, typeHash string) error {
@@ -841,21 +965,16 @@ func (b *Backend) PublishService(ctx context.Context, service, idlBase string, r
 	if err != nil {
 		return err
 	}
-	ddsTopic, ddsType, isRequest := servicePublishTarget(eps, role)
-	idlName, err := DemangleTypeName(ddsType)
+	ddsTopic, ddsType, isRequest, err := servicePublishTarget(eps, role)
 	if err != nil {
-		return fmt.Errorf("dds: publish service demangle: %w", err)
+		return err
 	}
-	hash := sedpTypeHashForIDL(idlName, typeHash)
+	ep, idlName, err := resolveServicePublishEndpoint(snap, service, ddsTopic, ddsType, isRequest, typeHash)
+	if err != nil {
+		return err
+	}
 	if !isPlainCDRSample(payload, idlName) {
 		return fmt.Errorf("dds: publish service payload not plain for %q: %w", idlName, ErrServiceInvalidPacket)
-	}
-	ep, ok := snap.sedp.findLocalServiceWriter(ddsTopic, ddsType, idlName, hash)
-	if !ok {
-		ep, err = snap.sedp.DeclareServiceEndpoint(false, service, idlName, isRequest, hash, nil)
-		if err != nil {
-			return fmt.Errorf("dds: publish service declare writer: %w", err)
-		}
 	}
 	if snap.routeCount == 0 && len(b.snapshotRoutes()) == 0 {
 		return routeError(service, snap.domain, ErrNoRoute)

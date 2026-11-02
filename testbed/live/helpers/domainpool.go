@@ -250,8 +250,6 @@ func claimPooledDomain() (int, uint64, error) {
 // It wraps AllocateDomainLease and discards the ownership token. Prefer
 // AllocateDomainLease plus ReleaseDomainLease for manual early releases;
 // the token form keeps a stale t.Cleanup from freeing a reused domain.
-// Direct callers that use AllocateDomain must call ReleaseDomain when the
-// domain is no longer needed.
 func AllocateDomain() (int, error) {
 	domain, _, err := AllocateDomainLease()
 	if err != nil {
@@ -281,23 +279,26 @@ func fleetContainers() []string {
 
 // containerProcGone reports whether no process matches the pkill pattern
 // in one container. pgrep runs directly (no shell wrapper) so the probe
-// command itself can never match the pattern. Exec failures report
+// command itself can never match the pattern. Only pgrep no-match with
+// exit code 1 means gone. Other exits are inconclusive and report
 // not-gone so callers retry instead of assuming a clean container.
+// Docker daemon errors carry text in combined output and never report
+// clean.
 func containerProcGone(ctx context.Context, container, pattern string) bool {
 	args := DockerArgs(container, 0, "pgrep", "-f", pattern)
 	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness invokes docker with fixed test args
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if len(bytes.TrimSpace(out)) != 0 {
 		return false
 	}
 	if err == nil {
 		return true
 	}
-	// pgrep exits 1 on no match, which still means gone. Any other error
-	// (docker unreachable, container gone) reports not-gone so the caller
-	// retries instead of assuming a clean container.
 	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr)
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode() == 1
+	}
+	return false
 }
 
 // WaitForContainerProcGone polls until no process matches the pkill pattern
@@ -343,8 +344,8 @@ const stalePeerAgeSeconds = "900"
 // so the purge only removes residue. Only a domain environ match is
 // signaled, so parallel suites are never disturbed. A survivor or an
 // inconclusive kill fails loudly instead of handing out a dirty domain.
-// Ancient topic peers of any domain are still reaped fleet-wide as a
-// backup for crashes that predate domain scoping.
+// Ancient topic peers for the same domain are still reaped as a backup
+// for crashes that predate the current purge.
 //
 //nolint:contextcheck,nolintlint // cleanup contexts intentionally outlive test cancellation, the purge runs at allocate time with a bounded Background timeout
 func purgeDomainResidue(domain int) error {
@@ -360,7 +361,7 @@ func purgeDomainResidue(domain int) error {
 		if err != nil {
 			return fmt.Errorf("helpers: purge domain %d topic peers: %w", domain, err)
 		}
-		reapStaleTopicPeers(ctx, container)
+		reapStaleTopicPeers(ctx, container, domain)
 	}
 	return nil
 }
@@ -391,14 +392,18 @@ func purgeDomainTopicPeers(ctx context.Context, container string, domain int) er
 	return nil
 }
 
-// reapStaleTopicPeers kills ros2 topic procs older than the stale bound.
+// reapStaleTopicPeers kills ros2 topic procs older than the stale bound
+// for one domain.
 //
 // Crash residue accumulates across suites in one fleet and poisons later
-// isolation assertions. The age bound keeps the reap clear of live tests:
-// parallel suites hold other domains and no live peer approaches the bound.
-// One extended pattern covers both verbs so the reap costs one exec.
-func reapStaleTopicPeers(ctx context.Context, container string) {
-	args := DockerArgs(container, 0, "pkill", "--older", stalePeerAgeSeconds, "-f", "topic (pub|echo)")
+// isolation assertions. Only a domain environ match is signaled, so
+// parallel suites are never disturbed. The age bound keeps the reap clear
+// of live tests: no live peer approaches the bound. One extended pattern
+// covers both verbs so the reap costs one exec. Best effort: absence of
+// stale peers is not an error.
+func reapStaleTopicPeers(ctx context.Context, container string, domain int) {
+	const script = `for pid in $(pgrep -f "$WPAT"); do if tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -q "^ROS_DOMAIN_ID=$DOMAIN$"; then age=$(ps -o etimes= -p $pid 2>/dev/null | tr -d ' '); if [ -n "$age" ] && [ "$age" -ge "$AGE" ] 2>/dev/null; then kill $pid; fi; fi; done`
+	args := []string{"exec", "-e", "WPAT=topic (pub|echo)", "-e", "DOMAIN=" + strconv.Itoa(domain), "-e", "AGE=" + stalePeerAgeSeconds, container, "sh", "-c", script}
 	cmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // live harness kills only stale test peers
 	_ = cmd.Run()                                      //nolint:errcheck // best effort; absence of stale peers is not an error
 }
@@ -421,21 +426,6 @@ func ReleaseDomainLease(domain int, token uint64) {
 	if !ok || current != token {
 		return
 	}
-	releaseDomainLock(domain)
-	delete(parallelPoolUsed, domain)
-	delete(parallelPoolTokens, domain)
-}
-
-// ReleaseDomain frees a pooled domain for later sequential reuse.
-//
-// Legacy form without ownership checking: it drops the in-process mark
-// and releases the cross-process flock unconditionally. Prefer
-// ReleaseDomainLease with the AllocateDomainLease token; the token form
-// keeps a stale cleanup from freeing a reused domain. MustAllocateDomain
-// no longer uses this; it registers the token form in t.Cleanup.
-func ReleaseDomain(domain int) {
-	parallelPoolMu.Lock()
-	defer parallelPoolMu.Unlock()
 	releaseDomainLock(domain)
 	delete(parallelPoolUsed, domain)
 	delete(parallelPoolTokens, domain)

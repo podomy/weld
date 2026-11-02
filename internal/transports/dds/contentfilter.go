@@ -102,6 +102,11 @@ const (
 	maxFilterTokens = 1024
 	// maxFilterDepth caps NOT plus paren nesting in one expression.
 	maxFilterDepth = 32
+	// filterIntFloatExactBoundary is 2^53, the largest magnitude where
+	// every integer is exactly representable as float64. Equalities
+	// mixing an integer beyond this magnitude with a float fail loudly
+	// instead of comparing through lossy promotion.
+	filterIntFloatExactBoundary = int64(1) << 53
 )
 
 // ParseError is a typed filter parse failure naming the byte position.
@@ -847,7 +852,10 @@ func (p *filterParser) parseOperandField(tok filterToken) (filterNode, error) {
 // parseOperandSigned parses a signed numeric literal starting at sign.
 //
 // Integer text without fraction or exponent stays an exact int64, including
-// the minimum int64 spelled as minus plus 9223372036854775808. Anything
+// the minimum int64 spelled as minus plus 9223372036854775808. The plus
+// path applies the same exact re-parse discipline: plus plus overflow
+// digits attempt ParseInt with an explicit plus sign, succeeding only
+// when the magnitude fits int64 and otherwise staying float64. Anything
 // else stays float64.
 func (p *filterParser) parseOperandSigned(sign filterToken) (filterNode, error) {
 	p.next()
@@ -870,6 +878,14 @@ func (p *filterParser) parseOperandSigned(sign filterToken) (filterNode, error) 
 		ival, perr := strconv.ParseInt(negText, 10, 64)
 		if perr == nil {
 			return literalNode{val: numSignedValue(ival)}, nil
+		}
+	}
+
+	if sign.kind == tokPlus && !strings.ContainsAny(num.text, ".eE") {
+		posText := "+" + num.text
+		posVal, posErr := strconv.ParseInt(posText, 10, 64)
+		if posErr == nil {
+			return literalNode{val: numSignedValue(posVal)}, nil
 		}
 	}
 
@@ -1674,13 +1690,56 @@ func evalFilterCmp(n cmpNode, fields map[string]filterValue) (bool, error) {
 //
 // NaN never matches: any comparison with a NaN operand reports false with
 // no error, including equality and inequality, so corrupt floats filter out
-// instead of matching or erroring.
+// instead of matching or erroring. Equality across the lossy int/float
+// boundary fails loudly: when one side is a float and the other is an
+// integer with magnitude above 2^53, promotion loses precision, so = and
+// <> report an eval error instead of a silent false match. Ordering
+// operators keep float comparison.
 func compareFilterNumsOrdered(op filterTokenKind, left, right filterNum) (bool, error) {
 	if isFilterNaN(left) || isFilterNaN(right) {
 		return false, nil
 	}
 
+	if isLossyIntFloatEq(op, left, right) {
+		return false, errors.New("dds: content filter eval lossy int/float equality above 2^53") //nolint:wrapcheck // new error, nothing to wrap
+	}
+
 	return compareFilterOp(op, compareFilterNums(left, right)), nil
+}
+
+// isLossyIntFloatEq reports whether an equality mixes a float with an
+// integer beyond exact representation.
+//
+// Only = and <> can silently misreport through rounding, so only those
+// fail loudly. Ordering keeps float comparison.
+func isLossyIntFloatEq(op filterTokenKind, left, right filterNum) bool {
+	if op != tokEq && op != tokNe {
+		return false
+	}
+
+	if left.flavor == numFloat && right.flavor != numFloat {
+		return intMagnitudeAboveBoundary(right)
+	}
+
+	if right.flavor == numFloat && left.flavor != numFloat {
+		return intMagnitudeAboveBoundary(left)
+	}
+
+	return false
+}
+
+// intMagnitudeAboveBoundary reports whether an integer exceeds 2^53 in magnitude.
+func intMagnitudeAboveBoundary(n filterNum) bool {
+	switch n.flavor {
+	case numSigned:
+		return n.i > filterIntFloatExactBoundary || n.i < -filterIntFloatExactBoundary
+	case numUnsigned:
+		return n.u > uint64(filterIntFloatExactBoundary)
+	case numFloat:
+		return false
+	default:
+		return false
+	}
 }
 
 // compareFilterBool applies one operator to two booleans.

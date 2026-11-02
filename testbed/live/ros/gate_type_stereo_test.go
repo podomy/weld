@@ -436,7 +436,6 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
 		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity forward topic %s hash %s", topic, typeHash)
@@ -475,7 +474,6 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 	stopTalker()
 	t.Logf("weld take did not see stereo disparity payload hash %s (known interop gap), local codec ok", typeHash)
 	reason := "weld take misses stereo disparity user DATA but local codec ok, known interop gap forward stereo"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
@@ -535,7 +533,6 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
 		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity reverse topic %s hash %s", topic, typeHash)
@@ -578,7 +575,6 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 	stopEcho()
 	t.Logf("ros2 topic echo did not see stereo disparity payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
 	reason := "ros echo misses stereo disparity user DATA but pub ok, known interop gap reverse stereo"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 

@@ -505,3 +505,54 @@ func TestDurabilityServiceParam(t *testing.T) {
 		t.Fatalf("param round trip = %+v, want %+v", decoded, WeldDurabilityServiceQoS())
 	}
 }
+
+// TestDurabilityServiceCompatRejectsUnknownKind pins fail-closed unknown history kinds.
+func TestDurabilityServiceCompatRejectsUnknownKind(t *testing.T) {
+	t.Parallel()
+
+	offered := DefaultDurabilityServiceQoS()
+	requested := DefaultDurabilityServiceQoS()
+	requested.HistoryKind = 99
+	result := CheckDurabilityServiceCompat(offered, requested)
+	if result.Compatible {
+		t.Fatalf("requested kind 99 compatible, want mismatch")
+	}
+	if !strings.Contains(result.Reason, "history kind") {
+		t.Fatalf("reason %q misses history kind", result.Reason)
+	}
+
+	swapped := CheckDurabilityServiceCompat(requested, offered)
+	if swapped.Compatible {
+		t.Fatalf("offered kind 99 compatible, want mismatch")
+	}
+	if !strings.Contains(swapped.Reason, "history kind") {
+		t.Fatalf("swapped reason %q misses history kind", swapped.Reason)
+	}
+}
+
+// TestDurabilityServiceCompatRejectsNegativeDepth pins negative depth as mismatch.
+func TestDurabilityServiceCompatRejectsNegativeDepth(t *testing.T) {
+	t.Parallel()
+
+	offered := DefaultDurabilityServiceQoS()
+	requested := DefaultDurabilityServiceQoS()
+	requested.HistoryDepth = -5
+	result := CheckDurabilityServiceCompat(offered, requested)
+	if result.Compatible {
+		t.Fatalf("requested depth -5 compatible, want mismatch")
+	}
+	if !strings.Contains(result.Reason, "history depth") {
+		t.Fatalf("reason %q misses history depth", result.Reason)
+	}
+
+	offeredBad := DefaultDurabilityServiceQoS()
+	offeredBad.HistoryDepth = -1
+	requestGood := DefaultDurabilityServiceQoS()
+	swapped := CheckDurabilityServiceCompat(offeredBad, requestGood)
+	if swapped.Compatible {
+		t.Fatalf("offered depth -1 compatible, want mismatch")
+	}
+	if !strings.Contains(swapped.Reason, "history depth") {
+		t.Fatalf("swapped reason %q misses history depth", swapped.Reason)
+	}
+}

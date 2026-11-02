@@ -538,6 +538,10 @@ func checkDataFragGeometry(out DataFrag, drops *Counter) error {
 // checkDataFragPayload validates the fragment payload length against geometry.
 func checkDataFragPayload(out DataFrag, payload []byte, drops *Counter) error {
 	offset := (uint64(out.FragmentStartingNum) - 1) * uint64(out.FragmentSize)
+	if offset >= uint64(out.SampleSize) {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: datafrag offset %d above sample %d", offset, out.SampleSize)
+	}
 	remaining := uint64(out.SampleSize) - offset
 	want := uint64(out.FragmentsInSubmessage) * uint64(out.FragmentSize)
 	want = min(want, remaining)
@@ -675,7 +679,7 @@ func (h Heartbeat) Encode(littleEndian bool) []byte {
 }
 
 // DecodeHeartbeat parses a HEARTBEAT body, ignoring trailing bytes for
-// tolerance. Short bodies drop with a counter increment.
+// tolerance. Short bodies and first above last drop with a counter increment.
 func DecodeHeartbeat(body []byte, flags uint8, drops *Counter) (Heartbeat, error) {
 	var out Heartbeat
 	if len(body) < heartbeatSize {
@@ -687,6 +691,10 @@ func DecodeHeartbeat(body []byte, flags uint8, drops *Counter) (Heartbeat, error
 	copy(out.WriterID[:], body[gapWriterOff:gapWriterOff+entityIDSize])
 	out.FirstSequence = seqNumberValue(body[heartbeatFirstOff:heartbeatFirstOff+dataSeqSize], littleEndian)
 	out.LastSequence = seqNumberValue(body[heartbeatLastOff:heartbeatLastOff+dataSeqSize], littleEndian)
+	if out.FirstSequence > out.LastSequence {
+		drops.RecordDrop()
+		return Heartbeat{}, fmt.Errorf("rtps: heartbeat first %d above last %d", out.FirstSequence, out.LastSequence)
+	}
 	out.Count = int32(uint32Value(body[heartbeatCountOff:heartbeatCountOff+wordSize], littleEndian)) //nolint:gosec // G115: intentional two's-complement reinterpret from the wire
 	return out, nil
 }
@@ -806,9 +814,10 @@ const gapListFixedSize = 12
 const gapListMaxBits = 4096
 
 // DecodeGap parses a GAP body through gap start plus the trailing sequence
-// set. Short bodies drop with a counter increment. A present list must be
-// fully covered by the body length and NumBits must stay under the cap;
-// otherwise the datagram drops loudly instead of trusting declared bits.
+// set. Short bodies and zero gap start drop with a counter increment.
+// A present list must be fully covered by the body length and NumBits must
+// stay under the cap; otherwise the datagram drops loudly instead of
+// trusting declared bits.
 func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	var out Gap
 	if len(body) < gapMinSize {
@@ -819,6 +828,10 @@ func DecodeGap(body []byte, flags uint8, drops *Counter) (Gap, error) {
 	copy(out.ReaderID[:], body[gapReaderOff:gapReaderOff+entityIDSize])
 	copy(out.WriterID[:], body[gapWriterOff:gapWriterOff+entityIDSize])
 	out.GapStart = seqNumberValue(body[gapStartOff:gapStartOff+gapStartSize], littleEndian)
+	if out.GapStart == 0 {
+		drops.RecordDrop()
+		return Gap{}, errors.New("rtps: gap start 0") //nolint:wrapcheck // new error, nothing to wrap
+	}
 	if len(body) == gapMinSize {
 		return out, nil
 	}
@@ -891,6 +904,8 @@ type Submessage struct {
 	Flags uint8
 	// Data holds a decoded DATA submessage, nil otherwise.
 	Data *Data
+	// DataFrag holds a decoded DATA_FRAG submessage, nil otherwise.
+	DataFrag *DataFrag
 	// InfoTS holds a decoded INFO_TS submessage, nil otherwise.
 	InfoTS *InfoTS
 	// Heartbeat holds a decoded HEARTBEAT submessage, nil otherwise.
@@ -945,6 +960,17 @@ func decodeGapSubmessage(raw RawSubmessage, drops *Counter) (Submessage, error) 
 	return out, nil
 }
 
+// decodeDataFragSubmessage decodes one DATA_FRAG body with drop accounting.
+func decodeDataFragSubmessage(raw RawSubmessage, drops *Counter) (Submessage, error) {
+	out := Submessage{ID: raw.ID, Flags: raw.Flags}
+	frag, err := DecodeDataFrag(raw.Body, raw.Flags, drops)
+	if err != nil {
+		return Submessage{}, fmt.Errorf("rtps: submessage datafrag: %w", err)
+	}
+	out.DataFrag = &frag
+	return out, nil
+}
+
 // DecodeSubmessage decodes one raw submessage by id. PAD content is
 // skipped without validation. ACKNACK is encode only in v1, so its content
 // is skipped by length. Unknown ids are skipped by length and never fatal:
@@ -953,6 +979,8 @@ func DecodeSubmessage(raw RawSubmessage, drops *Counter) (Submessage, error) {
 	switch raw.ID {
 	case SubmessageData:
 		return decodeDataSubmessage(raw, drops)
+	case SubmessageDataFrag:
+		return decodeDataFragSubmessage(raw, drops)
 	case SubmessageInfoTS:
 		return decodeInfoTSSubmessage(raw, drops)
 	case SubmessageHeartbeat:

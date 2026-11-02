@@ -66,6 +66,29 @@ func TestTakeHooksFilterMissDropsWithReason(t *testing.T) {
 	if !errors.Is(rej.err, ErrContentFilterMiss) {
 		t.Fatalf("miss error %v misses ErrContentFilterMiss", rej.err)
 	}
+
+	missBefore := recv.DropReasonCount(DropReasonContentFilterMiss)
+	dropsBefore := recv.DroppedCount()
+	err = recv.countTakeHookReject(rej)
+	if !errors.Is(err, ErrContentFilterMiss) {
+		t.Fatalf("count miss = %v, want ErrContentFilterMiss", err)
+	}
+	if got := recv.DropReasonCount(DropReasonContentFilterMiss); got != missBefore+1 {
+		t.Fatalf("miss count = %d, want %d", got, missBefore+1)
+	}
+	if got := recv.DroppedCount(); got != dropsBefore+1 {
+		t.Fatalf("drops = %d, want %d", got, dropsBefore+1)
+	}
+
+	hold := &takeHookReject{err: ErrLivelinessHold}
+	holdBefore := recv.DroppedCount()
+	err = recv.countTakeHookReject(hold)
+	if !errors.Is(err, ErrLivelinessHold) {
+		t.Fatalf("count hold = %v, want ErrLivelinessHold", err)
+	}
+	if got := recv.DroppedCount(); got != holdBefore {
+		t.Fatalf("hold counted drops = %d, want %d", got, holdBefore)
+	}
 }
 
 // TestTakeHooksFilterPassDelivers checks a matching sample passes hooks.

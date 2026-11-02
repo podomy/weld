@@ -207,8 +207,10 @@ func plainNackNextBase(st *plainNackState, seq uint64) uint64 {
 // were missed, typically a late join: NACK base 1 immediately. Later
 // gaps NACK the new base once per advance, so repair converges without
 // storms. Delivery never blocks on this: the sample always flows and
-// NACK send failures only bump demux errors. Unparseable seq skips
-// tracking. It self-locks and is safe for concurrent use.
+// NACK send failures only bump demux errors. The high-water lastNacked
+// advances only after a successful send, and a nil sender never advances
+// it, so failed or disabled NACKs do not mask the gap. Unparseable seq
+// skips tracking. It self-locks and is safe for concurrent use.
 func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq uint64) {
 	if seq == 0 {
 		return
@@ -232,7 +234,6 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 		return
 	}
 
-	st.lastNacked = base
 	send := r.nackSender
 	r.mu.Unlock()
 
@@ -243,7 +244,15 @@ func (r *DataReceiver) notePlainSample(ctx context.Context, guid WriterGUID, seq
 	err := send(ctx, guid, base)
 	if err != nil {
 		r.countDropReason(DropReasonNackSendFailed)
+
+		return
 	}
+
+	r.mu.Lock()
+	if current, seen := r.plainNack[guid]; seen && base > current.lastNacked {
+		current.lastNacked = base
+	}
+	r.mu.Unlock()
 }
 
 // SetNackSender installs the ACKNACK send hook for plain-path gaps.
@@ -285,18 +294,70 @@ type takeHookSnapshot struct {
 	deadline *core.DeadlineTracker
 }
 
+// livelyTrackerCap bounds the lazy tracker map under writer churn.
+//
+// Creation is rare (one per matched writer) but unauthenticated GUIDs must
+// never grow the map without bound; at cap one entry is evicted to make
+// room. The bound matches provisionalCap rationale: discovery churn stays
+// bounded while legitimate writers keep enforcement.
+const livelyTrackerCap = 1024
+
+// isMatchedWriter reports whether a writer GUID names a known writer.
+//
+// It returns true for confirmed SEDP remotes plus provisional placeholders
+// in SEDP or the receiver fast-path map. Unknown GUIDs return false so
+// lazy tracker creation never admits spoofed writers without a matching
+// SEDP announce. It self-locks and is safe for concurrent use.
+func (r *DataReceiver) isMatchedWriter(guid WriterGUID) bool {
+	if _, ok := r.remoteForGUID(guid); ok {
+		return true
+	}
+	if _, ok := r.ProvisionalForGUID(guid); ok {
+		return true
+	}
+
+	return false
+}
+
+// evictLivelyLocked evicts one tracker to hold the cap. Caller holds r.mu.
+func (r *DataReceiver) evictLivelyLocked() {
+	for id := range r.lively {
+		delete(r.lively, id)
+
+		return
+	}
+}
+
 // snapshotTakeHooks loads one sample's hook state with lazy tracker creation.
 //
 // The fast path is one short RLock. When a topic carries a liveliness
-// config but the writer has no tracker yet, the tracker is created under
-// a full Lock so writers discovered after subscribe are still enforced
-// from their first take. The lively map has no eviction by design: entries
-// are created lazily per writer GUID and deleted only by explicit tracker
-// clear or UnsetLivelinessTrackerForTopic. The bound is the matched writer
-// set, not the wire: a spoofed GUID reaches this map only after SEDP
-// matching admits the writer, so unauthenticated traffic cannot grow it
-// without a matching SEDP announce first. No cap is added; capping would
-// drop enforcement for legitimate writers.
+// config but the writer has no tracker yet, creation is gated on a matched
+// writer (a confirmed SEDP remote or a provisional placeholder): unknown
+// GUIDs never create trackers, so unauthenticated traffic cannot grow the
+// map without a matching SEDP announce. At cap one entry is evicted to
+// keep the map bounded. Writers discovered after subscribe are still
+// enforced from their first take.
+// ensureLivelyLocked installs the liveliness tracker for one matched
+// writer when the topic carries a contract, evicting oldest on cap.
+// Caller holds the write lock and passes the pre-checked match result;
+// unmatched writers never install.
+func (r *DataReceiver) ensureLivelyLocked(topic string, guid WriterGUID, cfg livelyConfig, matched bool) *core.LivelinessTracker {
+	if !matched {
+		return nil
+	}
+	if r.lively == nil {
+		r.lively = make(map[WriterGUID]*core.LivelinessTracker)
+	}
+	if _, ok := r.lively[guid]; !ok {
+		if len(r.lively) >= livelyTrackerCap {
+			r.evictLivelyLocked()
+		}
+		tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), cfg.kind, cfg.lease, time.Now().UnixNano())
+		r.lively[guid] = &tracker
+	}
+	return r.lively[guid]
+}
+
 func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHookSnapshot {
 	r.mu.RLock()
 	snap := takeHookSnapshot{
@@ -308,15 +369,9 @@ func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHook
 	r.mu.RUnlock()
 
 	if hasCfg && snap.tracker == nil {
+		matched := r.isMatchedWriter(guid)
 		r.mu.Lock()
-		if r.lively == nil {
-			r.lively = make(map[WriterGUID]*core.LivelinessTracker)
-		}
-		if _, ok := r.lively[guid]; !ok {
-			tracker := core.NewLivelinessTracker(topic, writerGUIDLabel(guid), cfg.kind, cfg.lease, time.Now().UnixNano())
-			r.lively[guid] = &tracker
-		}
-		snap.tracker = r.lively[guid]
+		snap.tracker = r.ensureLivelyLocked(topic, guid, cfg, matched)
 		r.mu.Unlock()
 	}
 
@@ -408,13 +463,15 @@ func writerGUIDLabel(guid WriterGUID) string {
 //
 // Receipt asserts liveliness and anchors the deadline even when the sample
 // is later filtered: the assert runs before filter evaluation so filtered
-// traffic still proves the writer alive. The deadline miss flag is captured
-// before anchoring, so the current sample still drops on a miss instead of
-// hiding behind its own anchor. It never counts and never takes receiver
-// locks: the caller counts reasoned drops exactly once and propagates holds
-// uncounted. Order after the assert is filter, then keyed, then liveliness
-// gate, so dashboards blame the earliest applicable cause. A nil return
-// means deliver. It never panics.
+// traffic still proves the writer alive. An expired writer sending only
+// filtered traffic therefore surfaces as a filter miss, not expiry.
+// The deadline miss flag is captured before anchoring, so the current
+// sample still drops on a miss instead of hiding behind its own anchor.
+// It never counts and never takes receiver locks: the caller counts
+// reasoned drops exactly once and propagates holds uncounted. Order after
+// the assert is filter, then keyed, then liveliness gate, so dashboards
+// blame the earliest applicable cause. A nil return means deliver. It
+// never panics.
 //
 //nolint:unparam // topic documents the sampled topic for call-site symmetry though the snapshot already carries the filter
 func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte, guid WriterGUID, keyed bool) *takeHookReject {

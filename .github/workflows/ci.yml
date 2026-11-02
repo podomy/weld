@@ -47,6 +47,8 @@ jobs:
         env:
           GOWORK: "off"
 
+      # CI stays offline with no fleet: plain go test runs the same live
+      # suites and skips without a peer; live runs are manual via serial.sh.
       - run: go test -coverprofile=coverage.out -covermode=atomic ./...
 
       - run: go test ./...

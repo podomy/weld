@@ -752,7 +752,10 @@ func TestMultiPortRoutesStored(t *testing.T) {
 // checkParamGolden pins one param ID with golden bytes and round trip.
 func checkParamGolden(t *testing.T, id uint16, value, want []byte, label string) {
 	t.Helper()
-	raw := rtps.EncodeParams([]rtps.Param{{ID: id, Value: value}})
+	raw, err := rtps.EncodeParams([]rtps.Param{{ID: id, Value: value}})
+	if err != nil {
+		t.Fatalf("encode %s: %v", label, err)
+	}
 	if !bytes.Equal(raw, want) {
 		t.Fatalf("%s golden = % X, want % X", label, raw, want)
 	}
@@ -785,7 +788,10 @@ func TestVendorPreservation(t *testing.T) {
 		{ID: 0x8007, Value: []byte{0x01, 0x02, 0x03, 0x04}},
 		{ID: 0x8019, Value: []byte{0x00, 0x00, 0x10, 0x00}},
 	}
-	raw := rtps.EncodeParams(params)
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode vendor: %v", err)
+	}
 	back, err := rtps.DecodeParams(raw)
 	if err != nil {
 		t.Fatalf("decode vendor: %v", err)

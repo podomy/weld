@@ -147,6 +147,7 @@ func checkSixErrorCombos(t *testing.T) {
 		{"automatic offered manual requested", base, withLiveliness(base, LivelinessManualByTopic), PolicyLiveliness},
 		{"default lease offered non default requested", base, withLease(base, NewDuration(4, 0)), PolicyLeaseDuration},
 		{"unspecified lease offered finite requested", withLease(base, UnspecifiedDuration()), withLease(base, NewDuration(4, 0)), PolicyLeaseDuration},
+		{"slower offered lease", withLease(base, NewDuration(10, 0)), withLease(base, NewDuration(4, 0)), PolicyLeaseDuration},
 	}
 	for _, tc := range cases {
 		report := CheckCompatibility(tc.offered, tc.requested)
@@ -196,6 +197,7 @@ func checkReverseCombosFlow(t *testing.T) {
 		{"finite offered default requested deadline", slower, base},
 		{"finite offered default requested lease", withLease(base, NewDuration(4, 0)), base},
 		{"equal leases", withLease(base, NewDuration(4, 0)), withLease(base, NewDuration(4, 0))},
+		{"faster offered lease", withLease(base, NewDuration(4, 0)), withLease(base, NewDuration(10, 0))},
 		{"infinite offered infinite requested deadline", withDeadline(base, InfiniteDuration()), withDeadline(base, InfiniteDuration())},
 	}
 	for _, tc := range cases {
@@ -305,8 +307,9 @@ func checkInvalidEnumsWarn(t *testing.T) {
 	}
 }
 
-// checkNegativeCompatibility asserts malformed negative deadline and lease
-// durations fail loudly in matching on either side, even without Validate.
+// checkNegativeCompatibility asserts malformed deadline and lease durations
+// fail loudly in matching on either side, even without Validate. Both
+// negative seconds and nanoseconds at or above one second are malformed.
 func checkNegativeCompatibility(t *testing.T) {
 	t.Helper()
 	base := resolvedBase(t)
@@ -320,6 +323,10 @@ func checkNegativeCompatibility(t *testing.T) {
 		{"negative requested deadline", base, withDeadline(base, Duration{Seconds: -1}), PolicyDeadline},
 		{"negative offered lease", withLease(base, Duration{Seconds: -2}), base, PolicyLeaseDuration},
 		{"negative requested lease", base, withLease(base, Duration{Seconds: -2}), PolicyLeaseDuration},
+		{"oversized offered deadline", withDeadline(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), base, PolicyDeadline},
+		{"oversized requested deadline", base, withDeadline(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), PolicyDeadline},
+		{"oversized offered lease", withLease(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), base, PolicyLeaseDuration},
+		{"oversized requested lease", base, withLease(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), PolicyLeaseDuration},
 	}
 	for _, tc := range cases {
 		report := CheckCompatibility(tc.offered, tc.requested)
@@ -664,6 +671,12 @@ func assertDurationFromNanos(t *testing.T) {
 	}
 	if DurationFromNanoseconds(math.MaxInt64) != InfiniteDuration() {
 		t.Fatal("max int64 input must yield infinite")
+	}
+	if DurationFromNanoseconds(math.MaxInt64-1) != BestAvailableDuration() {
+		t.Fatalf("max int64 minus one is reserved for best available, got %+v", DurationFromNanoseconds(math.MaxInt64-1))
+	}
+	if err := Validate(withDeadline(resolvedBase(t), DurationFromNanoseconds(math.MaxInt64-1))); err == nil {
+		t.Fatal("reserved sentinel total must fail validation")
 	}
 }
 

@@ -133,19 +133,18 @@ type Param struct {
 
 // EncodeParams renders params in little endian with a terminating
 // sentinel. Each entry is id plus length plus value plus zero pad to a
-// 4 byte boundary. Values longer than the uint16 range are truncated to
-// fit the length; callers should keep values small.
-func EncodeParams(params []Param) []byte {
+// 4 byte boundary. Values above maxSubmessageBody fail loudly with an
+// error instead of silent truncation.
+func EncodeParams(params []Param) ([]byte, error) {
 	const littleEndian = true
 	out := make([]byte, 0, len(params)*8+4)
 	for i := range params {
-		value := params[i].Value
-		if len(value) > maxSubmessageBody {
-			value = value[:maxSubmessageBody]
+		if len(params[i].Value) > maxSubmessageBody {
+			return nil, fmt.Errorf("rtps: param %#04x value %d above %d", params[i].ID, len(params[i].Value), maxSubmessageBody)
 		}
-		out = appendParamEntry(out, params[i].ID, value, littleEndian)
+		out = appendParamEntry(out, params[i].ID, params[i].Value, littleEndian)
 	}
-	return appendParamSentinel(out, PIDSentinel, littleEndian)
+	return appendParamSentinel(out, PIDSentinel, littleEndian), nil
 }
 
 // DecodeParams parses a little endian PID list requiring sentinel

@@ -658,7 +658,7 @@ func TestBoundsHeaderNested(t *testing.T) {
 	stamped := HeaderStampedMessageMembers()
 	err = stamped.Validate()
 	if err != nil {
-		t.Logf("stamped pre-patch validate: %v", err)
+		t.Fatalf("stamped pre-patch validate failed: %v", err)
 	}
 	err = stamped.EnsureNestedPatched()
 	if err != nil {

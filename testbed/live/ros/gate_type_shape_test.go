@@ -258,7 +258,6 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
 		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape forward topic %s hash %s", topic, typeHash)
@@ -297,7 +296,6 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 	stopTalker()
 	t.Logf("weld take did not see shape payload hash %s (known interop gap), local codec ok", typeHash)
 	reason := "weld take misses shape user DATA but local codec ok, known interop gap forward shape"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 
@@ -351,7 +349,6 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
 		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape reverse topic %s hash %s", topic, typeHash)
@@ -394,7 +391,6 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 	stopEcho()
 	t.Logf("ros2 topic echo did not see shape payload %q hash %s (known interop gap), pub ok\necho output:\n%s", want, typeHash, string(data))
 	reason := "ros echo misses shape user DATA but pub ok, known interop gap reverse shape"
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 

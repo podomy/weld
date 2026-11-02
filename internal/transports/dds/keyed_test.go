@@ -391,6 +391,28 @@ func TestKeyedUserEntityKinds(t *testing.T) {
 	}
 }
 
+// TestKeyedUserEntityCounterBoundary pins the 24 bit counter limit loudly.
+func TestKeyedUserEntityCounterBoundary(t *testing.T) {
+	t.Parallel()
+
+	maxEntity := KeyedUserEntity(0xFFFFFF, false)
+	if !bytes.Equal(maxEntity[:3], []byte{0xFF, 0xFF, 0xFF}) {
+		t.Fatalf("max counter = % x, want FF FF FF", maxEntity[:3])
+	}
+
+	for _, overflow := range []uint32{0x1000000, 0x1000001, 0xFFFFFFFF} {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("counter %#x succeeded, want loud panic", overflow)
+				}
+			}()
+			_ = KeyedUserEntity(overflow, false)
+		}()
+	}
+}
+
 // TestKeyedHashParamRoundTrip pins KeyHash encode, lookup, and rejects.
 func TestKeyedHashParamRoundTrip(t *testing.T) {
 	var want [16]byte

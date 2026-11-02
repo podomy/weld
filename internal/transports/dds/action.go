@@ -200,9 +200,27 @@ func GoalPaired(a, b GoalID) bool {
 }
 
 // MarshalActionServiceRequest wraps payload with header plus GUID and sequence.
-func MarshalActionServiceRequest(payload []byte, id ActionRequestID, littleEndian bool) []byte {
+//
+// It rejects a zero sequence via ValidateActionSequence and payloads above
+// the DDS sample cap. The payload is copied so caller mutation after
+// marshal cannot alias the wire bytes.
+func MarshalActionServiceRequest(payload []byte, id ActionRequestID, littleEndian bool) ([]byte, error) {
+	err := ValidateActionSequence(id.Sequence)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(payload) > maxPayloadLen {
+		return nil, fmt.Errorf(
+			"dds: action service request payload %d above cap %d: %w",
+			len(payload),
+			maxPayloadLen,
+			ErrServiceInvalidPacket,
+		)
+	}
+
 	cp := append([]byte(nil), payload...)
-	return types.MarshalServiceMessage(cp, id.ClientGUID, id.Sequence, littleEndian)
+	return types.MarshalServiceMessage(cp, id.ClientGUID, id.Sequence, littleEndian), nil
 }
 
 // ParseActionServiceRequest splits a service sample into payload and pairing ID.
@@ -367,18 +385,29 @@ func (s CancelScope) String() string {
 }
 
 // ClassifyCancelRequest maps goal ID plus stamp to its cancel scope.
-func ClassifyCancelRequest(goal GoalID, sec int32, nsec uint32) CancelScope {
+//
+// It requires sec >= 0 and nsec < 1e9. Out of range stamps fail loudly
+// with ErrActionInvalidGoal instead of classifying.
+func ClassifyCancelRequest(goal GoalID, sec int32, nsec uint32) (CancelScope, error) {
+	if sec < 0 {
+		return CancelScopeAll, fmt.Errorf("dds: cancel stamp sec %d below 0: %w", sec, ErrActionInvalidGoal)
+	}
+
+	if nsec >= 1000000000 {
+		return CancelScopeAll, fmt.Errorf("dds: cancel stamp nsec %d above 999999999: %w", nsec, ErrActionInvalidGoal)
+	}
+
 	empty := goal.IsZero()
 	zeroStamp := sec == 0 && nsec == 0
 	switch {
 	case empty && zeroStamp:
-		return CancelScopeAll
+		return CancelScopeAll, nil
 	case empty && !zeroStamp:
-		return CancelScopeBefore
+		return CancelScopeBefore, nil
 	case !empty && zeroStamp:
-		return CancelScopeSingle
+		return CancelScopeSingle, nil
 	default:
-		return CancelScopeSingleAndBefore
+		return CancelScopeSingleAndBefore, nil
 	}
 }
 

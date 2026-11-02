@@ -30,8 +30,9 @@ const (
 //
 // The zero value means unspecified, which is the default for deadline,
 // lifespan, and lease duration. Infinite is the largest total nanosecond
-// count, near max int64. Infinite minus one is reserved as the best
-// available sentinel; see BestAvailableDuration.
+// count, near max int64. Infinite minus one, with total math.MaxInt64-1, is
+// reserved as the best available sentinel and never represents a finite
+// duration; see BestAvailableDuration and DurationFromNanoseconds.
 type Duration struct {
 	// Seconds is whole seconds. Negative values are malformed and rejected
 	// by Validate.
@@ -61,7 +62,8 @@ func InfiniteDuration() Duration {
 }
 
 // BestAvailableDuration returns the sentinel carried by the best available
-// preset: infinite minus one nanosecond.
+// preset: infinite minus one nanosecond, with total math.MaxInt64-1 reserved
+// so it never represents a finite duration.
 //
 // The preset cannot carry unspecified (that means default, which resolves
 // differently) and cannot carry infinite (transports may treat infinite as
@@ -103,7 +105,10 @@ func NewDuration(sec int64, nsec uint32) Duration {
 // Zero maps to unspecified. Negative input is malformed and yields
 // Duration{Seconds: -1} so Validate rejects it loudly instead of collapsing
 // to unspecified; zero and negative stay distinguishable after the call.
-// Max int64 input yields exactly InfiniteDuration.
+// Max int64 input yields exactly InfiniteDuration. Total math.MaxInt64-1 is
+// reserved for the best available sentinel and maps there, so callers must
+// not use it as a finite duration; Validate rejects the sentinel loudly and
+// callers meaning infinite must use InfiniteDuration explicitly.
 func DurationFromNanoseconds(total int64) Duration {
 	if total == 0 {
 		return UnspecifiedDuration()

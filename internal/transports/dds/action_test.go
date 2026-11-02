@@ -267,24 +267,61 @@ func TestActionGoalStatus(t *testing.T) {
 	}
 }
 
+// checkCancelScopeEmpty pins empty-goal classification plus stamp validation.
+func checkCancelScopeEmpty(t *testing.T, empty dds.GoalID) {
+	t.Helper()
+	got, err := dds.ClassifyCancelRequest(empty, 0, 0)
+	if err != nil {
+		t.Fatalf("classify empty zero: %v", err)
+	}
+	if got != dds.CancelScopeAll {
+		t.Fatalf("empty plus zero = %v, want all", got)
+	}
+	got, err = dds.ClassifyCancelRequest(empty, 10, 0)
+	if err != nil {
+		t.Fatalf("classify empty stamp: %v", err)
+	}
+	if got != dds.CancelScopeBefore {
+		t.Fatalf("empty plus stamp = %v, want before", got)
+	}
+	if _, err := dds.ClassifyCancelRequest(empty, -1, 0); err == nil {
+		t.Fatalf("negative sec succeeded, want error")
+	}
+	if _, err := dds.ClassifyCancelRequest(empty, 0, 1000000000); err == nil {
+		t.Fatalf("nsec 1e9 succeeded, want error")
+	}
+}
+
+// checkCancelScopeSingle pins single-goal classification plus stamp validation.
+func checkCancelScopeSingle(t *testing.T, single dds.GoalID) {
+	t.Helper()
+	got, err := dds.ClassifyCancelRequest(single, 0, 0)
+	if err != nil {
+		t.Fatalf("classify single zero: %v", err)
+	}
+	if got != dds.CancelScopeSingle {
+		t.Fatalf("single plus zero = %v, want single", got)
+	}
+	got, err = dds.ClassifyCancelRequest(single, 10, 5)
+	if err != nil {
+		t.Fatalf("classify single stamp: %v", err)
+	}
+	if got != dds.CancelScopeSingleAndBefore {
+		t.Fatalf("single plus stamp = %v, want single_and_before", got)
+	}
+	if _, err := dds.ClassifyCancelRequest(single, 1, 1000000000); err == nil {
+		t.Fatalf("nsec above cap succeeded, want error")
+	}
+}
+
 // TestActionCancelScope checks the empty goal plus zero stamp policy.
 func TestActionCancelScope(t *testing.T) {
 	t.Parallel()
 	var empty dds.GoalID
-	if got := dds.ClassifyCancelRequest(empty, 0, 0); got != dds.CancelScopeAll {
-		t.Fatalf("empty plus zero = %v, want all", got)
-	}
-	if got := dds.ClassifyCancelRequest(empty, 10, 0); got != dds.CancelScopeBefore {
-		t.Fatalf("empty plus stamp = %v, want before", got)
-	}
+	checkCancelScopeEmpty(t, empty)
 	var single dds.GoalID
 	single[0] = 7
-	if got := dds.ClassifyCancelRequest(single, 0, 0); got != dds.CancelScopeSingle {
-		t.Fatalf("single plus zero = %v, want single", got)
-	}
-	if got := dds.ClassifyCancelRequest(single, 10, 5); got != dds.CancelScopeSingleAndBefore {
-		t.Fatalf("single plus stamp = %v, want single_and_before", got)
-	}
+	checkCancelScopeSingle(t, single)
 	if err := dds.ValidateCancelCode(dds.CancelErrorNone); err != nil {
 		t.Fatalf("validate cancel none: %v", err)
 	}
@@ -342,20 +379,14 @@ func TestActionGoalID(t *testing.T) {
 	}
 }
 
-// TestActionSequencePairing checks service GUID plus sequence pairing.
-//
-//nolint:cyclop // test pins sequence, request ID, and marshal pairing checks in one run, splitting would obscure intent
-func TestActionSequencePairing(t *testing.T) {
-	t.Parallel()
+// checkActionSequenceValidation pins sequence plus request ID validation.
+func checkActionSequenceValidation(t *testing.T, guid [8]byte) dds.ActionRequestID {
+	t.Helper()
 	if err := dds.ValidateActionSequence(0); !errors.Is(err, dds.ErrActionInvalidSequence) {
 		t.Fatalf("seq 0 = %v, want ErrActionInvalidSequence", err)
 	}
 	if err := dds.ValidateActionSequence(dds.FirstActionSequence); err != nil {
 		t.Fatalf("first seq: %v", err)
-	}
-	var guid [8]byte
-	for i := range guid {
-		guid[i] = byte(i + 1)
 	}
 	req := dds.ActionRequestID{ClientGUID: guid, Sequence: 7}
 	if err := dds.ValidateActionRequestID(req); err != nil {
@@ -364,8 +395,34 @@ func TestActionSequencePairing(t *testing.T) {
 	if err := dds.ValidateActionRequestID(dds.ActionRequestID{ClientGUID: guid}); !errors.Is(err, dds.ErrActionInvalidSequence) {
 		t.Fatalf("zero seq req succeeded, want error")
 	}
-	payload := []byte{0x01, 0x02, 0x03}
-	wire := dds.MarshalActionServiceRequest(payload, req, true)
+	return req
+}
+
+// checkActionSequenceMarshal pins marshal pairing plus error paths.
+func checkActionSequenceMarshal(t *testing.T, guid [8]byte, req dds.ActionRequestID, payload []byte) []byte {
+	t.Helper()
+	wire, err := dds.MarshalActionServiceRequest(payload, req, true)
+	if err != nil {
+		t.Fatalf("marshal service request: %v", err)
+	}
+	if _, err := dds.MarshalActionServiceRequest(payload, dds.ActionRequestID{ClientGUID: guid}, true); err == nil {
+		t.Fatalf("zero seq marshal succeeded, want error")
+	}
+	payload[0] = 0xFF
+	gotPayload, _, _, err := dds.ParseActionServiceRequest(wire)
+	if err != nil {
+		t.Fatalf("parse after input mutate: %v", err)
+	}
+	if gotPayload[0] == 0xFF {
+		t.Fatalf("marshal aliased caller payload")
+	}
+	payload[0] = 0x01
+	return wire
+}
+
+// checkActionSequenceParse pins parse pairing plus copy semantics.
+func checkActionSequenceParse(t *testing.T, guid [8]byte, req dds.ActionRequestID, wire []byte) {
+	t.Helper()
 	gotPayload, gotID, le, err := dds.ParseActionServiceRequest(wire)
 	if err != nil {
 		t.Fatalf("parse service request: %v", err)
@@ -383,13 +440,30 @@ func TestActionSequencePairing(t *testing.T) {
 	if dds.IsPairedReply(req, other) {
 		t.Fatalf("distinct sequences pair")
 	}
-	payload[0] = 0xFF
-	if gotPayload[0] == 0xFF {
-		t.Fatalf("marshal aliased caller payload")
+	gotPayload[0] = 0xEE
+	secondPayload, _, _, err := dds.ParseActionServiceRequest(wire)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if secondPayload[0] != 0x01 {
+		t.Fatalf("mutation through copy reached wire: %v", secondPayload)
 	}
 	if _, _, _, err := dds.ParseActionServiceRequest([]byte{0x00}); err == nil {
 		t.Fatalf("short service sample succeeded, want error")
 	}
+}
+
+// TestActionSequencePairing checks service GUID plus sequence pairing.
+func TestActionSequencePairing(t *testing.T) {
+	t.Parallel()
+	var guid [8]byte
+	for i := range guid {
+		guid[i] = byte(i + 1)
+	}
+	req := checkActionSequenceValidation(t, guid)
+	payload := []byte{0x01, 0x02, 0x03}
+	wire := checkActionSequenceMarshal(t, guid, req, payload)
+	checkActionSequenceParse(t, guid, req, wire)
 }
 
 // TestActionQoSFanout checks dual QoS fanout for services plus feedback plus status.

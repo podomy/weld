@@ -17,7 +17,8 @@ import (
 
 // configWatchBuffer sizes each watcher channel. Broadcast never blocks:
 // a full channel evicts its oldest event before the new one is queued,
-// and the evicted range stays recoverable through HistorySince.
+// and the evicted range stays recoverable through HistorySince within the
+// retained window only.
 // Evictions and drops increment BroadcastDrops loudly so overflow is never silent.
 const configWatchBuffer = 16
 
@@ -274,8 +275,8 @@ func cloneParamValue(v ParamValue) ParamValue {
 }
 
 // ParamDescriptor describes one parameter: its type, documentation, and
-// optional numeric range. A NotSet type means unconstrained: any concrete
-// value validates.
+// optional numeric range. A NotSet type means unconstrained at Declare, which
+// pins it to the first value type; only NotSet plus NotSet stays NotSet.
 type ParamDescriptor struct {
 	// Type is the required value type, or NotSet for unconstrained.
 	Type ParamType
@@ -544,7 +545,8 @@ func normalizeNodeKey(key string) string {
 // normalized with normalizeNodeKey before comparison. Duplicate section keys
 // that normalize to the same entry fail loudly naming both originals when
 // their contents differ; identical duplicates resolve deterministically in
-// sorted key order.
+// sorted key order. It panics on collision; use CollapseParamFilesChecked to
+// handle collisions as errors.
 func CollapseParamFiles(files map[string]map[string]ParamValue, nodeFQN string) map[string]ParamValue {
 	out, err := CollapseParamFilesChecked(files, nodeFQN)
 	if err != nil {
@@ -1077,7 +1079,7 @@ type ConfigStore struct {
 
 // BroadcastDrops returns the monotonic count of watcher broadcast evictions
 // plus drops. A full channel evicts its oldest event; the evicted range stays
-// recoverable through HistorySince.
+// recoverable through HistorySince within the retained window only.
 func (s *ConfigStore) BroadcastDrops() uint64 {
 	return s.drops.Load()
 }
@@ -1145,7 +1147,8 @@ func (s *ConfigStore) Remapped(name string) string {
 
 // Declare adds a parameter with its descriptor. The name is remapped first.
 // Re-declaring fails. The value must validate against the descriptor unless
-// both are NotSet. One declare is one versioned event.
+// both are NotSet. A NotSet descriptor pins to the first value type. One
+// declare is one versioned event.
 // Validators for the declare run outside the write lock against a read
 // snapshot with optimistic generation; a concurrent mutation aborts loudly.
 // Validators must still avoid deep reentrancy.
@@ -1322,8 +1325,9 @@ func cloneEvent(e ConfigEvent) ConfigEvent {
 }
 
 // Watch subscribes to future events. The returned version is the current
-// store version; HistorySince replays anything missed. The channel is
-// buffered and never blocks the store: a full channel evicts its oldest
+// store version; HistorySince replays anything missed within the retained
+// window only, which holds the last configHistoryLimit entries. The channel
+// is buffered and never blocks the store: a full channel evicts its oldest
 // event and counts the eviction in BroadcastDrops. Call cancel to unsubscribe;
 // cancel closes the channel. Consumers must tolerate non-monotonic event
 // order across concurrent batches: broadcast checks plus sends per watcher
@@ -1364,7 +1368,9 @@ func (s *ConfigStore) Watch() (uint64, <-chan ConfigEvent, func()) {
 // run in registration order outside the write lock against a read snapshot
 // with optimistic generation; the first error aborts the batch before apply
 // hooks run and before the version moves. A concurrent mutation between
-// validation and commit aborts loudly. Validators must still avoid deep
+// validation and commit aborts loudly. Registration bumps the version so a
+// concurrent batch prepared before registration aborts loudly instead of
+// bypassing the new validator. Validators must still avoid deep
 // reentrancy: they must not call back into the store.
 func (s *ConfigStore) AddValidator(name string, fn ConfigValidator) error {
 	err := ValidateParamName(name)
@@ -1378,11 +1384,14 @@ func (s *ConfigStore) AddValidator(name string, fn ConfigValidator) error {
 	defer s.mu.Unlock()
 	final := s.remappedLocked(name)
 	s.validators[final] = append(s.validators[final], fn)
+	s.version++
 	return nil
 }
 
 // AddApplyHook registers a post-set hook for one parameter. Hooks run after
 // a validated batch commits, in registration order, and never reject.
+// Registration bumps the version so a concurrent batch prepared before
+// registration aborts loudly instead of bypassing the new hook.
 func (s *ConfigStore) AddApplyHook(name string, fn ConfigApplyHook) error {
 	err := ValidateParamName(name)
 	if err != nil {
@@ -1395,6 +1404,7 @@ func (s *ConfigStore) AddApplyHook(name string, fn ConfigApplyHook) error {
 	defer s.mu.Unlock()
 	final := s.remappedLocked(name)
 	s.hooks[final] = append(s.hooks[final], fn)
+	s.version++
 	return nil
 }
 
@@ -1653,7 +1663,9 @@ func (s *ConfigStore) commitBatchWithValidators(updates map[string]ParamValue, d
 // collide on one final name. Type checks and read-only checks run here;
 // validators are collected here and run outside the write lock by the caller
 // with optimistic generation, so a late failure can never leave a partial
-// batch. The caller holds the write lock.
+// batch. Entries equal to the stored value are skipped with no change, so a
+// no-op batch yields an empty event and no version bump. The caller holds
+// the write lock.
 //
 // remapBatchLocked validates and remaps batch names deterministically.
 //
@@ -1708,32 +1720,51 @@ func (s *ConfigStore) prepareBatchLocked(
 	var pending []pendingValidator
 	for _, name := range ordered {
 		newValue := cloneParamValue(remapped[name])
-		entry, ok := s.params[name]
-		if !ok {
-			hookVals, pend, err := s.validateNewLocked(name, newValue, descs, autoDeclare)
-			if err != nil {
-				return ConfigEvent{}, nil, nil, err
-			}
-			pending = append(pending, pend...)
-			changes = append(changes, ConfigChange{Name: name, NewValue: newValue, HadOld: false})
-			for _, fn := range hookVals {
-				hooks = append(hooks, hookCall{fn: fn, old: ParamValue{}, new: cloneParamValue(newValue)})
-			}
-			continue
-		}
-		hookVals, pend, err := s.validateExistingNoValidatorsLocked(name, entry, newValue)
+		err := s.prepareSingleEntryLocked(name, newValue, descs, autoDeclare, &changes, &hooks, &pending)
 		if err != nil {
 			return ConfigEvent{}, nil, nil, err
-		}
-		pending = append(pending, pend...)
-		old := cloneParamValue(entry.value)
-		changes = append(changes, ConfigChange{Name: name, OldValue: old, NewValue: newValue, HadOld: true})
-		for _, fn := range hookVals {
-			hooks = append(hooks, hookCall{fn: fn, old: cloneParamValue(old), new: cloneParamValue(newValue)})
 		}
 	}
 	event := ConfigEvent{Version: next, Source: source, Changes: changes}
 	return event, hooks, pending, nil
+}
+
+// prepareSingleEntryLocked validates one remapped entry and appends its
+// change plus hooks plus validators. Equal stored values skip with no
+// change, so no-op writes never bump the version. The caller holds the
+// write lock.
+func (s *ConfigStore) prepareSingleEntryLocked(name string, newValue ParamValue, descs map[string]ParamDescriptor, autoDeclare bool, changes *[]ConfigChange, hooks *[]hookCall, pending *[]pendingValidator) error {
+	entry, ok := s.params[name]
+	if !ok {
+		hookVals, pend, err := s.validateNewLocked(name, newValue, descs, autoDeclare)
+		if err != nil {
+			return err
+		}
+		*pending = append(*pending, pend...)
+		*changes = append(*changes, ConfigChange{Name: name, NewValue: newValue, HadOld: false})
+		*hooks = appendHookCalls(*hooks, hookVals, ParamValue{}, newValue)
+		return nil
+	}
+	if entry.value.Equal(newValue) {
+		return nil
+	}
+	hookVals, pend, err := s.validateExistingNoValidatorsLocked(name, entry, newValue)
+	if err != nil {
+		return err
+	}
+	*pending = append(*pending, pend...)
+	old := cloneParamValue(entry.value)
+	*changes = append(*changes, ConfigChange{Name: name, OldValue: old, NewValue: newValue, HadOld: true})
+	*hooks = appendHookCalls(*hooks, hookVals, old, newValue)
+	return nil
+}
+
+// appendHookCalls builds hook calls for one change with snapshot copies.
+func appendHookCalls(hooks []hookCall, fns []ConfigApplyHook, old, newValue ParamValue) []hookCall {
+	for _, fn := range fns {
+		hooks = append(hooks, hookCall{fn: fn, old: cloneParamValue(old), new: cloneParamValue(newValue)})
+	}
+	return hooks
 }
 
 // validateNewLocked checks a write to an undeclared name. Auto-declare
@@ -1845,7 +1876,8 @@ func (s *ConfigStore) trimHistoryLocked() {
 // lock. Each watcher is checked plus sent under its own watcher mutex with a
 // per-watcher nonblocking send; a full channel evicts its oldest event and
 // counts loudly in BroadcastDrops, and a second full send drops loudly.
-// The evicted range stays available through HistorySince. Never sends on a
+// The evicted range stays available through HistorySince within the retained
+// window only. Never sends on a
 // closed channel because cancel deletes under the store write lock then
 // closes under the watcher mutex, while broadcast sends only while holding
 // that same watcher mutex with closed false (generation-checked delivery).

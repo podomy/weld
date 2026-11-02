@@ -44,13 +44,18 @@ func validateParamsNode(node string) error {
 // validateParamsName rejects bad parameter names at the CLI layer before
 // the store fails late.
 //
-// It mirrors the store shape rules so usage errors exit 2 with a weld
-// prefix instead of surfacing as runtime failures: empty, spaces or
-// slashes, leading or trailing dots, and empty segments all fail loudly.
-// The store still enforces the same rules as defense in depth.
+// It mirrors the store ValidateParamName charset rules so usage errors
+// exit 2 with a weld prefix instead of surfacing as runtime failures:
+// non-empty, at most 255 bytes, dot-separated segments each matching
+// [A-Za-z_][A-Za-z0-9_]*, no spaces or slashes, no leading or trailing
+// dots, and no empty segments. The store still enforces the same rules
+// as defense in depth.
 func validateParamsName(name string) error {
 	if name == "" {
 		return errors.New("weld: parameter name is empty") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("weld: parameter name %q exceeds 255 bytes", name)
 	}
 	if strings.ContainsAny(name, " \t\n\r/") {
 		return fmt.Errorf("weld: parameter name %q has spaces or slashes", name)
@@ -60,6 +65,27 @@ func validateParamsName(name string) error {
 	}
 	if strings.Contains(name, "..") {
 		return fmt.Errorf("weld: parameter name %q has an empty segment", name)
+	}
+	for segment := range strings.SplitSeq(name, ".") {
+		err := validateParamsSegment(segment)
+		if err != nil {
+			return fmt.Errorf("weld: parameter name %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// validateParamsSegment checks one dot-separated parameter name segment.
+func validateParamsSegment(segment string) error {
+	if segment == "" {
+		return errors.New("weld: empty name segment") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	for i := range len(segment) {
+		c := segment[i]
+		ok := c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return fmt.Errorf("weld: bad character %q in segment %q", c, segment)
+		}
 	}
 	return nil
 }
@@ -593,6 +619,10 @@ func applyParamsSetMany(owned *dds.MemoryStore, param dds.Parameter, stderr io.W
 }
 
 // runParamsSetCommand sets one parameter with optional atomic flag.
+//
+// The --atomic flag is vacuous for a single parameter: atomic and
+// non-atomic paths apply the same single update. It stays for symmetry
+// with multi-parameter flows and never changes arity or exit codes.
 func runParamsSetCommand(args []string, stdout, stderr io.Writer, store *dds.MemoryStore) int {
 	fs := flag.NewFlagSet("params set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -602,7 +632,7 @@ func runParamsSetCommand(args []string, stdout, stderr io.Writer, store *dds.Mem
 	}
 	nodeFlag := paramsNodeFlag(fs)
 	typeFlag := fs.String("type", "string", "value type")
-	atomicFlag := fs.Bool("atomic", false, "apply atomically")
+	atomicFlag := fs.Bool("atomic", false, "apply atomically (no-op for single param)")
 	err := fs.Parse(args)
 	if err != nil {
 		return 2

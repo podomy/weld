@@ -494,7 +494,6 @@ func TestGateCLIForwardRosTalkerSeenByWeldEcho(t *testing.T) {
 	if !strings.Contains(echoRes.stdout, live) {
 		t.Logf("weld echo did not receive ROS live %q (known user DATA gap), echo ok without payload\nstdout:\n%s\nstderr:\n%s", payload, echoRes.stdout, echoRes.stderr)
 		reason := "weld echo misses ROS user DATA but echo ok, known user DATA gap forward cli"
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }
@@ -582,7 +581,6 @@ func TestGateCLIReverseWeldPubSeenByRosEcho(t *testing.T) {
 		}
 		t.Logf("ros echo did not see live %q (known user DATA gap), pub ok\noutput:\n%s", payload, string(fileData))
 		reason := "ros echo misses weld user DATA but pub ok, known user DATA gap reverse cli"
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 }

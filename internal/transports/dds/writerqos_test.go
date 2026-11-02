@@ -177,9 +177,64 @@ func writerQoSParamHex(t *testing.T, wire []byte, id uint16) string {
 	return ""
 }
 
+// checkForwardQoSGoldenWire pins the exact PID bytes for one encoded preset.
+func checkForwardQoSGoldenWire(t *testing.T, wire []byte, golden writerQoSGolden) {
+	t.Helper()
+	if got := writerQoSParamHex(t, wire, rtps.PIDReliability); got != golden.reliability {
+		t.Fatalf("reliability bytes = %s, want %s", got, golden.reliability)
+	}
+
+	if got := writerQoSParamHex(t, wire, rtps.PIDHistory); got != golden.history {
+		t.Fatalf("history bytes = %s, want %s", got, golden.history)
+	}
+
+	if got := writerQoSParamHex(t, wire, rtps.PIDDurability); got != golden.durability {
+		t.Fatalf("durability bytes = %s, want %s", got, golden.durability)
+	}
+
+	if got := writerQoSParamHex(t, wire, writerQoSPIDDeadline); got != golden.deadline {
+		t.Fatalf("deadline bytes = %s, want %s", got, golden.deadline)
+	}
+
+	if got := writerQoSParamHex(t, wire, writerQoSPIDLifespan); got != golden.lifespan {
+		t.Fatalf("lifespan bytes = %s, want %s", got, golden.lifespan)
+	}
+
+	if got := writerQoSParamHex(t, wire, writerQoSPIDLiveliness); got != golden.liveliness {
+		t.Fatalf("liveliness bytes = %s, want %s", got, golden.liveliness)
+	}
+}
+
+// runForwardQoSGoldenCase runs one preset golden case by name.
+func runForwardQoSGoldenCase(t *testing.T, c writerQoSPresetCase, goldens map[string]writerQoSGolden) {
+	t.Helper()
+	q, err := ForwardQoS(writerQoSTestTopic, writerQoSTestPublisher, writerQoSTestSubscriber, c.profile)
+	if err != nil {
+		t.Fatalf("ForwardQoS %s: %v", c.name, err)
+	}
+
+	wire, err := rtps.EncodeParams(q.Params())
+	if err != nil {
+		t.Fatalf("encode %s: %v", c.name, err)
+	}
+
+	golden, ok := goldens[c.name]
+	if c.name == "explicit-finite" {
+		if !ok {
+			checkExplicitFiniteBytes(t, wire)
+		}
+
+		return
+	}
+
+	if !ok {
+		t.Fatalf("no golden for %s", c.name)
+	}
+
+	checkForwardQoSGoldenWire(t, wire, golden)
+}
+
 // TestForwardQoSPresetGoldens pins the exact PID bytes per preset.
-//
-//nolint:gocognit // test pins exact PID bytes across presets in one run, splitting would obscure intent
 func TestForwardQoSPresetGoldens(t *testing.T) {
 	cases := writerQoSPresets(t)
 	cases = append(cases,
@@ -191,49 +246,7 @@ func TestForwardQoSPresetGoldens(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			q, err := ForwardQoS(writerQoSTestTopic, writerQoSTestPublisher, writerQoSTestSubscriber, c.profile)
-			if err != nil {
-				t.Fatalf("ForwardQoS %s: %v", c.name, err)
-			}
-
-			wire := rtps.EncodeParams(q.Params())
-
-			golden, ok := goldens[c.name]
-			if c.name == "explicit-finite" {
-				if !ok {
-					checkExplicitFiniteBytes(t, wire)
-				}
-
-				return
-			}
-
-			if !ok {
-				t.Fatalf("no golden for %s", c.name)
-			}
-
-			if got := writerQoSParamHex(t, wire, rtps.PIDReliability); got != golden.reliability {
-				t.Fatalf("reliability bytes = %s, want %s", got, golden.reliability)
-			}
-
-			if got := writerQoSParamHex(t, wire, rtps.PIDHistory); got != golden.history {
-				t.Fatalf("history bytes = %s, want %s", got, golden.history)
-			}
-
-			if got := writerQoSParamHex(t, wire, rtps.PIDDurability); got != golden.durability {
-				t.Fatalf("durability bytes = %s, want %s", got, golden.durability)
-			}
-
-			if got := writerQoSParamHex(t, wire, writerQoSPIDDeadline); got != golden.deadline {
-				t.Fatalf("deadline bytes = %s, want %s", got, golden.deadline)
-			}
-
-			if got := writerQoSParamHex(t, wire, writerQoSPIDLifespan); got != golden.lifespan {
-				t.Fatalf("lifespan bytes = %s, want %s", got, golden.lifespan)
-			}
-
-			if got := writerQoSParamHex(t, wire, writerQoSPIDLiveliness); got != golden.liveliness {
-				t.Fatalf("liveliness bytes = %s, want %s", got, golden.liveliness)
-			}
+			runForwardQoSGoldenCase(t, c, goldens)
 		})
 	}
 }
@@ -269,7 +282,11 @@ func TestForwardQoSFramingGolden(t *testing.T) {
 		t.Fatalf("ForwardQoS default: %v", err)
 	}
 
-	got := hex.EncodeToString(rtps.EncodeParams(q.Params()))
+	encoded, err := rtps.EncodeParams(q.Params())
+	if err != nil {
+		t.Fatalf("encode framing golden: %v", err)
+	}
+	got := hex.EncodeToString(encoded)
 	want := "1a000c00" + "02000000ffffff7fffffffff" +
 		"40000800" + "000000000a000000" +
 		"1d000400" + "00000000" +

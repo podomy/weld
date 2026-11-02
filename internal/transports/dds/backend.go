@@ -669,6 +669,7 @@ func (b *Backend) advertiseWriterHistory(ctx context.Context) {
 
 	b.sweepExpiredRoutes(now)
 	sedpIdx.ExpireProvisional(now)
+	sedpIdx.ExpirePendingEvictions(now)
 
 	for _, ep := range sedpIdx.LocalEndpoints() {
 		if ep.IsReader {
@@ -1515,7 +1516,8 @@ func (b *Backend) installAnnouncementRoutes(ann Announcement, ports []int) {
 		delete(b.routeExpiry, ann.GUID.Prefix)
 		prefix := ann.GUID.Prefix
 		b.mu.Unlock()
-		b.evictParticipant(prefix)
+		b.evictParticipantRoutes(prefix)
+		b.scheduleSedpEvict(prefix)
 	case len(ann.Ports) != 0:
 		b.routes[ann.GUID.Prefix] = ports
 		lease := ann.Lease
@@ -2097,10 +2099,41 @@ func (b *Backend) nextRTPSSeqFor(guid WriterGUID) (uint64, error) {
 	return seq, nil
 }
 
+// rollbackSeqFor releases one claimed sequence after a failed send.
+//
+// It restores the per-writer next and the global count only when no other
+// publish has advanced past the failed seq, so a failed send may be retried
+// with the same sequence and the only-on-success contract holds for the
+// single-flight case. Concurrent successes keep their gaps instead of
+// corrupting the counter.
+func (b *Backend) rollbackSeqFor(guid WriterGUID, seq uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if seq == ^uint64(0) {
+		if b.rtpsSeqByWriter[guid] == 0 {
+			b.rtpsSeqByWriter[guid] = seq
+			if b.rtpsSeq != 0 && b.rtpsSeq != FirstSequenceNumber {
+				b.rtpsSeq--
+			}
+		}
+
+		return
+	}
+
+	if b.rtpsSeqByWriter[guid] == seq+1 {
+		b.rtpsSeqByWriter[guid] = seq
+		if b.rtpsSeq != 0 && b.rtpsSeq != FirstSequenceNumber {
+			b.rtpsSeq--
+		}
+	}
+}
+
 // sendData embeds payload in RTPS DATA and unicasts to each port.
 //
-// It stores the payload in history for ACKNACK repair before sending, so
-// a NACK arriving right after the send still finds the sample.
+// It stores the payload in history only after at least one route accepts
+// the datagram, so failed sends consume no history and may be retried with
+// the same sequence via rollbackSeqFor.
 func (b *Backend) sendData(
 	ctx context.Context,
 	guid WriterGUID,
@@ -2118,23 +2151,27 @@ func (b *Backend) sendData(
 		return err
 	}
 
-	b.mu.RLock()
-	history := b.repairHistory
-	b.mu.RUnlock()
-
-	if history != nil {
-		history.store(guid, seq, payload)
-	}
-
 	msg, err := b.buildDataMessage(guid, payload, seq)
 	if err != nil {
+		b.rollbackSeqFor(guid, seq)
+
 		return err
 	}
 
 	sent, last := sendToPorts(ctx, uni, ports, msg)
 	if sent > 0 {
+		b.mu.RLock()
+		history := b.repairHistory
+		b.mu.RUnlock()
+
+		if history != nil {
+			history.store(guid, seq, payload)
+		}
+
 		return nil
 	}
+
+	b.rollbackSeqFor(guid, seq)
 
 	if last != nil {
 		closed := b.isClosed()
@@ -2164,33 +2201,17 @@ func (b *Backend) WriteFrag(ctx context.Context, guid WriterGUID, seq uint64, fr
 		return fmt.Errorf("dds: frag sink context: %w", err)
 	}
 
-	if err = b.validateWriteFrag(guid, seq, fragNum, total, fragmentSize, sampleSize, data); err != nil {
-		return err
-	}
-
-	if fragNum == 1 {
-		if err = b.recordFragSeqUse(guid, seq); err != nil {
-			return err
-		}
-	}
-
-	ports := b.snapshotRoutes()
-	if len(ports) == 0 {
-		return fmt.Errorf("dds: frag sink without route: %w", ErrNoRoute)
-	}
-
-	uni := b.snapshotUnicast()
-	if uni == nil {
-		return fmt.Errorf("dds: frag sink without transport: %w", ErrDataPathNotWired)
-	}
-
-	msg, err := b.buildFragMessage(guid, seq, fragNum, total, fragmentSize, sampleSize, data)
+	ports, uni, msg, err := b.prepareFragMessage(ctx, guid, seq, fragNum, total, fragmentSize, sampleSize, data)
 	if err != nil {
 		return err
 	}
 
 	err = reportFragSend(ctx, b, uni, ports, msg)
 	if err != nil {
+		if fragNum == 1 {
+			b.rollbackFragSeqUse(guid, seq)
+		}
+
 		return err
 	}
 
@@ -2201,6 +2222,57 @@ func (b *Backend) WriteFrag(ctx context.Context, guid WriterGUID, seq uint64, fr
 	}
 
 	return nil
+}
+
+// prepareFragMessage validates one fragment and builds its wire message.
+//
+// It claims the Publisher seq on first fragments and rolls back on route,
+// transport, or build failures so failed sends may be retried with the same
+// sequence. It returns routes, unicast, and the encoded message for sending.
+func (b *Backend) prepareFragMessage(ctx context.Context, guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) ([]int, *rtps.UnicastConn, []byte, error) {
+	err := ctx.Err()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("dds: frag sink context: %w", err)
+	}
+
+	if err = b.validateWriteFrag(guid, seq, fragNum, total, fragmentSize, sampleSize, data); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if fragNum == 1 {
+		if err = b.recordFragSeqUse(guid, seq); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		if fragNum == 1 {
+			b.rollbackFragSeqUse(guid, seq)
+		}
+
+		return nil, nil, nil, fmt.Errorf("dds: frag sink without route: %w", ErrNoRoute)
+	}
+
+	uni := b.snapshotUnicast()
+	if uni == nil {
+		if fragNum == 1 {
+			b.rollbackFragSeqUse(guid, seq)
+		}
+
+		return nil, nil, nil, fmt.Errorf("dds: frag sink without transport: %w", ErrDataPathNotWired)
+	}
+
+	msg, err := b.buildFragMessage(guid, seq, fragNum, total, fragmentSize, sampleSize, data)
+	if err != nil {
+		if fragNum == 1 {
+			b.rollbackFragSeqUse(guid, seq)
+		}
+
+		return nil, nil, nil, err
+	}
+
+	return ports, uni, msg, nil
 }
 
 // recordFragSeqUse records one Publisher seq as the single RTPS seq.
@@ -2242,6 +2314,14 @@ func (b *Backend) recordFragSeqUse(guid WriterGUID, seq uint64) error {
 	return nil
 }
 
+// rollbackFragSeqUse releases one recorded Publisher seq after a failed first fragment.
+//
+// It shares rollbackSeqFor so the two paths stay identical; a failed first
+// fragment may be retried with the same sequence.
+func (b *Backend) rollbackFragSeqUse(guid WriterGUID, seq uint64) {
+	b.rollbackSeqFor(guid, seq)
+}
+
 // sendFragTerminalHeartbeat stores the completed frag run in repair history
 // and sends its terminal heartbeat. It returns nil only when at least one
 // route accepted the heartbeat.
@@ -2269,41 +2349,75 @@ func (b *Backend) sendFragTerminalHeartbeat(ctx context.Context, uni *rtps.Unica
 //
 // It copies the fragment bytes so the caller may reuse the input. The
 // caller must hold no lock; this self-locks. The table is bounded by
-// fragSendMaxEntries with a fragSendTimeout sweep mirroring the inbound
-// reassembler: expired entries drop loudly and a full table evicts the
-// oldest entry loudly instead of growing without limit.
+// fragSendMaxEntries plus fragMaxBytes with a fragSendTimeout sweep
+// mirroring the inbound reassembler: expired entries drop loudly and a full
+// table evicts the oldest entry loudly instead of growing without limit.
 func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if b.fragSend == nil {
 		b.fragSend = make(map[fragKey]*fragSendEntry)
 	}
-	b.sweepFragSendLocked(time.Now())
+	now := time.Now()
+	expired := b.sweepFragSendLocked(now)
 	key := fragKey{guid: guid, seq: seq}
 	entry, ok := b.fragSend[key]
+	var evictedOldest fragKey
+	evictedOldestOk := false
+	var evictedBytes []fragKey
 	if !ok {
-		if len(b.fragSend) >= fragSendMaxEntries {
-			b.evictOldestFragSendLocked()
-		}
+		evictedOldest, evictedOldestOk, evictedBytes = b.makeRoomForFragSendLocked(sampleSize)
 		entry = &fragSendEntry{
 			sampleSize:   sampleSize,
 			fragmentSize: fragmentSize,
 			total:        total,
 			buf:          make([]byte, sampleSize),
 			received:     make([]bool, total),
-			firstSeen:    time.Now(),
+			firstSeen:    now,
 		}
 		b.fragSend[key] = entry
 	}
+	bufferFragSendEntry(entry, fragNum, total, fragmentSize, sampleSize, data)
+	b.mu.Unlock()
+
+	logFragSendEvictions(expired, evictedOldest, evictedOldestOk)
+	for _, evicted := range evictedBytes {
+		log.Printf("dds: frag send bytes evict guid=%x seq=%d", evicted.guid, evicted.seq)
+	}
+}
+
+// makeRoomForFragSendLocked evicts entries to fit one new sample.
+//
+// The caller must hold b.mu for write. It first evicts for entry count,
+// then for byte budget, returning evicted keys for loud logging after unlock.
+func (b *Backend) makeRoomForFragSendLocked(sampleSize uint32) (fragKey, bool, []fragKey) {
+	var evictedOldest fragKey
+	evictedOldestOk := false
+	if len(b.fragSend) >= fragSendMaxEntries {
+		evictedOldest, evictedOldestOk = b.evictOldestFragSendLocked()
+	}
+	var evictedBytes []fragKey
+	for b.fragSendBytesLocked()+uint64(sampleSize) > fragMaxBytes && len(b.fragSend) > 0 {
+		oldest, hasOldest := b.evictOldestFragSendLocked()
+		if !hasOldest {
+			break
+		}
+		evictedBytes = append(evictedBytes, oldest)
+	}
+
+	return evictedOldest, evictedOldestOk, evictedBytes
+}
+
+// bufferFragSendEntry copies one fragment into its entry when geometry matches.
+//
+// It checks total, sizes, bounds, and duplicates without growing the table,
+// so mismatched or duplicate fragments drop silently while valid ones buffer.
+func bufferFragSendEntry(entry *fragSendEntry, fragNum, total uint32, fragmentSize uint16, sampleSize uint32, data []byte) {
 	if entry.total != total || entry.sampleSize != sampleSize || entry.fragmentSize != fragmentSize {
 		return
 	}
 	idx := fragNum - 1
-	if uint64(idx) >= uint64(len(entry.received)) {
-		return
-	}
-	if entry.received[idx] {
+	if uint64(idx) >= uint64(len(entry.received)) || entry.received[idx] {
 		return
 	}
 	off := uint64(fragNum-1) * uint64(fragmentSize)
@@ -2320,11 +2434,26 @@ func (b *Backend) accumulateFragSend(guid WriterGUID, seq uint64, fragNum, total
 	entry.count++
 }
 
+// logFragSendEvictions logs expired plus full-table evictions after unlock.
+//
+// It runs without the backend lock so high-volume eviction logging never
+// blocks discovery or the data path.
+func logFragSendEvictions(expired []fragKey, oldest fragKey, hasOldest bool) {
+	for _, evicted := range expired {
+		log.Printf("dds: frag send timeout evict guid=%x seq=%d", evicted.guid, evicted.seq)
+	}
+	if hasOldest {
+		log.Printf("dds: frag send table full evict guid=%x seq=%d", oldest.guid, oldest.seq)
+	}
+}
+
 // sweepFragSendLocked deletes expired outbound entries and counts loudly.
 //
-// The caller must hold b.mu for write. Expired entries drop with a demux
-// error plus log so the eviction is loud instead of silent.
-func (b *Backend) sweepFragSendLocked(now time.Time) {
+// The caller must hold b.mu for write. It returns timed-out keys for the
+// caller to log after unlock so logging never holds the backend lock.
+// Expired entries bump demuxErrors under lock; logging happens after unlock.
+func (b *Backend) sweepFragSendLocked(now time.Time) []fragKey {
+	var expired []fragKey
 	for key, entry := range b.fragSend {
 		if entry == nil {
 			delete(b.fragSend, key)
@@ -2335,22 +2464,39 @@ func (b *Backend) sweepFragSendLocked(now time.Time) {
 		}
 		delete(b.fragSend, key)
 		b.demuxErrors++
-		log.Printf("dds: frag send timeout evict guid=%x seq=%d", key.guid, key.seq)
+		expired = append(expired, key)
 	}
+	return expired
+}
+
+// fragSendBytesLocked returns total buffered outbound fragment bytes.
+//
+// The caller must hold b.mu.
+func (b *Backend) fragSendBytesLocked() uint64 {
+	var total uint64
+	for _, entry := range b.fragSend {
+		if entry != nil {
+			total += uint64(entry.sampleSize)
+		}
+	}
+
+	return total
 }
 
 // evictOldestFragSendLocked drops the oldest outbound entry loudly.
 //
 // The caller must hold b.mu for write and must have swept timeouts first.
 // It bounds the table at fragSendMaxEntries when many writers interleave.
-func (b *Backend) evictOldestFragSendLocked() {
+// It returns the evicted key for the caller to log after unlock so logging
+// never holds the backend lock.
+func (b *Backend) evictOldestFragSendLocked() (fragKey, bool) {
 	var (
 		oldestKey fragKey
 		oldest    time.Time
 		first     = true
 	)
 	for key, entry := range b.fragSend {
-		t := time.Now()
+		var t time.Time
 		if entry != nil {
 			t = entry.firstSeen
 		}
@@ -2359,11 +2505,11 @@ func (b *Backend) evictOldestFragSendLocked() {
 		}
 	}
 	if first {
-		return
+		return fragKey{}, false
 	}
 	delete(b.fragSend, oldestKey)
 	b.demuxErrors++
-	log.Printf("dds: frag send table full evict guid=%x seq=%d", oldestKey.guid, oldestKey.seq)
+	return oldestKey, true
 }
 
 // storeFragSendHistory stores one completed outbound sample in history.
@@ -2455,6 +2601,22 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 		return err
 	}
 
+	err = b.sendPlainFragRun(ctx, uni, ports, guid, seq, sample, sampleSize, fragmentSize, total)
+	if err != nil {
+		b.rollbackSeqFor(guid, seq)
+
+		return err
+	}
+
+	b.commitPlainFragSeq(guid, seq)
+
+	err = b.sendPlainFragHeartbeat(ctx, uni, ports, guid, seq)
+	if err != nil {
+		b.rollbackSeqFor(guid, seq)
+
+		return err
+	}
+
 	b.mu.RLock()
 	history := b.repairHistory
 	b.mu.RUnlock()
@@ -2463,14 +2625,7 @@ func (b *Backend) sendPlainFrags(ctx context.Context, guid WriterGUID, sample []
 		history.store(guid, seq, sample)
 	}
 
-	err = b.sendPlainFragRun(ctx, uni, ports, guid, seq, sample, sampleSize, fragmentSize, total)
-	if err != nil {
-		return err
-	}
-
-	b.commitPlainFragSeq(guid, seq)
-
-	return b.sendPlainFragHeartbeat(ctx, uni, ports, guid, seq)
+	return nil
 }
 
 // claimPlainFragSeq claims the next DATA sequence for one writer.
@@ -3343,6 +3498,12 @@ func (b *Backend) noteSedpHeartbeatBound(remote WriterGUID, beat rtps.Heartbeat)
 		b.sedpHeartbeatCount = make(map[WriterGUID]int32)
 	}
 
+	if _, seen := b.sedpHeartbeatLast[remote]; !seen {
+		if _, seenCount := b.sedpHeartbeatCount[remote]; !seenCount {
+			b.capSedpHeartbeatLocked(remote)
+		}
+	}
+
 	lastCount := b.sedpHeartbeatCount[remote]
 	lastLast := b.sedpHeartbeatLast[remote]
 	if beat.Count != 0 && lastCount != 0 && beat.Count <= lastCount && beat.LastSequence <= lastLast {
@@ -3608,11 +3769,28 @@ func (b *Backend) ReportLiveliness(ctx context.Context, report transports.Liveli
 		return fmt.Errorf("dds: report liveliness before join: %w", transports.ErrNotJoined)
 	}
 
+	if b.lastGen == nil {
+		b.lastGen = make(map[string]uint64)
+	}
+	if b.lastAlive == nil {
+		b.lastAlive = make(map[string]bool)
+	}
+	if b.leases == nil {
+		b.leases = make(map[string]time.Time)
+	}
+
+	var now time.Time
+	if b.clock != nil {
+		now = b.clock.Now()
+	} else {
+		now = time.Now()
+	}
+
 	last, seen := b.lastGen[report.ParticipantName]
 	if !seen {
 		b.lastGen[report.ParticipantName] = report.Generation
 		b.lastAlive[report.ParticipantName] = report.Alive
-		b.leases[report.ParticipantName] = b.clock.Now()
+		b.leases[report.ParticipantName] = now
 
 		return nil
 	}
@@ -3620,7 +3798,7 @@ func (b *Backend) ReportLiveliness(ctx context.Context, report transports.Liveli
 	if report.Generation > last {
 		b.lastGen[report.ParticipantName] = report.Generation
 		b.lastAlive[report.ParticipantName] = report.Alive
-		b.leases[report.ParticipantName] = b.clock.Now()
+		b.leases[report.ParticipantName] = now
 
 		return nil
 	}
@@ -3955,14 +4133,14 @@ func (b *Backend) HasRemoteEndpoint(topic string) bool {
 // CycloneDDS drops user DATA that arrives before its reader matches as
 // no readers out-of-sync. Waiting here keeps SEDP ahead of DATA: after
 // the synchronous announce above, the peer still needs one announce
-// interval to process SEDP and match. It polls every 20ms up to 1s and
-// returns true when a match appears. On timeout it returns false so the
-// caller still sends best-effort for Weld-to-Weld peers that never
-// announce readers. Context cancellation aborts early with false. A single
-// stopped timer with Reset paces polls instead of a fresh timer per tick.
-func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) bool {
+// interval to process SEDP and match. It polls every 20ms up to 1s. On
+// timeout it still returns so the caller sends best-effort for Weld-to-Weld
+// peers that never announce readers. Context cancellation aborts early.
+// A single stopped timer with Reset paces polls instead of a fresh timer
+// per tick.
+func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) {
 	if b.hasMatchingRemoteReader(ep) {
-		return true
+		return
 	}
 
 	timer := newStoppedTimer()
@@ -3971,19 +4149,17 @@ func (b *Backend) waitForMatchingReader(ctx context.Context, ep SEDPEndpoint) bo
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
-			return false
+			return
 		}
 
 		if !waitForTimerOrCancel(ctx, timer, 20*time.Millisecond) {
-			return false
+			return
 		}
 
 		if b.hasMatchingRemoteReader(ep) {
-			return true
+			return
 		}
 	}
-
-	return b.hasMatchingRemoteReader(ep)
 }
 
 // newStoppedTimer returns a timer stopped and drained for Reset reuse.
@@ -4086,7 +4262,8 @@ func (b *Backend) SubscribeWithPartitions(ctx context.Context, topic, typeName, 
 //
 // SEDP declare stores no partitions by default; this backfills the field
 // on locals for one topic and type so matching and announce carry the
-// requested set. It bumps generation once when any record changes.
+// requested set. Local partition stamps bump generation once when any
+// record actually changes.
 func (b *Backend) stampLocalPartitions(topic, typeName string, partitions []string) error {
 	b.mu.RLock()
 	sedpIdx := b.sedp
@@ -4372,58 +4549,118 @@ func (b *Backend) alignPublisherGUID(snapPublisher *Publisher, writer WriterGUID
 
 // dispatchPublish declares the writer and sends through the selected path.
 //
-// It holds publishMu from find through send so concurrent topics cannot
-// interleave find plus align plus PublishTo and emit A under writer B.
-// Without this guard the shared Publisher GUID plus sequence would race:
-// one topic aligns to its writer while another publishes, producing a
-// sample with the wrong GUID and a false per-writer sequence gap. Plain
-// DATA also serializes here so route checks and per-writer claims stay
-// ordered. The SEDP writer is announced synchronously before DATA so
-// single shot publishers do not exit before the periodic loop sends it.
-// Route misses map to routeError so the CLI can retry with backoff.
+// It holds publishMu from find through announce and align so concurrent
+// topics cannot interleave find plus align plus PublishTo and emit A under
+// writer B. Without this guard the shared Publisher GUID plus sequence
+// would race: one topic aligns to its writer while another publishes,
+// producing a sample with the wrong GUID and a false per-writer sequence
+// gap. The lock releases during waitForMatchingReader plus
+// pauseForPeerProcessing, then re-snapshots routes and re-checks plus
+// re-aligns before sending so waits never block concurrent topics while
+// sends stay ordered. Plain DATA also serializes here so route checks and
+// per-writer claims stay ordered. The SEDP writer is announced
+// synchronously before DATA so single shot publishers do not exit before
+// the periodic loop sends it. Route misses map to routeError so the CLI can
+// retry with backoff.
 func (b *Backend) dispatchPublish(
 	ctx context.Context,
 	msg transports.OutgoingMessage,
 	snap publishSnapshot,
 ) error {
 	b.publishMu.Lock()
-	defer b.publishMu.Unlock()
 
-	ep, err := b.declarePublishWriter(snap.sedp, msg)
+	ep, writer, ports, isPlain, err := b.preparePublishLocked(ctx, msg, snap)
 	if err != nil {
+		b.publishMu.Unlock()
+
 		return err
 	}
 
-	ports := b.snapshotRoutes()
-	if len(ports) == 0 {
-		return routeError(msg.TopicName, snap.domain, ErrNoRoute)
-	}
+	if !isPlain {
+		sink := &frameSink{backend: b, routes: ports, hasRoutes: true}
 
-	writer := b.writerForPublish(snap, ep)
-
-	err = b.announceWriterForPublish(ctx, msg, ep, writer, snap)
-	if err != nil {
-		return err
-	}
-
-	if isPlainCDRSample(msg.Payload, msg.TypeName) {
-		err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+		err = snap.publisher.PublishTo(ctx, sink, msg)
+		b.publishMu.Unlock()
 		if err != nil {
-			return err
+			if errors.Is(err, ErrNoRoute) {
+				return routeError(msg.TopicName, snap.domain, err)
+			}
+
+			return fmt.Errorf("dds: publish: %w", err)
 		}
 
 		return nil
 	}
 
-	sink := &frameSink{backend: b, routes: ports, hasRoutes: true}
+	b.publishMu.Unlock()
 
-	err = snap.publisher.PublishTo(ctx, sink, msg)
+	return b.publishPlainAfterWait(ctx, msg, snap, ep, writer)
+}
+
+// preparePublishLocked declares one writer and snapshots its route.
+//
+// The caller must hold publishMu for write and must unlock on return. It
+// declares the SEDP writer, snapshots routes, resolves the DATA writer,
+// announces once, and aligns the publisher. It returns the endpoint,
+// writer, ports, and whether the sample needs plain interop waits.
+func (b *Backend) preparePublishLocked(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot) (SEDPEndpoint, WriterGUID, []int, bool, error) {
+	ep, err := b.declarePublishWriter(snap.sedp, msg)
 	if err != nil {
-		if errors.Is(err, ErrNoRoute) {
-			return routeError(msg.TopicName, snap.domain, err)
+		return SEDPEndpoint{}, WriterGUID{}, nil, false, err
+	}
+
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		return SEDPEndpoint{}, WriterGUID{}, nil, false, routeError(msg.TopicName, snap.domain, ErrNoRoute)
+	}
+
+	writer := b.writerForPublish(snap, ep)
+
+	if ep.ID != (SEDPGUID{}) {
+		err = b.announceWriterOnce(ctx, ep)
+		if err != nil {
+			if errors.Is(err, ErrNoRoute) {
+				return SEDPEndpoint{}, WriterGUID{}, nil, false, routeError(msg.TopicName, snap.domain, err)
+			}
+
+			return SEDPEndpoint{}, WriterGUID{}, nil, false, err
 		}
 
-		return fmt.Errorf("dds: publish: %w", err)
+		b.alignPublisherGUID(snap.publisher, writer)
+	}
+
+	return ep, writer, ports, isPlainCDRSample(msg.Payload, msg.TypeName), nil
+}
+
+// publishPlainAfterWait waits for peer matching then sends plain DATA.
+//
+// It runs without publishMu across waits, then re-locks to re-snapshot
+// routes and re-align before sending so concurrent publishes cannot flap
+// the shared GUID while waits never block them.
+func (b *Backend) publishPlainAfterWait(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot, ep SEDPEndpoint, writer WriterGUID) error {
+	b.waitForMatchingReader(ctx, ep)
+
+	err := b.pauseForPeerProcessing(ctx)
+	if err != nil {
+		return err
+	}
+
+	b.publishMu.Lock()
+	ports := b.snapshotRoutes()
+	if len(ports) == 0 {
+		b.publishMu.Unlock()
+
+		return routeError(msg.TopicName, snap.domain, ErrNoRoute)
+	}
+
+	if ep.ID != (SEDPGUID{}) {
+		b.alignPublisherGUID(snap.publisher, writer)
+	}
+
+	err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+	b.publishMu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -4658,20 +4895,32 @@ func closeTeardown(peer UDPPeer, mcastRx, mcastUserRx *rtps.MulticastConn) error
 // evictWriter drops per-writer reliability state for one removed writer.
 //
 // It deletes remote contiguity tracking, SEDP high sequences and heartbeat
-// bounds, and receiver take state so a later writer reusing the GUID
-// restarts clean. It self-locks and is safe for concurrent use.
+// bounds, repair history, outbound fragment state, and receiver take state
+// so a later writer reusing the GUID restarts clean. It also drops the
+// prompt NACK count so the global table never retains the Backend pointer.
+// It self-locks and is safe for concurrent use.
 func (b *Backend) evictWriter(guid WriterGUID) {
 	b.mu.Lock()
 	delete(b.remoteTrack, guid)
 	delete(b.sedpHighSeq, guid)
 	delete(b.sedpHeartbeatLast, guid)
 	delete(b.sedpHeartbeatCount, guid)
+	for key := range b.fragSend {
+		if key.guid == guid {
+			delete(b.fragSend, key)
+		}
+	}
+	history := b.repairHistory
 	receiver := b.receiver
 	b.mu.Unlock()
 
 	promptNackMu.Lock()
 	delete(promptNackCounts, promptNackKey{backend: b, guid: guid})
 	promptNackMu.Unlock()
+
+	if history != nil {
+		history.evict(guid)
+	}
 
 	if receiver != nil {
 		receiver.EvictWriter(guid)
@@ -4681,8 +4930,12 @@ func (b *Backend) evictWriter(guid WriterGUID) {
 // evictParticipant drops per-writer state for all writers on one prefix.
 //
 // It snapshots matching GUIDs under lock, then evicts each without holding
-// the backend lock across receiver locks. It is used when SPDP removes a
-// participant or its route lease expires.
+// the backend lock across receiver locks. It also removes matching SEDP
+// remotes so discovery state never outlives the participant route; the
+// remove hook re-evicts reliability state idempotently. It is used when
+// a route lease expires after ten seconds of silence, where no in-flight
+// user DATA can still take. SPDP dispose uses evictParticipantRoutes plus
+// scheduleSedpEvict instead so single-shot DATA still takes.
 // writerPrefixOf returns the participant prefix of one writer GUID.
 func writerPrefixOf(guid WriterGUID) GUIDPrefix {
 	var p GUIDPrefix
@@ -4692,22 +4945,180 @@ func writerPrefixOf(guid WriterGUID) GUIDPrefix {
 }
 
 func (b *Backend) evictParticipant(prefix GUIDPrefix) {
+	guids, history, sedpIdx := b.collectBackendEvictGuids(prefix)
+	guids = appendHistoryEvictGuids(guids, history, prefix)
+	guids = b.appendPromptEvictGuids(guids, prefix)
+	evictSedpRemotesForPrefix(sedpIdx, prefix)
+
+	for _, guid := range guids {
+		b.evictWriter(guid)
+	}
+}
+
+// evictParticipantRoutes drops routes plus per-writer reliability state
+// for one prefix without touching SEDP remotes.
+//
+// SPDP dispose calls this so sends stop at once while endpoint records
+// survive their grace period for in-flight takes. Pair it with
+// scheduleSedpEvict.
+func (b *Backend) evictParticipantRoutes(prefix GUIDPrefix) {
+	guids, history, _ := b.collectBackendEvictGuids(prefix)
+	guids = appendHistoryEvictGuids(guids, history, prefix)
+	guids = b.appendPromptEvictGuids(guids, prefix)
+
+	for _, guid := range guids {
+		b.evictWriter(guid)
+	}
+}
+
+// scheduleSedpEvict defers SEDP remote removal for one prefix past the
+// dispose grace period so in-flight user DATA still resolves.
+func (b *Backend) scheduleSedpEvict(prefix GUIDPrefix) {
 	b.mu.RLock()
+	sedpIdx := b.sedp
+	clock := b.clock
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return
+	}
+
+	var now time.Time
+	if clock != nil {
+		now = clock.Now()
+	} else {
+		now = time.Now()
+	}
+
+	var sedpPrefix SEDPGUIDPrefix
+	copy(sedpPrefix[:], prefix[:])
+	sedpIdx.SchedulePrefixEvict(sedpPrefix, now)
+}
+
+// collectBackendEvictGuids snapshots backend per-writer GUIDs for one prefix.
+//
+// It returns matching GUIDs plus history and SEDP pointers for later steps
+// without holding the backend lock across receiver locks.
+func (b *Backend) collectBackendEvictGuids(prefix GUIDPrefix) ([]WriterGUID, *userHistory, *SEDPIndex) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	var guids []WriterGUID
+	guids = b.collectRemoteTrackGuids(prefix, guids)
+	guids = b.collectSedpHighSeqGuids(prefix, guids)
+	guids = b.collectSedpHeartbeatGuids(prefix, guids)
+	guids = b.collectFragSendGuids(prefix, guids)
+
+	return guids, b.repairHistory, b.sedp
+}
+
+// collectRemoteTrackGuids appends remote track writers for one prefix.
+//
+// The caller must hold b.mu for read.
+func (b *Backend) collectRemoteTrackGuids(prefix GUIDPrefix, guids []WriterGUID) []WriterGUID {
 	for guid := range b.remoteTrack {
 		if writerPrefixOf(guid) == prefix {
 			guids = append(guids, guid)
 		}
 	}
+
+	return guids
+}
+
+// collectSedpHighSeqGuids appends SEDP high seq writers for one prefix.
+//
+// The caller must hold b.mu for read.
+func (b *Backend) collectSedpHighSeqGuids(prefix GUIDPrefix, guids []WriterGUID) []WriterGUID {
 	for guid := range b.sedpHighSeq {
 		if writerPrefixOf(guid) == prefix && !slices.Contains(guids, guid) {
 			guids = append(guids, guid)
 		}
 	}
-	b.mu.RUnlock()
 
-	for _, guid := range guids {
-		b.evictWriter(guid)
+	return guids
+}
+
+// collectSedpHeartbeatGuids appends heartbeat bound writers for one prefix.
+//
+// The caller must hold b.mu for read.
+func (b *Backend) collectSedpHeartbeatGuids(prefix GUIDPrefix, guids []WriterGUID) []WriterGUID {
+	for guid := range b.sedpHeartbeatLast {
+		if writerPrefixOf(guid) == prefix && !slices.Contains(guids, guid) {
+			guids = append(guids, guid)
+		}
+	}
+	for guid := range b.sedpHeartbeatCount {
+		if writerPrefixOf(guid) == prefix && !slices.Contains(guids, guid) {
+			guids = append(guids, guid)
+		}
+	}
+
+	return guids
+}
+
+// collectFragSendGuids appends outbound fragment writers for one prefix.
+//
+// The caller must hold b.mu for read.
+func (b *Backend) collectFragSendGuids(prefix GUIDPrefix, guids []WriterGUID) []WriterGUID {
+	for key := range b.fragSend {
+		if writerPrefixOf(key.guid) == prefix && !slices.Contains(guids, key.guid) {
+			guids = append(guids, key.guid)
+		}
+	}
+
+	return guids
+}
+
+// appendHistoryEvictGuids adds history writers for one prefix.
+//
+// It keeps deterministic cleanup for repair state that has no backend map
+// entry, such as history-only writers.
+func appendHistoryEvictGuids(guids []WriterGUID, history *userHistory, prefix GUIDPrefix) []WriterGUID {
+	if history == nil {
+		return guids
+	}
+
+	for _, guid := range history.writers() {
+		if writerPrefixOf(guid) == prefix && !slices.Contains(guids, guid) {
+			guids = append(guids, guid)
+		}
+	}
+
+	return guids
+}
+
+// appendPromptEvictGuids adds prompt NACK writers for one prefix.
+//
+// It keeps deterministic cleanup for prompt-only writers so the global
+// table never retains the Backend pointer after the participant leaves.
+func (b *Backend) appendPromptEvictGuids(guids []WriterGUID, prefix GUIDPrefix) []WriterGUID {
+	promptNackMu.Lock()
+	defer promptNackMu.Unlock()
+
+	for key := range promptNackCounts {
+		if key.backend == b && writerPrefixOf(key.guid) == prefix && !slices.Contains(guids, key.guid) {
+			guids = append(guids, key.guid)
+		}
+	}
+
+	return guids
+}
+
+// evictSedpRemotesForPrefix removes SEDP remotes for one participant prefix.
+//
+// It runs without the backend lock; the remove hook re-evicts reliability
+// state idempotently so discovery never outlives the route.
+func evictSedpRemotesForPrefix(sedpIdx *SEDPIndex, prefix GUIDPrefix) {
+	if sedpIdx == nil {
+		return
+	}
+
+	var sedpPrefix SEDPGUIDPrefix
+	copy(sedpPrefix[:], prefix[:])
+	for _, ep := range sedpIdx.RemoteEndpoints() {
+		if ep.ID.Prefix == sedpPrefix {
+			sedpIdx.RemoveRemote(ep.ID)
+		}
 	}
 }
 

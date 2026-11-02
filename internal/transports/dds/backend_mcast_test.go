@@ -118,7 +118,7 @@ func checkSelfFiltering(t *testing.T, backend *Backend) {
 //
 //nolint:gocognit,cyclop // test pins join, port, snapshot, filter, and close breadth in one run, splitting would obscure intent
 func TestBackendMulticastJoinCloseLifecycle(t *testing.T) {
-	const domain uint32 = 90
+	const domain uint32 = 22
 
 	first := newLiveBackend(t, domain, "mcast-a")
 	defer func() {
@@ -225,7 +225,7 @@ func TestBackendMulticastJoinCloseLifecycle(t *testing.T) {
 //
 //nolint:gocognit,cyclop // test pins peer setup, send, install, and take breadth in one run, splitting would obscure intent
 func TestBackendMulticastSEDPInstallsWriter(t *testing.T) {
-	const domain uint32 = 91
+	const domain uint32 = 23
 
 	backend := newLiveBackend(t, domain, "mcast-sedp")
 	defer func() {
@@ -335,7 +335,7 @@ func TestBackendMulticastSEDPInstallsWriter(t *testing.T) {
 func TestBackendUserMulticastDeliversData(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 92
+	const domain uint32 = 24
 
 	first := newLiveBackend(t, domain, "umcast-a")
 	defer func() {

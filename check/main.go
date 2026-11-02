@@ -14,7 +14,7 @@
 // nothing. The test timeout matches the documented live budget because
 // the ros live package exceeds the 10 minute go test default with the
 // peer up. cmd/weld is its own module outside the workspace and runs
-// with GOWORK=off.
+// with GOWORK=off. CI plus hook stay offline and live runs are manual via serial.sh with fleet up.
 package main
 
 import (

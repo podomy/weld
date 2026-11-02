@@ -567,11 +567,11 @@ func testSupervisionBonds(t *testing.T, group *sdk.SerialGroup) {
 		t.Fatalf("fake advance late: %v", err)
 	}
 	dead := group.CheckBonds(later)
-	if len(dead) == 0 {
-		t.Fatalf("expired bonds reported none dead")
-	}
 	if dead == nil {
 		t.Fatalf("CheckBonds returned nil, want non-nil empty-or-dead slice")
+	}
+	if len(dead) == 0 {
+		t.Fatalf("expired bonds reported none dead")
 	}
 	err = group.Deactivate()
 	if err != nil {

@@ -80,7 +80,7 @@ SEDP
   testbed/unit/sedp/conformance_test.go:530.
 - Every DATA carries HEARTBEATs: publications announce from 0x000002c2
   plus the CycloneDDS variant 0x000003c2, subscriptions from 0x000004c2
-  (internal/transports/dds/sedp.go:157-164; announce loop
+  (internal/transports/dds/sedp.go:177-182; announce loop
   at internal/transports/dds/sedp.go:1006).
   Heartbeat body is 28 bytes (internal/transports/dds/sedp.go:132-133).
   Pinned by testbed/unit/sedp/conformance_test.go:604.
@@ -105,7 +105,7 @@ SEDP
   of depending on per-reader unicast. Pinned by
   TestBackendUserMulticastDeliversData.
 - Writer set is 0x000002c2 plus 0x000003c2 plus 0x000004c2
-  (internal/transports/dds/sedp.go:157-164).
+  (internal/transports/dds/sedp.go:177-182).
   Pinned by testbed/unit/sedp/conformance_test.go:799.
 
 Type hashes
@@ -381,11 +381,12 @@ CLI
 Gates
 
 Run: unit with go test ./testbed/unit/... -count=1, live with
-go test -tags live ./testbed/live/... -count=1 against the already running
+go test ./testbed/live/... -count=1 against the already running
 weld-jazzy peer (see testbed/live/helpers/helpers.go:444).
+Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 Only one run per domain and topic at a time.
 Parallel live tests allocate exclusive domains 70 through 101
-(testbed/live/helpers/domainpool.go); fixed numbers stay reserved: 42
+(testbed/live/helpers/domainpool.go:196 for AllocateDomainLease, :474 for MustAllocateDomain); fixed numbers stay reserved: 42
 for the canonical ROS peer, 48 for SPDP, 47 for the serial
 single-entrypoint gate, 43 plus 44 for the Humble plus Rolling distro
 matrix, 55 for large payloads (46 abandoned, no host-container
@@ -411,7 +412,7 @@ testbed/live/cyclone/gate1_spdp_test.go:379 and :421.
   (internal/transports/dds/datapath.go:802) and the TakeFrom fallback in
   DataReceiver.TakeFrom (internal/transports/dds/datapath.go:1322).
   Writer 03c2 is sedpPublicationsWriterCyclone
-  (internal/transports/dds/sedp.go:160-162), the announce loop is
+  (internal/transports/dds/sedp.go:177-182), the announce loop is
   SEDPIndex.AnnounceLoop with a 1 s resend interval
   (internal/transports/dds/sedp.go:1006,
   internal/transports/dds/sedp.go:139), DATA plus Heartbeat is the backend

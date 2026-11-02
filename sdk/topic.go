@@ -284,6 +284,18 @@ func (s *Subscription) Len() int {
 }
 
 // deliver queues one bus sample with drop oldest overflow.
+//
+// Channel and lock discipline: deliver holds mu for the closed check and
+// all channel steps. The two send probes and the eviction are
+// non-blocking so a concurrent Next that freed space is observed without
+// wedging. Next receives without holding mu so a blocked receiver never
+// wedges deliver or Close. Close sets closed under mu then closes the
+// channel after unlocking, so no send races a close. The overflow path
+// rechecks with a second non-blocking send before evicting so a
+// concurrent Next that freed space does not count a lost drop. Lost
+// increments only when an oldest sample is actually evicted. The final
+// send never blocks because the eviction just freed one slot, or the
+// channel already had space when no eviction was needed.
 func (s *Subscription) deliver(payload []byte) {
 	if s == nil {
 		return
@@ -300,10 +312,15 @@ func (s *Subscription) deliver(payload []byte) {
 	default:
 	}
 	select {
-	case <-s.ch:
+	case s.ch <- owned:
+		return
 	default:
 	}
-	s.lost.Add(1)
+	select {
+	case <-s.ch:
+		s.lost.Add(1)
+	default:
+	}
 	s.ch <- owned
 }
 
@@ -557,6 +574,12 @@ func (m *LoanedMessage) Valid() bool {
 }
 
 // Bytes exposes the sample bytes. It fails after Return.
+//
+// Zero-copy aliasing contract: the returned slice aliases the loaned
+// handle and stays valid only until Return. The caller must not retain or
+// mutate it, since the loan path must stay zero-copy and a future
+// in-process transport may back this handle with shared memory. Copy the
+// bytes first when longer ownership or mutation is needed.
 func (m *LoanedMessage) Bytes() ([]byte, error) {
 	if m == nil {
 		return nil, fmt.Errorf("sdk: loaned bytes on nil message: %w", ErrLoanReturned)

@@ -516,10 +516,11 @@ func (g *Graph) Participants() map[GID]ParticipantInfo {
 //
 // It accepts rt, rq, and rr prefixed names plus bare names. Prefixed
 // requests require the Request suffix and prefixed replies require the
-// Reply suffix. Bare names use the same suffix rule. The result is the
-// demangled ROS name such as /chatter. Transports perform the same mapping
-// at the border; this helper lets core ingestion validate the same shape
-// without importing transport packages.
+// Reply suffix. Bare names stay verbatim with no suffix stripping, so a
+// legitimate bare name such as myRequest maps to /myRequest. The result is
+// the demangled ROS name such as /chatter. Transports perform the same
+// mapping at the border; this helper lets core ingestion validate the same
+// shape without importing transport packages.
 func DemangleTopicName(ddsTopic string) (string, error) {
 	trimmed := strings.TrimSpace(ddsTopic)
 	err := validateDDSTopicName(trimmed, ddsTopic)
@@ -617,22 +618,10 @@ func demanglePrefixedTopic(trimmed, raw string) (string, bool, error) {
 
 // demangleBareTopic maps a prefix free DDS name back to ROS form.
 //
-// A trailing Request marks a request and a trailing Reply marks a reply,
-// otherwise the name is a normal topic. The exact names Request and Reply
-// alone map to /Request and /Reply as normal topics.
+// Bare names stay verbatim with no Request or Reply stripping: only rq and
+// rr prefixed forms strip those suffixes, so legitimate bare names such as
+// myRequest keep their suffix. The result is slash plus the trimmed name.
 func demangleBareTopic(trimmed string) string {
-	if strings.HasSuffix(trimmed, "Request") && trimmed != "Request" {
-		base := strings.TrimSuffix(trimmed, "Request")
-		if base != "" && !strings.HasSuffix(base, "/") {
-			return "/" + base
-		}
-	}
-	if strings.HasSuffix(trimmed, "Reply") && trimmed != "Reply" {
-		base := strings.TrimSuffix(trimmed, "Reply")
-		if base != "" && !strings.HasSuffix(base, "/") {
-			return "/" + base
-		}
-	}
 	return "/" + trimmed
 }
 

@@ -222,7 +222,11 @@ func partitionLiveQoS(t *testing.T, partitions []string) []byte {
 	if err != nil {
 		t.Fatalf("partition param: %v", err)
 	}
-	return rtps.EncodeParams([]rtps.Param{param})
+	raw, err := rtps.EncodeParams([]rtps.Param{param})
+	if err != nil {
+		t.Fatalf("encode partition param: %v", err)
+	}
+	return raw
 }
 
 // partitionLiveWirePartitions serializes one endpoint to SEDP DATA bytes,

@@ -27,7 +27,10 @@ func TestEncodeParamsGolden(t *testing.T) {
 		{ID: rtps.PIDTopicName, Value: []byte{0x01, 0x02, 0x03}},
 		{ID: rtps.PIDVendorID, Value: []byte{0x01, 0x02, 0x03, 0x04}},
 	}
-	got := rtps.EncodeParams(params)
+	got, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode golden: %v", err)
+	}
 	want := []byte{
 		0x50, 0x00, 0x01, 0x00, 0xAA, 0x00, 0x00, 0x00,
 		0x05, 0x00, 0x02, 0x00, 0x01, 0x02, 0x00, 0x00,
@@ -56,7 +59,10 @@ func TestEncodeParamsGolden(t *testing.T) {
 func TestEncodeParamsEmpty(t *testing.T) {
 	t.Parallel()
 
-	got := rtps.EncodeParams(nil)
+	got, err := rtps.EncodeParams(nil)
+	if err != nil {
+		t.Fatalf("encode empty: %v", err)
+	}
 	want := []byte{0x01, 0x00, 0x00, 0x00}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("empty encode = % X, want % X", got, want)
@@ -106,7 +112,10 @@ func TestDecodeParamsUnknownID(t *testing.T) {
 		{ID: rtps.PIDVendorID, Value: []byte{0x01, 0x10}},
 		{ID: 0xFFFF, Value: []byte{}},
 	}
-	raw := rtps.EncodeParams(params)
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode unknown: %v", err)
+	}
 	back, err := rtps.DecodeParams(raw)
 	if err != nil {
 		t.Fatalf("decode unknown: %v", err)
@@ -499,7 +508,10 @@ func listenReuse(t *testing.T, port int) (net.PacketConn, error) {
 func TestDecodeParamsEndianOrders(t *testing.T) {
 	t.Parallel()
 
-	le := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTopicName, Value: []byte("rt/x")}})
+	le, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTopicName, Value: []byte("rt/x")}})
+	if err != nil {
+		t.Fatalf("encode le: %v", err)
+	}
 
 	gotLE, consumed, err := rtps.DecodeParamsEndian(le, true)
 	if err != nil {
@@ -537,7 +549,11 @@ func TestDecodeParamsEndianOrders(t *testing.T) {
 func TestDecodeParamsEndianTrailing(t *testing.T) {
 	t.Parallel()
 
-	blob := append(rtps.EncodeParams(nil), 0xAA, 0xBB)
+	empty, err := rtps.EncodeParams(nil)
+	if err != nil {
+		t.Fatalf("encode empty: %v", err)
+	}
+	blob := append(append([]byte(nil), empty...), 0xAA, 0xBB)
 
 	got, consumed, err := rtps.DecodeParamsEndian(blob, true)
 	if err != nil {
@@ -574,7 +590,7 @@ func TestDecodeParamsEndianTruncated(t *testing.T) {
 	}
 }
 
-// TestEncodeParamsTruncates caps values to the uint16 range.
+// TestEncodeParamsTruncates rejects values above the uint16 range.
 func TestEncodeParamsTruncates(t *testing.T) {
 	t.Parallel()
 
@@ -582,16 +598,8 @@ func TestEncodeParamsTruncates(t *testing.T) {
 	for i := range big {
 		big[i] = 0xAB
 	}
-	raw := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTopicName, Value: big}})
-	back, err := rtps.DecodeParams(raw)
-	if err != nil {
-		t.Fatalf("decode truncated: %v", err)
-	}
-	if len(back) != 1 {
-		t.Fatalf("params = %d, want 1", len(back))
-	}
-	if len(back[0].Value) != 0xFFFF {
-		t.Fatalf("truncated len = %d, want %d", len(back[0].Value), 0xFFFF)
+	if _, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTopicName, Value: big}}); err == nil {
+		t.Fatalf("oversize encode succeeded, want error")
 	}
 }
 
@@ -656,7 +664,10 @@ func TestDecodeParamsVendorGolden(t *testing.T) {
 		{ID: rtps.PIDVendorAdlinkEntityFactory, Value: []byte{0x01, 0x00, 0x00, 0x00}},
 	}
 
-	raw := rtps.EncodeParams(params)
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode vendor: %v", err)
+	}
 	back, err := rtps.DecodeParams(raw)
 	if err != nil {
 		t.Fatalf("decode vendor: %v", err)
@@ -674,7 +685,10 @@ func TestDecodeParamsVendorGolden(t *testing.T) {
 
 	// Pin golden bytes for 0x8003 with zero value.
 	want8003 := []byte{0x03, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
-	single := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDVendorAdlinkWriterDataLifecycle, Value: []byte{0x00, 0x00, 0x00, 0x00}}})
+	single, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDVendorAdlinkWriterDataLifecycle, Value: []byte{0x00, 0x00, 0x00, 0x00}}})
+	if err != nil {
+		t.Fatalf("encode 0x8003: %v", err)
+	}
 	if !bytes.Equal(single, want8003) {
 		t.Fatalf("0x8003 golden = % X, want % X", single, want8003)
 	}
@@ -684,19 +698,28 @@ func TestDecodeParamsVendorGolden(t *testing.T) {
 func TestDecodeParamsManualAndBuiltinGolden(t *testing.T) {
 	t.Parallel()
 
-	manual := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDParticipantManualLivelinessCount, Value: []byte{0x07, 0x00, 0x00, 0x00}}})
+	manual, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDParticipantManualLivelinessCount, Value: []byte{0x07, 0x00, 0x00, 0x00}}})
+	if err != nil {
+		t.Fatalf("encode manual: %v", err)
+	}
 	wantManual := []byte{0x34, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
 	if !bytes.Equal(manual, wantManual) {
 		t.Fatalf("manual golden = % X, want % X", manual, wantManual)
 	}
 
-	builtin := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDBuiltinEndpointQos, Value: []byte{0x3F, 0x00, 0x00, 0x00}}})
+	builtin, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDBuiltinEndpointQos, Value: []byte{0x3F, 0x00, 0x00, 0x00}}})
+	if err != nil {
+		t.Fatalf("encode builtin: %v", err)
+	}
 	wantBuiltin := []byte{0x77, 0x00, 0x04, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}
 	if !bytes.Equal(builtin, wantBuiltin) {
 		t.Fatalf("builtin QoS golden = % X, want % X", builtin, wantBuiltin)
 	}
 
-	typeObject := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTypeObject, Value: []byte{0x01, 0x02}}})
+	typeObject, err := rtps.EncodeParams([]rtps.Param{{ID: rtps.PIDTypeObject, Value: []byte{0x01, 0x02}}})
+	if err != nil {
+		t.Fatalf("encode type object: %v", err)
+	}
 	back, err := rtps.DecodeParams(typeObject)
 	if err != nil {
 		t.Fatalf("decode type object: %v", err)

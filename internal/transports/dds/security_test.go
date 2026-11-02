@@ -380,3 +380,90 @@ func TestSecuredReceiverStaysHealthy(t *testing.T) {
 		t.Fatalf("topic %q, want %q", msg.TopicName, "/sec_health")
 	}
 }
+
+// checkSecurityMalformedHardRequire pins one hard-require key fail-closed.
+func checkSecurityMalformedHardRequire(t *testing.T, key string) {
+	t.Helper()
+	good := secTestPropList(t, key, "file:material")
+	malformed := append(append([]byte(nil), good...), 0xFF)
+	params := []rtps.Param{{ID: PIDPropertyList, Value: malformed}}
+
+	info, warnings := ExtractSecurityInfo(params)
+	if len(warnings) == 0 {
+		t.Fatalf("key %s malformed list must warn", key)
+	}
+
+	foundInvalid := false
+	for _, w := range warnings {
+		if errors.Is(w, ErrSecurityPropertyInvalid) {
+			foundInvalid = true
+		}
+	}
+	if !foundInvalid {
+		t.Fatalf("key %s warnings miss invalid sentinel: %v", key, warnings)
+	}
+
+	if info.Classification != SecurityRequiresCrypto {
+		t.Fatalf("key %s class %q, want RequiresCrypto", key, info.Classification)
+	}
+
+	err := CheckProtectedDiscovery(info)
+	if !errors.Is(err, ErrSecuredDiscoveryRequiresCrypto) {
+		t.Fatalf("key %s discovery err %v, want RequiresCrypto reject", key, err)
+	}
+
+	endianInfo, endianWarnings := ExtractSecurityInfoEndian(params, true)
+	if len(endianWarnings) == 0 {
+		t.Fatalf("key %s endian malformed list must warn", key)
+	}
+	if endianInfo.Classification != SecurityRequiresCrypto {
+		t.Fatalf("key %s endian class %q, want RequiresCrypto", key, endianInfo.Classification)
+	}
+	err = CheckProtectedDiscovery(endianInfo)
+	if !errors.Is(err, ErrSecuredDiscoveryRequiresCrypto) {
+		t.Fatalf("key %s endian discovery err %v, want RequiresCrypto reject", key, err)
+	}
+}
+
+// TestSecurityMalformedHardRequireFailClosed pins malformed governance,
+// permissions, and crypto property lists as RequiresCrypto.
+func TestSecurityMalformedHardRequireFailClosed(t *testing.T) {
+	t.Parallel()
+
+	hardKeys := []string{
+		"dds.sec.access.governance",
+		"dds.sec.access.permissions",
+		"dds.sec.access.permissions_ca",
+		"dds.sec.auth.identity_certificate",
+		"dds.sec.auth.private_key",
+		"dds.sec.crypto.key_exchange_algorithm",
+	}
+
+	for _, key := range hardKeys {
+		checkSecurityMalformedHardRequire(t, key)
+	}
+}
+
+// TestSecurityMalformedBenignStaysCompatible pins a malformed list without
+// hard-require markers as CompatibleUnknown instead of RequiresCrypto.
+func TestSecurityMalformedBenignStaysCompatible(t *testing.T) {
+	t.Parallel()
+
+	good := secTestPropList(t, "dds.sec.auth.identity_ca", "file:ca.pem")
+	malformed := append(append([]byte(nil), good...), 0xFF)
+	params := []rtps.Param{{ID: PIDPropertyList, Value: malformed}}
+
+	info, warnings := ExtractSecurityInfo(params)
+	if len(warnings) == 0 {
+		t.Fatalf("benign malformed list must warn")
+	}
+
+	if info.Classification != SecurityCompatibleUnknown {
+		t.Fatalf("benign class %q, want CompatibleUnknown", info.Classification)
+	}
+
+	err := CheckProtectedDiscovery(info)
+	if err != nil {
+		t.Fatalf("benign discovery must pass, got %v", err)
+	}
+}

@@ -344,7 +344,7 @@ func TestServiceUserdataToleratesUnknown(t *testing.T) {
 	}
 }
 
-// TestCheckServiceAvailable checks counts plus service id fallback.
+// TestCheckServiceAvailable checks counts plus strict service ids.
 func TestCheckServiceAvailable(t *testing.T) {
 	t.Parallel()
 
@@ -372,12 +372,24 @@ func TestCheckServiceAvailable(t *testing.T) {
 		t.Fatalf("writer id match unavailable, want true")
 	}
 
+	if !CheckServiceAvailable(1, 1, "ab", []string{"AB"}, nil) {
+		t.Fatalf("uppercase reader id unavailable, want lowercase match true")
+	}
+
+	if !CheckServiceAvailable(1, 1, "AB", nil, []string{"ab"}) {
+		t.Fatalf("uppercase want unavailable, want lowercase match true")
+	}
+
 	if CheckServiceAvailable(1, 1, "ab", []string{"cd"}, []string{"ef"}) {
 		t.Fatalf("mismatched ids available, want false")
 	}
 
-	if !CheckServiceAvailable(1, 1, "ab", nil, nil) {
-		t.Fatalf("no advertised ids unavailable, want fallback true")
+	if CheckServiceAvailable(1, 1, "ab", nil, nil) {
+		t.Fatalf("no advertised ids available, want strict false")
+	}
+
+	if CheckServiceAvailable(1, 1, "ab", []string{}, []string{}) {
+		t.Fatalf("empty advertised ids available, want strict false")
 	}
 }
 

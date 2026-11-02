@@ -416,18 +416,18 @@ func checkActionResultTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("result inside retention from completion must flow: %v", err)
 	}
-	_, _, err = srv.GetResult("g1", 10000000000+1000000001)
+	_, _, err = srv.GetResult("g1", 10000000000+1000000000)
 	if err == nil {
-		t.Fatal("result past retention from completion must time out")
+		t.Fatal("result at exactly the retention bound must time out")
 	}
 	if !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("timeout error must say timed out, got %q", err.Error())
+		t.Fatalf("boundary timeout must say timed out, got %q", err.Error())
 	}
-	_, ok := srv.GoalStatusOf("g1", 10000000000+1000000001)
+	_, ok := srv.GoalStatusOf("g1", 10000000000+1000000000)
 	if ok {
-		t.Fatal("expired result must evict from status lookup")
+		t.Fatal("expired result must evict from status lookup at the bound")
 	}
-	err = srv.AcceptGoal("g1", 0, ClockWall, 10000000000+1000000001)
+	err = srv.AcceptGoal("g1", 0, ClockWall, 10000000000+1000000000)
 	if err != nil {
 		t.Fatalf("expired id must be reusable: %v", err)
 	}

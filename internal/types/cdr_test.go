@@ -664,20 +664,29 @@ func TestCdrOctetSequence(t *testing.T) {
 	}
 }
 
-// drainTruncatedDecoder drains truncated decoder allowing failures.
+// drainTruncatedDecoder drains truncated decoder and requires an error.
+// It counts body plus Finish errors and fails when a truncated input decodes with zero errors.
 func drainTruncatedDecoder(t *testing.T, dec *Decoder) {
 	t.Helper()
+	errs := 0
 	if _, err := dec.ReadUint32(); err != nil {
+		errs++
 		t.Logf("truncated uint32 read: %v", err)
 	}
 	if _, err := dec.ReadString(); err != nil {
+		errs++
 		t.Logf("truncated string read: %v", err)
 	}
 	if _, err := dec.ReadFloat64(); err != nil {
+		errs++
 		t.Logf("truncated float64 read: %v", err)
 	}
 	if err := dec.Finish(); err != nil {
+		errs++
 		t.Logf("truncated finish: %v", err)
+	}
+	if errs == 0 {
+		t.Fatalf("truncated input decoded with zero errors, want at least one")
 	}
 }
 

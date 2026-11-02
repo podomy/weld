@@ -1399,7 +1399,7 @@ func TestBackendSnoopAnnouncementRoutes(t *testing.T) {
 		}
 	}()
 
-	const domain uint32 = 77
+	const domain uint32 = 25
 
 	local, err := NewLocalParticipant(domain, DefaultLeaseDuration)
 	if err != nil {

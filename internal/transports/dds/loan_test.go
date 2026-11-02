@@ -708,3 +708,186 @@ func TestLoanNewReceiverInvalid(t *testing.T) {
 		t.Fatal("nil receiver take from succeeded")
 	}
 }
+
+// TestLoanBytesAliasVisible pins the zero-copy alias: views share live storage.
+func TestLoanBytesAliasVisible(t *testing.T) {
+	t.Parallel()
+	pool, err := NewLoanPool(2, 64)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	loan, err := pool.Borrow(loanEligibleTable(), 4)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	defer func() {
+		err := loan.Return()
+		if err != nil {
+			t.Errorf("return: %v", err)
+		}
+	}()
+	first, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	copy(first, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	second, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("second bytes: %v", err)
+	}
+	if !bytes.Equal(second, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+		t.Fatalf("second view = %v, want alias of first write", second)
+	}
+	second[0] = 0xAA
+	third, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("third bytes: %v", err)
+	}
+	if third[0] != 0xAA {
+		t.Fatalf("third view byte 0 = %#02x, want alias of second write", third[0])
+	}
+}
+
+// checkLoanSendSide pins borrow plus Send invalidation on the sender side.
+func checkLoanSendSide(t *testing.T, pool *LoanPool, ch *LoanChannel) []byte {
+	t.Helper()
+	loan, err := pool.Borrow(loanEligibleTable(), 4)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	saved, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	copy(saved, []byte{0x11, 0x22, 0x33, 0x44})
+	err = ch.Send(loan)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if loan.Valid() {
+		t.Fatalf("sender handle still valid after send")
+	}
+	_, err = loan.Bytes()
+	if !errors.Is(err, ErrLoanReturned) {
+		t.Fatalf("sender bytes after send = %v, want ErrLoanReturned", err)
+	}
+	err = ch.Send(loan)
+	if !errors.Is(err, ErrLoanReturned) {
+		t.Fatalf("second send = %v, want ErrLoanReturned", err)
+	}
+	return saved
+}
+
+// checkLoanRecvAlias pins receiver alias visibility plus Return invalidation.
+func checkLoanRecvAlias(t *testing.T, ch *LoanChannel, saved []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultLoanTestTimeout)
+	defer cancel()
+	got, err := ch.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	payload, err := got.Bytes()
+	if err != nil {
+		t.Fatalf("recv bytes: %v", err)
+	}
+	if !bytes.Equal(payload, []byte{0x11, 0x22, 0x33, 0x44}) {
+		t.Fatalf("recv payload = %v, want sent pattern", payload)
+	}
+	saved[0] = 0xFF
+	if payload[0] != 0xFF {
+		t.Fatalf("recv byte 0 = %#02x after saved mutation, want alias visible", payload[0])
+	}
+	saved[0] = 0x11
+	err = got.Return()
+	if err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	_, err = got.Bytes()
+	if !errors.Is(err, ErrLoanReturned) {
+		t.Fatalf("recv bytes after return = %v, want ErrLoanReturned", err)
+	}
+}
+
+// TestLoanSendAliasStaleContract pins the must-drop-views contract across Send.
+func TestLoanSendAliasStaleContract(t *testing.T) {
+	t.Parallel()
+	pool, err := NewLoanPool(2, 64)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	ch, err := NewLoanChannel(2)
+	if err != nil {
+		t.Fatalf("new channel: %v", err)
+	}
+	saved := checkLoanSendSide(t, pool, ch)
+	checkLoanRecvAlias(t, ch, saved)
+}
+
+// TestLoanStaleSliceReuse pins post-Return recycling: stale views observe reuse.
+// checkLoanReturnZeroes pins zeroing of the backing array on Return.
+func checkLoanReturnZeroes(t *testing.T, pool *LoanPool) []byte {
+	t.Helper()
+	loan, err := pool.Borrow(loanEligibleTable(), 8)
+	if err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	view, err := loan.Bytes()
+	if err != nil {
+		t.Fatalf("bytes: %v", err)
+	}
+	for i := range view {
+		view[i] = 0xAA
+	}
+	stale := view
+	err = loan.Return()
+	if err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	for i, b := range stale {
+		if b != 0 {
+			t.Fatalf("stale byte %d = %#02x after return, want zeroed", i, b)
+		}
+	}
+	return stale
+}
+
+// checkLoanRecycledReuse pins stale views observing recycled reuse.
+func checkLoanRecycledReuse(t *testing.T, pool *LoanPool, stale []byte) {
+	t.Helper()
+	next, err := pool.Borrow(loanEligibleTable(), 8)
+	if err != nil {
+		t.Fatalf("reborrow: %v", err)
+	}
+	defer func() {
+		err := next.Return()
+		if err != nil {
+			t.Errorf("return recycled: %v", err)
+		}
+	}()
+	fresh, err := next.Bytes()
+	if err != nil {
+		t.Fatalf("fresh bytes: %v", err)
+	}
+	for i, b := range fresh {
+		if b != 0 {
+			t.Fatalf("recycled byte %d = %#02x, want zeroed", i, b)
+		}
+	}
+	copy(fresh, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+	for i := range stale {
+		if stale[i] != fresh[i] {
+			t.Fatalf("stale byte %d = %#02x, want reuse alias %#02x", i, stale[i], fresh[i])
+		}
+	}
+}
+
+func TestLoanStaleSliceReuse(t *testing.T) {
+	t.Parallel()
+	pool, err := NewLoanPool(1, 8)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	stale := checkLoanReturnZeroes(t, pool)
+	checkLoanRecycledReuse(t, pool, stale)
+}

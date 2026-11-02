@@ -373,6 +373,7 @@ func checkSerialLifecycleOrder(t *testing.T) {
 		t.Fatal("shutdown must clear active and configured")
 	}
 	group.Destroy()
+	checkSerialDetachCleanup(t)
 }
 
 // checkSerialLateAttach pins late entities auto configure plus activate.
@@ -416,6 +417,63 @@ func checkSerialLateAttach(t *testing.T) {
 		t.Fatalf("late work missing, trace %v", got)
 	}
 	group.Destroy()
+}
+
+// checkSerialDetachCleanup pins Detach runs Deactivate plus Cleanup in order
+// mirroring Attach Configure plus Activate.
+func checkSerialDetachCleanup(t *testing.T) {
+	t.Helper()
+	guard := &serialOrderGuard{}
+	mkEntity := func(name string) SerialEntity {
+		return SerialEntity{
+			Name:       name,
+			Configure:  func() error { guard.serialRecord("configure " + name); return nil },
+			Activate:   func() error { guard.serialRecord("activate " + name); return nil },
+			Deactivate: func() error { guard.serialRecord("deactivate " + name); return nil },
+			Cleanup:    func() error { guard.serialRecord("cleanup " + name); return nil },
+		}
+	}
+	group, err := NewSerialGroup("detach-cleanup")
+	if err != nil {
+		t.Fatalf("new group: %v", err)
+	}
+	defer group.Destroy()
+	err = group.Attach(mkEntity("worker"))
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	err = group.Configure()
+	if err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	err = group.Activate()
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	err = group.Detach("worker")
+	if err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	assertSerialOrder(t, guard.serialSnapshot(), []string{"configure worker", "activate worker", "deactivate worker", "cleanup worker"})
+	if group.Len() != 0 {
+		t.Fatalf("detach must remove entry, got len %d", group.Len())
+	}
+	quiet, err := NewSerialGroup("detach-quiet")
+	if err != nil {
+		t.Fatalf("new group: %v", err)
+	}
+	defer quiet.Destroy()
+	err = quiet.Attach(mkEntity("idle"))
+	if err != nil {
+		t.Fatalf("attach idle: %v", err)
+	}
+	err = quiet.Detach("idle")
+	if err != nil {
+		t.Fatalf("detach without lifecycle must succeed: %v", err)
+	}
+	if quiet.Len() != 0 {
+		t.Fatalf("quiet detach must remove entry, got len %d", quiet.Len())
+	}
 }
 
 // checkSerialDeactivateRejects pins SpinOnce skips Take while inactive.

@@ -701,17 +701,18 @@ func (s *ActionServer) cacheLocked(goal *actionGoal, status GoalStatus, payload 
 	}
 }
 
-// isExpiredLocked reports whether a result exceeded retention from completion.
+// isExpiredLocked reports whether a result reached retention from completion.
 //
 // A backward jump where now is before completion never expires, so the
 // cache survives clock rewinds. Elapsed uses the saturating helper so
-// near-range fake clocks cannot overflow the subtraction. Callers must hold
-// the mutex.
+// near-range fake clocks cannot overflow the subtraction. Expiry uses at or
+// past the timeout, matching DeadlineExceeded and MissedAt. Callers must
+// hold the mutex.
 func (s *ActionServer) isExpiredLocked(res *actionResult, nowNanos int64) bool {
 	if nowNanos < res.completedNanos {
 		return false
 	}
-	return saturatingSub(nowNanos, res.completedNanos) > s.resultTimeoutNanos
+	return saturatingSub(nowNanos, res.completedNanos) >= s.resultTimeoutNanos
 }
 
 // purgeExpiredLocked evicts results whose retention lapsed at nowNanos.

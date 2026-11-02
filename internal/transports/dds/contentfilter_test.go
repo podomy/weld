@@ -625,3 +625,201 @@ func TestContentFilterTruncatedSweep(t *testing.T) {
 		}
 	}
 }
+
+// intFilterDesc builds a single int64 field descriptor for boundary tests.
+func intFilterDesc() *types.MessageMembers {
+	return &types.MessageMembers{
+		Namespace:   "weld_test__msg",
+		Name:        "IntBound",
+		MemberCount: 1,
+		Members: []types.MessageMember{
+			{Name: "v", TypeID: types.RosTypeInt64},
+		},
+	}
+}
+
+// uintFilterDesc builds a single uint64 field descriptor for boundary tests.
+func uintFilterDesc() *types.MessageMembers {
+	return &types.MessageMembers{
+		Namespace:   "weld_test__msg",
+		Name:        "UintBound",
+		MemberCount: 1,
+		Members: []types.MessageMember{
+			{Name: "u", TypeID: types.RosTypeUint64},
+		},
+	}
+}
+
+// encodeFilterInt64 encodes one int64 sample as XCDR1.
+func encodeFilterInt64(t *testing.T, v int64) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	enc.WriteInt64(v)
+	return enc.Bytes()
+}
+
+// encodeFilterUint64 encodes one uint64 sample as XCDR1.
+func encodeFilterUint64(t *testing.T, v uint64) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	enc.WriteUint64(v)
+	return enc.Bytes()
+}
+
+// checkLossyEquality pins loud eval errors above 2^53 for = and <>.
+func checkLossyEquality(t *testing.T, desc *types.MessageMembers, bigPayload []byte) {
+	t.Helper()
+	for _, expr := range []string{
+		"v = 9007199254740992.0",
+		"v <> 9007199254740992.0",
+	} {
+		f, err := CompileContentFilter(expr)
+		if err != nil {
+			t.Fatalf("compile %q: %v", expr, err)
+		}
+		_, err = f.Evaluate(bigPayload, desc)
+		if err == nil {
+			t.Fatalf("eval %q above 2^53 succeeded, want lossy error", expr)
+		}
+		if !errors.Is(err, ErrContentFilterEvalError) {
+			t.Fatalf("eval %q error %v misses eval sentinel", expr, err)
+		}
+	}
+}
+
+// checkLossyUnsigned pins the loud error for unsigned above 2^53.
+func checkLossyUnsigned(t *testing.T, desc *types.MessageMembers) {
+	t.Helper()
+	bigUint := encodeFilterUint64(t, 9007199254740993)
+	f, err := CompileContentFilter("u = 9007199254740992.0")
+	if err != nil {
+		t.Fatalf("compile unsigned lossy: %v", err)
+	}
+	_, err = f.Evaluate(bigUint, desc)
+	if err == nil {
+		t.Fatalf("unsigned lossy equality succeeded, want loud error")
+	}
+	if !errors.Is(err, ErrContentFilterEvalError) {
+		t.Fatalf("unsigned lossy error %v misses eval sentinel", err)
+	}
+}
+
+// checkLossyBoundary pins exact match at 2^53 and float ordering above it.
+func checkLossyBoundary(t *testing.T, desc *types.MessageMembers) {
+	t.Helper()
+	smallPayload := encodeFilterInt64(t, 5)
+	exact, err := CompileContentFilter("v = 5.0")
+	if err != nil {
+		t.Fatalf("compile exact small: %v", err)
+	}
+	matched, err := exact.Evaluate(smallPayload, desc)
+	if err != nil {
+		t.Fatalf("exact small eval: %v", err)
+	}
+	if !matched {
+		t.Fatalf("exact small equality gave miss, want match")
+	}
+
+	boundaryPayload := encodeFilterInt64(t, 9007199254740992)
+	boundary, err := CompileContentFilter("v = 9007199254740992.0")
+	if err != nil {
+		t.Fatalf("compile boundary exact: %v", err)
+	}
+	matched, err = boundary.Evaluate(boundaryPayload, desc)
+	if err != nil {
+		t.Fatalf("boundary exact eval: %v", err)
+	}
+	if !matched {
+		t.Fatalf("boundary 2^53 equality gave miss, want match")
+	}
+
+	bigPayload := encodeFilterInt64(t, 9007199254740993)
+	ordered, err := CompileContentFilter("v > 9007199254740992.0")
+	if err != nil {
+		t.Fatalf("compile ordered: %v", err)
+	}
+	_, err = ordered.Evaluate(bigPayload, desc)
+	if err != nil {
+		t.Fatalf("ordered above 2^53 must keep float compare, got %v", err)
+	}
+}
+
+// TestContentFilterLossyBoundaryError pins loud eval errors above 2^53.
+func TestContentFilterLossyBoundaryError(t *testing.T) {
+	t.Parallel()
+
+	intDesc := intFilterDesc()
+	bigPayload := encodeFilterInt64(t, 9007199254740993)
+	checkLossyEquality(t, intDesc, bigPayload)
+	checkLossyUnsigned(t, uintFilterDesc())
+	checkLossyBoundary(t, intDesc)
+}
+
+// checkFilterSignExact pins exact matches for in-range signed literals.
+func checkFilterSignExact(t *testing.T, desc *types.MessageMembers) {
+	t.Helper()
+	minPayload := encodeFilterInt64(t, -9223372036854775808)
+	minFilter, err := CompileContentFilter("v = -9223372036854775808")
+	if err != nil {
+		t.Fatalf("compile minus MinInt64: %v", err)
+	}
+	matched, err := minFilter.Evaluate(minPayload, desc)
+	if err != nil {
+		t.Fatalf("minus MinInt64 eval: %v", err)
+	}
+	if !matched {
+		t.Fatalf("minus MinInt64 gave miss, want exact match")
+	}
+
+	maxPayload := encodeFilterInt64(t, 9223372036854775807)
+	maxFilter, err := CompileContentFilter("v = +9223372036854775807")
+	if err != nil {
+		t.Fatalf("compile plus MaxInt64: %v", err)
+	}
+	matched, err = maxFilter.Evaluate(maxPayload, desc)
+	if err != nil {
+		t.Fatalf("plus MaxInt64 eval: %v", err)
+	}
+	if !matched {
+		t.Fatalf("plus MaxInt64 gave miss, want exact match")
+	}
+
+	fivePayload := encodeFilterInt64(t, 5)
+	plusFive, err := CompileContentFilter("v = +5")
+	if err != nil {
+		t.Fatalf("compile plus five: %v", err)
+	}
+	matched, err = plusFive.Evaluate(fivePayload, desc)
+	if err != nil {
+		t.Fatalf("plus five eval: %v", err)
+	}
+	if !matched {
+		t.Fatalf("plus five gave miss, want match")
+	}
+}
+
+// checkFilterSignOverflow pins the loud error for out-of-range literals.
+func checkFilterSignOverflow(t *testing.T, desc *types.MessageMembers) {
+	t.Helper()
+	maxPayload := encodeFilterInt64(t, 9223372036854775807)
+	overflowFilter, err := CompileContentFilter("v = +9223372036854775808")
+	if err != nil {
+		t.Fatalf("compile plus overflow: %v", err)
+	}
+	_, err = overflowFilter.Evaluate(maxPayload, desc)
+	if err == nil {
+		t.Fatalf("plus overflow equality succeeded, want lossy error")
+	}
+	if !errors.Is(err, ErrContentFilterEvalError) {
+		t.Fatalf("plus overflow error %v misses eval sentinel", err)
+	}
+}
+
+// TestContentFilterPlusOverflowTyping pins the symmetric sign re-parse discipline.
+func TestContentFilterPlusOverflowTyping(t *testing.T) {
+	t.Parallel()
+
+	desc := intFilterDesc()
+	checkFilterSignExact(t, desc)
+	checkFilterSignOverflow(t, desc)
+}

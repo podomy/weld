@@ -758,7 +758,10 @@ func mustSEDPDataBody(writer SEDPEntityID, params []rtps.Param) []byte {
 // Params encode little endian then shift to big endian on request, so
 // value bytes must already carry the requested order.
 func mustSEDPDataBodyOrder(writer SEDPEntityID, params []rtps.Param, littleEndian bool) []byte {
-	encoded := rtps.EncodeParams(params)
+	encoded, err := rtps.EncodeParams(params)
+	if err != nil {
+		panic("rtps test: encode params: " + err.Error())
+	}
 	if !littleEndian {
 		encoded = sedpSwapParamOrder(encoded)
 	}
@@ -1344,6 +1347,37 @@ func TestSEDPParseSkipsForeignDATA(t *testing.T) {
 	}
 }
 
+// checkSEDPParamCodecOrder pins encode plus decode for one endianness.
+func checkSEDPParamCodecOrder(t *testing.T, params []rtps.Param, littleEndian bool) {
+	t.Helper()
+	encoded, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode le=%v: %v", littleEndian, err)
+	}
+	if !littleEndian {
+		encoded = sedpSwapParamOrder(encoded)
+	}
+
+	decoded, consumed, err := sedpDecodeParams(encoded, littleEndian)
+	if err != nil {
+		t.Fatalf("decode le=%v: %v", littleEndian, err)
+	}
+
+	if consumed != len(encoded) {
+		t.Fatalf("le=%v consumed = %d, want %d", littleEndian, consumed, len(encoded))
+	}
+
+	if len(decoded) != len(params) {
+		t.Fatalf("le=%v params = %d, want %d", littleEndian, len(decoded), len(params))
+	}
+
+	for i := range params {
+		if decoded[i].ID != params[i].ID || !bytes.Equal(decoded[i].Value, params[i].Value) {
+			t.Fatalf("le=%v param %d mismatch", littleEndian, i)
+		}
+	}
+}
+
 // TestSEDPParamCodecRoundTrip checks the local PID codec both orders.
 func TestSEDPParamCodecRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -1355,29 +1389,7 @@ func TestSEDPParamCodecRoundTrip(t *testing.T) {
 	}
 
 	for _, littleEndian := range []bool{true, false} {
-		encoded := rtps.EncodeParams(params)
-		if !littleEndian {
-			encoded = sedpSwapParamOrder(encoded)
-		}
-
-		decoded, consumed, err := sedpDecodeParams(encoded, littleEndian)
-		if err != nil {
-			t.Fatalf("decode le=%v: %v", littleEndian, err)
-		}
-
-		if consumed != len(encoded) {
-			t.Fatalf("le=%v consumed = %d, want %d", littleEndian, consumed, len(encoded))
-		}
-
-		if len(decoded) != len(params) {
-			t.Fatalf("le=%v params = %d, want %d", littleEndian, len(decoded), len(params))
-		}
-
-		for i := range params {
-			if decoded[i].ID != params[i].ID || !bytes.Equal(decoded[i].Value, params[i].Value) {
-				t.Fatalf("le=%v param %d mismatch", littleEndian, i)
-			}
-		}
+		checkSEDPParamCodecOrder(t, params, littleEndian)
 	}
 }
 
@@ -2073,6 +2085,11 @@ func TestSEDPConcurrentSmoke(t *testing.T) {
 	locals := idx.LocalEndpoints()
 	if len(locals) != workers*declaresPerWorker {
 		t.Fatalf("locals = %d, want %d", len(locals), workers*declaresPerWorker)
+	}
+
+	remotes := idx.RemoteEndpoints()
+	if len(remotes) != 0 {
+		t.Fatalf("remotes = %d, want 0 after concurrent upsert plus remove", len(remotes))
 	}
 }
 
@@ -3250,7 +3267,7 @@ func TestSEDPSeqGatingAfterUpsert(t *testing.T) {
 	}
 }
 
-// TestSEDPSeqZeroNeverAdvances pins seq 0 staleness behavior.
+// TestSEDPSeqZeroNeverAdvances pins seq 0 rejection behavior.
 func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
 	t.Parallel()
 
@@ -3274,8 +3291,16 @@ func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
 	}
 
 	err := local.ingestSample(zero)
-	if err != nil {
-		t.Fatalf("seq 0 ingest = %v, want nil", err)
+	if !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("seq 0 ingest = %v, want ErrSEDPInvalidDATA", err)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 0 {
+		t.Fatalf("remotes = %d, want 0 after seq 0 rejection", n)
+	}
+
+	if got := local.Generation(); got != 0 {
+		t.Fatalf("gen = %d, want 0 after seq 0 rejection", got)
 	}
 
 	oneBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
@@ -3466,5 +3491,78 @@ func TestSEDPParamPreCap(t *testing.T) {
 	_, _, err = sedpDecodeParams(blob, true)
 	if !errors.Is(err, ErrSEDPInvalidDATA) {
 		t.Fatalf("pre-cap decode = %v, want ErrSEDPInvalidDATA", err)
+	}
+}
+
+// TestSEDPDisposeGraceKeepsRemote pins deferred endpoint removal.
+//
+// Scheduling eviction must leave the remote resolvable until the grace
+// elapses so in-flight user DATA still takes; expiring before the
+// deadline keeps it, expiring after removes it with a generation bump.
+func TestSEDPDisposeGraceKeepsRemote(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xE1)
+	peer := mustSEDPIndexWithPrefix(t, 0xE2)
+	writer := mustSEDPWriter(t, peer, "/grace", "RIHS01_grace")
+
+	if err := local.UpsertRemote(writer); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	base := time.Now()
+	local.SchedulePrefixEvict(writer.ID.Prefix, base)
+
+	if n := len(local.RemoteEndpoints()); n != 1 {
+		t.Fatalf("remotes = %d, want 1 during grace", n)
+	}
+
+	if got := local.ExpirePendingEvictions(base.Add(time.Second)); got != 0 {
+		t.Fatalf("expired = %d, want 0 before deadline", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 1 {
+		t.Fatalf("remotes = %d, want 1 before deadline", n)
+	}
+
+	gen := local.Generation()
+	if got := local.ExpirePendingEvictions(base.Add(sedpEvictGracePeriod + time.Second)); got != 1 {
+		t.Fatalf("expired = %d, want 1 after deadline", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 0 {
+		t.Fatalf("remotes = %d, want 0 after deadline", n)
+	}
+
+	if local.Generation() <= gen {
+		t.Fatalf("gen = %d, want above %d after evict", local.Generation(), gen)
+	}
+}
+
+// TestSEDPReannounceCancelsGraceEvict pins UpsertRemote cancelling a
+// scheduled dispose eviction for the same prefix.
+func TestSEDPReannounceCancelsGraceEvict(t *testing.T) {
+	t.Parallel()
+
+	local := mustSEDPIndexWithPrefix(t, 0xE3)
+	peer := mustSEDPIndexWithPrefix(t, 0xE4)
+	writer := mustSEDPWriter(t, peer, "/gracecancel", "RIHS01_gracecancel")
+
+	if err := local.UpsertRemote(writer); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	local.SchedulePrefixEvict(writer.ID.Prefix, time.Now())
+
+	if err := local.UpsertRemote(writer); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+
+	if got := local.ExpirePendingEvictions(time.Now().Add(sedpEvictGracePeriod + time.Second)); got != 0 {
+		t.Fatalf("expired = %d, want 0 after re-announce cancel", got)
+	}
+
+	if n := len(local.RemoteEndpoints()); n != 1 {
+		t.Fatalf("remotes = %d, want 1 after cancel", n)
 	}
 }

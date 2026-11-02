@@ -322,7 +322,10 @@ func TestPartitionParamRoundTrip(t *testing.T) {
 		t.Fatalf("PIDPartition = %#04x, want DDSI-RTPS PID_PARTITION 0x0029", PIDPartition)
 	}
 
-	raw := rtps.EncodeParams([]rtps.Param{param})
+	raw, err := rtps.EncodeParams([]rtps.Param{param})
+	if err != nil {
+		t.Fatalf("encode partition: %v", err)
+	}
 	back, err := rtps.DecodeParams(raw)
 	if err != nil {
 		t.Fatalf("rtps round trip: %v", err)
@@ -376,5 +379,32 @@ func TestPartitionRouteKey(t *testing.T) {
 	topic := PartitionRouteKey("rt/other", []string{"A"})
 	if topic == other {
 		t.Fatalf("different topics share key %q", other)
+	}
+}
+
+// TestPartitionRouteKeyRejectsNUL pins loud NUL rejection in topic plus names.
+func TestPartitionRouteKeyRejectsNUL(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		topic      string
+		partitions []string
+	}{
+		{name: "topic NUL", topic: "rt/chatter\x00x", partitions: []string{"A"}},
+		{name: "partition NUL", topic: "rt/chatter", partitions: []string{"A\x00B"}},
+		{name: "empty partition NUL", topic: "rt/chatter", partitions: []string{"\x00"}},
+	}
+
+	for _, tc := range cases {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("%s succeeded, want loud NUL panic", tc.name)
+				}
+			}()
+			_ = PartitionRouteKey(tc.topic, tc.partitions)
+		}()
 	}
 }

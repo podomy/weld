@@ -260,8 +260,9 @@ func validateSaturatingDurations(p QoSProfile) []string {
 // instead. Callers normally resolve with ResolveSystemDefaults and endpoint
 // creation first, so a warning means something skipped that order. Callers
 // should Validate before matching; CheckCompatibility still guards malformed
-// negative deadline and lease durations loudly as errors so skipped
-// validation can never flow silently.
+// deadline and lease durations loudly as errors, both negative seconds and
+// nanoseconds at or above one second, so skipped validation can never flow
+// silently.
 // Matching never silently unmatches: errors are returned loudly and runtime
 // deadline or liveliness loss uses alerts, so facades surface both. All
 // entry points that create entities (CreateEndpoint, ResolveServiceQoS)
@@ -283,11 +284,10 @@ func CheckCompatibility(offered, requested QoSProfile) CompatibilityReport {
 }
 
 // checkNegativeDurations records an error when either side carries a
-// malformed negative deadline or lease duration. Lifespan never participates
-// in matching so it is ignored here and rejected loudly by Validate instead.
-// Nanoseconds at or above one second likewise stay Validate's job and are not
-// checked here. This guard runs first so skipped validation still fails loudly
-// in matching.
+// malformed deadline or lease duration: negative seconds or nanoseconds at
+// or above one second. Lifespan never participates in matching so it is
+// ignored here and rejected loudly by Validate instead. This guard runs
+// first so skipped validation still fails loudly in matching.
 func checkNegativeDurations(offered, requested QoSProfile, report *CompatibilityReport) {
 	if offered.Deadline.Seconds < 0 || requested.Deadline.Seconds < 0 {
 		report.Errors = append(report.Errors, CompatibilityIssue{
@@ -295,10 +295,22 @@ func checkNegativeDurations(offered, requested QoSProfile, report *Compatibility
 			Detail: "malformed negative deadline seconds; call Validate first",
 		})
 	}
+	if offered.Deadline.Nanoseconds >= nanosPerSecond || requested.Deadline.Nanoseconds >= nanosPerSecond {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyDeadline,
+			Detail: "malformed deadline nanoseconds >= 1e9; normalize with NewDuration first",
+		})
+	}
 	if offered.LeaseDuration.Seconds < 0 || requested.LeaseDuration.Seconds < 0 {
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind:   PolicyLeaseDuration,
 			Detail: "malformed negative lease duration seconds; call Validate first",
+		})
+	}
+	if offered.LeaseDuration.Nanoseconds >= nanosPerSecond || requested.LeaseDuration.Nanoseconds >= nanosPerSecond {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyLeaseDuration,
+			Detail: "malformed lease duration nanoseconds >= 1e9; normalize with NewDuration first",
 		})
 	}
 }
@@ -333,9 +345,9 @@ func checkDurability(offered, requested QoSProfile, report *CompatibilityReport)
 // side skip the error check so the pair warns instead; the marker is checked
 // before any String call so sentinel values never leak into error text.
 // The early returns above guarantee requested is finite here, so the switch
-// needs no second unspecified conjuncts. Nanoseconds at or above one second
-// and lifespan never participate here; they stay Validate's job and are
-// documented there, not widened in matching.
+// needs no second unspecified conjuncts. Malformed nanoseconds at or above
+// one second fail loudly in checkNegativeDurations; lifespan never
+// participates here and stays Validate's job.
 func checkDeadline(offered, requested QoSProfile, report *CompatibilityReport) {
 	if IsBestAvailableDuration(offered.Deadline) || IsBestAvailableDuration(requested.Deadline) {
 		return
@@ -372,7 +384,9 @@ func checkLiveliness(offered, requested QoSProfile, report *CompatibilityReport)
 }
 
 // checkLease records an error when a default lease publisher meets a non
-// default request. Magnitudes are never compared beyond that. A requested
+// default request, or when the requested lease is shorter than the offered
+// one. A shorter offered lease always satisfies a longer request, matching
+// the deadline rule that offered must be at most requested. A requested
 // unspecified or infinite means no constraint and always flows, while an
 // offered unspecified or infinite is the default and cannot satisfy a finite
 // request. Best available sentinels on either side skip the error check so
@@ -385,11 +399,19 @@ func checkLease(offered, requested QoSProfile, report *CompatibilityReport) {
 	if requested.LeaseDuration.IsUnspecified() || requested.LeaseDuration.IsInfinite() {
 		return
 	}
-	if offered.LeaseDuration.IsUnspecified() || offered.LeaseDuration.IsInfinite() {
+	switch {
+	case offered.LeaseDuration.IsUnspecified() || offered.LeaseDuration.IsInfinite():
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind:   PolicyLeaseDuration,
 			Detail: "offered default lease cannot satisfy requested lease " + requested.LeaseDuration.String(),
 		})
+	case requested.LeaseDuration.Compare(offered.LeaseDuration) < 0:
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind: PolicyLeaseDuration,
+			Detail: "requested lease " + requested.LeaseDuration.String() +
+				" is shorter than offered lease " + offered.LeaseDuration.String(),
+		})
+	default:
 	}
 }
 

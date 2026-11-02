@@ -250,8 +250,12 @@ func (g *SerialGroup) Attach(e SerialEntity) error {
 // Detach removes an entity by name.
 //
 // Empty and unknown names are errors. When the group is active the entity
-// Deactivate runs before removal; a failing Deactivate keeps the entity
-// attached for retry. Serialize Detach with other bringup calls.
+// Deactivate runs before removal, and when the group is configured the entity
+// Cleanup runs after a successful Deactivate; a failing Deactivate or Cleanup
+// keeps the entity attached for retry. The order mirrors Attach, which runs
+// Configure plus Activate, so Detach runs Deactivate plus Cleanup without
+// Shutdown, which stays a group teardown step. Serialize Detach with other
+// bringup calls.
 func (g *SerialGroup) Detach(name string) error {
 	if g == nil {
 		return errors.New("core: serial group detach on nil group") //nolint:wrapcheck // new error, nothing to wrap
@@ -266,12 +270,19 @@ func (g *SerialGroup) Detach(name string) error {
 		return fmt.Errorf("core: serial group detach unknown entity %q", name)
 	}
 	active := g.active
+	configured := g.configured
 	entity := g.entries[idx].entity
 	g.mu.Unlock()
 	if active {
 		err := callSerialCallback(entity.Deactivate)
 		if err != nil {
 			return fmt.Errorf("core: serial group detach %q deactivate: %w", name, err)
+		}
+	}
+	if configured {
+		err := callSerialCallback(entity.Cleanup)
+		if err != nil {
+			return fmt.Errorf("core: serial group detach %q cleanup: %w", name, err)
 		}
 	}
 	g.mu.Lock()

@@ -79,13 +79,13 @@ func (t *DeadlineTracker) MarkSeen(nowNanos int64) {
 // the window recovers even when the target equals the last sample time. A
 // best available sentinel never alerts, mirroring MissedAt. Unspecified
 // deadlines never alert. Infinite deadlines in practice never
-// alert because elapsed time stays below max int64. Negative deadlines are
-// malformed and rejected by Validate; Check treats them as unspecified and
-// never alerts so malformed input stays quiet here instead of firing false
-// alarms. A backward time jump rebases lastNanos to nowNanos, clears the
-// outage flag, and reports no alert, so the next forward window recovers
-// without unmatching instead of carrying a stale future timestamp. Safe
-// for concurrent use with MarkSeen.
+// alert because elapsed time stays below max int64. Negative seconds and
+// nanoseconds at or above one second are malformed and rejected by Validate;
+// Check treats them as unspecified and never alerts so malformed input stays
+// quiet here instead of firing false alarms. A backward time jump rebases
+// lastNanos to nowNanos, clears the outage flag, and reports no alert, so
+// the next forward window recovers without unmatching instead of carrying a
+// stale future timestamp. Safe for concurrent use with MarkSeen.
 func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -93,6 +93,9 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 		return DeadlineAlert{}, false
 	}
 	if t.deadline.Seconds < 0 {
+		return DeadlineAlert{}, false
+	}
+	if t.deadline.Nanoseconds >= nanosPerSecond {
 		return DeadlineAlert{}, false
 	}
 	if IsBestAvailableDuration(t.deadline) {
@@ -120,14 +123,18 @@ func (t *DeadlineTracker) Check(nowNanos int64) (DeadlineAlert, bool) {
 
 // DeadlineExceeded reports whether elapsedNanos reaches deadline without state.
 //
-// Unspecified, infinite, best available sentinel, and negative malformed
-// deadlines never exceed, matching Check quiet rules. It is pure for the
-// gating path: it never fires, never latches, and never rebases.
+// Unspecified, infinite, best available sentinel, negative seconds, and
+// nanoseconds at or above one second never exceed, matching Check quiet
+// rules. It is pure for the gating path: it never fires, never latches, and
+// never rebases.
 func DeadlineExceeded(deadline Duration, elapsedNanos int64) bool {
 	if deadline.IsUnspecified() {
 		return false
 	}
 	if deadline.Seconds < 0 {
+		return false
+	}
+	if deadline.Nanoseconds >= nanosPerSecond {
 		return false
 	}
 	if IsBestAvailableDuration(deadline) {
@@ -154,9 +161,9 @@ func (t *DeadlineTracker) ElapsedAt(nowNanos int64) int64 {
 // MissedAt reports whether the deadline window elapsed at nowNanos.
 //
 // It never fires, never latches, and never rebases, so repeated calls are
-// stable and gating stays pure. Unspecified, infinite, sentinel, and
-// negative deadlines never miss. Backward time never misses. Elapsed uses
-// saturating subtraction mirroring tfAddSaturating.
+// stable and gating stays pure. Unspecified, infinite, sentinel, negative
+// seconds, and nanoseconds at or above one second never miss. Backward time
+// never misses. Elapsed uses saturating subtraction mirroring tfAddSaturating.
 func (t *DeadlineTracker) MissedAt(nowNanos int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -164,6 +171,9 @@ func (t *DeadlineTracker) MissedAt(nowNanos int64) bool {
 		return false
 	}
 	if t.deadline.Seconds < 0 {
+		return false
+	}
+	if t.deadline.Nanoseconds >= nanosPerSecond {
 		return false
 	}
 	if IsBestAvailableDuration(t.deadline) {

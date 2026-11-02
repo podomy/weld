@@ -88,6 +88,18 @@ func runServiceCallCommand(ctx context.Context, args []string, stdout, stderr io
 		return 2
 	}
 
+	requestExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "request" {
+			requestExplicit = true
+		}
+	})
+	if requestExplicit && *requestFlag == "" {
+		_, _ = fmt.Fprintln(stderr, "weld: service call --request must not be empty") //nolint:errcheck // final error output is best effort
+
+		return 2
+	}
+
 	service, request, err := resolveServiceCallArgs(*serviceFlag, *requestFlag, fs.Args())
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort

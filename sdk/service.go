@@ -108,8 +108,16 @@ type ServiceClient struct {
 	mu sync.Mutex
 	// closed marks teardown; Close is idempotent.
 	closed bool
-	// inflight counts concurrent plus abandoned handler goroutines.
+	// inflight counts concurrent active handler goroutines. Abandoned
+	// handlers no longer count here once the caller times out; they move
+	// to abandoned below so a hung handler cannot wedge new calls at the
+	// cap. See Call for the hung-handler deadline contract.
 	inflight int
+	// abandoned counts handler goroutines still running after the caller
+	// abandoned them via timeout or cancel. It is separate accounting so
+	// reclaiming the inflight slot never double releases and never leaks:
+	// each abandoned handler decrements it exactly once on return.
+	abandoned int
 }
 
 // Service returns the called service name.
@@ -144,11 +152,16 @@ type serviceResult struct {
 // It copies the request at ingress, applies the default timeout when ctx
 // carries no deadline, and errors exactly one call when the server is
 // gone or the context ends. Gone servers and canceled contexts never
-// affect other calls. Concurrent plus abandoned handler goroutines are
-// bounded by maxServiceInflight per client; excess calls fail loudly with
-// ErrServiceInflightExceeded instead of spawning without bound. Abandoned
-// calls still count until their handler finishes, so a slow server cannot
-// accumulate unbounded goroutines through timeouts.
+// affect other calls. Concurrent active handler goroutines are bounded by
+// maxServiceInflight per client; excess calls fail loudly with
+// ErrServiceInflightExceeded instead of spawning without bound. An
+// abandoned call reclaims its inflight slot immediately so a slow server
+// cannot wedge new calls at the cap, while the orphaned handler stays
+// tracked in abandoned accounting until it returns. A hung handler that
+// ignores ctx therefore accumulates orphaned goroutines: handlers must
+// honor ctx and return on Done, and callers must keep per-call deadlines
+// tight, or timeouts can grow goroutines without bound. This is a handler
+// liveness contract, not a silent queue.
 func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	if c == nil {
 		return nil, errors.New("sdk: call on nil service client") //nolint:wrapcheck // new error, nothing to wrap
@@ -185,10 +198,12 @@ func (c *ServiceClient) Call(ctx context.Context, req []byte) ([]byte, error) {
 	seq := c.seq.Add(1)
 	owned := copyBytes(req)
 	resCh := make(chan serviceResult, 1)
-	go c.runBoundedServiceHandler(eff, handler, owned, resCh)
+	claimed := &atomic.Bool{}
+	go c.runBoundedServiceHandler(eff, handler, owned, resCh, claimed)
 	select {
 	case <-eff.Done():
 		ctxErr := eff.Err()
+		c.reclaimIfAbandoned(claimed)
 		if ctxErr != nil {
 			return nil, fmt.Errorf("sdk: service call on %q seq %d: %w", c.service, seq, ctxErr)
 		}
@@ -213,10 +228,59 @@ func (c *ServiceClient) finishCall() {
 	}
 }
 
+// abandonCall reclaims one inflight slot on timeout or cancel while
+// tracking the still-running handler separately. The caller must hold no
+// lock; this takes mu. Exactly one of abandonCall and finishCall runs per
+// call via the claimed flag in Call.
+func (c *ServiceClient) abandonCall() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inflight > 0 {
+		c.inflight--
+	}
+	c.abandoned++
+}
+
+// reclaimIfAbandoned reclaims the inflight slot exactly once when the
+// caller abandons before the handler finishes.
+func (c *ServiceClient) reclaimIfAbandoned(claimed *atomic.Bool) {
+	if c == nil || claimed == nil {
+		return
+	}
+	if claimed.CompareAndSwap(false, true) {
+		c.abandonCall()
+	}
+}
+
+// finishAbandoned releases one abandoned handler on return. It pairs with
+// abandonCall exactly once per abandoned call via the claimed flag.
+func (c *ServiceClient) finishAbandoned() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.abandoned > 0 {
+		c.abandoned--
+	}
+}
+
 // runBoundedServiceHandler invokes one handler, reports one result, then
-// releases the inflight slot so abandoned calls still bound goroutines.
-func (c *ServiceClient) runBoundedServiceHandler(ctx context.Context, handler ServiceHandler, req []byte, resCh chan<- serviceResult) {
-	defer c.finishCall()
+// releases accounting exactly once. When the caller already abandoned the
+// call and reclaimed the inflight slot, this releases the abandoned
+// tracking instead so the slot is never double released and the orphaned
+// goroutine never leaks accounting.
+func (c *ServiceClient) runBoundedServiceHandler(ctx context.Context, handler ServiceHandler, req []byte, resCh chan<- serviceResult, claimed *atomic.Bool) {
+	defer func() {
+		if claimed.CompareAndSwap(false, true) {
+			c.finishCall()
+			return
+		}
+		c.finishAbandoned()
+	}()
 	runServiceHandler(ctx, handler, req, resCh)
 }
 

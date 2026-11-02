@@ -25,6 +25,7 @@ func TestDeadlineEnforcementPeek(t *testing.T) {
 	t.Run("exceeded table", checkDeadlineExceededTable)
 	t.Run("missed never latches", checkDeadlineMissedNoLatch)
 	t.Run("elapsed peek", checkDeadlineElapsedPeek)
+	t.Run("malformed nanos quiet", checkDeadlineMalformedNanosQuiet)
 }
 
 // checkLivelinessStateMatrix pins alive, stale, expired with hysteresis.
@@ -376,6 +377,7 @@ func checkDeadlineExceededTable(t *testing.T) {
 		{"infinite", InfiniteDuration()},
 		{"sentinel", BestAvailableDuration()},
 		{"negative", Duration{Seconds: -1}},
+		{"oversized nanos", Duration{Seconds: 1, Nanoseconds: 2000000000}},
 	} {
 		if DeadlineExceeded(tc.d, 1_000_000_000_000) {
 			t.Fatalf("%s must never exceed", tc.name)
@@ -425,5 +427,23 @@ func checkDeadlineElapsedPeek(t *testing.T) {
 	}
 	if _, ok := tracker.Check(500000000); ok {
 		t.Fatal("backward peek must not alert")
+	}
+}
+
+// checkDeadlineMalformedNanosQuiet pins nanoseconds at or above one second
+// never alert, miss, or exceed, matching negative malformed quiet rules.
+// Callers pass validated values in practice so this never fires on the wire.
+func checkDeadlineMalformedNanosQuiet(t *testing.T) {
+	t.Helper()
+	malformed := Duration{Seconds: 1, Nanoseconds: 2000000000}
+	if DeadlineExceeded(malformed, 1_000_000_000_000) {
+		t.Fatal("oversized nanos must never exceed")
+	}
+	tracker := NewDeadlineTracker("/scan", "listener", malformed, 0)
+	if tracker.MissedAt(1_000_000_000_000) {
+		t.Fatal("oversized nanos must never miss")
+	}
+	if _, ok := tracker.Check(1_000_000_000_000); ok {
+		t.Fatal("oversized nanos must never alert")
 	}
 }

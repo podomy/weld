@@ -214,6 +214,17 @@ func runPubCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 2
 	}
 
+	textExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "text" {
+			textExplicit = true
+		}
+	})
+	if textExplicit && *text == "" {
+		_, _ = fmt.Fprintln(stderr, "weld: pub --text must not be empty") //nolint:errcheck // final error output is best effort
+		return 2
+	}
+
 	domain, err := resolveEffectiveDomain(*domainFlag)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, oneLine(err)) //nolint:errcheck // final error output is best effort
@@ -620,7 +631,9 @@ func handleEchoTakeError(ctx context.Context, tracker *lossTracker, err error) (
 // handleEchoSample filters, decodes, and prints one sample.
 //
 // It returns nil to continue the loop after drops or successful prints,
-// and a terminal error for decode or print failures.
+// and a terminal error for decode or print failures. A mismatched type is
+// filtered by the single pre-decode check above, so decode failures for
+// the expected type always fail loudly instead of dropping.
 func handleEchoSample(tracker *lossTracker, topic string, msg transports.IncomingMessage, stdout io.Writer) error {
 	if msg.TopicName != topic {
 		tracker.countDrop()
@@ -632,10 +645,6 @@ func handleEchoSample(tracker *lossTracker, topic string, msg transports.Incomin
 	}
 	text, err := decodeStringPayload(msg.Payload)
 	if err != nil {
-		if msg.TypeName != "" && msg.TypeName != stringTypeName {
-			tracker.countDrop()
-			return nil
-		}
 		return fmt.Errorf("weld: decode message on %q: %w", msg.TopicName, err)
 	}
 	_, err = fmt.Fprintln(stdout, text)

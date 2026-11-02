@@ -84,6 +84,16 @@ func sedpConformDeclareReader(t *testing.T, idx *dds.SEDPIndex, typeHash string)
 }
 
 // sedpConformNewIndex returns an index with a fixed prefix and domain.
+// mustEncodeVendorParams encodes params or fails the test loudly.
+func mustEncodeVendorParams(t *testing.T, params []rtps.Param) []byte {
+	t.Helper()
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode vendor params: %v", err)
+	}
+	return raw
+}
+
 func sedpConformNewIndex(t *testing.T, base byte, domain uint32) *dds.SEDPIndex {
 	t.Helper()
 	prefix := sedpConformPrefix(base)
@@ -308,8 +318,12 @@ func sedpConformGUIDValue(id dds.SEDPGUID) []byte {
 }
 
 // sedpConformBuildBody builds a DATA body with the given writer, seq, and params.
-func sedpConformBuildBody(writer [4]byte, seq uint64, params []rtps.Param) []byte {
-	encoded := rtps.EncodeParams(params)
+func sedpConformBuildBody(t *testing.T, writer [4]byte, seq uint64, params []rtps.Param) []byte {
+	t.Helper()
+	encoded, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode test params: %v", err)
+	}
 	body := make([]byte, 0, sedpConformDataFixedLen+len(encoded))
 	body = append(body, 0x00, 0x00)
 	body = binary.LittleEndian.AppendUint16(body, 16)
@@ -403,7 +417,7 @@ func TestSEDPConformStringPadInLength(t *testing.T) {
 	sedpConformCheckStringValue(t, typeValue, sedpConformTypeDDS)
 
 	padParams := sedpConformIdentityParams(ep, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
-	padBody := sedpConformBuildBody(sedpConformPubsWriter, 1, padParams)
+	padBody := sedpConformBuildBody(t, sedpConformPubsWriter, 1, padParams)
 	padRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, padBody)
 	padDecoded := sedpConformMustParse(t, padRaw)
 	if padDecoded.DDSTopic != sedpConformDDSTopic {
@@ -411,7 +425,7 @@ func TestSEDPConformStringPadInLength(t *testing.T) {
 	}
 
 	minParams := sedpConformIdentityParams(ep, sedpConformEncodeStringMinimal(sedpConformDDSTopic), sedpConformEncodeStringMinimal(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
-	minBody := sedpConformBuildBody(sedpConformPubsWriter, 1, minParams)
+	minBody := sedpConformBuildBody(t, sedpConformPubsWriter, 1, minParams)
 	minRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, minBody)
 	minDecoded := sedpConformMustParse(t, minRaw)
 	if minDecoded.DDSTopic != sedpConformDDSTopic {
@@ -449,7 +463,7 @@ func TestSEDPConformOctetSequencePadAndTrim(t *testing.T) {
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpConformGUIDValue(ep.ID)},
 		{ID: rtps.PIDUserData, Value: sedpConformEncodeSequencePad(userdata)},
 	}
-	padBody := sedpConformBuildBody(sedpConformPubsWriter, 1, padParams)
+	padBody := sedpConformBuildBody(t, sedpConformPubsWriter, 1, padParams)
 	padRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, padBody)
 	padDecoded := sedpConformMustParse(t, padRaw)
 	if padDecoded.TypeHash != sedpConformTypeHash {
@@ -462,7 +476,7 @@ func TestSEDPConformOctetSequencePadAndTrim(t *testing.T) {
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpConformGUIDValue(ep.ID)},
 		{ID: rtps.PIDUserData, Value: sedpConformEncodeSequenceMinimal(userdata)},
 	}
-	minBody := sedpConformBuildBody(sedpConformPubsWriter, 1, minParams)
+	minBody := sedpConformBuildBody(t, sedpConformPubsWriter, 1, minParams)
 	minRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, minBody)
 	minDecoded := sedpConformMustParse(t, minRaw)
 	if minDecoded.TypeHash != sedpConformTypeHash {
@@ -787,7 +801,7 @@ func TestSEDPConformEndpointGUIDWire(t *testing.T) {
 	}
 
 	legacyParams := sedpConformIdentityParams(ep, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUID)
-	legacyBody := sedpConformBuildBody(sedpConformPubsWriter, 9, legacyParams)
+	legacyBody := sedpConformBuildBody(t, sedpConformPubsWriter, 9, legacyParams)
 	legacyRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, legacyBody)
 	legacyDecoded := sedpConformMustParse(t, legacyRaw)
 	if !legacyDecoded.ID.Equal(ep.ID) {
@@ -815,7 +829,7 @@ func TestSEDPConformBuiltinWriters(t *testing.T) {
 	}
 
 	cycloneParams := sedpConformIdentityParams(writer, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
-	cycloneBody := sedpConformBuildBody(sedpConformPubsWriterCyclone, 7, cycloneParams)
+	cycloneBody := sedpConformBuildBody(t, sedpConformPubsWriterCyclone, 7, cycloneParams)
 	cycloneRaw := sedpConformBuildMessage(writer.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, cycloneBody)
 	cycloneDecoded := sedpConformMustParse(t, cycloneRaw)
 	if cycloneDecoded.IsReader {
@@ -826,7 +840,7 @@ func TestSEDPConformBuiltinWriters(t *testing.T) {
 	}
 
 	subsParams := sedpConformIdentityParams(reader, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
-	subsBody := sedpConformBuildBody(sedpConformSubsWriter, 8, subsParams)
+	subsBody := sedpConformBuildBody(t, sedpConformSubsWriter, 8, subsParams)
 	subsRaw := sedpConformBuildMessage(reader.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, subsBody)
 	subsDecoded := sedpConformMustParse(t, subsRaw)
 	if !subsDecoded.IsReader {
@@ -1119,13 +1133,13 @@ func TestSEDPConformVendorTolerated(t *testing.T) {
 		{ID: 0x8003, Value: []byte{0x00, 0x00, 0x00, 0x00}},
 		{ID: 0x800c, Value: []byte{0x01, 0x00, 0x00, 0x00}},
 	}
-	body := sedpConformBuildBody(sedpConformPubsWriter, 1, params)
+	body := sedpConformBuildBody(t, sedpConformPubsWriter, 1, params)
 	raw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, body)
 	decoded := sedpConformMustParse(t, raw)
 	if decoded.DDSTopic != sedpConformDDSTopic {
 		t.Fatalf("topic = %q, want %q", decoded.DDSTopic, sedpConformDDSTopic)
 	}
-	back, _, err := rtps.DecodeParamsEndian(rtps.EncodeParams(params), true)
+	back, _, err := rtps.DecodeParamsEndian(mustEncodeVendorParams(t, params), true)
 	if err != nil {
 		t.Fatalf("vendor round trip: %v", err)
 	}

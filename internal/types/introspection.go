@@ -772,6 +772,7 @@ func LookupMessageMembers(namespace, name string) (*MessageMembers, error) {
 // Member funcs and nested table pointers are shared; the copy isolates
 // top-level mutation (for example setting Members on the clone) from the
 // registry entry.
+// Mutation through shared nested pointers is forbidden; callers must treat the clone read-only below the top level.
 func cloneMessageMembers(m *MessageMembers) *MessageMembers {
 	if m == nil {
 		return nil

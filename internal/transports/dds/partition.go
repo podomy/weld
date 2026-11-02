@@ -520,8 +520,20 @@ func FindPartitionParamEndian(params []rtps.Param, littleEndian bool) ([]string,
 // on different partitions therefore never shares a key, and the same set in
 // different orders shares one. Backend route and data maps keyed by this
 // string stay isolated across partitions; see the backend.go INTEGRATION
-// note for the wiring step.
+// note for the wiring step. Topic plus names must be NUL-free because
+// MatchPartitions treats elements as opaque bytes: a NUL inside any input
+// panics loudly with ErrInvalidPartition instead of forging a colliding key.
 func PartitionRouteKey(ddsTopic string, partitions []string) string {
+	if strings.IndexByte(ddsTopic, 0x00) >= 0 {
+		panic(fmt.Errorf("dds: partition route key topic carries NUL: %w", ErrInvalidPartition))
+	}
+
+	for _, name := range partitions {
+		if strings.IndexByte(name, 0x00) >= 0 {
+			panic(fmt.Errorf("dds: partition route key name carries NUL: %w", ErrInvalidPartition))
+		}
+	}
+
 	names := normalizePartitions(partitions)
 	sorted := append([]string(nil), names...)
 	slices.Sort(sorted)

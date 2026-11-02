@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -103,6 +104,24 @@ const maxTypeLen = 1024
 // sample on the wire in internal/types, so a corrupt user length cannot
 // force more than 32 MiB.
 const maxPayloadLen = 32 << 20
+
+// weldTakeDebugOnce caches the WELD_TAKE_DEBUG lookup once.
+var weldTakeDebugOnce sync.Once
+
+// weldTakeDebugEnabled caches whether take debug logging is on.
+var weldTakeDebugEnabled bool
+
+// weldTakeDebug reports whether take debug logging is enabled.
+//
+// It reads WELD_TAKE_DEBUG once process wide so the take hot path pays no
+// per-sample getenv cost.
+func weldTakeDebug() bool {
+	weldTakeDebugOnce.Do(func() {
+		weldTakeDebugEnabled = os.Getenv("WELD_TAKE_DEBUG") != ""
+	})
+
+	return weldTakeDebugEnabled
+}
 
 // ErrTruncated reports a truncated DATA frame or envelope.
 var ErrTruncated = errors.New("dds: truncated frame")
@@ -354,52 +373,83 @@ func (p *Publisher) PublishTo(ctx context.Context, s FrameSink, msg transports.O
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.next == 0 {
+		p.mu.Unlock()
+
 		return fmt.Errorf("dds: publish to sequence overflow: %w", ErrInvalidFrame)
 	}
 
 	seq := p.next
+	guid := p.guid
+	if seq == ^uint64(0) {
+		p.next = 0
+	} else {
+		p.next = seq + 1
+	}
+	p.mu.Unlock()
 
-	frame, err := encodeNextFrame(p.guid, seq, msg, "publish to")
+	frame, err := encodeNextFrame(guid, seq, msg, "publish to")
 	if err != nil {
+		p.rollbackPublishTo(seq)
+
 		return err
 	}
 
 	payload, err := MarshalRTPSPayload(frame)
 	if err != nil {
+		p.rollbackPublishTo(seq)
+
 		return fmt.Errorf("dds: publish to validate seq %d: %w", seq, err)
 	}
-
-	guid := p.guid
 
 	if !fragNeedsSplit(uint32(len(payload))) { //nolint:gosec // G115: length checked against maxPayloadLen in preparePublishPayload
 		err = s.WriteFrame(ctx, guid, payload)
 		if err != nil {
+			p.rollbackPublishTo(seq)
+
 			return fmt.Errorf("dds: publish to write seq %d: %w", seq, err)
 		}
-
-		p.next++
 
 		return nil
 	}
 
 	err = p.publishFrags(ctx, s, guid, seq, payload)
 	if err != nil {
+		p.rollbackPublishTo(seq)
+
 		return err
 	}
-
-	p.next++
 
 	return nil
 }
 
+// rollbackPublishTo releases one claimed sequence after a failed PublishTo.
+//
+// It restores next only when no other publish has advanced past the failed
+// seq, so a failed PublishTo may be retried with the same sequence and the
+// only-on-success contract holds for the single-flight case.
+func (p *Publisher) rollbackPublishTo(seq uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if seq == ^uint64(0) {
+		if p.next == 0 {
+			p.next = seq
+		}
+
+		return
+	}
+
+	if p.next == seq+1 {
+		p.next = seq
+	}
+}
+
 // publishFrags emits one large payload as ordered fragments.
 //
-// The caller must hold p.mu and must have validated payload. It requires
-// the sink to implement FragSink, splits payload with planFragSend, and
-// emits fragments 1 through total in order with the same seq. A missing
+// The caller must have claimed seq and must have validated payload. It
+// requires the sink to implement FragSink, splits payload with planFragSend,
+// and emits fragments 1 through total in order with the same seq. A missing
 // FragSink or a bounds failure reports an error. The caller advances the
 // sequence only after all fragments succeed.
 func (p *Publisher) publishFrags(ctx context.Context, s FrameSink, guid WriterGUID, seq uint64, payload []byte) error {
@@ -1381,7 +1431,7 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 		return empty, fmt.Errorf("dds: take from read: %w", err)
 	}
 
-	if os.Getenv("WELD_TAKE_DEBUG") != "" {
+	if weldTakeDebug() {
 		n := min(len(payload), 32)
 		_, _ = fmt.Fprintf(os.Stderr, "weld-take-debug: frame guid=%x len=%d head=% x\n", guid, len(payload), payload[:n]) //nolint:errcheck // diagnostics are best effort
 	}
@@ -1466,13 +1516,30 @@ func (r *DataReceiver) countPlainDrop(guid WriterGUID, cause error, op string) e
 // must still use NewDataReceiver for correct drop and lost accounting. The
 // first sample from a GUID is accepted with no lost count. A gap adds the
 // skipped count to lost and accepts the current frame. A duplicate or old
-// sequence counts a drop and returns ErrStaleSequence.
+// sequence counts a drop and returns ErrStaleSequence. Distinct writers stay
+// bounded by maxTrackedWriters with loud eviction so writer churn cannot
+// grow take state without limit.
 func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) error {
 	if r.last == nil {
 		r.last = make(map[WriterGUID]uint64)
 	}
 	last, seen := r.last[guid]
 	if !seen {
+		if len(r.last) >= maxTrackedWriters {
+			for victim := range r.last {
+				if victim == guid {
+					continue
+				}
+				delete(r.last, victim)
+				delete(r.plainNack, victim)
+				delete(r.lively, victim)
+				delete(r.provisional, victim)
+				r.drops++
+				log.Printf("dds: take table full evict guid=%x", victim)
+
+				break
+			}
+		}
 		r.last[guid] = seq
 
 		return nil

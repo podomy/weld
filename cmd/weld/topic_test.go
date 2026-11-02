@@ -364,10 +364,14 @@ func TestDetectMismatchesSorted(t *testing.T) {
 	}
 
 	for i := 1; i < len(got); i++ {
-		prev := got[i-1].Publisher + got[i-1].Subscriber + string(got[i-1].Policy)
-		curr := got[i].Publisher + got[i].Subscriber + string(got[i].Policy)
-		if prev > curr {
-			t.Fatalf("mismatches not sorted: %q before %q", prev, curr)
+		prev := got[i-1]
+		curr := got[i]
+		if prev.Publisher > curr.Publisher ||
+			(prev.Publisher == curr.Publisher && prev.Subscriber > curr.Subscriber) ||
+			(prev.Publisher == curr.Publisher && prev.Subscriber == curr.Subscriber && string(prev.Policy) > string(curr.Policy)) {
+			t.Fatalf("mismatches not sorted: (%q,%q,%q) before (%q,%q,%q)",
+				prev.Publisher, prev.Subscriber, string(prev.Policy),
+				curr.Publisher, curr.Subscriber, string(curr.Policy))
 		}
 	}
 }

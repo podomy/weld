@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
@@ -543,7 +542,6 @@ func TestROSTypeStdByteMultiArrayReverse(t *testing.T) {
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, restHashByteMultiArray, typeMatrixProbeWait, "std-bytemultiarray-reverse")
 	if err != nil {
 		reason := fmt.Sprintf("std-bytemultiarray hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
-		helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse std-bytemultiarray-reverse topic %s hash %s", topic, typeHash)

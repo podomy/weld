@@ -58,6 +58,12 @@ type Jump struct {
 
 // JumpCallback observes one clock jump. Callbacks run in registration
 // order without holding the clock lock.
+//
+// Non-reentrant contract: callbacks must not call SetSimTime, SetDomain,
+// or SetUseSimTime recursively. Reentrancy is forbidden because a
+// callback that drives the clock would nest jump notifications and reorder
+// observer delivery. No in-repo caller drives the clock from inside a
+// jump callback; all registrations only record the jump.
 type JumpCallback func(Jump)
 
 // Clock is one context clock with wall, steady, and sim sources.
@@ -264,7 +270,8 @@ func (d *Clock) AdvanceSteady(delta int64) {
 }
 
 // SetSimTime records one sim tick and notifies callbacks in order.
-// Negative ticks clamp to zero.
+// Negative ticks clamp to zero. Jump callbacks are non-reentrant and must
+// not call SetSimTime, SetDomain, or SetUseSimTime; see JumpCallback.
 func (d *Clock) SetSimTime(nanos int64) Jump {
 	if d == nil {
 		return Jump{}
@@ -288,7 +295,8 @@ func (d *Clock) SetSimTime(nanos int64) Jump {
 }
 
 // SetDomain switches the active domain with jump notification. It rejects
-// invalid domains loudly.
+// invalid domains loudly. Jump callbacks are non-reentrant and must not
+// call back into SetSimTime, SetDomain, or SetUseSimTime; see JumpCallback.
 func (d *Clock) SetDomain(domain Domain) (Jump, error) {
 	if d == nil {
 		return Jump{}, errors.New("sdk: set domain on nil clock") //nolint:wrapcheck // new error, nothing to wrap

@@ -538,22 +538,48 @@ type DurabilityServiceResult struct {
 //
 // Every mismatch carries a distinct reason string so wiring can surface
 // which bound failed. Cleanup delay requests must not exceed the offer,
-// with an infinite offer satisfying any request. Keep-all history
-// requests need a keep-all offer. Keep-last depth requests must not
-// exceed a keep-last offer; a keep-all offer satisfies any depth. A zero
-// keep-last depth on either side means unstated per the
-// DurabilityServiceQoS struct contract and imposes no constraint, so it
-// never mismatches here and matching stays unchanged. Each
-// resource limit request must not exceed the offer, where unlimited (-1)
-// needs unlimited and unstated (0) imposes no constraint on either side.
-func CheckDurabilityServiceCompat(offered, requested DurabilityServiceQoS) DurabilityServiceResult {
-	if !cleanupDelaySatisfies(offered, requested) {
-		return mismatch("durability_service: requested service_cleanup_delay %s exceeds offered %s",
-			formatCleanupDelay(requested), formatCleanupDelay(offered))
+// with an infinite offer satisfying any request. History kinds outside
+// keep-last (0) and keep-all (1) mismatch loudly on either side instead
+// of passing as compatible. Keep-all history requests need a keep-all
+// offer. Keep-last depth requests must not exceed a keep-last offer; a
+// keep-all offer satisfies any depth. A zero keep-last depth on either
+// side means unstated per the DurabilityServiceQoS struct contract and
+// imposes no constraint, so it never mismatches here and matching stays
+// unchanged. A negative depth on either side is malformed and mismatches
+// instead of reading as unstated. Each resource limit request must not
+// exceed the offer, where unlimited (-1) needs unlimited and unstated
+// (0) imposes no constraint on either side.
+// checkDurabilityServiceHistory checks history kind plus depth compat.
+//
+// Unknown kinds on either side mismatch loudly instead of passing as
+// compatible. Negative depths mismatch instead of reading as unstated.
+// Keep-all requests need a keep-all offer; keep-last depth requests must
+// not exceed a keep-last offer.
+// checkDurabilityServiceKind checks history kind compat on both sides.
+func checkDurabilityServiceKind(offered, requested DurabilityServiceQoS) (DurabilityServiceResult, bool) {
+	if offered.HistoryKind != durabilityServiceHistoryKeepLast && offered.HistoryKind != durabilityServiceHistoryKeepAll {
+		return mismatch("durability_service: offered history kind %d is unknown", offered.HistoryKind), false
 	}
 
+	if requested.HistoryKind != durabilityServiceHistoryKeepLast && requested.HistoryKind != durabilityServiceHistoryKeepAll {
+		return mismatch("durability_service: requested history kind %d is unknown", requested.HistoryKind), false
+	}
+
+	if offered.HistoryDepth < 0 {
+		return mismatch("durability_service: offered history depth %d is negative", offered.HistoryDepth), false
+	}
+
+	if requested.HistoryDepth < 0 {
+		return mismatch("durability_service: requested history depth %d is negative", requested.HistoryDepth), false
+	}
+
+	return DurabilityServiceResult{}, true
+}
+
+// checkDurabilityServiceDepth checks keep-all plus keep-last depth compat.
+func checkDurabilityServiceDepth(offered, requested DurabilityServiceQoS) (DurabilityServiceResult, bool) {
 	if requested.HistoryKind == durabilityServiceHistoryKeepAll && offered.HistoryKind != durabilityServiceHistoryKeepAll {
-		return mismatch("durability_service: requested keep_all history exceeds offered keep_last")
+		return mismatch("durability_service: requested keep_all history exceeds offered keep_last"), false
 	}
 
 	if requested.HistoryKind == durabilityServiceHistoryKeepLast &&
@@ -561,19 +587,49 @@ func CheckDurabilityServiceCompat(offered, requested DurabilityServiceQoS) Durab
 		requested.HistoryDepth > 0 && offered.HistoryDepth > 0 &&
 		requested.HistoryDepth > offered.HistoryDepth {
 		return mismatch("durability_service: requested history depth %d exceeds offered %d",
-			requested.HistoryDepth, offered.HistoryDepth)
+			requested.HistoryDepth, offered.HistoryDepth), false
 	}
 
+	return DurabilityServiceResult{}, true
+}
+
+func checkDurabilityServiceHistory(offered, requested DurabilityServiceQoS) (DurabilityServiceResult, bool) {
+	if result, ok := checkDurabilityServiceKind(offered, requested); !ok {
+		return result, false
+	}
+
+	return checkDurabilityServiceDepth(offered, requested)
+}
+
+// checkDurabilityServiceLimits checks resource limit compat for one pair.
+func checkDurabilityServiceLimits(offered, requested DurabilityServiceQoS) (DurabilityServiceResult, bool) {
 	if reason := checkResourceLimit("max_samples", offered.MaxSamples, requested.MaxSamples); reason != "" {
-		return DurabilityServiceResult{Reason: reason}
+		return DurabilityServiceResult{Reason: reason}, false
 	}
 
 	if reason := checkResourceLimit("max_instances", offered.MaxInstances, requested.MaxInstances); reason != "" {
-		return DurabilityServiceResult{Reason: reason}
+		return DurabilityServiceResult{Reason: reason}, false
 	}
 
 	if reason := checkResourceLimit("max_samples_per_instance", offered.MaxSamplesPerInstance, requested.MaxSamplesPerInstance); reason != "" {
-		return DurabilityServiceResult{Reason: reason}
+		return DurabilityServiceResult{Reason: reason}, false
+	}
+
+	return DurabilityServiceResult{}, true
+}
+
+func CheckDurabilityServiceCompat(offered, requested DurabilityServiceQoS) DurabilityServiceResult {
+	if !cleanupDelaySatisfies(offered, requested) {
+		return mismatch("durability_service: requested service_cleanup_delay %s exceeds offered %s",
+			formatCleanupDelay(requested), formatCleanupDelay(offered))
+	}
+
+	if result, ok := checkDurabilityServiceHistory(offered, requested); !ok {
+		return result
+	}
+
+	if result, ok := checkDurabilityServiceLimits(offered, requested); !ok {
+		return result
 	}
 
 	return DurabilityServiceResult{Compatible: true}

@@ -191,13 +191,19 @@ func typeObjectCheckVendorReEncoded(t *testing.T, decoded []rtps.Param, reEncode
 // typeObjectCheckVendorCodec checks vendor params decode plus re-encode stability.
 func typeObjectCheckVendorCodec(t *testing.T, params []rtps.Param, vendorIDs []uint16) []rtps.Param {
 	t.Helper()
-	encoded := rtps.EncodeParams(params)
+	encoded, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode vendor params: %v", err)
+	}
 	decoded, consumed, err := rtps.DecodeParamsEndian(encoded, true)
 	if err != nil {
 		t.Fatalf("decode vendor params: %v", err)
 	}
 	typeObjectCheckVendorDecoded(t, decoded, params, vendorIDs, encoded, consumed)
-	reEncoded := rtps.EncodeParams(decoded)
+	reEncoded, err := rtps.EncodeParams(decoded)
+	if err != nil {
+		t.Fatalf("re-encode vendor params: %v", err)
+	}
 	typeObjectCheckVendorReEncoded(t, decoded, reEncoded, encoded)
 	return decoded
 }
@@ -205,7 +211,7 @@ func typeObjectCheckVendorCodec(t *testing.T, params []rtps.Param, vendorIDs []u
 // typeObjectCheckVendorParsed checks the vendor params survive a SEDP parse.
 func typeObjectCheckVendorParsed(t *testing.T, ep dds.SEDPEndpoint, params []rtps.Param) {
 	t.Helper()
-	body := sedpConformBuildBody(sedpConformPubsWriter, 1, params)
+	body := sedpConformBuildBody(t, sedpConformPubsWriter, 1, params)
 	raw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, body)
 	parsed, err := dds.ParseSEDPDATA(raw)
 	if err != nil {
@@ -270,7 +276,7 @@ func TestTypeObjectInlineAbsentTolerated(t *testing.T) {
 		{ID: rtps.PIDTypeName, Value: sedpConformEncodeStringPad(sedpConformTypeDDS)},
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpConformGUIDValue(ep.ID)},
 	}
-	manualBody := sedpConformBuildBody(sedpConformPubsWriter, 2, manualParams)
+	manualBody := sedpConformBuildBody(t, sedpConformPubsWriter, 2, manualParams)
 	manualRaw := sedpConformBuildMessage(ep.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, manualBody)
 	manualDecoded, err := dds.ParseSEDPDATA(manualRaw)
 	if err != nil {

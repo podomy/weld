@@ -17,13 +17,16 @@ func TestConfig(t *testing.T) {
 	t.Run("declare get describe", checkDeclareGetDescribe)
 	t.Run("declare duplicate", checkDeclareDuplicate)
 	t.Run("declare validation", checkDeclareValidation)
+	t.Run("declare notset pins type", checkDeclareNotSetPinsType)
 	t.Run("get missing", checkGetMissing)
 	t.Run("set version event", checkSetVersionEvent)
+	t.Run("set skips equal", checkSetSkipsEqual)
 	t.Run("set type mismatch", checkSetTypeMismatch)
 	t.Run("set read only", checkSetReadOnly)
 	t.Run("set undeclared", checkSetUndeclared)
 	t.Run("atomic all or nothing", checkAtomicAllOrNothing)
 	t.Run("validator splits from apply", checkValidatorSplitsFromApply)
+	t.Run("validator version bump", checkValidatorVersionBump)
 	t.Run("apply runs on success", checkApplyRunsOnSuccess)
 	t.Run("startup batching precedence", checkStartupBatchingPrecedence)
 	t.Run("startup empty", checkStartupEmpty)
@@ -122,6 +125,32 @@ func checkDeclareValidation(t *testing.T) {
 	}
 }
 
+// checkDeclareNotSetPinsType pins a NotSet descriptor pins to the first value
+// type, so a later mismatched type fails while the pinned type flows.
+func checkDeclareNotSetPinsType(t *testing.T) {
+	t.Helper()
+	s := mustStore(t, ConfigStoreOptions{})
+	err := s.Declare("flex", NewIntegerParam(1), ParamDescriptor{Type: ParamTypeNotSet})
+	if err != nil {
+		t.Fatalf("declare NotSet integer: %v", err)
+	}
+	desc, err := s.Describe("flex")
+	if err != nil {
+		t.Fatalf("describe pinned: %v", err)
+	}
+	if desc.Type != ParamTypeInteger {
+		t.Fatalf("NotSet declare must pin to integer, got %s", desc.Type)
+	}
+	err = s.Set("flex", NewStringParam("fast"))
+	if err == nil {
+		t.Fatal("mismatched type after pinning must fail")
+	}
+	err = s.Set("flex", NewIntegerParam(2))
+	if err != nil {
+		t.Fatalf("pinned type set must succeed: %v", err)
+	}
+}
+
 // checkGetMissing pins unknown names fail get and describe.
 func checkGetMissing(t *testing.T) {
 	t.Helper()
@@ -165,6 +194,35 @@ func checkSetVersionEvent(t *testing.T) {
 		}
 	default:
 		t.Fatal("set must emit one event")
+	}
+}
+
+// checkSetSkipsEqual pins a no-op set skips the change with no version bump.
+func checkSetSkipsEqual(t *testing.T) {
+	t.Helper()
+	s := mustStore(t, ConfigStoreOptions{AllowUndeclared: true})
+	mustDeclare(t, s, "gain", NewDoubleParam(1.0), ParamDescriptor{Type: ParamTypeDouble})
+	before := s.Version()
+	histBefore := len(s.History())
+	event, err := s.SetWithSource(map[string]ParamValue{"gain": NewDoubleParam(1.0)}, "set")
+	if err != nil {
+		t.Fatalf("no-op set: %v", err)
+	}
+	if len(event.Changes) != 0 {
+		t.Fatalf("no-op set must carry no changes, got %+v", event)
+	}
+	if got := s.Version(); got != before {
+		t.Fatalf("no-op set moved version to %d", got)
+	}
+	if got := len(s.History()); got != histBefore {
+		t.Fatalf("no-op set appended history, got %d want %d", got, histBefore)
+	}
+	event, err = s.SetAtomically(map[string]ParamValue{"gain": NewDoubleParam(1.0), "fresh": NewIntegerParam(1)})
+	if err != nil {
+		t.Fatalf("mixed batch: %v", err)
+	}
+	if len(event.Changes) != 1 || event.Changes[0].Name != "fresh" {
+		t.Fatalf("mixed batch must carry only the changed entry, got %+v", event)
 	}
 }
 
@@ -324,6 +382,32 @@ func checkValidatorSplitsFromApply(t *testing.T) {
 	}
 	if !got.Equal(NewDoubleParam(1.0)) {
 		t.Fatalf("rejected set mutated value: %+v", got)
+	}
+}
+
+// checkValidatorVersionBump pins validator and hook registration bump the
+// version so a concurrent batch prepared before registration aborts loudly.
+func checkValidatorVersionBump(t *testing.T) {
+	t.Helper()
+	s := mustStore(t, ConfigStoreOptions{})
+	mustDeclare(t, s, "gain", NewDoubleParam(1.0), ParamDescriptor{Type: ParamTypeDouble})
+	before := s.Version()
+	err := s.AddValidator("gain", func(_, _ ParamValue) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("add validator: %v", err)
+	}
+	if got := s.Version(); got != before+1 {
+		t.Fatalf("validator registration must bump version, got %d want %d", got, before+1)
+	}
+	before = s.Version()
+	err = s.AddApplyHook("gain", func(_, _ ParamValue) {})
+	if err != nil {
+		t.Fatalf("add hook: %v", err)
+	}
+	if got := s.Version(); got != before+1 {
+		t.Fatalf("hook registration must bump version, got %d want %d", got, before+1)
 	}
 }
 

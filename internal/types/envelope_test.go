@@ -122,7 +122,56 @@ func TestCdrEnvelopeTruncatedEmptyDrops(t *testing.T) {
 	}
 }
 
+// checkEnvelopeUnmarshalBoundary asserts opaque view matches truncation length.
+// Prefixes shorter than the header must fail; longer prefixes carry a valid
+// header and must succeed as an unvalidated view.
+func checkEnvelopeUnmarshalBoundary(t *testing.T, i int, unmarshalErr error) {
+	t.Helper()
+	if i < HeaderSize {
+		if unmarshalErr == nil {
+			t.Fatalf("truncated len %d: UnmarshalMessage succeeded, want header error", i)
+		}
+		t.Logf("truncated prefix %d: %v", i, unmarshalErr)
+		return
+	}
+	if unmarshalErr != nil {
+		t.Fatalf("truncated len %d: UnmarshalMessage failed: %v", i, unmarshalErr)
+	}
+}
+
+// drainEnvelopeTruncatedDecoder drains one truncated envelope body and requires an error.
+// It counts Read plus Finish errors. Only the exact HeaderSize plus 4 boundary
+// is a valid shorter envelope and may report zero errors; all other lengths
+// must report at least one error.
+func drainEnvelopeTruncatedDecoder(t *testing.T, dec *Decoder, i int) {
+	t.Helper()
+	errs := 0
+	if _, err := dec.ReadUint32(); err != nil {
+		errs++
+		t.Logf("truncated body %d: %v", i, err)
+	}
+	if err := dec.Finish(); err != nil {
+		errs++
+		t.Logf("truncated finish %d: %v", i, err)
+	}
+	if errs != 0 {
+		return
+	}
+	if i != HeaderSize+4 {
+		t.Fatalf("truncated len %d decoded with zero errors, want at least one", i)
+	}
+	if dec.Remaining() != 0 {
+		t.Fatalf("valid boundary len %d leaves %d bytes, want 0", i, dec.Remaining())
+	}
+	t.Logf("truncated len %d is exact valid boundary, zero errors allowed", i)
+}
+
 // checkEnvelopeTruncatedPrefix exercises one truncated prefix without panic.
+//
+// A truncated prefix that ends on the uint32 boundary (HeaderSize plus 4)
+// is a valid shorter envelope and decodes clean with no trailing bytes.
+// Only that exact boundary may report zero body plus Finish errors;
+// all other truncated lengths must report at least one error.
 func checkEnvelopeTruncatedPrefix(t *testing.T, wire []byte, i int) {
 	t.Helper()
 	func() {
@@ -133,19 +182,16 @@ func checkEnvelopeTruncatedPrefix(t *testing.T, wire []byte, i int) {
 			}
 		}()
 		var mm Metrics
-		if _, _, err := UnmarshalMessage(wire[:i], &mm); err != nil {
-			t.Logf("truncated prefix %d: %v", i, err)
-		}
+		_, _, unmarshalErr := UnmarshalMessage(wire[:i], &mm)
+		checkEnvelopeUnmarshalBoundary(t, i, unmarshalErr)
 		dec, err := NewDecoder(wire[:i])
 		if err != nil {
+			if dec.Dropped() == 0 {
+				t.Fatalf("truncated len %d: drop not counted on header error", i)
+			}
 			return
 		}
-		if _, err := dec.ReadUint32(); err != nil {
-			t.Logf("truncated body %d: %v", i, err)
-		}
-		if err := dec.Finish(); err != nil {
-			t.Logf("truncated finish %d: %v", i, err)
-		}
+		drainEnvelopeTruncatedDecoder(t, dec, i)
 	}()
 }
 

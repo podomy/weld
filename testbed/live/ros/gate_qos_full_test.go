@@ -320,7 +320,6 @@ func qosFullProbeQoS(ctx context.Context, domain int) ([]string, []string, []str
 // then notes via the shared skip budget so AssertNoExcessSkips stays wired.
 func qosFullBudgetedSkip(t *testing.T, reason string) {
 	t.Helper()
-	helpers.RegisterAllowlistedSkip(t.Name(), reason, time.Date(2027, 5, 1, 0, 0, 0, 0, time.UTC))
 	helpers.NoteProductSkip(t, t.Name(), reason)
 }
 

@@ -987,6 +987,9 @@ type Backend struct {
 	lastAlive map[string]bool
 }
 
+// Compile time check that Backend exposes the Backend contract.
+var _ transports.Backend = (*Backend)(nil)
+
 // cloneXMLProfiles returns a copy of the XML profile map.
 func cloneXMLProfiles(src map[string]core.QoSProfile) map[string]core.QoSProfile {
 	if src == nil {

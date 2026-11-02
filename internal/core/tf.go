@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // TF topic split with latched statics.
@@ -383,9 +384,9 @@ func (s *TFStore) Lookup(target, source string, stampNanos int64) (TransformStam
 // Timeout accounting uses the buffer clock: deadline equals clock.Now plus
 // timeoutNanos, and expiry is decided by clock.Now, never by wall. Zero
 // timeout means one attempt with no polling. Positive timeout polls with a
-// short wall pause between attempts but the stop decision stays on the
-// buffer clock, so a frozen buffer clock with no new data stays pending
-// until the buffer deadline passes. A nil clock is an error. The last
+// short wall pause between attempts and the stop decision stays on the
+// buffer clock, with a wall time safety bound of the same length so a frozen
+// or backward buffer clock cannot livelock. A nil clock is an error. The last
 // lookup error is wrapped with timeout context on expiry so the taxonomy
 // stays visible.
 func (s *TFStore) LookupWithTimeout(target, source string, stampNanos, timeoutNanos int64, clock *ClockState) (TransformStamped, error) {
@@ -405,8 +406,13 @@ func (s *TFStore) LookupWithTimeout(target, source string, stampNanos, timeoutNa
 	start := clock.Now()
 	deadline := tfAddSaturating(start, timeoutNanos)
 	lastErr := err
+	wallStart := time.Now()
+	wallDeadline := wallStart.Add(time.Duration(timeoutNanos))
 	for {
 		if clock.Now() >= deadline {
+			return TransformStamped{}, fmt.Errorf("core: lookup with timeout %q to %q timed out after %d ns: %w", target, source, timeoutNanos, lastErr)
+		}
+		if !time.Now().Before(wallDeadline) {
 			return TransformStamped{}, fmt.Errorf("core: lookup with timeout %q to %q timed out after %d ns: %w", target, source, timeoutNanos, lastErr)
 		}
 		clock.SleepWall(1000000)

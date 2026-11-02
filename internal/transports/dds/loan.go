@@ -272,7 +272,13 @@ type Loan struct {
 	TypeName string
 }
 
-// Bytes exposes the loaned sample bytes. It fails after Return.
+// Bytes exposes the loaned sample bytes without copying. It fails after Return.
+//
+// The returned slice aliases live pooled storage, not a private copy:
+// writes through it mutate the loan, and retaining it after Return or
+// Send keeps aliasing recycled storage that Return zeroes then reuses
+// for later borrows. Callers must drop every view before Return; the
+// zero-copy path never copies to isolate stale views.
 func (l *Loan) Bytes() ([]byte, error) {
 	if l == nil {
 		return nil, fmt.Errorf("dds: loan bytes on nil handle: %w", ErrLoanReturned)
@@ -582,8 +588,14 @@ func NewLoanChannel(depth int) (*LoanChannel, error) {
 
 // Send transfers one loan without copying. It consumes the sender handle: the
 // sender must not use it after Send returns nil and must drop its alias.
-// The sender handle is invalidated like Return, with buf and full cleared
-// under the handle mutex so a stale alias observes nil, never live data.
+// Saved Bytes views from before Send keep aliasing the same array now
+// owned by the receiver, so the sender must drop every view at Send and
+// the receiver must drop every view before Return. The sender handle is
+// invalidated like Return, with buf and full cleared under the handle
+// mutex so the handle itself observes nil, never live data. Pooled arrays
+// are zeroed on Return then reused, so a stale view observes zeros then
+// live reuse data. The path never copies; dropping views is the caller
+// contract that keeps zero-copy safe.
 // The handle mutex covers only the snapshot; the channel send runs without
 // holding it so a full buffer blocks without freezing handle observers.
 //

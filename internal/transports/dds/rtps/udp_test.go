@@ -289,7 +289,7 @@ func TestDialUnicastExchange(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	const domain uint32 = 70
+	const domain uint32 = 10
 
 	first, err := rtps.DialUnicast(ctx, domain)
 	if err != nil {
@@ -311,13 +311,24 @@ func TestDialUnicastExchange(t *testing.T) {
 	msg := buildTestMessage(t)
 
 	srcIP, srcPort, got := sendUnicastAndReceive(t, ctx, second, first, msg)
+	checkUnicastSource(t, srcIP, srcPort, second)
+	checkUnicastCopyIsolation(t, ctx, first, second, msg, got)
+}
+
+// checkUnicastSource pins the observed sender address and port.
+func checkUnicastSource(t *testing.T, srcIP string, srcPort int, second *rtps.UnicastConn) {
+	t.Helper()
 	if srcIP != "127.0.0.1" {
 		t.Fatalf("src ip = %q, want 127.0.0.1", srcIP)
 	}
 	if srcPort != second.LocalPort() {
 		t.Fatalf("src port = %d, want %d", srcPort, second.LocalPort())
 	}
+}
 
+// checkUnicastCopyIsolation pins receive-copy isolation across datagrams.
+func checkUnicastCopyIsolation(t *testing.T, ctx context.Context, first, second *rtps.UnicastConn, msg, got []byte) {
+	t.Helper()
 	// Mutating the returned copy must not affect the next datagram.
 	got[0] ^= 0xFF
 	_, _, got2 := sendUnicastAndReceive(t, ctx, first, second, msg)
@@ -372,7 +383,7 @@ func sendUnicastAndReceive(
 func TestJoinMulticastLoopback(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 71
+	const domain uint32 = 11
 	conn, err := rtps.JoinMulticast(t.Context(), domain)
 	if err != nil {
 		t.Fatalf("join multicast: %v", err)
@@ -426,7 +437,7 @@ func TestUnicastReceiveCancel(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	conn, err := rtps.DialUnicast(ctx, 72)
+	conn, err := rtps.DialUnicast(ctx, 12)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -502,7 +513,7 @@ func TestBackendConnsDoubleClose(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	uni, err := rtps.DialUnicast(ctx, 74)
+	uni, err := rtps.DialUnicast(ctx, 13)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -559,7 +570,7 @@ func TestBackendConnsSendErrors(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	uni, err := rtps.DialUnicast(ctx, 76)
+	uni, err := rtps.DialUnicast(ctx, 14)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -593,11 +604,16 @@ func TestBackendConnsSendErrors(t *testing.T) {
 // TestWrongDomainMismatch documents that domains map to distinct ports, so
 // a datagram sent on one domain never arrives on another. Backends must
 // keep domains separate by port; there is no cross domain delivery.
+//
+// Domains 20 and 21 sit outside every live range (fixed 42 through 48,
+// 55, ephemeral 60 through 69, pooled 70 through 101) and outside the
+// unit probe block, so concurrent live suites cannot pollute the quiet
+// assertions with SPDP chatter on a shared multicast group.
 func TestWrongDomainMismatch(t *testing.T) {
 	t.Parallel()
 
-	const domainA uint32 = 78
-	const domainB uint32 = 79
+	const domainA uint32 = 20
+	const domainB uint32 = 21
 
 	checkDomainPortsDiffer(t, domainA, domainB)
 
@@ -723,7 +739,7 @@ func closeMulticastSender(t *testing.T, c *rtps.MulticastSender) {
 func TestDialMulticastSenderSendOnly(t *testing.T) {
 	t.Parallel()
 
-	const domain uint32 = 80
+	const domain uint32 = 15
 
 	first, second := dialTwoSenders(t, domain)
 	msg := buildTestMessage(t)
@@ -834,7 +850,7 @@ func checkSenderRejects(t *testing.T, sender *rtps.MulticastSender) {
 func TestMulticastSenderDoubleClose(t *testing.T) {
 	t.Parallel()
 
-	sender, err := rtps.DialMulticastSender(81)
+	sender, err := rtps.DialMulticastSender(16)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -887,7 +903,7 @@ func TestBackendGetters(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	uni, err := rtps.DialUnicast(ctx, 82)
+	uni, err := rtps.DialUnicast(ctx, 17)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -896,7 +912,7 @@ func TestBackendGetters(t *testing.T) {
 		t.Fatalf("local addr = %v, want port %d", addr, uni.LocalPort())
 	}
 
-	multi, err := rtps.JoinMulticast(ctx, 83)
+	multi, err := rtps.JoinMulticast(ctx, 18)
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
@@ -905,7 +921,7 @@ func TestBackendGetters(t *testing.T) {
 		t.Fatalf("target = %v, want port %d", target, multi.Port())
 	}
 
-	sender, err := rtps.DialMulticastSender(84)
+	sender, err := rtps.DialMulticastSender(19)
 	if err != nil {
 		t.Fatalf("dial sender: %v", err)
 	}
@@ -949,7 +965,10 @@ func TestSetReadDeadlineAfterClose(t *testing.T) {
 func TestDecodeParamsEndianPad(t *testing.T) {
 	t.Parallel()
 
-	raw := rtps.EncodeParams([]rtps.Param{{ID: 0x0050, Value: []byte{0xAA}}})
+	raw, err := rtps.EncodeParams([]rtps.Param{{ID: 0x0050, Value: []byte{0xAA}}})
+	if err != nil {
+		t.Fatalf("encode pad: %v", err)
+	}
 	// Corrupt pad: drop last pad byte so value is present but pad is short.
 	short := raw[:len(raw)-1]
 	if _, _, err := rtps.DecodeParamsEndian(short, true); err == nil {

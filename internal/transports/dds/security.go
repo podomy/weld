@@ -841,10 +841,5 @@ func HandleProtectedSubmessage(r *DataReceiver, sub rtps.RawSubmessage) (bool, e
 		return false, nil
 	}
 
-	err := DropProtectedSubmessage(r, sub.ID)
-	if err != nil {
-		return true, err
-	}
-
-	return true, nil
+	return true, DropProtectedSubmessage(r, sub.ID)
 }

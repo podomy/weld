@@ -983,9 +983,9 @@ func tryExecProbe(t *testing.T, ctx context.Context, dockerBase []string, script
 	err = cmd.Run()
 	doc, perr := parseProbeDoc(stdout.Bytes())
 	if err != nil {
-		var exitErr *exec.ExitError
 		code := -1
-		if errors.As(err, &exitErr) {
+		exitErr, ok := errors.AsType[*exec.ExitError](err)
+		if ok {
 			code = exitErr.ExitCode()
 		}
 		if code == 2 && perr == nil && doc.Received == 0 {
@@ -1074,9 +1074,9 @@ func tryExecWeldAgent(t *testing.T, ctx context.Context, dockerPrefix, args []st
 	err := cmd.Run()
 	doc, perr := parseProbeDoc(stdout.Bytes())
 	if err != nil {
-		var exitErr *exec.ExitError
 		code := -1
-		if errors.As(err, &exitErr) {
+		exitErr, ok := errors.AsType[*exec.ExitError](err)
+		if ok {
 			code = exitErr.ExitCode()
 		}
 		if code == 2 && perr == nil && doc.Received == 0 {

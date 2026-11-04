@@ -34,22 +34,36 @@ mark lossy rates.](testbed/bench/latency-vs-throughput.svg)
 
 Documentation
 
-  Start here: Overview - /docs/overview, Weld design - /docs/design,
-    Weld invariants - /docs/invariants, Glossary - /docs/glossary,
-    FAQ - /docs/faq.
+  Start here:
+    Overview - /docs/overview
+    Weld design - /docs/design
+    Weld invariants - /docs/invariants
+    Glossary - /docs/glossary
+    FAQ - /docs/faq
 
-  Wire and types: Types - /docs/types, Type hashes - /docs/hash,
-    CDR - /docs/cdr, Introspection and bounds - /docs/introspection,
-    Corpus - /docs/corpus, QoS - /docs/qos,
-    Transports - /docs/transports, Interop - /docs/interop.
+  Wire and types:
+    Types - /docs/types
+    Type hashes - /docs/hash
+    CDR - /docs/cdr
+    Introspection and bounds - /docs/introspection
+    Corpus - /docs/corpus
+    QoS - /docs/qos
+    Transports - /docs/transports
+    Interop - /docs/interop
 
-  System: Actions - /docs/actions, Services - /docs/services,
-    Config - /docs/config, Supervision - /docs/supervision,
-    Time - /docs/time.
+  System:
+    Actions - /docs/actions
+    Services - /docs/services
+    Config - /docs/config
+    Supervision - /docs/supervision
+    Time - /docs/time
 
-  Fleet and tools: Testbed - /docs/testbed, Testbed Go - /docs/testbed-go,
-    Conformance - /docs/conformance, Wireless - /docs/wireless,
-    CLI - /docs/cli.
+  Fleet and tools:
+    Testbed - /docs/testbed
+    Testbed Go - /docs/testbed-go
+    Conformance - /docs/conformance
+    Wireless - /docs/wireless
+    CLI - /docs/cli
 
 Contributing
 

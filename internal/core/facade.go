@@ -32,8 +32,8 @@ import (
 // wire.
 //
 // Derivation: DefaultHistoryDepth is 10 (core normalized keep last when
-// depth is unset; CycloneDDS would use 1 and Zenoh would use 42, core
-// converges to 10 before entity creation). FacadeHistoryDepth is 100, ten
+// depth is unset; CycloneDDS would use 1,
+// core converges to 10 before entity creation). FacadeHistoryDepth is 100, ten
 // times the default, large enough to serve latched static topics such as
 // parameters to late joiners without replaying a full log. Rosout and
 // parameter presets use 1000 because logging and parameter events are

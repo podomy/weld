@@ -38,7 +38,7 @@ import (
 // DDS Security discovery parameter ids.
 //
 // Values follow the OMG DDS Security specification parameter id table as
-// observed in CycloneDDS and FastDDS peers. PIDPropertyList is the generic
+// observed in CycloneDDS peers. PIDPropertyList is the generic
 // key-value carrier (PropertyQosPolicy) that transports dds.sec.* entries
 // on both SPDP and SEDP announcements.
 const (
@@ -652,7 +652,7 @@ func ParseSecurityPropertyListEndian(value []byte, littleEndian bool) (map[strin
 // parseSecurityPropertyListEndian decodes a property list in one byte order.
 //
 // The wire layout is a count followed by (name, value) string pairs with
-// NO propagate boolean: CycloneDDS and FastDDS serialize PID 0x0059 as
+// NO propagate boolean: CycloneDDS serializes PID 0x0059 as
 // bare name/value pairs, proven by live captures. Some encoders append a
 // single propagate byte plus pad after each value; the parser accepts
 // that shape too by falling back to a propagate skip when the next bytes

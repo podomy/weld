@@ -5,9 +5,9 @@
 // machines for Weld.
 //
 // This file owns the RMW QoS profile model and the offered versus requested
-// (RxO) compatibility truth table shared by every transport backend.
+// (RxO) compatibility truth table shared by the DDS backend.
 // internal/core never imports internal/transports: matching lives here once
-// so DDS, Zenoh, and MQTT backends behave identically by construction.
+// so behavior is identical by construction.
 //
 // The profile answers only the matching question. Runtime behavior such as
 // backpressure, bounded retention, overflow drops, and deadline alerts lives
@@ -30,17 +30,17 @@ const MaxReasonLength = 2048
 
 // DefaultHistoryDepth is the keep last depth used when no depth is set.
 //
-// Depth zero means not set. CycloneDDS maps an unset keep last depth to 1
-// and Zenoh maps zero to 42; core normalizes to 10 before entity creation so
-// every vendor converges, and ActualQoS exposes the resolved value.
+// Depth zero means not set. CycloneDDS maps an unset keep last depth to 1;
+// core normalizes to 10 before entity creation so peers converge,
+// and ActualQoS exposes the resolved value.
 const DefaultHistoryDepth = 10
 
 // ResolveSystemDefaults returns p with every system default replaced by the
 // concrete core default, so vendors converge before entity creation.
 //
 // Mapping: history system default becomes keep last; keep last with depth
-// zero becomes DefaultHistoryDepth (CycloneDDS would use 1 and Zenoh would
-// use 42; core normalizes to 10 and ActualQoS exposes the resolved value);
+// zero becomes DefaultHistoryDepth (CycloneDDS would use 1;
+// core normalizes to 10 and ActualQoS exposes the resolved value);
 // reliability becomes reliable; durability becomes volatile; liveliness
 // becomes automatic; unspecified deadline and unspecified lease duration
 // become infinite, which is the wire encoding of no constraint. Transports

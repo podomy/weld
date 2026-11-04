@@ -10,9 +10,9 @@ import (
 
 // Bus is the in-memory hub carrying topics and services.
 //
-// REVIEW: the bus stands in for DDS, Zenoh, and MQTT transports so unit
+// REVIEW: the bus stands in for the DDS transport so unit
 // and fleet tests run without live ROS. Matching, routing, and timeouts
-// live in this package; transports would only move these bytes later.
+// live in this package; the transport would only move these bytes later.
 type Bus struct {
 	// mu guards topics and services.
 	mu sync.Mutex

@@ -14,11 +14,11 @@ var ErrInvalidParam = errors.New("rtps: invalid param")
 
 // DDSI-RTPS parameter ids for discovery and endpoint QoS.
 //
-// Values match the DDSI-RTPS spec and the CycloneDDS q_protocol.h and
-// FastDDS ParameterTypes.hpp headers. Two aliases below are intentional:
+// Values match the DDSI-RTPS spec and the CycloneDDS q_protocol.h header.
+// Two aliases below are intentional:
 // PIDDefaultUnicastLocator follows the discovery brief mapping to 0x002f
 // which is PIDUnicastLocator on the wire, and PIDEndpointGUID follows the
-// brief mapping to 0x005b while Cyclone and FastDDS send 0x005a on the
+// brief mapping to 0x005b while Cyclone sends 0x005a on the
 // wire (see PIDEndpointGUIDWire). Decode is tolerant and keeps both.
 //
 // PAD entries carry no meaning and are skipped on decode so alignment
@@ -71,8 +71,8 @@ const (
 	PIDBuiltinEndpointSet uint16 = 0x0058
 	// PIDEndpointGUID carries the endpoint GUID per the discovery brief.
 	PIDEndpointGUID uint16 = 0x005b
-	// PIDEndpointGUIDWire is the 0x005a value sent by CycloneDDS and
-	// FastDDS for the endpoint GUID. Decoders must accept both.
+	// PIDEndpointGUIDWire is the 0x005a value sent by CycloneDDS
+	// for the endpoint GUID. Decoders must accept both.
 	PIDEndpointGUIDWire uint16 = 0x005a
 	// PIDUserData carries the CDR octet sequence userdata blob.
 	PIDUserData uint16 = 0x002c

@@ -57,8 +57,8 @@ const (
 
 // Vendor unset-depth defaults.
 //
-// An unset keep-last depth (zero) means something different per stack:
-// CycloneDDS maps it to 1 and Zenoh maps it to 42, while core normalizes
+// An unset keep-last depth (zero) means something different per layer:
+// CycloneDDS maps it to 1, while core normalizes
 // to 10 before entity creation (see DefaultHistoryDepth in
 // internal/core/matcher.go) and the Weld facade advertises 100 (see
 // FacadeHistoryDepth in internal/core/facade.go).
@@ -69,8 +69,6 @@ const (
 	WeldCoreUnsetDepth uint64 = 10
 	// WeldFacadeDepth is the depth the Weld facade advertises on the wire.
 	WeldFacadeDepth uint64 = 100
-	// ZenohUnsetDepth is the keep-last depth Zenoh assumes when unset.
-	ZenohUnsetDepth uint64 = 42
 	// UnknownVendorUnsetDepth is the fallback for unrecognized vendors.
 	//
 	// It matches the core normalized default so unknown peers converge
@@ -250,8 +248,6 @@ const (
 	VendorWeldCore
 	// VendorWeldFacade is the advertised facade depth 100.
 	VendorWeldFacade
-	// VendorZenoh is Zenoh with unset depth 42.
-	VendorZenoh
 )
 
 // String renders the vendor in lowercase form.
@@ -263,8 +259,6 @@ func (v PeerVendor) String() string {
 		return "weld_core"
 	case VendorWeldFacade:
 		return "weld_facade"
-	case VendorZenoh:
-		return "zenoh"
 	case VendorUnknown:
 		return "unknown"
 	default:
@@ -281,8 +275,6 @@ func (v PeerVendor) DefaultDepth() uint64 {
 		return WeldCoreUnsetDepth
 	case VendorWeldFacade:
 		return WeldFacadeDepth
-	case VendorZenoh:
-		return ZenohUnsetDepth
 	case VendorUnknown:
 		return UnknownVendorUnsetDepth
 	default:
@@ -294,8 +286,8 @@ func (v PeerVendor) DefaultDepth() uint64 {
 // depth for one peer vendor.
 //
 // A set depth passes through untouched. An unset depth (zero) resolves to
-// the vendor default, so Cyclone gets 1, core gets 10, the facade gets
-// 100, and Zenoh gets 42. Normalization never invents a smaller promise
+// the layer default, so Cyclone gets 1, core gets 10, and the facade gets
+// 100. Normalization never invents a smaller promise
 // for a set depth; peer side shortfalls surface through NegotiateDepth.
 func NormalizeDepthForVendor(requested uint64, vendor PeerVendor) uint64 {
 	if requested != 0 {

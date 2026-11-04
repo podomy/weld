@@ -347,7 +347,7 @@ func checkNegativeCompatibility(t *testing.T) {
 
 // checkResolveSystemDefaults pins the explicit resolution mapping and the
 // documented depth zero normalization: core uses DefaultHistoryDepth where
-// CycloneDDS would use 1 and Zenoh would use 42. Unspecified deadline and
+// CycloneDDS would use 1. Unspecified deadline and
 // lease become infinite, which is the wire encoding of no constraint.
 func checkResolveSystemDefaults(t *testing.T) {
 	t.Helper()

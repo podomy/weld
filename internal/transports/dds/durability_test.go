@@ -220,7 +220,6 @@ func TestDepthNormMatrix(t *testing.T) {
 		{VendorCyclone, 1},
 		{VendorWeldCore, 10},
 		{VendorWeldFacade, 100},
-		{VendorZenoh, 42},
 		{VendorUnknown, 10},
 	}
 

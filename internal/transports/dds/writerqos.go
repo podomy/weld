@@ -10,7 +10,7 @@
 // This file translates a resolved best available core profile to the exact
 // SEDP-announced DDS QoS (reliability kind plus blocking, durability kind,
 // history kind plus depth, deadline, lifespan, liveliness plus lease) and
-// back, following the internal/transports/fastdds ForwardQoS table shape.
+// back through the ForwardQoS and ReverseQoS tables below.
 //
 // Nothing narrows silently: a setting with no exact wire encoding reports a
 // typed *WireQoSRefusal naming topic, endpoint pair, and policy kind, never
@@ -212,10 +212,10 @@ func decodeWireDuration(raw []byte, policy WriterPolicyKind) (WireDuration, erro
 
 // WireQoS is the SEDP-announced DDS QoS for one writer endpoint.
 //
-// It follows the FastDDS ForwardQoS table shape: reliability kind plus
+// It follows the ForwardQoS table shape: reliability kind plus
 // blocking time, durability kind only, history kind plus depth, deadline,
 // lifespan, and liveliness kind plus lease. Unspecified core durations map
-// to DDS infinite, matching the FastDDS forward rule; core matching treats
+// to DDS infinite, matching the forward rule; core matching treats
 // an unspecified offer and an infinite offer identically, so the mapping
 // preserves every RxO verdict.
 type WireQoS struct {
@@ -442,8 +442,8 @@ func forwardLifeDurations(topic, publisher, subscriber string, p core.QoSProfile
 // refuses; keep last depth above the uint32 wire range refuses; keep all
 // encodes depth zero because depth is ignored for keep all. Reliable maps
 // to infinite blocking and best effort to zero blocking. Unspecified
-// deadline, lifespan, and lease map to DDS infinite, matching the FastDDS
-// forward rule. Topic plus publisher plus subscriber scope every refusal so
+// deadline, lifespan, and lease map to DDS infinite, matching the forward
+// rule. Topic plus publisher plus subscriber scope every refusal so
 // the loud event carries the full endpoint pair.
 func ForwardQoS(topic, publisher, subscriber string, p core.QoSProfile) (WireQoS, error) {
 	var out WireQoS
@@ -981,7 +981,7 @@ func reverseWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 
 // ReverseQoS translates a wire QoS back to a core profile for matching.
 //
-// It mirrors the FastDDS ReverseQoS shape: keep all maps directly and
+// It mirrors the ReverseQoS shape: keep all maps directly and
 // reliable plus best effort map directly, while transient, persistent,
 // and manual by participant kinds refuse loudly with typed
 // WireQoSReverseRefusal instead of mapping to Unknown that would pass

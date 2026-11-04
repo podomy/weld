@@ -29,8 +29,8 @@ import (
 
 // GID identifies one endpoint or participant.
 //
-// It holds the 16 byte RMW GID: the DDS participant GUID bytes on DDS paths
-// and the derived token bytes on Zenoh paths. The zero value means unset.
+// It holds the 16 byte RMW GID: the DDS participant GUID bytes.
+// The zero value means unset.
 type GID [16]byte
 
 // String renders the GID as 32 lowercase hex digits.

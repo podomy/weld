@@ -42,9 +42,10 @@ Sustained achieved throughput at 1 KiB: weld-to-weld about
 11.5k msgs/s, ros-to-ros about 9.0k msgs/s, roughly 25% more
 headroom, and every Weld-receiving leg stays lossless throughout.
 
-Chart (latency-vs-throughput.svg): latency vs achieved throughput, 1 KiB
-sweep. One p50 curve per leg in leg colors with circle markers, p99
-dashed with triangles; red rings mark lossy rates.
+Chart file, open in a browser to view (latency-vs-throughput.svg):
+latency vs achieved throughput, 1 KiB sweep. One p50 curve per leg in
+leg colors with circle markers, p99 dashed with triangles; red rings
+mark lossy rates.
 
 Reading the chart
 

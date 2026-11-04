@@ -37,7 +37,7 @@ at 50, 100, 200, 400, 800, 1600, 5000, 10000, 30000, 60000, 100000 Hz
 with a latency-vs-throughput chart.
 Sweep alone (fleet up):
 WELD_BENCH_FULL=1 go test ./testbed/bench/ -run TestBenchSweep -count=1 -timeout 60m.
-Results with charts live in testbed/bench/README.md.
+Results with charts live in testbed/bench/README.
 
 Live runs need -timeout 60m: the default 10m package timeout fires mid-suite
 with the peer present.

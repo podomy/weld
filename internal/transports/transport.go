@@ -1,14 +1,14 @@
 // Copyright (C) 2026 Podomy.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package transports defines the backend interface all network buses implement.
+// Package transports defines the backend interface the DDS bus implements.
 //
 // internal/core never imports this package. Core owns matching, QoS,
-// routing, timeouts, retries, and state machines. Transports are thin
-// translators at the border: inbound they turn wire bytes into core
-// messages, outbound they turn core messages into wire bytes.
+// routing, timeouts, retries, and state machines. The transport is a thin
+// translator at the border: inbound it turns wire bytes into core
+// messages, outbound it turns core messages into wire bytes.
 //
-// New buses arrive as pull requests implementing Backend with interop
+// Backends arrive as pull requests implementing Backend with interop
 // tests, never as plugins. There is no plugin registry and no dynamic
 // loading, so version skew has nowhere to hide.
 package transports
@@ -180,7 +180,7 @@ func ParseDiscoveryRange(s string) (DiscoveryRange, error) {
 // ResolveDiscoveryRange returns the configured range unchanged.
 //
 // Unlike ResolveDomainID it reads no environment variable. There is no
-// single stable env contract for discovery range across vendors, so the
+// single stable env contract for discovery range, so the
 // range stays explicit config. NotSet passes through unchanged here.
 // Sidecar construction normalizes NotSet to SystemDefault so the join
 // path always carries a concrete range. Callers that need a concrete
@@ -238,7 +238,7 @@ type LivelinessReport struct {
 // backends treat nil and zero length identically and must not retain
 // the caller slice in either case.
 //
-// v1 carries TopicName, TypeName, and Payload only, with TypeHash as an
+// Carries TopicName, TypeName, and Payload only, with TypeHash as an
 // optional backward compatible extension. TypeHash carries the RIHS01
 // type hash when the caller knows it, and empty when unknown. Publish
 // prefers the caller hash and falls back to a static table, then to
@@ -266,7 +266,7 @@ type OutgoingMessage struct {
 // bytes beyond the call. A nil Payload is valid and means an empty
 // sample, equivalent to zero length.
 //
-// v1 carries TopicName, TypeName, and Payload only. The same reserved
+// Carries TopicName, TypeName, and Payload only. The same reserved
 // extension note as OutgoingMessage applies: type hash, QoS offer, GID,
 // and sequence number arrive later without breaking topics.
 type IncomingMessage struct {

@@ -18,6 +18,16 @@ Scope
   correctness, reliability, verification, and optimization of what
   is already here. No new surface, fixes only.
 
+  The bar, same for every change: externally identical behavior.
+  Optimization needs a measurement before and after, not a hunch.
+  Replacement needs the same wire format, CLI surface, and journal
+  semantics, proven by the existing gate plus a Resonance run, not
+  by reading the diff. Fixes need a failing gate first, then the
+  smallest patch that turns it green without moving any other
+  number. Cleanup needs the full gate green on both sides; elegance
+  in the diff proves nothing. Anything adding a flag, a verb, or a
+  field is expansion, and the answer is no until the freeze lifts.
+
 Weld is faster than ROS 2 on the same host: up to 68% lower latency.
 
 It also scales further: zero packet loss where ROS starts dropping,

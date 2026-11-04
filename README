@@ -11,6 +11,13 @@ against CycloneDDS, the only supported DDS.
 Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as
 first-class nodes, verified by mixed fleet behavior.
 
+Scope
+
+  Weld is consolidated, not expanding. CycloneDDS is the only
+  transport and no others will be added. All work goes inward:
+  correctness, reliability, and verification of what is already
+  here. No new surface, fixes only.
+
 Weld is faster than ROS 2 on the same host: up to 68% lower latency.
 
 It also scales further: zero packet loss where ROS starts dropping,

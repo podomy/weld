@@ -27,7 +27,16 @@ Type System and Serialization
 - Weld MUST enforce bounds from __MAX_SIZE plus __MAX_STRING_SIZE enums plus introspection string_upper_bound_, array_size_, is_upper_bound_, and description capacity plus string capacity at serialize time.
 - Weld MUST support init modes all, skip, zero, and defaults only with explicit zeroing or default fill behavior per mode, and Weld MUST honor the is_rosidl_buffer flag on uint8[] while ignoring other C++ runtime and buffer backend differences.
 - Weld MUST handle corpus families std_msgs, geometry_msgs, sensor_msgs plus SetCameraInfo service, nav_msgs with map services, trajectory_msgs, plus diagnostic, shape, stereo, visualization, and std_srvs packages, and Weld MUST treat point cloud Python helpers as utility code and MUST NOT treat them as codegen target.
-- Weld MUST preserve header semantics where Header carries stamp plus frame id, Time carries int32 seconds plus uint32 nanoseconds with Duration alongside, Odometry header frame is pose parent with twist in child frame, LaserScan stamp is first ray acquisition with angles about positive Z from positive X, Image stamp is acquisition in optical frame with X right plus Y down plus Z forward, Path header is path frame with fallback headers for poses, TransformStamped header is reference with child as target at stamp, NavSat stamp is ROS time with antenna frame, joint and trajectory stamps are recording and reference times, and Marker lifetime zero means forever.
+- Weld MUST preserve header semantics where Header carries stamp plus frame id.
+- Weld MUST preserve header semantics where Time carries int32 seconds plus uint32 nanoseconds with Duration alongside.
+- Weld MUST preserve header semantics where Odometry header frame is pose parent with twist in child frame.
+- Weld MUST preserve header semantics where LaserScan stamp is first ray acquisition with angles about positive Z from positive X.
+- Weld MUST preserve header semantics where Image stamp is acquisition in optical frame with X right plus Y down plus Z forward.
+- Weld MUST preserve header semantics where Path header is path frame with fallback headers for poses.
+- Weld MUST preserve header semantics where TransformStamped header is reference with child as target at stamp.
+- Weld MUST preserve header semantics where NavSat stamp is ROS time with antenna frame.
+- Weld MUST preserve header semantics where joint and trajectory stamps are recording and reference times.
+- Weld MUST preserve header semantics where Marker lifetime zero means forever.
 - Weld MUST treat fixed float64[36] covariance as inline with 8 byte alignment and no length prefix, fixed arrays as inline with 8 byte alignment and no prefix, all unbounded sequences with uint32 length prefix, and strings as length prefixed plus NUL in CDR.
 - Weld MUST treat the single bounded sequence in the corpus, shape_msgs/SolidPrimitive float64 with max 3 dimensions, as the bounded path fixture, and Weld MUST test that path explicitly.
 - Weld MUST NOT send constants on the wire and MUST emit them as Go consts only, MUST keep bool plus uint8 endian plus byte plus char distinct despite equal size, MUST validate encoding and format strings out of band, and MUST apply the single IDL default in the corpus which is the identity quaternion.
@@ -59,7 +68,14 @@ Topic and Type Naming
 - OPEN ITEM: sources note Humble peers without hashes use hashless keys while Iron peers include hashes, so Weld MUST treat hashless versus hashed keys as different rendezvous strings and MUST negotiate per peer.
 
 QoS Matching and Facade
-- Weld MUST implement RMW QoS profile with history plus depth plus reliability plus durability plus deadline plus lifespan plus liveliness plus lease duration plus avoid namespace conventions flag, where history covers keep last plus keep all plus system default with depth meaningful for keep last, reliability covers reliable plus best effort plus system default, durability covers transient local plus volatile plus system default, unspecified deadline means implementation default, lifespan is publisher only naming message expiry, liveliness covers automatic plus manual by topic plus system default with lease duration naming how long silence means gone, and avoidance flag skips rt prefix for native DDS topics.
+- Weld MUST implement RMW QoS profile with history plus depth plus reliability plus durability plus deadline plus lifespan plus liveliness plus lease duration plus avoid namespace conventions flag.
+- Weld MUST implement RMW QoS profile where history covers keep last plus keep all plus system default with depth meaningful for keep last.
+- Weld MUST implement RMW QoS profile where reliability covers reliable plus best effort plus system default.
+- Weld MUST implement RMW QoS profile where durability covers transient local plus volatile plus system default.
+- Weld MUST implement RMW QoS profile where unspecified deadline means implementation default.
+- Weld MUST implement RMW QoS profile where lifespan is publisher only naming message expiry.
+- Weld MUST implement RMW QoS profile where liveliness covers automatic plus manual by topic plus system default with lease duration naming how long silence means gone.
+- Weld MUST implement RMW QoS profile where avoidance flag skips rt prefix for native DDS topics.
 - Weld MUST use time base seconds plus nanoseconds with infinite near max int64 and unspecified as zero, and string conversions with lowercase names such as best_effort.
 - Weld MUST support presets sensor data keep last 5 best effort volatile, parameters keep last 1000 reliable volatile, default keep last 10 reliable volatile, services default keep last 10 reliable volatile, parameter events keep last 1000 reliable volatile, rosout default keep last 1000 reliable transient local with lifespan 10 s, system default all system default, best available keep last 10 best available, unknown history depth 0 with unknown policies, with depth system default 0 meaning not set, deadline plus lifespan plus lease defaults unspecified, and best available durations infinite minus one.
 - Weld MUST apply offered versus requested RxO so reliable publisher to best effort subscription flows because offer exceeds request, best effort publisher to reliable subscription is blocked because request exceeds offer, transient local publisher to volatile subscription flows because history is available, volatile publisher to transient local subscription is blocked because no history is kept, publisher deadline 10 ms to subscription 100 ms flows because publisher is faster than needed, and publisher deadline 100 ms to subscription 10 ms is blocked because publisher is too slow.
@@ -108,7 +124,12 @@ Discovery and Graph Index
 - OPEN ITEM: sources show stale plus missing graph entries plus slow first topic list plus daemon divergence plus same name confusion plus incomplete tokens plus flaky multicast plus stale caches plus unexposed type hashes plus unsupported static topologies plus cross vendor localhost leaks, so Weld MUST version index with generation plus expose type hash plus GID and MUST NOT present partial view as global truth.
 
 DDS Transport Specifics
-- Weld MUST create publishers by adapting best available reliability plus durability plus liveliness against discovered subscriptions before creating DDS writer, MUST reject strictly required network flow endpoints, MUST derive type name from message type name plus fully qualified topic with rt prefix unless avoidance set, MUST build value type plus check self containment plus size plus create sertype plus optional dynamic type plus create DDS topic transferring sertype ownership while keeping it for serialized forwarding, MUST attach event listener plus translate QoS plus create writer plus record instance handle plus GID, and MUST report loan availability exactly as the vendor would (self-contained type plus shared memory available) for can_loan_messages queries from ROS peers, without implementing loan borrow or return APIs in v1.
+- Weld MUST create publishers by adapting best available reliability plus durability plus liveliness against discovered subscriptions before creating DDS writer.
+- Weld MUST reject strictly required network flow endpoints.
+- Weld MUST derive type name from message type name plus fully qualified topic with rt prefix unless avoidance set.
+- Weld MUST build value type plus check self containment plus size plus create sertype plus optional dynamic type plus create DDS topic transferring sertype ownership while keeping it for serialized forwarding.
+- Weld MUST attach event listener plus translate QoS plus create writer plus record instance handle plus GID.
+- Weld MUST report loan availability exactly as the vendor would (self-contained type plus shared memory available) for can_loan_messages queries from ROS peers, without implementing loan borrow or return APIs in v1.
 - Weld MUST create subscriptions with read condition with any state, MUST install data available listener calling callback or bumping unread count, and MUST provide no content filter or loan support on Cyclone subscriptions.
 - Weld MUST publish with current time, MUST forward serialized publish by building serdata from CDR buffer without deserializing, and MUST NOT require a loaned sample to do so.
 - Weld MUST take by looping DDS take one sample at a time skipping invalid data, converting sample info to message info with publication handle as GID keeping source timestamp stamping received time as now and leaving sequence numbers unsupported, MUST batch sequence take then compact valid samples to front, and MUST use CDR take with shared memory fast path for serialized take.
@@ -117,7 +138,15 @@ DDS Transport Specifics
 - Weld MUST wrap send with header plus data written with timestamp where request header GUID is client publisher instance handle with atomic increment sequence, yielding service packet 4 byte CDR header plus 8 byte GUID plus 8 byte sequence plus XCDR1 user fields.
 - Weld MUST split response handling 16 byte writer GUID into request GUID plus publisher handle, MUST wait up to 100 ms for matched response reader where gone reader is OK and possible reader is timeout, MUST rebuild take request id from header GUID plus publication handle, and MUST filter client side on own publisher handle.
 - Weld MUST check server availability with graph counts for request readers plus reply writers then match on service id userdata with fallback to non empty reader plus writer sets.
-- Weld MUST implement waitset with DDS waitset plus trigger list plus lock plus in use flag plus entity snapshots, MUST attach global dummy guard keeping empty waitsets from returning immediately, MUST reject concurrent use, MUST reattach only when cached pointers changed, MUST attach subscription plus guard plus service plus client conditions plus per entity event status masks, MUST wait with nanosecond timeout else forever, MUST sort triggers plus null non fired entries while taking guard conditions, MUST handle active events through status changes, and MUST report timeout only when nothing but sentinel fired.
+- Weld MUST implement waitset with DDS waitset plus trigger list plus lock plus in use flag plus entity snapshots.
+- Weld MUST attach global dummy guard keeping empty waitsets from returning immediately.
+- Weld MUST reject concurrent use.
+- Weld MUST reattach only when cached pointers changed.
+- Weld MUST attach subscription plus guard plus service plus client conditions plus per entity event status masks.
+- Weld MUST wait with nanosecond timeout else forever.
+- Weld MUST sort triggers plus null non fired entries while taking guard conditions.
+- Weld MUST handle active events through status changes.
+- Weld MUST report timeout only when nothing but sentinel fired.
 - Weld MUST map event masks to liveliness changed plus lost, requested plus offered deadline missed, requested plus offered incompatible QoS, message plus sample lost, incompatible types both sides, and subscription plus publication matched, with takes reading DDS status structs.
 - Weld MUST memcpy GUID bytes into gid storage but MUST return instance handle not GUID for publisher GID call, and message info GID MUST be publication handle.
 - OPEN ITEM: sources report service request ID headers vendor divergent plus Cyclone to FastDDS service interop failing plus cross vendor service payload misdeserialize plus native keyed types unable to talk to ROS types, so Weld MUST treat services plus keyed topics as high risk paths with explicit interop tests and MUST assume ROS types normally unkeyed.

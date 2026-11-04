@@ -34,31 +34,22 @@ mark lossy rates.](testbed/bench/latency-vs-throughput.svg)
 
 Documentation
 
-  Weld design - /docs/design: architecture, invariants, and build order.
-  Weld invariants - /docs/invariants: 250+ testable promises the system
-    holds, drawn from 6000+ upstream ROS issues.
-  Overview - /docs/overview: what Weld is and what v1 ships.
-  Types - /docs/types: IDL mapping, registry, constants.
-  Type hashes - /docs/hash: RIHS01 computation and negotiation.
-  CDR - /docs/cdr: XCDR1 wire encoding.
-  Introspection and bounds - /docs/introspection: reflection tables
-    and limits.
-  Corpus - /docs/corpus: message families and fixtures.
-  Actions - /docs/actions: goals, feedback, results, timeouts.
-  Services - /docs/services: calls, deadlines, discovery.
-  Config - /docs/config: versioned parameter store.
-  Supervision - /docs/supervision: serial and pooled groups.
-  Time - /docs/time: clock domains, jumps, overload.
-  QoS - /docs/qos: matching, best-available, facade, retention.
-  Transports - /docs/transports: backend interface and DDS sidecar.
-  Interop - /docs/interop: field notes from CycloneDDS interop.
-  Testbed - /docs/testbed: Docker peers and first interop.
-  Testbed Go - /docs/testbed-go: live harness, domains, file split.
-  Conformance - /docs/conformance: wire end state and gate record.
-  Wireless - /docs/wireless: Rappaport distilled for WiFi fleets.
-  CLI - /docs/cli: the weld echo/pub commands plus weld action send.
-  Glossary - /docs/glossary: terms in plain words.
-  FAQ - /docs/faq: constants, identity quaternion, one binary, sidecar.
+  Start here: Overview - /docs/overview, Weld design - /docs/design,
+    Weld invariants - /docs/invariants, Glossary - /docs/glossary,
+    FAQ - /docs/faq.
+
+  Wire and types: Types - /docs/types, Type hashes - /docs/hash,
+    CDR - /docs/cdr, Introspection and bounds - /docs/introspection,
+    Corpus - /docs/corpus, QoS - /docs/qos,
+    Transports - /docs/transports, Interop - /docs/interop.
+
+  System: Actions - /docs/actions, Services - /docs/services,
+    Config - /docs/config, Supervision - /docs/supervision,
+    Time - /docs/time.
+
+  Fleet and tools: Testbed - /docs/testbed, Testbed Go - /docs/testbed-go,
+    Conformance - /docs/conformance, Wireless - /docs/wireless,
+    CLI - /docs/cli.
 
 Contributing
 

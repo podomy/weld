@@ -39,7 +39,7 @@ const (
 //
 // RosType is the slash form for ros2 topic pub and echo. IDLName is the
 // double underscore form for Weld SEDP Subscribe and PublishBytes.
-// Static hash is the RIHS01 value from ros2 topic info -v on weld-jazzy.
+// Static hash is the RIHS01 value from ros2 topic info -v on ros-jazzy.
 // Live probing is preferred at runtime and this value is the fallback.
 const (
 	stereoDisparityRosType    = "stereo_msgs/msg/DisparityImage"
@@ -435,7 +435,7 @@ func runStereoDisparityForward(t *testing.T, ctx context.Context, domain int, li
 	}
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
-		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain ros-jazzy Jazzy topic %s: %v", topic, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity forward topic %s hash %s", topic, typeHash)
@@ -532,7 +532,7 @@ func runStereoDisparityReverse(t *testing.T, ctx context.Context, domain int, li
 	}
 	typeHash, err := resolveStereoDisparityHash(ctx, domain, topic)
 	if err != nil {
-		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		reason := fmt.Sprintf("stereo disparity hash unavailable for pooled domain ros-jazzy Jazzy topic %s: %v", topic, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("stereo disparity reverse topic %s hash %s", topic, typeHash)

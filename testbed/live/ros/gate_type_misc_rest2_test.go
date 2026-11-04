@@ -78,7 +78,7 @@ func checkMiscRest2Corpus(t *testing.T) {
 // Offline it verifies the seven corpus entries across builtin_interfaces,
 // stereo_msgs, and shape_msgs are present. Live it skips when the peer is
 // absent and skips when the peer lacks any one of the ROS types, using
-// docker argv probes on the allocated domain against weld-jazzy. A per-run live ID
+// docker argv probes on the allocated domain against ros-jazzy. A per-run live ID
 // plus topic is minted for isolation parity with the matrix runners even
 // though this file sends no traffic.
 func TestROSTypeMiscRest2Completeness(t *testing.T) {

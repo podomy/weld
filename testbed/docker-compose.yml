@@ -1,23 +1,34 @@
 services:
-  weld-humble:
+  ros-humble:
     build: ./humble
-    container_name: weld-humble
+    container_name: ros-humble
     network_mode: host
     command: ["sleep", "infinity"]
     volumes:
       - ./logs:/testbed/logs
 
-  weld-jazzy:
+  ros-jazzy:
     build: ./jazzy
-    container_name: weld-jazzy
+    container_name: ros-jazzy
     network_mode: host
     command: ["sleep", "infinity"]
     volumes:
       - ./logs:/testbed/logs
 
-  weld-rolling:
+  ros-rolling:
     build: ./rolling
-    container_name: weld-rolling
+    container_name: ros-rolling
+    network_mode: host
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./logs:/testbed/logs
+
+  weld:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: testbed-weld:latest
+    container_name: weld
     network_mode: host
     command: ["sleep", "infinity"]
     volumes:

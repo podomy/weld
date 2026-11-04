@@ -61,7 +61,7 @@ const (
 	stdMultiU8D  uint8  = 69
 )
 
-// Static type hashes from ros2 topic info -v on weld-jazzy.
+// Static type hashes from ros2 topic info -v on ros-jazzy.
 const (
 	stdMultiHashInt16        = "RIHS01_1dcc3464e47c288a55f943a389d337cdb06804de3f5cd7a266b0de718eee17e5"
 	stdMultiHashInt64        = "RIHS01_8cd1048c2f186b6bd9a92472dc1ce51723c0833a221e2b7aecfff111774f4b49"

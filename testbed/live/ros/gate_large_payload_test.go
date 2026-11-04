@@ -597,7 +597,7 @@ func verifyLargeEcho(t *testing.T, echoPath, live string, want []byte) {
 // per-run live ID in header frame_id, checks the local XCDR1 codec
 // round trips full bytes, then publishes the fragmented XCDR1 sample
 // through Weld on one allocated exclusive domain and proves ros2 topic echo in the
-// already running weld-jazzy peer sees the live ID plus full geometry
+// already running ros-jazzy peer sees the live ID plus full geometry
 // plus all data bytes. The sample stays under the 32MiB maxPayloadLen
 // cap that bounds DATA_FRAG reassembly while exceeding one DATA MTU so
 // the wire fragments and reassembles. It uses os/exec docker argv only
@@ -1001,7 +1001,7 @@ func verifyLargePC2Echo(t *testing.T, echoPath, live string, want []byte) {
 // bytes plus a per-run live ID in header frame_id, checks the local XCDR1
 // codec round trips full bytes, then publishes the fragmented XCDR1 sample
 // through Weld on one allocated exclusive domain and proves ros2 topic echo in the
-// already running weld-jazzy peer sees the live ID plus full geometry plus
+// already running ros-jazzy peer sees the live ID plus full geometry plus
 // all data bytes. The sample stays under the 32MiB maxPayloadLen cap that
 // bounds DATA_FRAG reassembly while exceeding one DATA MTU so the wire
 // fragments and reassembles. It uses os/exec docker argv only with context

@@ -28,12 +28,12 @@ const (
 	extraByteSentinel    uint8   = 66
 )
 
-// Static type hashes from ros2 topic info -v on weld-jazzy.
+// Static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime; these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	extraHashUInt8   = "RIHS01_6138bd83d8c3569cb80a667db03cfc1629f529fee79d944c39c34e352e72f010"
 	extraHashInt8    = "RIHS01_26525065a403d972cb672f0777e333f0c799ad444ae5fcd79e43d1e73bd0f440"

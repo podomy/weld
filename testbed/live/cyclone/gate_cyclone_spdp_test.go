@@ -298,7 +298,7 @@ func TestCycloneSPDPUnicastLoopback(t *testing.T) {
 // TestCycloneSPDPContainerLogCrossCheck optionally reads container logs.
 //
 // It uses docker argv with no shell through the shared helpers. It skips
-// cleanly when no daemon or weld-jazzy container is present and never
+// cleanly when no daemon or ros-jazzy container is present and never
 // starts the compose stack. It skips only when container logs are
 // unavailable (docker exec fails); when logs are available it asserts the
 // tail holds rows so the cross check is not vacuous. The direct UDP

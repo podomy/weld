@@ -14,12 +14,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Rest geometry static type hashes from ros2 topic info -v on weld-jazzy.
+// Rest geometry static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy. PointStamped plus Vector3 plus Pose plus Quaternion plus
+// ros-jazzy Jazzy. PointStamped plus Vector3 plus Pose plus Quaternion plus
 // Twist are already covered by the base matrix and the extra geometry gate,
 // so this file covers the remaining geometry_msgs types in corpus order.
 const (

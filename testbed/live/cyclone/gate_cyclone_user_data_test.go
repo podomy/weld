@@ -34,7 +34,7 @@ const (
 // TestCycloneUserDataReceiptToWeld checks Weld backend Take sees Cyclone pub.
 //
 // It starts ros2 topic pub detached via docker exec -d writing to
-// /testbed/logs/<run-id>.out in the already running weld-jazzy peer and
+// /testbed/logs/<run-id>.out in the already running ros-jazzy peer and
 // never starts the compose stack. It joins the Weld backend on the
 // allocated domain, declares an SEDP reader with Subscribe, then loops
 // TakeBytes (the DataReceiver TakeFrom path) until a sample arrives on the

@@ -21,7 +21,7 @@ import (
 // QoS durability and history constants for Jazzy canonical.
 //
 // Each subtest allocates one exclusive domain from the parallel pool. The container name and
-// Cyclone RMW come from helpers so the gate stays on weld-jazzy with
+// Cyclone RMW come from helpers so the gate stays on ros-jazzy with
 // RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Only one run per domain and topic
 // at a time is supported, so tests never run in parallel and every payload
 // carries a per-run live ID. Reliability is pinned to reliable so the
@@ -156,10 +156,10 @@ func qosDHRequireFlags(t *testing.T, ctx context.Context, domain int) bool {
 	t.Helper()
 	flagsOk, keepAllOk, err := qosDHFlagsSupported(ctx, domain)
 	if err != nil {
-		qosDHBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
+		qosDHBudgetedSkip(t, fmt.Sprintf("peer ros-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !flagsOk {
-		qosDHBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy")
+		qosDHBudgetedSkip(t, "peer ros-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy")
 	}
 	if !keepAllOk {
 		t.Logf("ros2 topic pub or echo help lacks keep_all, keep_all cases will skip with reason")
@@ -425,7 +425,7 @@ func qosDHRunCase(t *testing.T, ctx context.Context, bin string, domain int, c q
 	})
 	qosDHCheckCore(t, c)
 	if c.history == "keep_all" && !keepAllOk {
-		qosDHBudgetedSkip(t, fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name))
+		qosDHBudgetedSkip(t, fmt.Sprintf("case %s: peer ros-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name))
 	}
 	if c.direction == "forward" {
 		qosDHRunForward(t, ctx, bin, domain, c)
@@ -501,7 +501,7 @@ func TestROSQoSDurabilityHistoryCore(t *testing.T) {
 //
 // It parametrizes ros2 topic pub and echo with --qos-durability,
 // --qos-history, and --qos-depth on the allocated exclusive domain with the Cyclone RMW in
-// weld-jazzy. Each subtest uses its own live ID and topic with context
+// ros-jazzy. Each subtest uses its own live ID and topic with context
 // timeouts and docker argv only. It skips cleanly only when no peer is
 // present or when the flags are unsupported. A missing payload with a clean
 // echo is a failure. Keep_all cases skip with reason when the peer help

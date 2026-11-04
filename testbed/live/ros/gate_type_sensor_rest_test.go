@@ -20,12 +20,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static sensor rest type hashes from ros2 topic info -v on weld-jazzy.
+// Static sensor rest type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	sensorRestHashCameraInfo       = "RIHS01_b3dfd68ff46c9d56c80fd3bd4ed22c7a4ddce8c8348f2f59c299e73118e7e275"
 	sensorRestHashCompressedImage  = "RIHS01_15640771531571185e2efc8a100baf923961a4d15d5569652e6cb6691e8e371a"
@@ -2574,7 +2574,7 @@ func publishSensorRestLargeStrict(ctx context.Context, t *testing.T, backend *dd
 // 320 by 320 mono8 Image with deterministic bytes and a per-run live ID
 // in header frame_id. The local XCDR1 codec round trips full bytes, then
 // the fragmented sample publishes through Weld and ros2 topic echo in the
-// already running weld-jazzy peer proves the live ID plus geometry plus
+// already running ros-jazzy peer proves the live ID plus geometry plus
 // all data bytes. The sample stays under the 32MiB maxPayloadLen cap while
 // exceeding one DATA MTU so the wire fragments. It uses os/exec docker
 // argv only with context timeouts and skips cleanly when no peer runs or

@@ -20,13 +20,14 @@ Rules:
 
 - Use os/exec with docker argv plus structured Env. See testbed/live/helpers/helpers.go:218 (DockerArgs) and testbed/live/helpers/helpers.go:368 (ExecRun).
 - No shell inside the container for ros2 calls. testbed/live/helpers/helpers.go:115-123 (ImageEnv) replicates the Jazzy setup as -e flags, so ros2 runs directly as argv. Same pattern in testbed/live/helpers/distro.go:77 (DistroEnv) via testbed/live/helpers/distro.go:110 (DistroDockerArgs).
-- Never run compose up per test. weld-jazzy already runs with host networking and sleep infinity per testbed/docker-compose.yml. Tests fail fast or skip when it is absent. See testbed/live/helpers/helpers.go:444 (SkipIfNoPeer) and testbed/live/helpers/distro.go:161 (SkipIfNoDistroPeer).
+- Never run compose up per test. ros-jazzy already runs with host networking and sleep infinity per testbed/docker-compose.yml. Tests fail fast or skip when it is absent. See testbed/live/helpers/helpers.go:444 (SkipIfNoPeer) and testbed/live/helpers/distro.go:161 (SkipIfNoDistroPeer).
 - Bring the fleet up once: cd testbed && docker compose up -d. Then run Go tests only.
 
 Commands:
 
   go test ./testbed/unit/... -count=1
   go test -timeout 60m ./testbed/live/... -count=1
+  go test ./testbed/bench/ -count=1
 
 Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 
@@ -45,6 +46,7 @@ Per-package matrix (unit first, then live by package):
   go test ./testbed/live/cyclone/... -count=1
   go test -timeout 60m ./testbed/live/ros/... -count=1
   go test ./testbed/live/cli/... -count=1
+  go test ./testbed/bench/ -count=1
 
 Skip-when-absent rule: every live test calls SkipIfNoPeer first and type
 matrix tests also call SkipIfNoTypeInterface. A missing docker daemon, a
@@ -95,3 +97,7 @@ Bulletproof checks
 Status note
 
 Go tests are the canonical live harness, plus testbed/live/serial.sh as the serial runner for the ROS suites. Gate 0 is offline. Gate 1 proves SPDP acceptance by GUID prefix inequality with zero deserialization failures. Gate 2 forward is green after plain CDR receive (internal/transports/dds/datapath.go:1194) plus SEDP fixes; reverse is green after writer 03c2 (internal/transports/dds/sedp.go:177-182) plus announce loop (internal/transports/dds/sedp.go:1350) plus Heartbeat (internal/transports/dds/backend.go:708). A missed live ID in peer echo fails loudly; backend errors and missing sent: still fail. The type matrix in testbed/live/ros/gate_type_matrix_test.go:100 follows the same rule: local XCDR1 codec proof must pass, a publish with no route fails loudly (testbed/live/helpers/live.go:403-408), and ros2 interface show absence skips cleanly (testbed/live/helpers/live.go:326). Full wire record is in Conformance - /docs/conformance.
+
+Bench
+
+testbed/bench/ compares Weld against native ROS 2 on legs L1 weld-weld in process, L1c weld-weld containerized, L2 ros-ros, L3 weld-ros, L4 ros-weld. Except L1, both endpoints are containerized: Weld in the weld container, ROS in ros-jazzy, all host-networked with the Go orchestrator on the host. Default go test runs the P0 smoke on all five legs and skips without fleet. WELD_BENCH_FULL=1 scales up: the P0-P6 payload tiers (64 B control, 1/4 KiB, 64 KiB above the fragmentation boundary at 65515, 256 KiB, 1 MiB), 1-to-5 fanout and 5-to-1 fanin with disjoint seq spaces, an uncapped P1 saturation blast for headroom, and a P1 load-latency sweep from 50 Hz to 100 kHz at 50, 100, 200, 400, 800, 1600, 5000, 10000, 30000, 60000, 100000 Hz on all five legs (headroom rows; the choke point is read off the latency-vs-throughput chart with red loss rings). Sweep alone (fleet up): WELD_BENCH_FULL=1 go test ./testbed/bench/ -run TestBenchSweep -count=1 -timeout 60m. Benchmarks allocate pooled domains 70 through 101 with per-run topics like every live test, so no serial.sh entry is needed. One go test run writes exactly one self-contained HTML (inline SVG charts, blue Weld versus orange ROS) to testbed/logs/, gitignored as bench-*.html. Fairness notes ship in testbed/bench/doc.go: same host, same bytes, pinned reliable plus transient_local plus keep_last depth 100 both sides. Observed scaling (WELD_BENCH_FULL=1, 2026-11-03, 110 rows, exit 0; report bench-20261103-204430-3581965.html, all p50 unless noted): 0% loss on L1 and L4 at every payload tier (64 B through 1 MiB) and every sweep rate (50 Hz through 100 kHz offered); ros-to-ros first drops at 10 kHz (2.6%), containerized legs at 10 kHz (13 to 26%). Latency at 1 KiB while lossless (50 Hz to 5 kHz): weld-to-weld p50 10 to 62% below ros-to-ros (about 50% through 100 to 800 Hz, converging toward 10% at 5 kHz as both take loops saturate). Latency by payload, all 0% loss both sides: 16 to 68% lower p50 from 64 B to 64 KiB and at 1 MiB, parity at 256 KiB (within 4%). Sustained achieved throughput at 1 KiB: weld-to-weld about 11.5k msgs/s, ros-to-ros about 9.0k msgs/s. Container tax (L1 vs L1c): within 15% at 256 B and below, within a few percent elsewhere (about 3% at 1 MiB). Caveats: the ros legs subscribe in Python rclpy, so part of their gap is subscriber-side; above about 1 kHz offered the Weld legs achieve less than offered (route settle on fresh domains, still open); choke onset jitters run to run, so treat 10 kHz as the onset zone, not a cliff.

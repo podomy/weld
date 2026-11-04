@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Extra geometry static type hashes from ros2 topic info -v on weld-jazzy.
+// Extra geometry static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	extraHashPose       = "RIHS01_d501954e9476cea2996984e812054b68026ae0bfae789d9a10b23daf35cc90fa"
 	extraHashQuaternion = "RIHS01_8a765f66778c8ff7c8ab94afcc590a2ed5325a1d9a076ffff38fbce36f458684"

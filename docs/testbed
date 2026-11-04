@@ -4,9 +4,9 @@ Reproducible ROS peers for the conformance gates: one container per supported di
 
 Images
 
-- weld-humble: ros:humble-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
-- weld-jazzy: ros:jazzy-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
-- weld-rolling: ros:rolling-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
+- ros-humble: ros:humble-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
+- ros-jazzy: ros:jazzy-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
+- ros-rolling: ros:rolling-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
 
 FastDDS ships in each base image. Dockerfiles pin nothing beyond the ROS apt snapshots.
 
@@ -19,15 +19,15 @@ Each container idles on sleep infinity with host networking, so DDS multicast di
   docker compose up -d
   docker compose ps
 
-weld-jazzy is the canonical peer for the gates below. The Humble and Rolling images exist for manual cross-distro checks.
+ros-jazzy is the canonical peer for the gates below. The Humble and Rolling images exist for manual cross-distro checks.
 
 Live tests use docker argv with no shell. ImageEnv replicates the Jazzy setup as -e flags so ros2 runs directly as argv (testbed/live/helpers/helpers.go:115-123, DockerArgs at testbed/live/helpers/helpers.go:218). Distro peers use the same pattern (testbed/live/helpers/distro.go:110). Context timeouts bound every docker and weld call. No timeout binary and no mktemp.
 
 Layout
 
 - testbed/unit/*: pure Go, no Docker. Port math, SPDP marshal and parse, SEDP shape, data path. Conformance files per area, not one file each: datapath 9, launch 9 (fixtures plus expected dumps), sedp 4, spdp 2, ports 2, cli 2, services 2, negative 2, chaos 3, bags 1. testbed/unit/launch/ is the launch-argument gate with fixtures plus expected dumps (see testbed/unit/launch/conformance_test.go:199).
-- testbed/live/*: needs Docker and the already running weld-jazzy peer. Go entrypoint with docker argv and no shell, plus the serial.sh runner above. Tests use gate star test files plus roundtrip files with no generic live_test.go file and no empty files. Gates live in testbed/live/gates (6 files), per-peer checks in testbed/live/cyclone (15 files, SPDP acceptance) and testbed/live/ros (50 files, String round trip plus type matrix), with cli 3, actions 1, services 1, moved 3, and helpers 8.
-- testbed/logs/: compose volume for peer logs. Restart the fleet with cd testbed && docker compose down && docker compose up -d. Never run compose up per test; bring the fleet up once and reuse it. See testbed/live/helpers/helpers.go:444.
+- testbed/live/*: needs Docker and the already running ros-jazzy peer. Go entrypoint with docker argv and no shell, plus the serial.sh runner above. Tests use gate star test files plus roundtrip files with no generic live_test.go file and no empty files. Gates live in testbed/live/gates (6 files), per-peer checks in testbed/live/cyclone (15 files, SPDP acceptance) and testbed/live/ros (50 files, String round trip plus type matrix), with cli 3, actions 1, services 1, moved 3, and helpers 8.
+- testbed/logs/: compose volume for peer logs. Bench reports also land here: testbed/bench/ writes one self-contained HTML per go test run (gitignored bench-*.html). Restart the fleet with cd testbed && docker compose down && docker compose up -d. Never run compose up per test; bring the fleet up once and reuse it. See testbed/live/helpers/helpers.go:444.
 
 Run
 
@@ -56,6 +56,7 @@ Per-package matrix (unit first, then live by package):
   go test ./testbed/live/cyclone/... -count=1
   go test -timeout 60m ./testbed/live/ros/... -count=1
   go test ./testbed/live/cli/... -count=1
+  go test ./testbed/bench/ -count=1
 
 Skip-when-absent rule: every live test calls SkipIfNoPeer first and type
 matrix tests also call SkipIfNoTypeInterface. A missing docker daemon, a
@@ -75,7 +76,7 @@ no route fails loudly after the local codec passes
 (testbed/live/helpers/live.go:403-408), and backend errors fail
 (testbed/live/helpers/live.go:379-385).
 
-Unit is pure Go with no container. Live needs the already running weld-jazzy peer and skips otherwise. Go uses context timeouts on every docker and weld call plus volume log outputs under testbed/logs/ and per-run live IDs: no timeout binary, no mktemp. Detached peers run via docker exec -d writing to /testbed/logs/<run-id>.out (host ./testbed/logs/<run-id>.out), the host polls that file directly with no docker exec cat per poll, and cleanup kills the pidfile PID plus one scoped pkill per run. Per-run topics derive from /chatter plus the live ID (testbed/live/helpers/helpers.go:131, testbed/live/helpers/helpers.go:144).
+Unit is pure Go with no container. Live needs the already running ros-jazzy peer and skips otherwise. Go uses context timeouts on every docker and weld call plus volume log outputs under testbed/logs/ and per-run live IDs: no timeout binary, no mktemp. Detached peers run via docker exec -d writing to /testbed/logs/<run-id>.out (host ./testbed/logs/<run-id>.out), the host polls that file directly with no docker exec cat per poll, and cleanup kills the pidfile PID plus one scoped pkill per run. Per-run topics derive from /chatter plus the live ID (testbed/live/helpers/helpers.go:131, testbed/live/helpers/helpers.go:144).
 
 One-time restart after a compose or logs volume change (user restarts, tests never start containers):
 
@@ -85,7 +86,7 @@ See CLI - /docs/cli for the CLI flags the checks exercise.
 
 Domain split (see Testbed Go - /docs/testbed-go):
 
-- 42: canonical ROS String peer (weld-jazzy distro entry, testbed/live/helpers/distro.go:38-44). Round-trip checks allocate exclusive pooled domains instead of camping on 42: forward at testbed/live/ros/roundtrip_test.go:107, reverse at testbed/live/ros/roundtrip_test.go:160.
+- 42: canonical ROS String peer (ros-jazzy distro entry, testbed/live/helpers/distro.go:38-44). Round-trip checks allocate exclusive pooled domains instead of camping on 42: forward at testbed/live/ros/roundtrip_test.go:107, reverse at testbed/live/ros/roundtrip_test.go:160.
 - 48: SPDP acceptance, now on allocated exclusive domains. See testbed/live/cyclone/gate1_spdp_test.go (announcement check at :97, pure-Go acceptance at :379, live acceptance at :421).
 - 47: serial single-entrypoint live gate (testbed/live/helpers/helpers.go:41, LiveDomain; the pool never hands out 47). Serial file split is testbed/live/serial.sh. Gate 0 offline at testbed/live/gates/gate0_test.go:41, gate 1 at testbed/live/gates/gate1_test.go:32, gate 2 forward at testbed/live/gates/gate2_test.go:33 and reverse at testbed/live/gates/gate2_test.go:107.
 - 43 plus 44: distro matrix. Humble on 43 (testbed/live/helpers/distro.go:46-52), Rolling on 44 (testbed/live/helpers/distro.go:54-60), Jazzy canonical on 42 (testbed/live/helpers/distro.go:38-44).
@@ -112,9 +113,9 @@ Cyclone SPDP and ROS String stay separate. SPDP checks assert wire fields and ne
 
 Conflict
 
-A stale container name fails up with Conflict. The container name "/weld-rolling" is already in use. Remove it first:
+A stale container name fails up with Conflict. The container name "/ros-rolling" is already in use. Remove it first:
 
-  docker rm -f weld-rolling weld-humble weld-jazzy
+  docker rm -f ros-rolling ros-humble ros-jazzy
   docker compose up -d
 
 Teardown

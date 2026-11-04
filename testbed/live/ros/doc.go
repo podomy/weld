@@ -3,7 +3,7 @@
 
 // Package ros holds the ROS String round trip proof on domain 42.
 //
-// Tests drive the already running weld-jazzy peer with os/exec docker
+// Tests drive the already running ros-jazzy peer with os/exec docker
 // argv only and no shell. Forward checks weld echo sees ros2 topic pub
 // on /chatter with std_msgs/String. Reverse checks ros2 topic echo sees
 // weld pub on the same topic. Every payload carries a per-run live ID so

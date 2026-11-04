@@ -22,7 +22,7 @@ import (
 //
 // Each subtest allocates one exclusive domain from the parallel pool, so
 // per-run topics plus the allocated domain isolate runs. The container
-// name and Cyclone RMW come from helpers so the gate stays on weld-jazzy
+// name and Cyclone RMW come from helpers so the gate stays on ros-jazzy
 // with RMW_IMPLEMENTATION=rmw_cyclonedds_cpp.
 const (
 	qosEchoWait     = 10 * time.Second
@@ -139,10 +139,10 @@ func qosRequireFlags(t *testing.T, ctx context.Context, domain int) {
 	t.Helper()
 	ok, err := qosMatrixSupported(ctx, domain)
 	if err != nil {
-		qosBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
+		qosBudgetedSkip(t, fmt.Sprintf("peer ros-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !ok {
-		qosBudgetedSkip(t, "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy")
+		qosBudgetedSkip(t, "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy")
 	}
 }
 
@@ -463,7 +463,7 @@ func TestROSQoSMatrixCore(t *testing.T) {
 //
 // It parametrizes ros2 topic pub and echo with --qos-reliability,
 // --qos-durability, --qos-history, and --qos-depth on the allocated exclusive domain with the
-// Cyclone RMW in weld-jazzy. Each subtest uses its own live ID and topic
+// Cyclone RMW in ros-jazzy. Each subtest uses its own live ID and topic
 // with context timeouts and docker argv only. It skips cleanly only when no
 // peer is present or when the flags are unsupported. A missing payload with
 // ok echo output fails.

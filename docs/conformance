@@ -381,7 +381,7 @@ Gates
 
 Run: unit with go test ./testbed/unit/... -count=1, live with
 go test ./testbed/live/... -count=1 against the already running
-weld-jazzy peer (see testbed/live/helpers/helpers.go:444).
+ros-jazzy peer (see testbed/live/helpers/helpers.go:444).
 Plain go test runs the same suites and skips without a peer; -tags live is accepted as a no-op selector.
 Only one run per domain and topic at a time.
 Parallel live tests allocate exclusive domains 70 through 101

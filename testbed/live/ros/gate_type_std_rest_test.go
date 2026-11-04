@@ -44,12 +44,12 @@ const (
 // single Byte gate.
 var restByteData = []byte{66, 67, 68, 69}
 
-// Static type hashes from ros2 topic info -v on weld-jazzy.
+// Static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime; these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	restHashColorRGBA      = "RIHS01_77a7a5b9ae477306097665106e0413ba74440245b1f3d0c6d6405fe5c7813fe8"
 	restHashDimension      = "RIHS01_5e773a60a4c7fc8a54985f307c7837aa2994252a126c301957a24e31282c9cbe"
@@ -541,7 +541,7 @@ func TestROSTypeStdByteMultiArrayReverse(t *testing.T) {
 	t.Logf("local byte array codec ok len %d id %s", len(payload), live)
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, restHashByteMultiArray, typeMatrixProbeWait, "std-bytemultiarray-reverse")
 	if err != nil {
-		reason := fmt.Sprintf("std-bytemultiarray hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		reason := fmt.Sprintf("std-bytemultiarray hash unavailable for pooled domain ros-jazzy Jazzy topic %s: %v", topic, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse std-bytemultiarray-reverse topic %s hash %s", topic, typeHash)

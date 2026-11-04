@@ -3,7 +3,7 @@
 
 // Package services holds live service call checks that need a peer and network.
 //
-// Tests drive the built weld binary and the already running weld-jazzy
+// Tests drive the built weld binary and the already running ros-jazzy
 // peer with structured argv and no shell. They pin request plus reply
 // pairing with per-call context deadlines on isolated domains. Every run
 // uses one per-run live ID for payload isolation

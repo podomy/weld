@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Extra shape static type hashes from ros2 topic info -v on weld-jazzy.
+// Extra shape static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	shapeExtraHashPlane        = "RIHS01_dfbfe8314689c850615d4a727af017e9aa86c10e369a606c8c851ef8f16c58c8"
 	shapeExtraHashMeshTriangle = "RIHS01_618e5c073eeb729e433ef6226e72c01d995c459fb7d76348c9700409a5020bd0"

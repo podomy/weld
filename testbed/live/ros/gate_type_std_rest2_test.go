@@ -12,7 +12,7 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static type hash from ros2 topic info -v on weld-jazzy.
+// Static type hash from ros2 topic info -v on ros-jazzy.
 //
 // This is the RIHS01 hash reported for std_msgs String on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime; this value

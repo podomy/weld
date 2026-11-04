@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static type hash from ros2 topic info -v on weld-jazzy.
+// Static type hash from ros2 topic info -v on ros-jazzy.
 //
 // This is the RIHS01 hash reported for JointTrajectoryPoint on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime; this value
 // is the fallback when the probe cannot run. Value was captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const trajectoryHashJointTrajectoryPoint = "RIHS01_de8907036d8bd45aac6f30cc9044a3d4a329c42cbf719aff7d95a584cfa532d7"
 
 // Fixed sentinels for JointTrajectoryPoint.

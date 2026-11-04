@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static Marker type hash from ros2 topic info -v on weld-jazzy.
+// Static Marker type hash from ros2 topic info -v on ros-jazzy.
 //
 // This is the RIHS01 hash reported for visualization_msgs/msg/Marker on
 // domain 42. Live probing via ros2 topic info -v is preferred at runtime;
 // this value is the fallback when the probe cannot run. Value was captured
-// from weld-jazzy Jazzy.
+// from ros-jazzy Jazzy.
 const vizMarkerHash = "RIHS01_45b13ccf791f225962bf74e746f9644518855d783a6f42ba0cc14fde2b4f3ce0"
 
 // Small Marker sentinels for the live gate.

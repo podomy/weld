@@ -13,7 +13,7 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static nav type hashes from ros2 topic info -v on weld-jazzy.
+// Static nav type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each nav type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime and these

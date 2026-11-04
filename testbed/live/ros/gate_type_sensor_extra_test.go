@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Extra sensor static type hashes from ros2 topic info -v on weld-jazzy.
+// Extra sensor static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	sensorExtraHashImu       = "RIHS01_7d9a00ff131080897a5ec7e26e315954b8eae3353c3f995c55faf71574000b5b"
 	sensorExtraHashLaserScan = "RIHS01_64c191398013af96509d518dac71d5164f9382553fce5c1f8cca5be7924bd828"

@@ -37,7 +37,7 @@ var (
 	// DistroJazzy is the canonical Jazzy peer on domain 42.
 	DistroJazzy = DistroPeer{
 		Distro:    "jazzy",
-		Container: "weld-jazzy",
+		Container: "ros-jazzy",
 		SetupBash: "/opt/ros/jazzy/setup.bash",
 		Domain:    42,
 		RosBin:    "/opt/ros/jazzy/bin/ros2",
@@ -45,7 +45,7 @@ var (
 	// DistroHumble is the Humble peer on domain 43.
 	DistroHumble = DistroPeer{
 		Distro:    "humble",
-		Container: "weld-humble",
+		Container: "ros-humble",
 		SetupBash: "/opt/ros/humble/setup.bash",
 		Domain:    43,
 		RosBin:    "/opt/ros/humble/bin/ros2",
@@ -53,7 +53,7 @@ var (
 	// DistroRolling is the Rolling peer on domain 44.
 	DistroRolling = DistroPeer{
 		Distro:    "rolling",
-		Container: "weld-rolling",
+		Container: "ros-rolling",
 		SetupBash: "/opt/ros/rolling/setup.bash",
 		Domain:    44,
 		RosBin:    "/opt/ros/rolling/bin/ros2",

@@ -13,12 +13,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Extra trajectory static type hashes from ros2 topic info -v on weld-jazzy.
+// Extra trajectory static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	trajExtraHashJointTrajectory = "RIHS01_179b33eba59d676f6d967ac71fe35e7ca2f64b2f3928f4a018cec115e213796e"
 	trajExtraHashMDOF            = "RIHS01_3a18fd095292a65cfde8833c72985a30af981f3ec44494655c6267262b443a4a"

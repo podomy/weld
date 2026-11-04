@@ -3,7 +3,7 @@
 
 // Package actions holds live action workflow checks that need a peer and network.
 //
-// Tests drive the built weld binary and the already running weld-jazzy
+// Tests drive the built weld binary and the already running ros-jazzy
 // peer with structured argv and no shell. They pin goal admission,
 // cancel propagation, feedback buffering before handle attachment, and
 // result caching independent of handle lifetime on isolated domains.

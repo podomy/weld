@@ -24,7 +24,7 @@ import (
 // Static sensor rest2 type hash from the Jazzy type description JSON.
 //
 // The RIHS01 hash is the first entry of type_hashes in
-// /opt/ros/jazzy/share/sensor_msgs/msg/Image.json on weld-jazzy.
+// /opt/ros/jazzy/share/sensor_msgs/msg/Image.json on ros-jazzy.
 // Live probing via ros2 topic info -v is preferred at runtime, this value
 // is the fallback when the probe cannot run.
 const sensorRest2HashImage = "RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47"
@@ -544,7 +544,7 @@ func verifySensorRest2PC2Echo(t *testing.T, echoPath, live string, want []byte) 
 // 100 cloud with three float32 fields and deterministic bytes plus a
 // per-run live ID in header frame_id. The local XCDR1 codec round trips
 // full bytes, then the fragmented sample publishes through Weld and ros2
-// topic echo in the already running weld-jazzy peer proves the live ID
+// topic echo in the already running ros-jazzy peer proves the live ID
 // plus geometry plus all data bytes. The sample is 100KiB so it exceeds
 // one DATA MTU and fragments while staying far under the 32MiB
 // maxPayloadLen cap. It uses os/exec docker argv only with context

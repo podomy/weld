@@ -42,19 +42,19 @@ func init() {
 // Probe failures carry a %v error and share the same parent test name as
 // the static fallback, so the static verbatim reason covers both.
 func registerRosQoSParents(expiry time.Time) {
-	helpers.RegisterAllowlistedSkip("TestROSQoSDurabilityHistoryCompatibleDelivers", "peer weld-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSDurabilityHistoryIncompatibleLoud", "peer weld-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSFullCompatibleDelivers", "peer weld-jazzy Jazzy lacks --qos-depth, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSFullIncompatibleLoud", "peer weld-jazzy Jazzy lacks --qos-depth, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSCompatibleDelivers", "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSIncompatibleLoud", "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSReliabilityCompatibleDelivers", "peer weld-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSQoSReliabilityIncompatibleLoud", "peer weld-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSDurabilityHistoryCompatibleDelivers", "peer ros-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSDurabilityHistoryIncompatibleLoud", "peer ros-jazzy Jazzy lacks --qos-durability, --qos-history, or --qos-depth, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSFullCompatibleDelivers", "peer ros-jazzy Jazzy lacks --qos-depth, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSFullIncompatibleLoud", "peer ros-jazzy Jazzy lacks --qos-depth, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSCompatibleDelivers", "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSIncompatibleLoud", "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSReliabilityCompatibleDelivers", "peer ros-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSQoSReliabilityIncompatibleLoud", "peer ros-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy", expiry)
 }
 
 // registerRosDHKeepAll allowlists the keep_all subtests.
 //
-// Runtime uses fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name)
+// Runtime uses fmt.Sprintf("case %s: peer ros-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name)
 // with c.name from the compatible plus incompatible case lists filtered to
 // keep_all. The init entries use the same format with concrete names.
 func registerRosDHKeepAll(expiry time.Time) {
@@ -68,14 +68,14 @@ func registerRosDHKeepAll(expiry time.Time) {
 		{"TestROSQoSDurabilityHistoryIncompatibleLoud", "forward_volatile_keepall"},
 	}
 	for _, c := range keepAll {
-		reason := fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name)
+		reason := fmt.Sprintf("case %s: peer ros-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name)
 		helpers.RegisterAllowlistedSkip(c.parent+"/"+c.name, reason, expiry)
 	}
 }
 
 // registerRosFullCoreBestAvailable allowlists the core best_available subtests.
 //
-// Runtime uses fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, err)
+// Runtime uses fmt.Sprintf("case %s: profile mapping unsupported on ros-jazzy Jazzy: %v", c.name, err)
 // where err is qos full unsupported history "best_available" for every
 // best_available history case. The init entries use the same format with
 // the same deterministic error text.
@@ -85,21 +85,21 @@ func registerRosFullCoreBestAvailable(expiry time.Time) {
 		if c.history != "best_available" {
 			continue
 		}
-		reason := fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, detail)
+		reason := fmt.Sprintf("case %s: profile mapping unsupported on ros-jazzy Jazzy: %v", c.name, detail)
 		helpers.RegisterAllowlistedSkip("TestROSQoSFullCore/"+c.name, reason, expiry)
 	}
 }
 
 // registerRosFullLiveMarker allowlists the live marker subtests.
 //
-// Runtime uses fmt.Sprintf("case %s: marker value needs resolution on weld-jazzy Jazzy, core truth pinned above", c.name)
+// Runtime uses fmt.Sprintf("case %s: marker value needs resolution on ros-jazzy Jazzy, core truth pinned above", c.name)
 // for marker cases. Live cases are all concrete so this path is currently
 // unreachable, but the entries keep the triple allowlisted. Lacks flag and
 // profile mapping variants for the same subtest names share the same test
 // name allowance.
 func registerRosFullLiveMarker(expiry time.Time) {
 	for _, c := range qosFullLiveCases() {
-		reason := fmt.Sprintf("case %s: marker value needs resolution on weld-jazzy Jazzy, core truth pinned above", c.name)
+		reason := fmt.Sprintf("case %s: marker value needs resolution on ros-jazzy Jazzy, core truth pinned above", c.name)
 		if qosFullWantCompatible(c) {
 			// Compatible live cases run under the compatible delivers gate.
 			// Incompatible cases run under the incompatible loud gate below.
@@ -113,7 +113,7 @@ func registerRosFullLiveMarker(expiry time.Time) {
 	// future compatible split change cannot leave a subtest unallowlisted.
 	// The reason text stays identical; only the parent prefix differs.
 	for _, c := range qosFullLiveCases() {
-		reason := fmt.Sprintf("case %s: marker value needs resolution on weld-jazzy Jazzy, core truth pinned above", c.name)
+		reason := fmt.Sprintf("case %s: marker value needs resolution on ros-jazzy Jazzy, core truth pinned above", c.name)
 		if qosFullWantCompatible(c) {
 			helpers.RegisterAllowlistedSkip("TestROSQoSFullIncompatibleLoud/"+c.name, reason, expiry)
 		} else {
@@ -277,7 +277,7 @@ func registerRosShapeStereoRest(expiry time.Time) {
 	helpers.RegisterAllowlistedSkip("TestROSTypeShapeSolidPrimitive", "ros echo misses shape user DATA but pub ok, known interop gap reverse shape", expiry)
 	helpers.RegisterAllowlistedSkip("TestROSTypeStereoDisparity", "weld take misses stereo disparity user DATA but local codec ok, known interop gap forward stereo", expiry)
 	helpers.RegisterAllowlistedSkip("TestROSTypeStereoDisparity", "ros echo misses stereo disparity user DATA but pub ok, known interop gap reverse stereo", expiry)
-	helpers.RegisterAllowlistedSkip("TestROSTypeStdByteMultiArrayReverse", "std-bytemultiarray hash unavailable for pooled domain weld-jazzy Jazzy", expiry)
+	helpers.RegisterAllowlistedSkip("TestROSTypeStdByteMultiArrayReverse", "std-bytemultiarray hash unavailable for pooled domain ros-jazzy Jazzy", expiry)
 }
 
 // registerRosWriterQoSParents allowlists the writer QoS gates.
@@ -285,7 +285,7 @@ func registerRosShapeStereoRest(expiry time.Time) {
 // Probe failures carry a %v error and share the same parent test names as
 // the static fallback below.
 func registerRosWriterQoSParents(expiry time.Time) {
-	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveBestEffortOfferFlows", "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
-	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveVolatileServiceEquivalent", "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
-	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveIncompatibleRefusedLoudly", "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
+	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveBestEffortOfferFlows", "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
+	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveVolatileServiceEquivalent", "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
+	helpers.RegisterAllowlistedSkip("TestWriterQoSLiveIncompatibleRefusedLoudly", "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate", expiry)
 }

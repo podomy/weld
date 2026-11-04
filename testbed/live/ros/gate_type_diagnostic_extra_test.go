@@ -14,12 +14,12 @@ import (
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
-// Static type hash from ros2 topic info -v on weld-jazzy.
+// Static type hash from ros2 topic info -v on ros-jazzy.
 //
 // This is the RIHS01 hash reported for diagnostic_msgs DiagnosticArray on
 // domain 42. Live probing via ros2 topic info -v is preferred at runtime;
 // this value is the fallback when the probe cannot run. The value was
-// captured from weld-jazzy Jazzy.
+// captured from ros-jazzy Jazzy.
 const diagExtraHashArray = "RIHS01_5a8a36efb05fb25070fa0fb3810290c0e6cd4862b54a8fb975a1ee8dc55a333e"
 
 // Fixed sentinels for diagnostic extra service shapes.

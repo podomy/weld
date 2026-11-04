@@ -20,7 +20,7 @@ import (
 // Reliability gate constants for Jazzy canonical.
 //
 // Each subtest allocates one exclusive domain from the parallel pool. The container name and
-// Cyclone RMW come from helpers so the gate stays on weld-jazzy with
+// Cyclone RMW come from helpers so the gate stays on ros-jazzy with
 // RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Only one run per domain and topic
 // at a time is supported, so tests never run in parallel and every payload
 // carries a per-run live ID. Humble and Rolling already cover default QoS
@@ -149,10 +149,10 @@ func relRequireFlag(t *testing.T, ctx context.Context, domain int) {
 	t.Helper()
 	ok, err := relSupported(ctx, domain)
 	if err != nil {
-		relBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy reliability flag probe failed, distro pin Jazzy: %v", err))
+		relBudgetedSkip(t, fmt.Sprintf("peer ros-jazzy Jazzy reliability flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !ok {
-		relBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy")
+		relBudgetedSkip(t, "peer ros-jazzy Jazzy lacks --qos-reliability, distro pin Jazzy")
 	}
 }
 
@@ -520,7 +520,7 @@ func TestROSQoSReliabilityCore(t *testing.T) {
 // TestROSQoSReliabilityCompatibleDelivers checks compatible pairs deliver live.
 //
 // It parametrizes ros2 topic pub and echo with --qos-reliability on the
-// allocated exclusive domain with the Cyclone RMW in weld-jazzy. Each subtest uses its own live ID
+// allocated exclusive domain with the Cyclone RMW in ros-jazzy. Each subtest uses its own live ID
 // and topic with context timeouts and docker argv only. It skips cleanly
 // only when no peer is present or when the flag is unsupported. A missing
 // payload with a clean echo is a failure. The ros_to_ros best_effort pair

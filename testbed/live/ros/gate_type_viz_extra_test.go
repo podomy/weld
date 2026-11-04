@@ -25,12 +25,12 @@ import (
 // trips below without a ROS peer. The split is documented here so a
 // reader knows live proves interop and local proves nesting.
 
-// Static type hashes from ros2 topic info -v on weld-jazzy.
+// Static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime, these values
 // are the fallback when the probe cannot run. Values were captured from
-// weld-jazzy Jazzy.
+// ros-jazzy Jazzy.
 const (
 	vizExtraHashMarkerArray           = "RIHS01_86cb8800b6fb05b5eff1abd7a56f62a5641d3ae9a1c29e78e67e704f1d067dcf"
 	vizExtraHashMenuEntry             = "RIHS01_22170c387c70fd4236232ec902de8604e72ff027342c7c0f28ad9f68c64c51d6"

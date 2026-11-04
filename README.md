@@ -12,6 +12,26 @@ v1 behind the same interface.
 Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as
 first-class nodes, verified by mixed fleet behavior.
 
+**Weld is faster than ROS 2 on the same host: up to 68% lower latency.**
+
+**It also scales further: zero packet loss where ROS starts dropping,
+with about 25% more throughput.**
+
+Benchmarks
+
+  Weld versus ROS 2 (ros-jazzy/CycloneDDS), same host and bytes, full
+  matrix green (110 rows, exit 0; reports in testbed/logs/bench-*.html).
+  Weld-to-weld latency is lower than ros-to-ros at every payload size
+  (16 to 68% lower p50 from 64 B to 1 MiB) and every lossless rate
+  (about 50% lower through 100 to 800 Hz at 1 KiB). Weld legs hold 0%
+  loss from 50 Hz to 100 kHz offered; ros-to-ros first drops at 10 kHz.
+  Full tables, the latency-vs-throughput chart, and caveats live in
+  testbed/bench/README.md.
+
+![Latency vs achieved throughput, 1 KiB sweep: one p50 curve per leg in
+leg colors with circle markers, p99 dashed with triangles; red rings
+mark lossy rates.](testbed/bench/latency-vs-throughput.svg)
+
 Documentation
 
   Weld design - /docs/design: architecture, invariants, and build order.

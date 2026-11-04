@@ -58,12 +58,12 @@ const (
 	matrixZeroVariance    float64 = 0.0
 )
 
-// Static type hashes from ros2 topic info -v on weld-jazzy.
+// Static type hashes from ros2 topic info -v on ros-jazzy.
 //
 // These are the RIHS01 hashes reported for each ROS type on domain 42.
 // Live probing via ros2 topic info -v is preferred at runtime; these values
 // are the fallback when the probe cannot run. String hash matches the pinned
-// backend hash. Values were captured from weld-jazzy Jazzy.
+// backend hash. Values were captured from ros-jazzy Jazzy.
 const (
 	matrixHashInt32         = "RIHS01_b6578ded3c58c626cfe8d1a6fb6e04f706f97e9f03d2727c9ff4e74b1cef0deb"
 	matrixHashFloat64       = "RIHS01_705ba9c3d1a09df43737eb67095534de36fd426c0587779bda2bc51fe790182a"
@@ -78,7 +78,7 @@ const (
 //
 // RosType is the slash form for ros2 topic pub and echo. IDLName is the
 // double underscore form for Weld SEDP Subscribe and PublishBytes. staticHash
-// is the RIHS01 fallback from ros2 topic info -v on weld-jazzy. yaml
+// is the RIHS01 fallback from ros2 topic info -v on ros-jazzy. yaml
 // builds the ROS YAML for the talker, encode builds XCDR1 bytes for Weld
 // pub, decode checks XCDR1 bytes from Weld take, and want is the substring
 // expected in ros2 topic echo output.
@@ -582,7 +582,7 @@ func runMatrixForward(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
-		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
+		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain ros-jazzy Jazzy: %v", tc.Label, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix forward %s topic %s hash %s", tc.Label, topic, typeHash)
@@ -695,7 +695,7 @@ func runMatrixReverse(t *testing.T, ctx context.Context, domain int, tc typeMatr
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, tc.staticHash, typeMatrixProbeWait, "matrix")
 	if err != nil {
-		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain weld-jazzy Jazzy: %v", tc.Label, err)
+		reason := fmt.Sprintf("matrix hash unavailable for %s on pooled domain ros-jazzy Jazzy: %v", tc.Label, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("matrix reverse %s topic %s hash %s", tc.Label, topic, typeHash)

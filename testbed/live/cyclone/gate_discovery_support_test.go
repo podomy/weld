@@ -115,7 +115,7 @@ func discoverySendTwice(t *testing.T, sender *rtps.MulticastSender, packet []byt
 //
 // It uses os/exec with fixed docker argv and context timeouts and never
 // starts the compose stack. It never fails the test and never parses trace
-// output. It only records whether weld-jazzy is running beside the live run.
+// output. It only records whether ros-jazzy is running beside the live run.
 func discoveryDockerCrossCheck(t *testing.T, ctx context.Context) {
 	t.Helper()
 	_, err := exec.LookPath("docker")

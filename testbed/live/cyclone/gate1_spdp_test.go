@@ -414,7 +414,7 @@ func TestCycloneGate1SPDPST0NonLocalPureGo(t *testing.T) {
 
 // TestCycloneGate1SPDPST0NonLocalLive proves non-local SPDP beside a live peer.
 //
-// It assumes the weld-jazzy container is already running. It uses the same
+// It assumes the ros-jazzy container is already running. It uses the same
 // direct UDP path as the pure-go test and additionally counts any external
 // allocated domain SPDP seen during the window. It passes on the self proof when
 // no external talker is present and logs externals when Cyclone is present.

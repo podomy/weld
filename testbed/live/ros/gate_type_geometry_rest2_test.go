@@ -65,7 +65,7 @@ func rest2CoveredRosTypes() map[string]bool {
 // TestROSTypeGeometryRest2Coverage pins that no rest geometry type remains.
 //
 // The test allocates one exclusive domain from the parallel pool. The peer
-// is weld-jazzy via helpers.Container. Docker argv is built with
+// is ros-jazzy via helpers.Container. Docker argv is built with
 // helpers.DockerArgs and no shell. Per-run live IDs plus the allocated
 // domain isolate the check. The test skips when the peer is absent,
 // matching the Skip if absent rule for live gates.

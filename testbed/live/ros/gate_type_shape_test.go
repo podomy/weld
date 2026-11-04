@@ -54,7 +54,7 @@ const (
 //
 // RosType is the slash form for ros2 topic pub and echo. IDLName is the
 // double underscore form for Weld SEDP Subscribe and PublishBytes. The
-// static hash was captured from ros2 topic info -v on weld-jazzy Jazzy for
+// static hash was captured from ros2 topic info -v on ros-jazzy Jazzy for
 // shape_msgs/msg/SolidPrimitive on domain 42. Live probing is preferred at
 // runtime; this value is the fallback when the probe cannot run.
 const (
@@ -257,7 +257,7 @@ func runShapeForward(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
-		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		reason := fmt.Sprintf("shape hash unavailable for pooled domain ros-jazzy Jazzy topic %s: %v", topic, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape forward topic %s hash %s", topic, typeHash)
@@ -348,7 +348,7 @@ func runShapeReverse(t *testing.T, ctx context.Context, domain int, live, topic 
 	}
 	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, shapeHashInit, shapeProbeWait, "shape")
 	if err != nil {
-		reason := fmt.Sprintf("shape hash unavailable for pooled domain weld-jazzy Jazzy topic %s: %v", topic, err)
+		reason := fmt.Sprintf("shape hash unavailable for pooled domain ros-jazzy Jazzy topic %s: %v", topic, err)
 		helpers.NoteProductSkip(t, t.Name(), reason)
 	}
 	t.Logf("shape reverse topic %s hash %s", topic, typeHash)

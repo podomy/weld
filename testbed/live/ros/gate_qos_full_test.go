@@ -22,7 +22,7 @@ import (
 // Full QoS matrix constants for Jazzy canonical.
 //
 // Each subtest allocates one exclusive domain from the parallel pool. The container name and
-// Cyclone RMW come from helpers so the gate stays on weld-jazzy with
+// Cyclone RMW come from helpers so the gate stays on ros-jazzy with
 // RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Only one run per domain and topic
 // at a time is supported, so tests never run in parallel and every payload
 // carries a per-run live ID. Humble and Rolling already cover default QoS
@@ -331,10 +331,10 @@ func qosFullRequireProbe(t *testing.T, ctx context.Context, domain int) ([]strin
 	t.Helper()
 	relVals, durVals, histVals, depthOk, err := qosFullProbeQoS(ctx, domain)
 	if err != nil {
-		qosFullBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
+		qosFullBudgetedSkip(t, fmt.Sprintf("peer ros-jazzy Jazzy flag probe failed, distro pin Jazzy: %v", err))
 	}
 	if !depthOk {
-		qosFullBudgetedSkip(t, "peer weld-jazzy Jazzy lacks --qos-depth, distro pin Jazzy")
+		qosFullBudgetedSkip(t, "peer ros-jazzy Jazzy lacks --qos-depth, distro pin Jazzy")
 	}
 	t.Logf("qos full probed reliability=%v durability=%v history=%v", relVals, durVals, histVals)
 	if !qosFullContainsValue(histVals, "best_available") {
@@ -701,15 +701,15 @@ func qosFullRunLiveCase(t *testing.T, ctx context.Context, bin string, domain in
 	facade := core.FacadeAdvertisedQoS()
 	offered, requested, publisher, subscriber, report, err := qosFullBuildReport(c, facade)
 	if err != nil {
-		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, err))
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on ros-jazzy Jazzy: %v", c.name, err))
 	}
 	qosFullAssertCore(t, c, offered, requested, publisher, subscriber, report)
 	ok, reason := qosFullCaseSupported(c, relVals, durVals, histVals)
 	if !ok {
-		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: peer weld-jazzy Jazzy lacks flag value, distro pin Jazzy: %s", c.name, reason))
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: peer ros-jazzy Jazzy lacks flag value, distro pin Jazzy: %s", c.name, reason))
 	}
 	if !qosFullIsConcreteCase(c) {
-		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: marker value needs resolution on weld-jazzy Jazzy, core truth pinned above", c.name))
+		qosFullBudgetedSkip(t, fmt.Sprintf("case %s: marker value needs resolution on ros-jazzy Jazzy, core truth pinned above", c.name))
 	}
 	compatible := report.Compatible
 	if c.direction == "forward" {
@@ -775,7 +775,7 @@ func TestROSQoSFullCore(t *testing.T) {
 			})
 			offered, requested, publisher, subscriber, report, err := qosFullBuildReport(c, facade)
 			if err != nil {
-				qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on weld-jazzy Jazzy: %v", c.name, err))
+				qosFullBudgetedSkip(t, fmt.Sprintf("case %s: profile mapping unsupported on ros-jazzy Jazzy: %v", c.name, err))
 			}
 			qosFullAssertCore(t, c, offered, requested, publisher, subscriber, report)
 		})
@@ -787,7 +787,7 @@ func TestROSQoSFullCore(t *testing.T) {
 //
 // It parametrizes ros2 topic pub and echo with --qos-reliability,
 // --qos-durability, --qos-history, and --qos-depth on the allocated exclusive domain with the
-// Cyclone RMW in weld-jazzy. Each subtest uses its own live ID and topic
+// Cyclone RMW in ros-jazzy. Each subtest uses its own live ID and topic
 // with context timeouts and docker argv only. Marker and unsupported values
 // skip with a reason while core truth stays pinned above. A missing payload
 // with ok echo output fails. It skips cleanly only when no peer is present

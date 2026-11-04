@@ -42,7 +42,7 @@ import (
 //
 // Each test allocates one exclusive domain from the parallel pool. The
 // container name and Cyclone RMW come from helpers so the gate stays on
-// weld-jazzy with RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Only one run per
+// ros-jazzy with RMW_IMPLEMENTATION=rmw_cyclonedds_cpp. Only one run per
 // domain and topic at a time is supported, so tests never run in parallel
 // and every payload carries a per-run live ID.
 const (
@@ -154,11 +154,11 @@ func wqRequireQoSFlags(t *testing.T, ctx context.Context, domain int) {
 	cmd := exec.CommandContext(probeCtx, "docker", argv...) //nolint:gosec // live harness probes ros2 help with fixed argv and no shell
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		wqBudgetedSkip(t, fmt.Sprintf("peer weld-jazzy Jazzy writerqos pub help probe failed, distro pin Jazzy: %v", err))
+		wqBudgetedSkip(t, fmt.Sprintf("peer ros-jazzy Jazzy writerqos pub help probe failed, distro pin Jazzy: %v", err))
 	}
 
 	if !strings.Contains(string(out), "--qos-reliability") || !strings.Contains(string(out), "--qos-durability") {
-		wqBudgetedSkip(t, "peer weld-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate")
+		wqBudgetedSkip(t, "peer ros-jazzy Jazzy lacks QoS flags, distro pin Jazzy, skipping writerqos gate")
 	}
 }
 

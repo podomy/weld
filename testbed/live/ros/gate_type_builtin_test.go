@@ -25,7 +25,7 @@ import (
 //
 // Domain 42 is reused through the shared matrix runners so builtin types
 // ride the same standalone first contact domain as the seven type matrix.
-// Hashes were captured from weld-jazzy Jazzy via ros2 topic info -v on
+// Hashes were captured from ros-jazzy Jazzy via ros2 topic info -v on
 // domain 42. Sentinel uses fixed sec plus nanosec with per-run topic plus
 // domain isolation because Time and Duration carry no string field.
 const (

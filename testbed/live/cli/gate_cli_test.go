@@ -4,7 +4,7 @@
 // Package live_cli holds live CLI checks that need a peer and network.
 //
 // These tests drive the built weld binary and the already running
-// weld-jazzy peer through os/exec docker argv only. They pin topic
+// ros-jazzy peer through os/exec docker argv only. They pin topic
 // validation, domain range and defaults, timeout handling, text selection,
 // help output, exit codes, gap and drop counters, pub confirmation,
 // echo payload lines, route waiting, and SEDP reader declaration.

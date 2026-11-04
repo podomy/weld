@@ -52,7 +52,7 @@ const (
 	// EphemeralDomainMax is the last ephemeral live domain.
 	EphemeralDomainMax = 69
 	// Container is the canonical ROS peer.
-	Container = "weld-jazzy"
+	Container = "ros-jazzy"
 	// Topic is the ROS topic base for forward and reverse checks.
 	// Per-run topics derive from this base with the live ID appended.
 	Topic = "/chatter"

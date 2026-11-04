@@ -1,6 +1,6 @@
 Testbed
 
-Layout: testbed/unit/* is pure Go with no Docker; testbed/unit/launch/ is the launch-argument gate (testbed/unit/launch/conformance_test.go:199); testbed/live/* needs Docker and the already running weld-jazzy peer; testbed/logs/ is the compose log volume. ROS type gates live in testbed/live/ros/gate_type_*_test.go including rest2 gates testbed/live/ros/gate_type_std_rest2_test.go:100, testbed/live/ros/gate_type_geometry_rest2_test.go:71, testbed/live/ros/gate_type_viz_rest2_test.go:33, testbed/live/ros/gate_type_diag_rest2_test.go:398, and testbed/live/ros/gate_type_misc_rest2_test.go:86.
+Layout: testbed/unit/* is pure Go with no Docker; testbed/unit/launch/ is the launch-argument gate (testbed/unit/launch/conformance_test.go:199); testbed/live/* needs Docker and the already running ros-jazzy peer; testbed/bench/ holds Weld-vs-ROS benchmarks (Go stdlib harness driving containerized Weld and ROS endpoints, pooled domains, skips cleanly without fleet); testbed/logs/ is the compose log volume. ROS type gates live in testbed/live/ros/gate_type_*_test.go including rest2 gates testbed/live/ros/gate_type_std_rest2_test.go:100, testbed/live/ros/gate_type_geometry_rest2_test.go:71, testbed/live/ros/gate_type_viz_rest2_test.go:33, testbed/live/ros/gate_type_diag_rest2_test.go:398, and testbed/live/ros/gate_type_misc_rest2_test.go:86.
 
 File names: testbed/unit/* uses conformance_test.go files; testbed/live/* uses gate star test files plus roundtrip files; no generic live_test.go file remains and no empty files. Test names use TestCyclone* for Cyclone SPDP, TestROSType* for ROS types, and TestGate* for single entrypoint gates.
 
@@ -8,6 +8,9 @@ Run
 
   go test ./testbed/unit/... -count=1
   go test -tags live -timeout 60m ./testbed/live/... -count=1
+  go test ./testbed/bench/ -count=1
+
+The bench runs five legs (L1, L1c, L2, L3, L4) on P0 and writes one self-contained HTML report per run to testbed/logs/. WELD_BENCH_FULL=1 selects the scale matrix instead: P0-P6 payload tiers, fanout, fanin, an uncapped saturation blast, and a P1 load-latency sweep at 50, 100, 200, 400, 800, 1600, 5000, 10000, 30000, 60000, 100000 Hz with a latency-vs-throughput chart. Sweep alone (fleet up): WELD_BENCH_FULL=1 go test ./testbed/bench/ -run TestBenchSweep -count=1 -timeout 60m. Results with charts live in testbed/bench/README.md.
 
 Live runs need -timeout 60m: the default 10m package timeout fires mid-suite with the peer present. The ros package holds 187 top-level tests and QoS cases budget 30m each (see testbed/live/ros/gate_qos_full_test.go:38); raise the timeout further if the ros matrix still exceeds it.
 

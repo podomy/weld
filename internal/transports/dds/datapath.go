@@ -482,20 +482,31 @@ func (p *Publisher) publishFrags(ctx context.Context, s FrameSink, guid WriterGU
 	return nil
 }
 
+// deliveredCap bounds one writer's delivered set. Redeliveries arrive
+// within a few thousand seqs of the original; older duplicates are
+// pathological, and the set must stay bounded under writer churn.
+const deliveredCap = 8192
+
 // DataReceiver accepts DATA frames in best effort order and strips the envelope.
 //
 // The zero value is not usable. Use NewDataReceiver. DataReceiver is safe for
-// concurrent use. Take gaps count missing samples as lost; GAP via ApplyGap
+// concurrent use. Take gaps count missing samples as lost; late repairs of
+// skipped samples deliver and un-count the loss, while true redeliveries
+// still drop with ErrStaleSequence. GAP via ApplyGap
 // skips without lost and ACKNACK repair arrives as duplicate DATA through the
-// demux. Duplicates and reordered samples are dropped with ErrStaleSequence.
-// The mutex must not be copied after first use; counters self-lock with
+// demux. The mutex must not be copied after first use; counters self-lock with
 // RLock while takes hold Lock for drops and ordering.
 type DataReceiver struct {
 	mu    sync.RWMutex
 	last  map[WriterGUID]uint64
 	lost  uint64
 	drops uint64
-	sedp  *SEDPIndex
+	// delivered tracks per-writer delivered sequences so a late repair of
+	// a skipped sample is delivered instead of dropped as a duplicate.
+	// Only true redeliveries report ErrStaleSequence. Each set holds a
+	// sliding window of recent seqs; older duplicates are pathological.
+	delivered map[WriterGUID]map[uint64]struct{}
+	sedp      *SEDPIndex
 	// now supplies FirstSeen times for provisional endpoints, tracker start
 	// times, and take-path evaluation. It defaults to time.Now and tests may
 	// replace it with a fake clock. Wall-clock stays intentional for pacing
@@ -1335,9 +1346,10 @@ func (r *DataReceiver) takeDecoded(
 // Best effort tolerance works per writer GUID. The first sample from a GUID
 // is always accepted with no lost count. A sequence equal to last plus one
 // is accepted. A larger sequence counts the skipped samples as lost and
-// accepts the current frame with no repair in v1. A sequence at or below
-// the last observed value is dropped with ErrStaleSequence and a drop
-// counter increment.
+// accepts the current frame. A late repair of a skipped sample is accepted
+// too and un-counts one loss, so reliable redelivery converges; only a
+// true redelivery of an already delivered sample is dropped with
+// ErrStaleSequence and a drop counter increment.
 //
 // Truncated or malformed input increments the drop counter and returns an
 // explicit error. Take never panics on short or corrupt input. Nil user
@@ -1572,42 +1584,75 @@ func (r *DataReceiver) countPlainDrop(guid WriterGUID, cause error, op string) e
 // panic, but callers must still use NewDataReceiver for correct drop and
 // lost accounting. The first sample from a GUID is accepted with no lost
 // count. A gap adds the skipped count to lost and accepts the current frame.
-// A duplicate or old sequence counts a drop and returns ErrStaleSequence.
-// Distinct writers stay bounded by maxTrackedWriters with loud eviction so
-// writer churn cannot grow take state without limit. Eviction never logs
-// under the lock: the evicted writer returns for the caller to log after
-// unlocking.
+// A late repair of a skipped sample is accepted too and un-counts one
+// loss, so reliable redelivery converges instead of arriving stale
+// forever; only a true redelivery of an already delivered sample counts a
+// drop and returns ErrStaleSequence. Delivered sets stay bounded to a
+// sliding window of recent seqs (see deliveredCap). Distinct writers stay
+// bounded by maxTrackedWriters with loud eviction so writer churn cannot
+// grow take state without limit. Eviction never logs under the lock: the
+// evicted writer returns for the caller to log after unlocking.
+// markDeliveredLocked records seq as delivered, reporting true for a
+// redelivery. Delivered sets stay bounded: past twice the cap the set is
+// rebuilt keeping only the window behind the high-water mark, so steady
+// state pays one rebuild per cap inserts instead of a scan per take.
+// Callers must hold mu for write.
+func (r *DataReceiver) markDeliveredLocked(guid WriterGUID, seq uint64) bool {
+	if r.delivered == nil {
+		r.delivered = make(map[WriterGUID]map[uint64]struct{})
+	}
+	delivered, ok := r.delivered[guid]
+	if !ok {
+		delivered = make(map[uint64]struct{})
+		r.delivered[guid] = delivered
+	}
+	if _, dup := delivered[seq]; dup {
+		return true
+	}
+	delivered[seq] = struct{}{}
+	if len(delivered) <= 2*deliveredCap {
+		return false
+	}
+	hi := max(r.last[guid], seq)
+	var floor uint64
+	if hi > deliveredCap {
+		floor = hi - deliveredCap
+	}
+	kept := make(map[uint64]struct{}, deliveredCap)
+	for s := range delivered {
+		if s >= floor {
+			kept[s] = struct{}{}
+		}
+	}
+	r.delivered[guid] = kept
+	return false
+}
+
 func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) (WriterGUID, bool, error) {
 	var none WriterGUID
 	if r.last == nil {
 		r.last = make(map[WriterGUID]uint64)
 	}
+	if r.delivered == nil {
+		r.delivered = make(map[WriterGUID]map[uint64]struct{})
+	}
 	last, seen := r.last[guid]
 	if !seen {
-		if len(r.last) >= maxTrackedWriters {
-			for victim := range r.last {
-				if victim == guid {
-					continue
-				}
-				delete(r.last, victim)
-				delete(r.plainNack, victim)
-				delete(r.lively, victim)
-				delete(r.provisional, victim)
-				r.drops++
-				r.last[guid] = seq
-
-				return victim, true, nil
-			}
-		}
-		r.last[guid] = seq
-
-		return none, false, nil
+		return r.installFirstSequenceLocked(guid, seq)
 	}
 
-	if seq <= last {
+	if r.markDeliveredLocked(guid, seq) {
 		r.drops++
 
 		return none, false, fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
+	}
+
+	if seq <= last {
+		if r.lost > 0 {
+			r.lost--
+		}
+
+		return none, false, nil
 	}
 
 	if seq > last+1 {
@@ -1615,6 +1660,34 @@ func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) (WriterG
 	}
 
 	r.last[guid] = seq
+
+	return none, false, nil
+}
+
+// installFirstSequenceLocked records the first sample from a writer with
+// no lost count. Eviction reports its victim for the caller to log after
+// unlock. Callers must hold mu for write.
+func (r *DataReceiver) installFirstSequenceLocked(guid WriterGUID, seq uint64) (WriterGUID, bool, error) {
+	var none WriterGUID
+	if len(r.last) >= maxTrackedWriters {
+		for victim := range r.last {
+			if victim == guid {
+				continue
+			}
+			delete(r.last, victim)
+			delete(r.plainNack, victim)
+			delete(r.lively, victim)
+			delete(r.provisional, victim)
+			delete(r.delivered, victim)
+			r.drops++
+			r.last[guid] = seq
+			r.delivered[guid] = map[uint64]struct{}{seq: {}}
+
+			return victim, true, nil
+		}
+	}
+	r.last[guid] = seq
+	r.delivered[guid] = map[uint64]struct{}{seq: {}}
 
 	return none, false, nil
 }

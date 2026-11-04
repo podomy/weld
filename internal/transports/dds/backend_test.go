@@ -1924,6 +1924,133 @@ func sedpPeerPrefix() SEDPGUIDPrefix {
 	return prefix
 }
 
+// injectLoopbackRouteForPlainFastTest installs a loopback unicast route for offline publish.
+func injectLoopbackRouteForPlainFastTest(t *testing.T, backend *Backend) {
+	t.Helper()
+
+	backend.mu.RLock()
+	uni := backend.uni
+	backend.mu.RUnlock()
+
+	if uni == nil {
+		t.Fatalf("unicast is nil after join, want live transport")
+	}
+
+	port := uni.LocalPort()
+
+	backend.mu.Lock()
+	var routePrefix GUIDPrefix
+	routePrefix[0] = 0xAA
+	routePrefix[1] = 0xBB
+	backend.routes[routePrefix] = []int{port}
+	if backend.routeExpiry == nil {
+		backend.routeExpiry = make(map[GUIDPrefix]time.Time)
+	}
+	backend.routeExpiry[routePrefix] = time.Now().Add(time.Minute)
+	backend.mu.Unlock()
+}
+
+// distinctPeerPrefixForPlainFastTest returns a peer prefix distinct from local.
+func distinctPeerPrefixForPlainFastTest(local GUIDPrefix) SEDPGUIDPrefix {
+	var peerPrefix SEDPGUIDPrefix
+	for i := range peerPrefix {
+		peerPrefix[i] = 0xB0 + byte(i)
+	}
+
+	matched := true
+	for i := range peerPrefix {
+		if peerPrefix[i] != local[i] {
+			matched = false
+			break
+		}
+	}
+
+	if matched {
+		peerPrefix[0] ^= 0xFF
+	}
+
+	return peerPrefix
+}
+
+// upsertMatchingReaderForPlainFastTest declares a peer reader matching topic and installs it.
+func upsertMatchingReaderForPlainFastTest(t *testing.T, backend *Backend, domain uint32, topic string) SEDPEndpoint {
+	t.Helper()
+
+	writerEp, err := backend.sedp.DeclareWriter(topic, "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare writer: %v", err)
+	}
+
+	backend.mu.RLock()
+	localPrefix := backend.local.GUID().Prefix
+	backend.mu.RUnlock()
+
+	peerPrefix := distinctPeerPrefixForPlainFastTest(localPrefix)
+
+	peerIdx, err := NewSEDPIndex(peerPrefix, domain)
+	if err != nil {
+		t.Fatalf("new peer index: %v", err)
+	}
+
+	readerEp, err := peerIdx.DeclareReader(topic, "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare peer reader: %v", err)
+	}
+
+	err = backend.sedp.UpsertRemote(readerEp)
+	if err != nil {
+		t.Fatalf("upsert remote reader: %v", err)
+	}
+
+	return writerEp
+}
+
+// TestBackendPublishPlainSkipsPauseWithMatchingReader pins the steady-state fast path.
+func TestBackendPublishPlainSkipsPauseWithMatchingReader(t *testing.T) {
+	// Domain 38 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 38
+
+	backend := newLiveBackend(t, domain, "plain-fast")
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	injectLoopbackRouteForPlainFastTest(t, backend)
+
+	const topic = "/chatter_plain_fast_38"
+
+	writerEp := upsertMatchingReaderForPlainFastTest(t, backend, domain, topic)
+
+	if !backend.hasMatchingRemoteReader(writerEp) {
+		t.Fatalf("matching reader not observed after upsert, want true")
+	}
+
+	payload := encodeTestString(t, "hello fast")
+
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  "std_msgs__msg__String",
+		TypeHash:  StringTypeHash,
+		Payload:   payload,
+	}
+
+	start := time.Now()
+
+	err := backend.PublishBytes(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("publish with match: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("publish with match took %v, want under 200ms", elapsed)
+	}
+}
+
 // TestBackendSweepOnceExpiresPendingEvict pins the stub-path sweeper unit.
 func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
 	t.Parallel()
@@ -1960,5 +2087,233 @@ func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
 
 	if n := len(local.RemoteEndpoints()); n != 0 {
 		t.Fatalf("remotes = %d, want 0 after sweep", n)
+	}
+}
+
+// TestBackendSameSeqAliveRefreshesRoute pins the route-lease counterpart of
+// the table refresh: a same-sequence alive is not stale and extends
+// routeExpiry, so a periodic Cyclone re-announcement keeps the publish route
+// across the 10s lease instead of expiring mid-run.
+func TestBackendSameSeqAliveRefreshesRoute(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	clock := &fakeClock{}
+	base := time.Unix(7000, 0).UTC()
+	clock.setNow(base)
+	backend.mu.Lock()
+	backend.clock = clock
+	backend.remotes = NewRemoteTable(nil)
+	backend.mu.Unlock()
+
+	guid := testGUID(0xD2)
+	first := mustMarshalAlive(t, guid, 70, 9, 10*time.Second)
+	backend.handleSpdpBytesOnce(first, 70, nil, base)
+	firstAnn, err := ParseAnnouncement(first)
+	if err != nil {
+		t.Fatalf("parse first: %v", err)
+	}
+	if backend.isAnnouncementStale(firstAnn) {
+		t.Fatalf("first alive reports stale, want live")
+	}
+	backend.mu.RLock()
+	expiry := backend.routeExpiry[guid.Prefix]
+	backend.mu.RUnlock()
+	if expiry.IsZero() {
+		t.Fatalf("missing routeExpiry after first alive")
+	}
+
+	later := base.Add(9 * time.Second)
+	clock.setNow(later)
+	dup := mustMarshalAlive(t, guid, 70, 9, 10*time.Second)
+	ann, err := ParseAnnouncement(dup)
+	if err != nil {
+		t.Fatalf("parse dup: %v", err)
+	}
+	if backend.isAnnouncementStale(ann) {
+		t.Fatalf("same-seq alive reports stale, want refresh")
+	}
+	backend.handleSpdpBytesOnce(dup, 70, nil, later)
+	backend.mu.RLock()
+	refreshed := backend.routeExpiry[guid.Prefix]
+	backend.mu.RUnlock()
+	if !refreshed.After(expiry) {
+		t.Fatalf("routeExpiry not refreshed: first %v refreshed %v", expiry, refreshed)
+	}
+	if n := backend.sweepExpiredRoutes(base.Add(10 * time.Second)); n != 0 {
+		t.Fatalf("sweep at original expiry evicted %d, want 0", n)
+	}
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+}
+
+// TestBackendRepairLargeSampleUsesFrags pins fragment-aware repair: a 1MiB
+// stored sample must attempt a DATA_FRAG resend (failing here on no route),
+// not fail at DATA encoding with "data body above".
+func TestBackendRepairLargeSampleUsesFrags(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	var guid WriterGUID
+	for i := range guid {
+		guid[i] = byte(0xE0 + i)
+	}
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	backend.mu.RLock()
+	history := backend.repairHistory
+	backend.mu.RUnlock()
+	if history == nil {
+		backend.mu.Lock()
+		backend.repairHistory = newUserHistory()
+		history = backend.repairHistory
+		backend.mu.Unlock()
+	}
+	history.store(guid, 1, payload)
+	err := backend.repairOneSeq(context.Background(), guid, 1, 1, 1)
+	if errors.Is(err, ErrNoRoute) || errors.Is(err, ErrDataPathNotWired) {
+	} else {
+		t.Fatalf("repair large err = %v, want frag-path send error (no route or not wired), not data-body limit", err)
+	}
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+}
+
+// TestBackendQueueFragRepairContracts pins the NACKFRAG queue gate: empty
+// requests are silent no-ops, a closed backend fails loudly instead of
+// queueing post-teardown work, and a full queue reports backpressure.
+func TestBackendQueueFragRepairContracts(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	local, err := NewLocalParticipant(72, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	backend.mu.Lock()
+	backend.local = local
+	backend.mu.Unlock()
+	var writer rtps.EntityID
+	writer[3] = 0x02
+	if err := backend.queueFragRepair(writer, 9, nil); err != nil {
+		t.Fatalf("empty frags: %v, want silent no-op", err)
+	}
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	if err := backend.queueFragRepair(writer, 9, []uint32{1}); err == nil {
+		t.Fatalf("closed queue accepted work, want loud failure")
+	}
+}
+
+// TestBackendQueueFragRepairBackpressure pins the full-queue report: with
+// no worker draining, the bounded queue fills and the overflow returns
+// ErrRepairBackpressure instead of blocking demux.
+func TestBackendQueueFragRepairBackpressure(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 73, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	local, err := NewLocalParticipant(73, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	backend.mu.Lock()
+	backend.local = local
+	backend.repairQueue = make(chan repairTask, repairQueueDepth)
+	backend.mu.Unlock()
+	var writer rtps.EntityID
+	writer[3] = 0x02
+	for i := range repairQueueDepth {
+		if err := backend.queueFragRepair(writer, uint64(i+1), []uint32{1}); err != nil {
+			t.Fatalf("fill %d: %v", i, err)
+		}
+	}
+	if err := backend.queueFragRepair(writer, 9999, []uint32{1}); !errors.Is(err, ErrRepairBackpressure) {
+		t.Fatalf("overflow err = %v, want ErrRepairBackpressure", err)
+	}
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+}
+
+// TestServeRepairWindowContinuesPastFailedSeq pins the window discipline:
+// one failed seq logs loudly and continues instead of aborting the rest.
+// With no routes every seq fails to send, so a 3-seq window must count
+// exactly 3 demux errors.
+func TestServeRepairWindowContinuesPastFailedSeq(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 74, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	local, err := NewLocalParticipant(74, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	backend.mu.Lock()
+	backend.local = local
+	backend.repairHistory = newUserHistory()
+	backend.mu.Unlock()
+	var guid WriterGUID
+	for i := range guid {
+		guid[i] = byte(0xF0 + i)
+	}
+	payload := make([]byte, 128)
+	backend.mu.RLock()
+	history := backend.repairHistory
+	backend.mu.RUnlock()
+	for seq := uint64(1); seq <= 3; seq++ {
+		history.store(guid, seq, payload)
+	}
+	before := backend.demuxErrorCount()
+	serveRepairWindow(backend, context.Background(), guid, 1, 1, 3, 3)
+	if got := backend.demuxErrorCount() - before; got != 3 {
+		t.Fatalf("demux errors = %d, want 3 (one per failed seq, no abort)", got)
+	}
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+}
+
+// TestServePathsSkipQuietlyAfterClose pins teardown discipline: repair,
+// ack, and frag repair after Close return silently without counting
+// demux errors.
+func TestServePathsSkipQuietlyAfterClose(t *testing.T) {
+	t.Parallel()
+
+	cfg := SidecarConfig{DomainID: 75, PeerAddress: DefaultPeerAddress, Range: 0}
+	backend := newTestBackend(t, cfg)
+	local, err := NewLocalParticipant(75, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	backend.mu.Lock()
+	backend.local = local
+	backend.repairHistory = newUserHistory()
+	backend.mu.Unlock()
+	cerr := backend.Close()
+	if cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	var writer rtps.EntityID
+	writer[3] = 0x02
+	before := backend.demuxErrorCount()
+	backend.serveRepair(repairTask{kind: repairTaskRepair, writer: writer, base: 1})
+	backend.serveAckSend(repairTask{kind: repairTaskAck})
+	backend.serveFragRepair(repairTask{kind: repairTaskFragRepair, writer: writer, seq: 1, fragNums: []uint32{1}})
+	if got := backend.demuxErrorCount() - before; got != 0 {
+		t.Fatalf("demux errors after close = %d, want 0 silent", got)
 	}
 }

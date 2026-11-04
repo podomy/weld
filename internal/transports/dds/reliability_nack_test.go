@@ -5,6 +5,7 @@ package dds
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -749,5 +750,113 @@ func TestSedpShouldSkipResendAtUsesFakeClock(t *testing.T) {
 
 	if sedpShouldSkipResendAt(nil, nil, nil, nil, fake, fake.Add(2*time.Second)) {
 		t.Fatalf("skip past interval returned true, want false")
+	}
+}
+
+// encodeTestNackFrag builds one little-endian NACKFRAG body: reader,
+// writer, writer seq, fragment base, bit count, MSB-first bitmap words,
+// then the reader count.
+func encodeTestNackFrag(t *testing.T, reader, writer rtps.EntityID, seq uint64, fragBase uint32, frags []uint32, count int32) []byte {
+	t.Helper()
+	maxFrag := fragBase
+	for _, f := range frags {
+		if f > maxFrag {
+			maxFrag = f
+		}
+	}
+	var numBits uint32
+	if len(frags) > 0 {
+		numBits = maxFrag - fragBase + 1
+	}
+	words := (numBits + 31) / 32
+	bitmap := make([]uint32, words)
+	for _, f := range frags {
+		i := f - fragBase
+		bitmap[i/32] |= 1 << (31 - (i % 32))
+	}
+	out := make([]byte, 0, 28+4*len(bitmap))
+	out = append(out, reader[:]...)
+	out = append(out, writer[:]...)
+	var u32 [4]byte
+	putNackUint32(u32[:], uint32(seq>>32))
+	out = append(out, u32[:]...)
+	putNackUint32(u32[:], uint32(seq)) //nolint:gosec // G115: test seqs are small literals
+	out = append(out, u32[:]...)
+	putNackUint32(u32[:], fragBase)
+	out = append(out, u32[:]...)
+	putNackUint32(u32[:], numBits)
+	out = append(out, u32[:]...)
+	for _, w := range bitmap {
+		putNackUint32(u32[:], w)
+		out = append(out, u32[:]...)
+	}
+	putNackUint32(u32[:], uint32(count)) //nolint:gosec // G115: test reader count is a small literal
+	out = append(out, u32[:]...)
+	return out
+}
+
+// putNackUint32 stores one little-endian word for the NACKFRAG test body.
+func putNackUint32(out []byte, v uint32) {
+	binary.LittleEndian.PutUint32(out, v)
+}
+
+// TestDecodeUserNackFragRoundTrip pins the NACKFRAG codec: frags 5 and 7 of
+// seq 9 decode back exactly, MSB first like the Gap bitmap order.
+func TestDecodeUserNackFragRoundTrip(t *testing.T) {
+	t.Parallel()
+	var reader, writer rtps.EntityID
+	reader[3] = 0x01
+	writer[3] = 0x02
+	body := encodeTestNackFrag(t, reader, writer, 9, 5, []uint32{5, 7}, 3)
+	req, err := decodeUserNackFrag(body, rtps.FlagLittleEndian)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if req.seq != 9 {
+		t.Fatalf("seq = %d, want 9", req.seq)
+	}
+	if len(req.fragNums) != 2 || req.fragNums[0] != 5 || req.fragNums[1] != 7 {
+		t.Fatalf("frags = %v, want [5 7]", req.fragNums)
+	}
+	if req.count != 3 {
+		t.Fatalf("count = %d, want 3", req.count)
+	}
+}
+
+// TestDecodeUserNackFragRejectsBadBodies pins the loud bounds: short
+// bodies, zero fragment bases, and oversized bit counts fail; a zero bit
+// count decodes to an empty no-op request.
+func TestDecodeUserNackFragRejectsBadBodies(t *testing.T) {
+	t.Parallel()
+	var reader, writer rtps.EntityID
+	if _, err := decodeUserNackFrag(make([]byte, 10), rtps.FlagLittleEndian); err == nil {
+		t.Fatalf("short body decoded without error")
+	}
+	zeroBase := encodeTestNackFrag(t, reader, writer, 9, 0, nil, 1)
+	if _, err := decodeUserNackFrag(zeroBase, rtps.FlagLittleEndian); err == nil {
+		t.Fatalf("zero frag base decoded without error")
+	}
+	huge := encodeTestNackFrag(t, reader, writer, 9, 1, nil, 1)
+	// Patch numBits past the cap: body is reader+writer+seq+base+bits+count.
+	huge[20] = 0xFF
+	huge[21] = 0xFF
+	if _, err := decodeUserNackFrag(huge, rtps.FlagLittleEndian); err == nil {
+		t.Fatalf("oversized bits decoded without error")
+	}
+	empty := encodeTestNackFrag(t, reader, writer, 9, 5, nil, 1)
+	req, err := decodeUserNackFrag(empty, rtps.FlagLittleEndian)
+	if err != nil {
+		t.Fatalf("empty request: %v", err)
+	}
+	if len(req.fragNums) != 0 {
+		t.Fatalf("empty request frags = %v, want none", req.fragNums)
+	}
+	zeroSeq := encodeTestNackFrag(t, reader, writer, 0, 5, nil, 1)
+	req, err = decodeUserNackFrag(zeroSeq, rtps.FlagLittleEndian)
+	if err != nil {
+		t.Fatalf("zero seq: %v", err)
+	}
+	if len(req.fragNums) != 0 {
+		t.Fatalf("zero seq frags = %v, want none", req.fragNums)
 	}
 }

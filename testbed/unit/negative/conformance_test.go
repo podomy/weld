@@ -693,7 +693,7 @@ func TestNegativeZeroSequenceRejected(t *testing.T) {
 	}
 }
 
-// TestNegativeStaleDuplicateSequenceDropped checks stale sequences drop with ErrStaleSequence.
+// TestNegativeStaleDuplicateSequenceDropped checks late repair delivers and true duplicates drop.
 func TestNegativeStaleDuplicateSequenceDropped(t *testing.T) {
 	t.Parallel()
 
@@ -719,12 +719,26 @@ func TestNegativeStaleDuplicateSequenceDropped(t *testing.T) {
 		t.Fatalf("lost = %d, want 1", recv.LostCount())
 	}
 
+	lateMsg, err := recv.Take(second)
+	if err != nil {
+		t.Fatalf("late repair take: %v", err)
+	}
+	if len(lateMsg.Payload) != 2 || lateMsg.Payload[0] != 0x02 {
+		t.Fatalf("late payload = %v want [2 2]", lateMsg.Payload)
+	}
+	if recv.LostCount() != 0 {
+		t.Fatalf("lost after late repair = %d, want 0", recv.LostCount())
+	}
+	if recv.DroppedCount() != 0 {
+		t.Fatalf("drops after late repair = %d, want 0", recv.DroppedCount())
+	}
+
 	_, err = recv.Take(second)
 	if err == nil {
-		t.Fatalf("stale take succeeded, want error")
+		t.Fatalf("duplicate take succeeded, want error")
 	}
 	if !errors.Is(err, dds.ErrStaleSequence) {
-		t.Fatalf("stale error = %v, want ErrStaleSequence", err)
+		t.Fatalf("duplicate error = %v, want ErrStaleSequence", err)
 	}
 
 	_, err = recv.Take(third)

@@ -351,7 +351,22 @@ func logFragBytesEvictions(dropped []fragKey) {
 	}
 }
 
+// logFragTableEvicts logs entry-count evictions after unlock, next to the
+// byte-budget evictions, so a clogged table stays visible without holding
+// the reassembler lock across logging.
+func logFragTableEvicts(dropped []fragKey) {
+	for _, droppedKey := range dropped {
+		log.Printf("dds: datafrag table evict guid=%x seq=%d", droppedKey.guid, droppedKey.seq)
+	}
+}
+
 // add stores one fragment run and returns the complete payload when done.
+// A full table evicts the oldest incomplete entry to make room: dropping
+// the new sample instead would stall the reader behind stuck partials
+// forever, while evicting lets fresh samples complete, advance
+// contiguity, and pull repairs for the evicted seqs. A resend that
+// disagrees with the stored geometry resets the entry instead of
+// dropping: the new arrival reflects the peer's current send.
 func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool, error) {
 	if f == nil {
 		return nil, false, fmt.Errorf("dds: datafrag without reassembler: %w", ErrDataFragDropped)
@@ -363,40 +378,49 @@ func (f *fragReassembler) add(guid WriterGUID, frag rtps.DataFrag) ([]byte, bool
 	f.mu.Lock()
 	key := fragKey{guid: guid, seq: frag.SequenceNumber}
 	entry, seen := f.entries[key]
-	var evicted []fragKey
+	var evicted, tableEvicted []fragKey
+	var resetKey *fragKey
+	finish := func() {
+		logFragBytesEvictions(evicted)
+		logFragTableEvicts(tableEvicted)
+		if resetKey != nil {
+			log.Printf("dds: datafrag inconsistent sample reset guid=%x seq=%d", resetKey.guid, resetKey.seq)
+		}
+	}
+	if seen && (entry.sampleSize != frag.SampleSize || entry.fragmentSize != frag.FragmentSize) {
+		resetKey = &key
+		delete(f.entries, key)
+		seen = false
+	}
 	if !seen {
 		if len(f.entries) >= f.maxEntries {
-			f.mu.Unlock()
-
-			return nil, false, fmt.Errorf("dds: datafrag table full: %w", ErrDataFragDropped)
+			oldest, ok := f.evictOldestFragLocked()
+			if !ok {
+				f.mu.Unlock()
+				finish()
+				return nil, false, fmt.Errorf("dds: datafrag table full: %w", ErrDataFragDropped)
+			}
+			tableEvicted = append(tableEvicted, oldest)
 		}
 		evicted = f.makeRoomForFragLocked(frag.SampleSize)
 		entry = makeFragEntry(frag.SampleSize, frag.FragmentSize, total, f.now())
 		f.entries[key] = entry
-	} else if entry.sampleSize != frag.SampleSize || entry.fragmentSize != frag.FragmentSize {
-		f.mu.Unlock()
-		logFragBytesEvictions(evicted)
-
-		return nil, false, fmt.Errorf("dds: datafrag inconsistent sample: %w", ErrDataFragDropped)
 	}
 	err = copyFragRun(entry, frag)
 	if err != nil {
 		f.mu.Unlock()
-		logFragBytesEvictions(evicted)
-
+		finish()
 		return nil, false, err
 	}
 	if entry.receivedCount != entry.total {
 		f.mu.Unlock()
-		logFragBytesEvictions(evicted)
-
+		finish()
 		return nil, false, nil
 	}
 	out := append([]byte(nil), entry.buf...)
 	delete(f.entries, key)
 	f.mu.Unlock()
-	logFragBytesEvictions(evicted)
-
+	finish()
 	return out, true, nil
 }
 

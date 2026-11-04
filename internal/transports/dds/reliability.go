@@ -446,7 +446,108 @@ func (h *userHistory) makeRoomForHistoryLocked(_ uint64) []historyEvict {
 	return evicted
 }
 
-// ackRequest is one decoded user ACKNACK.
+// nackFragRequest is one decoded user NACKFRAG: the requested fragment
+// numbers of a single writer sequence.
+type nackFragRequest struct {
+	// reader names the requesting reader.
+	reader rtps.EntityID
+	// writer names the targeted writer.
+	writer rtps.EntityID
+	// seq names the writer sequence holding the fragments.
+	seq uint64
+	// fragNums holds the requested one based fragment numbers in order.
+	fragNums []uint32
+	// count is the reader counter.
+	count int32
+}
+
+// decodeUserNackFrag parses one NACKFRAG body with its flags. The layout
+// mirrors ACKNACK: reader, writer, writer sequence, then a fragment
+// number set (base plus MSB-first bitmap exactly like a sequence set),
+// then the reader count. Bodies short of the 28 byte fixed part, zero
+// fragment bases, and bit counts above userAckBitsMax fail loudly with
+// bounded work. A zero sequence decodes to an empty request without
+// error, like an ACKNACK base 0; a zero bit count likewise decodes to an
+// empty request. Callers treat both as silent no-ops.
+func decodeUserNackFrag(
+	body []byte,
+	flags uint8,
+) (nackFragRequest, error) {
+	var out nackFragRequest
+
+	little := rtps.LittleEndian(flags)
+
+	const need = 28
+
+	if len(body) < need {
+		return out, fmt.Errorf(
+			"dds: nackfrag need %d have %d: %w",
+			need,
+			len(body),
+			ErrInvalidFrame,
+		)
+	}
+
+	copy(out.reader[:], body[0:4])
+	copy(out.writer[:], body[4:8])
+
+	high := getAckUint32(body[8:12], little)
+	low := getAckUint32(body[12:16], little)
+	out.seq = uint64(high)<<32 | uint64(low)
+
+	if out.seq == 0 {
+		return out, nil
+	}
+
+	fragBase := getAckUint32(body[16:20], little)
+	numBits := getAckUint32(body[20:24], little)
+
+	if fragBase == 0 {
+		return out, fmt.Errorf(
+			"dds: nackfrag fragment base 0: %w",
+			ErrInvalidFrame,
+		)
+	}
+
+	if numBits > userAckBitsMax {
+		return out, fmt.Errorf(
+			"dds: nackfrag bits %d above %d: %w",
+			numBits,
+			userAckBitsMax,
+			ErrInvalidFrame,
+		)
+	}
+
+	words := (uint64(numBits) + 31) / 32
+	needTotal := uint64(need) + words*4
+	if uint64(len(body)) < needTotal {
+		return out, fmt.Errorf(
+			"dds: nackfrag need %d have %d: %w",
+			needTotal,
+			len(body),
+			ErrInvalidFrame,
+		)
+	}
+
+	off := 24 + 4*int(words)
+	// Walk words MSB first, matching the Gap bitmap order: bit 31 of
+	// word zero names fragBase, bit 30 names fragBase plus 1, and so on.
+	for n := range numBits {
+		word := getAckUint32(body[24+(n/32)*4:24+(n/32)*4+4], little)
+		shift := 31 - (n % 32)
+		if word&(1<<shift) == 0 {
+			continue
+		}
+		out.fragNums = append(out.fragNums, fragBase+n)
+	}
+
+	out.count = int32( //nolint:gosec // G115: count wrap is layout
+		getAckUint32(body[off:off+4], little),
+	)
+
+	return out, nil
+}
+
 type ackRequest struct {
 	// reader names the requesting reader.
 	reader rtps.EntityID
@@ -1275,6 +1376,46 @@ func (b *Backend) buildRepairMessage(
 	return msg, nil
 }
 
+// sendRepairFrags re-emits one stored sample larger than a single DATA as
+// an ordered DATA_FRAG run plus a terminal heartbeat for that seq. It
+// mirrors sendPlainFragRun plus the repair heartbeat so a reliable reader
+// reassembles the sample and advances past it. Frags pace like the initial
+// send so a repair does not recreate the burst the pacing removes.
+func (b *Backend) sendRepairFrags(ctx context.Context, guid WriterGUID, seq uint64, payload []byte) error {
+	sampleSize := uint32(len(payload)) //nolint:gosec // G115: repair history holds at most tens of MiB, fits uint32
+	fragmentSize, total, err := planFragSend(sampleSize)
+	if err != nil {
+		return err
+	}
+	timer := time.NewTimer(fragSendPace)
+	defer timer.Stop()
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	for fragNum := uint32(1); fragNum <= total; fragNum++ {
+		fragData := fragSlice(payload, fragNum, total, fragmentSize)
+		msg, err := b.buildFragMessage(guid, seq, fragNum, total, fragmentSize, sampleSize, fragData)
+		if err != nil {
+			return err
+		}
+		err = b.sendUserControl(ctx, msg)
+		if err != nil {
+			return err
+		}
+		if fragNum < total && !paceFragSend(timer, ctx) {
+			return fmt.Errorf("dds: repair frag pacing ended: %w", ctx.Err())
+		}
+	}
+	hb, err := b.buildHeartbeatMessage(guid, seq)
+	if err != nil {
+		return err
+	}
+	return b.sendUserControl(ctx, hb)
+}
+
 // buildGapMessage wraps one GAP plus one HEARTBEAT for a missing seq. It tells a reliable reader to
 // skip seq it will never receive because history evicted it.
 func (b *Backend) buildGapMessage(
@@ -1695,7 +1836,10 @@ func (b *Backend) repairWindow(
 	return start, first, last, end, true
 }
 
-// repairOneSeq resends one seq or GAPs it when history misses it.
+// repairOneSeq resends one seq or GAPs it when history misses it. Samples
+// larger than a single DATA submessage re-emit as an ordered DATA_FRAG run
+// plus a terminal heartbeat, mirroring the initial send path; the single
+// DATA repair cannot encode them and must not block the window.
 func (b *Backend) repairOneSeq(
 	ctx context.Context,
 	guid WriterGUID,
@@ -1709,6 +1853,9 @@ func (b *Backend) repairOneSeq(
 
 	payload, ok := history.load(guid, seq)
 	if ok {
+		if fragNeedsSplit(uint32(len(payload))) { //nolint:gosec // G115: repair history holds at most tens of MiB, fits uint32
+			return b.sendRepairFrags(ctx, guid, seq, payload)
+		}
 		msg, err := b.buildRepairMessage(
 			guid,
 			payload,
@@ -1766,13 +1913,16 @@ const (
 	repairTaskRepair repairTaskKind = iota
 	// repairTaskAck sends one queued ACKNACK for a heartbeat gap.
 	repairTaskAck
+	// repairTaskFragRepair resends the requested fragments of one stored
+	// sample for one queued NACKFRAG.
+	repairTaskFragRepair
 )
 
-// repairTask is one queued ACKNACK repair or ACK send.
+// repairTask is one queued ACKNACK repair, ACK send, or NACKFRAG repair.
 type repairTask struct {
 	// gen is the backend generation; stale tasks skip work.
 	gen uint64
-	// kind selects repair versus ACK send.
+	// kind selects repair versus ACK send versus fragment repair.
 	kind repairTaskKind
 	// writer names the targeted writer for repair.
 	writer rtps.EntityID
@@ -1786,6 +1936,11 @@ type repairTask struct {
 	numBits uint32
 	// bitmap holds repair bits for an ACK send.
 	bitmap []uint32
+	// seq names the sample for a fragment repair.
+	seq uint64
+	// fragNums holds the requested one based fragment numbers for a
+	// fragment repair.
+	fragNums []uint32
 }
 
 // ensureRepairWorkerLocked starts the per-backend FIFO repair worker.
@@ -1829,6 +1984,8 @@ func (b *Backend) repairWorkerLoop(q chan repairTask, done <-chan struct{}) {
 				b.serveAckSend(task)
 			case repairTaskRepair:
 				b.serveRepair(task)
+			case repairTaskFragRepair:
+				b.serveFragRepair(task)
 			default:
 				b.bumpDemuxError()
 				log.Printf("dds: demux repair unknown task kind %d", task.kind)
@@ -1847,12 +2004,16 @@ func (b *Backend) currentRepairGen() uint64 {
 	return b.repairGen
 }
 
-// serveAckSend sends one queued ACKNACK best effort.
+// serveAckSend sends one queued ACKNACK best effort. Teardown races skip
+// quietly: a close between queue and send is not a fault.
 //
 // Failures count a demux error loudly instead of failing silently, except
 // a missing route which stays best-effort quiet. Backpressure counts
 // loudly via ErrRepairBackpressure.
 func (b *Backend) serveAckSend(task repairTask) {
+	if b.isClosed() {
+		return
+	}
 	ctx := context.Background()
 	err := b.sendUserAckNack(ctx, task.remote, task.reader, task.base, task.numBits, task.bitmap)
 	if err != nil {
@@ -1864,13 +2025,19 @@ func (b *Backend) serveAckSend(task repairTask) {
 	}
 }
 
-// serveRepair resends history for one queued ACKNACK.
+// serveRepair resends history for one queued ACKNACK. Teardown races skip
+// quietly like serveFragRepair: a close between queue and send is not a
+// fault.
 //
 // When durability reports ReplayBound 0 the reader would stall waiting for
 // samples the writer will never replay, so a GAP for the NACKed range is
 // sent instead and the reader converges past the gap.
 func (b *Backend) serveRepair(task repairTask) {
 	ctx := context.Background()
+
+	if b.isClosed() {
+		return
+	}
 
 	b.mu.RLock()
 	local := b.local
@@ -1893,6 +2060,132 @@ func (b *Backend) serveRepair(task repairTask) {
 	}
 
 	serveRepairWindow(b, ctx, guid, start, first, last, end)
+}
+
+// serveFragRepair resends the requested fragments of one stored sample for
+// a queued NACKFRAG. Fragment numbers name the writer's own fragmentation,
+// which matches the stored sample because repairs re-emit the deterministic
+// planFragSend layout of the original send. Out-of-range numbers skip
+// loudly without aborting the rest; a sample no longer in history gets a
+// GAP for the seq so the reader converges past it; a stored sample that
+// fits one DATA takes the whole-sample path with a loud note since a
+// NACKFRAG for an unfragmented sample means the peers disagree.
+func (b *Backend) serveFragRepair(task repairTask) {
+	ctx := context.Background()
+
+	if b.isClosed() {
+		return
+	}
+
+	b.mu.RLock()
+	local := b.local
+	b.mu.RUnlock()
+
+	if local == nil {
+		return
+	}
+
+	var guid WriterGUID
+
+	lg := local.GUID()
+	copy(guid[:12], lg.Prefix[:])
+	copy(guid[12:16], task.writer[:])
+
+	first, last := b.repairHistoryBounds(guid)
+
+	b.mu.RLock()
+	history := b.repairHistory
+	b.mu.RUnlock()
+
+	payload, ok := history.load(guid, task.seq)
+	if !ok {
+		log.Printf("dds: demux frag repair history miss seq=%d window=[%d..%d]", task.seq, first, last)
+		b.sendFragMissGap(ctx, guid, task.seq, first, last)
+		return
+	}
+	if n := fragRepairServed.Add(1); n%64 == 1 {
+		log.Printf("dds: demux frag repair serve seq=%d frags=%d (sample %d)", task.seq, len(task.fragNums), n)
+	}
+
+	if !fragNeedsSplit(uint32(len(payload))) { //nolint:gosec // G115: repair history holds at most tens of MiB, fits uint32
+		log.Printf("dds: demux frag repair unfragmented seq=%d, whole repair", task.seq)
+		msg, err := b.buildRepairMessage(guid, payload, task.seq, first, last)
+		if err != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux frag repair data: %v", err)
+			return
+		}
+		if err := b.sendUserControl(ctx, msg); err != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux frag repair send: %v", err)
+		}
+		return
+	}
+
+	sampleSize := uint32(len(payload)) //nolint:gosec // G115: repair history holds at most tens of MiB, fits uint32
+	fragmentSize, total, err := planFragSend(sampleSize)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux frag repair plan: %v", err)
+		return
+	}
+	b.sendFragList(ctx, guid, task.seq, payload, sampleSize, fragmentSize, total, task.fragNums)
+}
+
+// sendFragMissGap GAPs a NACKFRAGed seq whose sample already left history
+// so the reader converges past it instead of waiting for a repair that
+// will never come. Out-of-window seqs stay silent: nothing was ever kept
+// for them.
+func (b *Backend) sendFragMissGap(ctx context.Context, guid WriterGUID, seq, first, last uint64) {
+	if last == 0 || seq == 0 || seq > last {
+		return
+	}
+	msg, err := b.buildGapMessage(guid, seq, first, last)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux frag repair gap build: %v", err)
+		return
+	}
+	if err := b.sendUserControl(ctx, msg); err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux frag repair gap send: %v", err)
+	}
+}
+
+// sendFragList resends the requested fragments of one stored sample,
+// paced like a repair window. Out-of-range numbers skip loudly without
+// aborting the rest; each send failure logs loudly and continues.
+func (b *Backend) sendFragList(ctx context.Context, guid WriterGUID, seq uint64, payload []byte, sampleSize uint32, fragmentSize uint16, total uint32, fragNums []uint32) {
+	timer := time.NewTimer(repairPace)
+	defer timer.Stop()
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	for _, fragNum := range fragNums {
+		if fragNum == 0 || fragNum > total {
+			b.bumpDemuxError()
+			log.Printf("dds: demux frag repair frag %d out of %d seq=%d", fragNum, total, seq)
+			continue
+		}
+		fragData := fragSlice(payload, fragNum, total, fragmentSize)
+		msg, err := b.buildFragMessage(guid, seq, fragNum, total, fragmentSize, sampleSize, fragData)
+		if err != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux frag repair build: %v", err)
+			continue
+		}
+		if err := b.sendUserControl(ctx, msg); err != nil {
+			b.bumpDemuxError()
+			log.Printf("dds: demux frag repair send: %v", err)
+			continue
+		}
+		if !paceRepair(timer, ctx) {
+			return
+		}
+	}
 }
 
 // sendBoundZeroGap GAPs the NACKed range when durability replays nothing.
@@ -1963,7 +2256,9 @@ func (b *Backend) sendOneBoundZeroGap(ctx context.Context, guid WriterGUID, seq,
 	return true
 }
 
-// serveRepairWindow sends one bounded repair window with pacing.
+// serveRepairWindow sends one bounded repair window with pacing. One failed
+// seq logs loudly and continues: a single unrepairable sample must not
+// block repair for the rest of the window.
 func serveRepairWindow(b *Backend, ctx context.Context, guid WriterGUID, start, first, last, end uint64) {
 	timer := time.NewTimer(repairPace)
 	defer timer.Stop()
@@ -1976,29 +2271,21 @@ func serveRepairWindow(b *Backend, ctx context.Context, guid WriterGUID, start, 
 	}
 
 	for seq := start; ; seq++ {
-		err := ctx.Err()
-		if err != nil {
+		if ctx.Err() != nil {
 			return
 		}
 
-		err = b.repairOneSeq(ctx, guid, seq, first, last)
-		if err != nil {
+		if err := b.repairOneSeq(ctx, guid, seq, first, last); err != nil {
 			b.bumpDemuxError()
 			log.Printf("dds: demux repair: %v", err)
-
-			return
 		}
 
-		if seq == end {
+		if seq == end || seq == ^uint64(0) {
 			break
 		}
 
 		if !paceRepair(timer, ctx) {
 			return
-		}
-
-		if seq == ^uint64(0) {
-			break
 		}
 	}
 }
@@ -2065,6 +2352,49 @@ func (b *Backend) repairFromAck(
 		return nil
 	default:
 		return fmt.Errorf("dds: repair queue full base %d: %w", base, ErrRepairBackpressure)
+	}
+}
+
+// queueFragRepair queues one fragment repair for a NACKFRAG: the requested
+// one based fragment numbers of one writer sequence. Empty requests are a
+// silent no-op like an ACKNACK base 0. A full queue reports loudly via
+// ErrRepairBackpressure so demux counts instead of blocking.
+func (b *Backend) queueFragRepair(writer rtps.EntityID, seq uint64, fragNums []uint32) error {
+	if seq == 0 || len(fragNums) == 0 {
+		return nil
+	}
+
+	if !isUserWriterEntity(writer) {
+		return nil
+	}
+
+	b.mu.RLock()
+	local := b.local
+	closed := b.closed
+	q := b.repairQueue
+	gen := b.repairGen
+	b.mu.RUnlock()
+
+	if local == nil {
+		return nil
+	}
+
+	if closed {
+		return fmt.Errorf("dds: frag repair after close seq %d: %w", seq, transports.ErrBackendClosed)
+	}
+
+	if q == nil {
+		return fmt.Errorf("dds: frag repair worker without queue seq %d: %w", seq, ErrDataPathNotWired)
+	}
+
+	cp := append([]uint32(nil), fragNums...)
+	task := repairTask{gen: gen, kind: repairTaskFragRepair, writer: writer, seq: seq, fragNums: cp}
+
+	select {
+	case q <- task:
+		return nil
+	default:
+		return fmt.Errorf("dds: frag repair queue full seq %d: %w", seq, ErrRepairBackpressure)
 	}
 }
 
@@ -2370,15 +2700,78 @@ func (b *Backend) maybePromptNackOnData(
 // handleUserAck routes one ACKNACK for a user writer to repair, not to dataCh.
 //
 // The caller decodes once via decodeUserAckNack and shares the result so
-// the sub is not decoded twice.
+// the sub is not decoded twice. Teardown races skip quietly: a close
+// between demux and queue is not a fault.
 func (b *Backend) handleUserAck(
 	ctx context.Context,
 	req ackRequest,
 ) {
 	err := b.repairFromAck(ctx, req.writer, req.base)
 	if err != nil {
+		if b.isClosed() {
+			return
+		}
 		b.bumpDemuxError()
 		log.Printf("dds: demux repair: %v", err)
+	}
+}
+
+// handleUserNackFragRaw decodes one NACKFRAG submessage and routes it to
+// fragment repair, reporting whether the submessage was user control.
+// Malformed bodies count loudly; a non-user writer returns false so the
+// submessage can fall through to the DATA path like other non-user
+// control.
+func (b *Backend) handleUserNackFragRaw(sub rtps.RawSubmessage) bool {
+	rawReq, err := decodeUserNackFrag(
+		sub.Body,
+		sub.Flags,
+	)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf(
+			"dds: demux nackfrag decode: %v",
+			err,
+		)
+
+		return true
+	}
+
+	if !isUserWriterEntity(rawReq.writer) {
+		return false
+	}
+
+	b.handleUserNackFrag(rawReq)
+
+	return true
+}
+
+// fragNackArrivals counts received NACKFRAG requests for sampled logging so
+// steady-state repair stays quiet while a stuck seq still shows up.
+var fragNackArrivals atomic.Uint64
+
+// fragRepairServed counts served fragment repairs for sampled logging,
+// on a separate counter so arrivals and serves sample independently.
+var fragRepairServed atomic.Uint64
+
+// handleUserNackFrag routes one NACKFRAG for a user writer to fragment
+// repair, not to dataCh. Empty requests are a silent no-op like an
+// ACKNACK base 0. Teardown races skip quietly like handleUserAck.
+func (b *Backend) handleUserNackFrag(
+	req nackFragRequest,
+) {
+	if len(req.fragNums) == 0 {
+		return
+	}
+	if n := fragNackArrivals.Add(1); n%64 == 1 {
+		log.Printf("dds: demux nackfrag seq=%d frags=%d (sample %d)", req.seq, len(req.fragNums), n)
+	}
+	err := b.queueFragRepair(req.writer, req.seq, req.fragNums)
+	if err != nil {
+		if b.isClosed() {
+			return
+		}
+		b.bumpDemuxError()
+		log.Printf("dds: demux frag repair: %v", err)
 	}
 }
 
@@ -2393,8 +2786,37 @@ func (b *Backend) handleUserHeartbeat(
 	b.ackUserHeartbeat(header, beat)
 }
 
-// handleUserGap routes one GAP for a user writer to skip, not to dataCh. The full
-// gap list applies in order so every contiguous run advances contiguity.
+// handleUserGapRaw decodes one GAP submessage and routes it to skip,
+// reporting whether the submessage was user control. It mirrors the
+// NACKFRAG case: malformed bodies count loudly, a non-user writer
+// returns false.
+func (b *Backend) handleUserGapRaw(header rtps.Header, sub rtps.RawSubmessage) bool {
+	var drops rtps.Counter
+
+	gap, err := rtps.DecodeGap(
+		sub.Body,
+		sub.Flags,
+		&drops,
+	)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: demux user gap decode: %v", err)
+
+		return true
+	}
+
+	if !isUserWriterEntity(gap.WriterID) {
+		return false
+	}
+
+	b.handleUserGap(header, gap)
+
+	return true
+}
+
+// handleUserGap routes one GAP for a user writer to skip, not to dataCh.
+// The full gap list applies in order so every contiguous run advances
+// contiguity.
 //
 // The caller decodes once via DecodeGap and shares the result so the sub
 // is not decoded twice.
@@ -2414,7 +2836,8 @@ func (b *Backend) handleUserGap(
 }
 
 // handleUserControl processes user control subs before DATA queueing. It handles ACKNACK with repair,
-// HEARTBEAT with ACK, GAP with skip, and DATA_FRAG with reassembly to dataCh. It returns true when sub
+// NACKFRAG with fragment repair, HEARTBEAT with ACK, GAP with skip, and
+// DATA_FRAG with reassembly to dataCh. It returns true when sub
 // was user control and must not reach dataCh through the DATA path. Malformed
 // control submessages count a demux error loudly instead of skipping silently.
 // Each sub decodes once and the result is shared with the handler so the
@@ -2448,6 +2871,8 @@ func (b *Backend) handleUserControl(
 		b.handleUserAck(ctx, rawReq)
 
 		return true
+	case rtps.SubmessageNackFrag:
+		return b.handleUserNackFragRaw(sub)
 	case rtps.SubmessageHeartbeat:
 		var drops rtps.Counter
 
@@ -2471,27 +2896,7 @@ func (b *Backend) handleUserControl(
 
 		return true
 	case rtps.SubmessageGap:
-		var drops rtps.Counter
-
-		gap, err := rtps.DecodeGap(
-			sub.Body,
-			sub.Flags,
-			&drops,
-		)
-		if err != nil {
-			b.bumpDemuxError()
-			log.Printf("dds: demux user gap decode: %v", err)
-
-			return true
-		}
-
-		if !isUserWriterEntity(gap.WriterID) {
-			return false
-		}
-
-		b.handleUserGap(header, gap)
-
-		return true
+		return b.handleUserGapRaw(header, sub)
 	case rtps.SubmessageDataFrag:
 		return b.handleDataFrag(ctx, header, sub, dataCh)
 	default:

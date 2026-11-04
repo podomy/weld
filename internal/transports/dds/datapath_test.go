@@ -274,19 +274,63 @@ func TestDataPathGapDropCounter(t *testing.T) {
 	if len(msg.Payload) != 4 || msg.Payload[0] != 3 {
 		t.Fatalf("gap payload = %v, want [3 3 3 3]", msg.Payload)
 	}
+}
 
+// TestDataPathLateRepairDelivers pins reliable convergence: a skipped
+// sample that arrives late is delivered and un-counts the loss, and only
+// a true redelivery counts a stale drop.
+func TestDataPathLateRepairDelivers(t *testing.T) {
+	t.Parallel()
+
+	sink := &recordingWriter{}
+	pub := mustNewPublisher(t, testWriterGUID(), sink)
+
+	mustPublish(t, pub, transports.OutgoingMessage{TopicName: "/chatter", Payload: []byte{1, 1, 1, 1}})
+	mustPublish(t, pub, transports.OutgoingMessage{TopicName: "/chatter", Payload: []byte{2, 2, 2, 2}})
+	mustPublish(t, pub, transports.OutgoingMessage{TopicName: "/chatter", Payload: []byte{3, 3, 3, 3}})
+
+	first := sink.frameAt(t, 0)
 	second := sink.frameAt(t, 1)
+	third := sink.frameAt(t, 2)
+
+	recv := NewDataReceiver()
+
+	mustTake(t, recv, first)
+	if _, err := recv.Take(third); err != nil {
+		t.Fatalf("take gap frame: %v", err)
+	}
+	if recv.LostCount() != 1 {
+		t.Fatalf("lost after gap = %d, want 1", recv.LostCount())
+	}
+
+	msg, err := recv.Take(second)
+	if err != nil {
+		t.Fatalf("late repair take: %v", err)
+	}
+
+	if len(msg.Payload) != 4 || msg.Payload[0] != 2 {
+		t.Fatalf("late payload = %v, want [2 2 2 2]", msg.Payload)
+	}
+
+	if recv.DroppedCount() != 0 {
+		t.Fatalf("drops after late repair = %d, want 0", recv.DroppedCount())
+	}
+
+	if recv.LostCount() != 0 {
+		t.Fatalf("lost after late repair = %d, want 0", recv.LostCount())
+	}
+
 	_, err = recv.Take(second)
 	if !errors.Is(err, ErrStaleSequence) {
-		t.Fatalf("stale take = %v, want ErrStaleSequence", err)
+		t.Fatalf("duplicate take = %v, want ErrStaleSequence", err)
 	}
 
 	if recv.DroppedCount() != 1 {
-		t.Fatalf("drops after stale = %d, want 1", recv.DroppedCount())
+		t.Fatalf("drops after duplicate = %d, want 1", recv.DroppedCount())
 	}
 
-	if recv.LostCount() != 1 {
-		t.Fatalf("lost after stale = %d, want 1", recv.LostCount())
+	if recv.LostCount() != 0 {
+		t.Fatalf("lost after duplicate = %d, want 0", recv.LostCount())
 	}
 }
 

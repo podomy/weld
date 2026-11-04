@@ -186,3 +186,93 @@ func TestFragProbeEncodeDecodeGeometry(t *testing.T) {
 		}
 	}
 }
+
+// TestFragReassemblerTableFullEvictsOldest pins the anti-stall policy: a
+// full table of stuck partials evicts the oldest entry to make room for a
+// new sample instead of dropping the newcomer forever.
+func TestFragReassemblerTableFullEvictsOldest(t *testing.T) {
+	t.Parallel()
+	sample := buildProbeLargeSample()
+	sampleSize := uint32(len(sample)) //nolint:gosec // G115: probe length under 32MiB cap
+	fragmentSize, total, err := planFragSend(sampleSize)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if total < 2 {
+		t.Fatalf("total = %d, want at least 2 for a partial-stall test", total)
+	}
+	var guid WriterGUID
+	for i := range guid {
+		guid[i] = byte(0x70 + i)
+	}
+	reasm := newFragReassembler(nil)
+	// Park one fragment for maxEntries distinct seqs: all stuck partials.
+	for seq := uint64(1); seq <= uint64(fragMaxEntries); seq++ {
+		_, done := feedProbeFrag(t, reasm, guid, seq, 1, fragmentSize, sampleSize, fragSlice(sample, 1, total, fragmentSize))
+		if done {
+			t.Fatalf("park frag seq %d completed, want partial", seq)
+		}
+	}
+	// The next new sample must evict the oldest, not drop.
+	// feedProbeFrag fails the test on any error, so reaching here
+	// proves the full table evicted instead of dropping.
+	_, done := feedProbeFrag(t, reasm, guid, uint64(fragMaxEntries)+1, 1, fragmentSize, sampleSize, fragSlice(sample, 1, total, fragmentSize))
+	if done {
+		t.Fatalf("single frag completed, want partial")
+	}
+	// Finish the new sample: every remaining frag lands in the kept entry.
+	var complete []byte
+	for fragNum := uint32(2); fragNum <= total; fragNum++ {
+		complete, done = feedProbeFrag(t, reasm, guid, uint64(fragMaxEntries)+1, fragNum, fragmentSize, sampleSize, fragSlice(sample, fragNum, total, fragmentSize))
+	}
+	if !done {
+		t.Fatalf("evicted-slot sample incomplete after full run")
+	}
+	if !bytes.Equal(complete, sample) {
+		t.Fatalf("reassembled len %d differs from want %d", len(complete), len(sample))
+	}
+}
+
+// TestFragReassemblerInconsistentResetsEntry pins the resend path: a frag
+// run that disagrees with the stored geometry resets the entry instead of
+// dropping the newcomer, so a peer repair with new framing converges.
+func TestFragReassemblerInconsistentResetsEntry(t *testing.T) {
+	t.Parallel()
+	sample := buildProbeLargeSample()
+	sampleSize := uint32(len(sample)) //nolint:gosec // G115: probe length under 32MiB cap
+	fragmentSize, total, err := planFragSend(sampleSize)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	var guid WriterGUID
+	for i := range guid {
+		guid[i] = byte(0x80 + i)
+	}
+	reasm := newFragReassembler(nil)
+	// Park one frag under the true geometry.
+	feedProbeFrag(t, reasm, guid, 3, 1, fragmentSize, sampleSize, fragSlice(sample, 1, total, fragmentSize))
+	// A resend with doubled fragment size must reset, not drop.
+	bigFragSize := fragmentSize * 2
+	bigTotal, err := checkFragBounds(sampleSize, bigFragSize)
+	if err != nil {
+		t.Fatalf("plan big: %v", err)
+	}
+	// A resend with doubled fragment size must reset, not drop: reaching
+	// here proves reset since feedProbeFrag fails on error.
+	_, done := feedProbeFrag(t, reasm, guid, 3, 1, bigFragSize, sampleSize, fragSlice(sample, 1, bigTotal, bigFragSize))
+	if done && bigTotal == 1 {
+		t.Fatalf("unexpected completion")
+	}
+	// Finish under the new geometry: the reset entry must complete.
+	var complete []byte
+	done = false
+	for fragNum := uint32(2); fragNum <= bigTotal; fragNum++ {
+		complete, done = feedProbeFrag(t, reasm, guid, 3, fragNum, bigFragSize, sampleSize, fragSlice(sample, fragNum, bigTotal, bigFragSize))
+	}
+	if bigTotal > 1 && !done {
+		t.Fatalf("reset entry incomplete after full new-geometry run")
+	}
+	if bigTotal > 1 && !bytes.Equal(complete, sample) {
+		t.Fatalf("reset reassembled len %d differs from want %d", len(complete), len(sample))
+	}
+}

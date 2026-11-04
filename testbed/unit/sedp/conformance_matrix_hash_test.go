@@ -14,7 +14,7 @@ import (
 
 // Pinned RIHS01 type hashes from testbed/live/ros/gate_type_matrix_test.go:69-75.
 //
-// These are the weld-jazzy Jazzy values reported by ros2 topic info -v on
+// These are the ros-jazzy Jazzy values reported by ros2 topic info -v on
 // domain 42. The backend table in internal/transports/dds/backend.go
 // (sedpTypeHashForIDL) carries the same strings as the static fallback for
 // the Publish path and for probes that fail. The function is unexported,

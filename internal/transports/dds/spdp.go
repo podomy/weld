@@ -42,7 +42,7 @@ const (
 // Vendor id announced as Eclipse CycloneDDS.
 //
 // Both the RTPS header vendor and the PID 0x0016 value carry 01 10 as
-// observed on a live domain 42 Cyclone talker in weld-jazzy.
+// observed on a live domain 42 Cyclone talker in ros-jazzy.
 const (
 	vendorID0 = 0x01
 	vendorID1 = 0x10
@@ -1564,13 +1564,15 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement, now time.Time) (bool
 
 // handleAliveLocked adds or refreshes one entry. Caller holds the lock.
 //
-// An alive at the stored sequence is a routine multicast duplicate and
-// returns silently without touching generation or the entry. Only a
-// strictly older sequence fails loudly with ErrStaleSPDP. Only a newer
-// sequence installs or refreshes the entry. A missing entry consults the
-// tombstone: an alive at the tombstone sequence is a duplicate and returns
-// silently, a strictly older alive fails loudly, and only a newer alive
-// deletes the tombstone and installs.
+// An alive at the stored sequence is a routine periodic re-announcement
+// (same sample resent on lossy groups or on the announce tick) and refreshes
+// the lease without touching generation or the entry: liveness is renewed,
+// content is unchanged. Only a strictly older sequence fails loudly with
+// ErrStaleSPDP. Only a newer sequence installs or refreshes the entry plus
+// generation. A missing entry consults the tombstone: an alive at the
+// tombstone sequence is a duplicate and returns silently, a strictly older
+// alive fails loudly, and only a newer alive deletes the tombstone and
+// installs.
 // installAliveLocked installs one alive announcement for a missing prefix.
 //
 // A tombstone sequence match is a duplicate and returns silently; a
@@ -1607,6 +1609,8 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 	}
 
 	if ann.Sequence == existing.LastSeq {
+		existing.LeaseExpiry = expiry
+		t.entries[ann.GUID.Prefix] = existing
 		return false, 0, nil, nil
 	}
 
@@ -1630,8 +1634,9 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 // HandlePacket parses one SPDP packet and updates the table.
 //
 // Alive packets add or refresh the entry with expiry now plus lease.
-// Same-sequence duplicates return nil quietly: senders repeat packets on
-// lossy groups, so a duplicate is routine, not an error. Strictly older
+// Same-sequence alive re-announcements refresh the lease quietly without
+// bumping generation: senders repeat the same sample on the announce tick,
+// so a duplicate is liveness, not an error. Strictly older
 // sequences fail loudly with ErrStaleSPDP without bumping generation.
 // Dispose packets remove the entry only when their sequence is newer
 // than the stored LastSeq; older disposes fail loudly like stale alive

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"syscall"
@@ -522,6 +523,63 @@ func receive(conn *net.UDPConn, op string, buf []byte) (int, *net.UDPAddr, error
 	return sent, addr, nil
 }
 
+// socketReceiveBufferSize requests an 8 MiB kernel receive buffer on every
+// DDS receive socket. A 1 MiB sample arrives as a back-to-back burst of 64
+// datagrams; the megabyte OS default drops burst tails under scheduling
+// jitter, and each dropped fragment stalls its sample until repair. The
+// kernel clamps the request to net.core.rmem_max, so the effective size is
+// verified and a shortfall logs loudly instead of masquerading as
+// transport loss.
+const socketReceiveBufferSize = 8 << 20
+
+// tuneReceiveBuffer requests a large kernel receive buffer on conn and
+// verifies it. A shortfall logs loudly with the sysctl to raise; senders
+// cannot detect kernel drops, so silent clamping would look like random
+// fragment loss.
+func tuneReceiveBuffer(conn *net.UDPConn, label string) {
+	if conn == nil {
+		return
+	}
+	if err := conn.SetReadBuffer(socketReceiveBufferSize); err != nil {
+		log.Printf("rtps: %s receive buffer %d: %v", label, socketReceiveBufferSize, err)
+		return
+	}
+	got, err := readReceiveBuffer(conn)
+	if err != nil {
+		log.Printf("rtps: %s receive buffer verify: %v", label, err)
+		return
+	}
+	// The kernel reports twice the usable size for bookkeeping.
+	if got/2 < socketReceiveBufferSize {
+		log.Printf("rtps: %s receive buffer %d below target %d (raise net.core.rmem_max)", label, got/2, socketReceiveBufferSize)
+	}
+}
+
+// readReceiveBuffer returns the kernel SO_RCVBUF size for conn.
+func readReceiveBuffer(conn *net.UDPConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, fmt.Errorf("rtps: receive buffer syscall conn: %w", err)
+	}
+	var got int
+	var opErr error
+	ctrlErr := raw.Control(func(fd uintptr) {
+		v, serr := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+		if serr != nil {
+			opErr = serr
+			return
+		}
+		got = v
+	})
+	if ctrlErr != nil {
+		return 0, fmt.Errorf("rtps: receive buffer control: %w", ctrlErr)
+	}
+	if opErr != nil {
+		return 0, fmt.Errorf("rtps: receive buffer getsockopt: %w", opErr)
+	}
+	return got, nil
+}
+
 // listenMeta binds the SPDP multicast receive socket and joins the group.
 // A zero port binds an ephemeral port for tests. It prefers the
 // reuse-port path so Weld coexists with vendor participants on one host,
@@ -533,6 +591,7 @@ func listenMeta(ctx context.Context, port int) (*net.UDPConn, error) {
 	}
 	conn, err := listenMetaReuse(ctx, port, group)
 	if err == nil {
+		tuneReceiveBuffer(conn, "spdp multicast")
 		return conn, nil
 	}
 	if !errors.Is(err, errReuseUnavailable) {
@@ -542,6 +601,7 @@ func listenMeta(ctx context.Context, port int) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rtps: listen spdp multicast: %w", err)
 	}
+	tuneReceiveBuffer(conn, "spdp multicast")
 	return conn, nil
 }
 
@@ -552,6 +612,7 @@ func listenUnicast(port int) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rtps: listen unicast: %w", err)
 	}
+	tuneReceiveBuffer(conn, "unicast")
 	return conn, nil
 }
 

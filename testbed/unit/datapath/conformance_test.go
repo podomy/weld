@@ -617,9 +617,12 @@ func TestDataPathCorruptCountsDrop(t *testing.T) {
 	}
 }
 
-// TestBestEffortOrdering checks first accepted plus gap plus stale handling.
+// TestBestEffortOrdering checks first accepted plus gap plus late repair convergence.
 //
-//nolint:gocognit,cyclop // ordering test asserts accept, gap and stale branches in one run
+// Late repairs of skipped samples deliver and un-count the loss so
+// reliable redelivery converges; only true redeliveries drop stale.
+//
+//nolint:gocognit,cyclop // ordering test asserts accept, gap, repair and stale branches in one run
 func TestBestEffortOrdering(t *testing.T) {
 	t.Parallel()
 	guid := dataPathWriterGUID()
@@ -662,15 +665,25 @@ func TestBestEffortOrdering(t *testing.T) {
 	if recv.LostCount() != 1 {
 		t.Fatalf("lost after gap = %d want 1", recv.LostCount())
 	}
+	lateMsg, err := recv.Take(second)
+	if err != nil {
+		t.Fatalf("late repair take: %v", err)
+	}
+	if lateMsg.Payload[0] != 2 {
+		t.Fatalf("late payload = %v want first byte 2", lateMsg.Payload)
+	}
+	if recv.DroppedCount() != 0 {
+		t.Fatalf("drops after late repair = %d want 0", recv.DroppedCount())
+	}
+	if recv.LostCount() != 0 {
+		t.Fatalf("lost after late repair = %d want 0", recv.LostCount())
+	}
 	_, err = recv.Take(second)
 	if !errors.Is(err, dds.ErrStaleSequence) {
-		t.Fatalf("stale take = %v want ErrStaleSequence", err)
+		t.Fatalf("duplicate take = %v want ErrStaleSequence", err)
 	}
 	if recv.DroppedCount() != 1 {
-		t.Fatalf("drops after stale = %d want 1", recv.DroppedCount())
-	}
-	if recv.LostCount() != 1 {
-		t.Fatalf("lost after stale = %d want 1", recv.LostCount())
+		t.Fatalf("drops after duplicate = %d want 1", recv.DroppedCount())
 	}
 	_, err = recv.Take(third)
 	if !errors.Is(err, dds.ErrStaleSequence) {

@@ -14,12 +14,14 @@ import (
 const (
 	// SubmessagePad is alignment with no meaning.
 	SubmessagePad uint8 = 0x01
-	// SubmessageAckNack is a reader to writer receipt. Encode only in v1.
+	// SubmessageAckNack is a reader to writer receipt. Decoded on the user
+	// repair path and encoded for sent receipts.
 	SubmessageAckNack uint8 = 0x06
-	// SubmessageHeartbeat announces writer sequence bounds. Decode only;
-	// v1 runs no reliability engine.
+	// SubmessageHeartbeat announces writer sequence bounds. Decoded for
+	// ACK replies and encoded for history and repair heartbeats.
 	SubmessageHeartbeat uint8 = 0x07
-	// SubmessageGap describes skipped sequence numbers. Skip tolerant.
+	// SubmessageGap describes skipped sequence numbers. Decoded for skip
+	// handling and encoded for gap repairs.
 	SubmessageGap uint8 = 0x08
 	// SubmessageInfoTS carries a sample timestamp.
 	SubmessageInfoTS uint8 = 0x09
@@ -31,7 +33,9 @@ const (
 	SubmessageInfoDst uint8 = 0x0e
 	// SubmessageInfoReply carries reply flags. Skipped by length.
 	SubmessageInfoReply uint8 = 0x0f
-	// SubmessageNackFrag is a fragment receipt. Skipped by length.
+	// SubmessageNackFrag is a fragment receipt. Decoded on the user repair
+	// path into fragment resends; skipped by length in the generic
+	// decoder.
 	SubmessageNackFrag uint8 = 0x12
 	// SubmessageHeartbeatFrag announces fragment bounds. Skipped by length.
 	SubmessageHeartbeatFrag uint8 = 0x13

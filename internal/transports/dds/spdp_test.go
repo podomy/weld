@@ -669,7 +669,7 @@ func TestMarshalDisposeGoldenShape(t *testing.T) {
 // liveCycloneSPDP42Hex is a verbatim domain 42 SPDP DATA capture.
 //
 // Capture: bound the free domain 42 SPDP multicast port with no talker
-// running, started a domain 42 Cyclone talker in weld-jazzy, and saved
+// running, started a domain 42 Cyclone talker in ros-jazzy, and saved
 // the first SPDP DATA datagram. RTPS 2.1, vendor 01 10, writer
 // 0x000100c2, PL_CDR_LE payload with domain tag 42, 10s lease, and
 // 192.168.0.162 unicast locators.
@@ -2567,5 +2567,48 @@ func TestCheckSPDPInfoDstShortBodyDrops(t *testing.T) {
 	err = checkSPDPInfoDstUnicast(data, guid.Prefix)
 	if !errors.Is(err, ErrInvalidSPDP) {
 		t.Fatalf("short INFO_DST err = %v, want ErrInvalidSPDP", err)
+	}
+}
+
+// TestRemoteTableSameSeqRefreshesLease pins periodic re-announcement liveness:
+// a same-seq alive refreshes LeaseExpiry without bumping generation, so a
+// Cyclone-style resend extends the lease instead of letting it expire.
+func TestRemoteTableSameSeqRefreshesLease(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	base := time.Unix(6000, 0).UTC()
+	guid := testGUID(0xD1)
+
+	first := mustMarshalAlive(t, guid, 0, 7, 10*time.Second)
+	if err := table.HandlePacket(first, base); err != nil {
+		t.Fatalf("handle first: %v", err)
+	}
+	info, ok := table.Get(guid.Prefix)
+	if !ok {
+		t.Fatalf("missing entry after first")
+	}
+	firstExpiry := info.LeaseExpiry
+
+	later := base.Add(9 * time.Second)
+	dup := mustMarshalAlive(t, guid, 0, 7, 10*time.Second)
+	if err := table.HandlePacket(dup, later); err != nil {
+		t.Fatalf("handle dup: %v", err)
+	}
+	if table.Generation() != 1 {
+		t.Fatalf("gen = %d, want 1 after same-seq refresh", table.Generation())
+	}
+	refreshed, ok := table.Get(guid.Prefix)
+	if !ok {
+		t.Fatalf("missing entry after dup")
+	}
+	if !refreshed.LeaseExpiry.After(firstExpiry) {
+		t.Fatalf("lease not refreshed: first %v refreshed %v", firstExpiry, refreshed.LeaseExpiry)
+	}
+	if removed := table.Sweep(base.Add(10 * time.Second)); removed != 0 {
+		t.Fatalf("sweep at original expiry removed %d, want 0 after refresh", removed)
+	}
+	if removed := table.Sweep(later.Add(10 * time.Second)); removed != 1 {
+		t.Fatalf("sweep at refreshed expiry removed %d, want 1", removed)
 	}
 }

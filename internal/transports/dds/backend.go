@@ -1599,8 +1599,10 @@ func (b *Backend) ensureRouteMapsForStore() bool {
 //
 // It reads the RemoteTable LastSeq plus the tombstone high-water without
 // holding the backend lock across the table lock beyond a snapshot. A
-// stale alive at or below either never reinstalls routes the table would
-// reject.
+// strictly older alive, or a dispose at or below either, never reinstalls
+// routes the table would reject. A same-sequence alive is a periodic
+// re-announcement and refreshes the route lease, so it is not stale; the
+// tombstone gate still holds for removed prefixes.
 func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 	b.mu.RLock()
 	remotes := b.remotes
@@ -1609,8 +1611,13 @@ func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 		return false
 	}
 	info, ok := remotes.Get(ann.GUID.Prefix)
-	if ok && ann.Sequence <= info.LastSeq {
-		return true
+	if ok {
+		if ann.Sequence < info.LastSeq {
+			return true
+		}
+		if ann.Sequence == info.LastSeq && !ann.Alive {
+			return true
+		}
 	}
 	if tombSeq, tombed := remotes.TombstoneSeq(ann.GUID.Prefix); tombed && ann.Sequence <= tombSeq {
 		return true
@@ -1619,10 +1626,84 @@ func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 }
 
 // installAnnouncementRoutes writes one gated announcement to the tables.
+// A same-sequence alive refreshes only the route lease; newer sequences
+// rewrite routes plus lease. Disposes delete. Empty port lists store
+// nothing.
 func (b *Backend) installAnnouncementRoutes(ann Announcement, ports []int) {
-	b.mu.Lock()
-	if b.closed {
+	if !ann.Alive {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return
+		}
+		if b.routes == nil {
+			b.routes = make(map[GUIDPrefix][]int)
+		}
+		if b.routeExpiry == nil {
+			b.routeExpiry = make(map[GUIDPrefix]time.Time)
+		}
+		delete(b.routes, ann.GUID.Prefix)
+		delete(b.routeExpiry, ann.GUID.Prefix)
+		prefix := ann.GUID.Prefix
 		b.mu.Unlock()
+		b.evictParticipantRoutes(prefix)
+		b.scheduleSedpEvict(prefix)
+		return
+	}
+	if len(ann.Ports) == 0 {
+		return
+	}
+	if b.isSameSeqAlive(ann) {
+		b.refreshRouteLease(ann)
+		return
+	}
+	b.storeRoutesWithLease(ann, ports)
+}
+
+// isSameSeqAlive reports whether ann matches the stored table sequence.
+// It snapshots remotes without holding the backend lock across the table
+// lock.
+func (b *Backend) isSameSeqAlive(ann Announcement) bool {
+	b.mu.RLock()
+	remotes := b.remotes
+	b.mu.RUnlock()
+	if remotes == nil {
+		return false
+	}
+	info, ok := remotes.Get(ann.GUID.Prefix)
+	return ok && ann.Sequence == info.LastSeq
+}
+
+// refreshRouteLease extends the route lease for a periodic re-announcement
+// without rewriting ports. It snapshots the clock before locking: callers
+// must not hold b.mu across backendNow, which takes b.mu itself.
+func (b *Backend) refreshRouteLease(ann Announcement) {
+	lease := ann.Lease
+	if lease <= 0 {
+		lease = DefaultLeaseDuration
+	}
+	now := b.backendNow()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	if b.routeExpiry == nil {
+		b.routeExpiry = make(map[GUIDPrefix]time.Time)
+	}
+	b.routeExpiry[ann.GUID.Prefix] = now.Add(lease)
+}
+
+// storeRoutesWithLease installs routes plus lease for a newer sequence.
+func (b *Backend) storeRoutesWithLease(ann Announcement, ports []int) {
+	lease := ann.Lease
+	if lease <= 0 {
+		lease = DefaultLeaseDuration
+	}
+	now := b.backendNow()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
 		return
 	}
 	if b.routes == nil {
@@ -1631,30 +1712,8 @@ func (b *Backend) installAnnouncementRoutes(ann Announcement, ports []int) {
 	if b.routeExpiry == nil {
 		b.routeExpiry = make(map[GUIDPrefix]time.Time)
 	}
-
-	switch {
-	case !ann.Alive:
-		delete(b.routes, ann.GUID.Prefix)
-		delete(b.routeExpiry, ann.GUID.Prefix)
-		prefix := ann.GUID.Prefix
-		b.mu.Unlock()
-		b.evictParticipantRoutes(prefix)
-		b.scheduleSedpEvict(prefix)
-	case len(ann.Ports) != 0:
-		b.routes[ann.GUID.Prefix] = ports
-		lease := ann.Lease
-		if lease <= 0 {
-			lease = DefaultLeaseDuration
-		}
-		if b.clock != nil {
-			b.routeExpiry[ann.GUID.Prefix] = b.clock.Now().Add(lease)
-		} else {
-			b.routeExpiry[ann.GUID.Prefix] = time.Now().Add(lease)
-		}
-		b.mu.Unlock()
-	default:
-		b.mu.Unlock()
-	}
+	b.routes[ann.GUID.Prefix] = ports
+	b.routeExpiry[ann.GUID.Prefix] = now.Add(lease)
 }
 
 // sweepExpiredRoutes removes routes whose lease expired and evicts state.
@@ -2776,8 +2835,34 @@ func (b *Backend) claimPlainFragSeq(guid WriterGUID) (uint64, error) {
 func (b *Backend) commitPlainFragSeq(_ WriterGUID, _ uint64) {
 }
 
+// fragSendPace spaces DATA_FRAG datagrams within one sample run so a
+// large sample does not hit the peer as one back-to-back burst. Bursts
+// overflow the peer socket buffer under scheduling jitter and every
+// dropped fragment stalls its sample until repair; pacing costs a fraction
+// of a millisecond per fragment against millisecond-scale samples.
+const fragSendPace = 200 * time.Microsecond
+
+// paceFragSend waits one frag pace unless the context ends.
+func paceFragSend(timer *time.Timer, ctx context.Context) bool {
+	timer.Reset(fragSendPace)
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // sendPlainFragRun emits each DATA_FRAG in order.
 func (b *Backend) sendPlainFragRun(ctx context.Context, uni *rtps.UnicastConn, ports []int, guid WriterGUID, seq uint64, sample []byte, sampleSize uint32, fragmentSize uint16, total uint32) error {
+	timer := time.NewTimer(fragSendPace)
+	defer timer.Stop()
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 	for fragNum := uint32(1); fragNum <= total; fragNum++ {
 		err := ctx.Err()
 		if err != nil {
@@ -2791,6 +2876,9 @@ func (b *Backend) sendPlainFragRun(ctx context.Context, uni *rtps.UnicastConn, p
 		err = reportFragSend(ctx, b, uni, ports, msg)
 		if err != nil {
 			return err
+		}
+		if fragNum < total && !paceFragSend(timer, ctx) {
+			return fmt.Errorf("dds: send frag pacing ended: %w", ctx.Err())
 		}
 	}
 	return nil
@@ -4121,7 +4209,7 @@ var sedpTypeHashStatic = map[string]string{
 // The live hash from ros2 topic info -v wins when present so distro
 // changes are picked up on the Subscribe and Publish paths. The static
 // fallback covers probes that fail on older CLIs and callers that pass
-// empty TypeHash in OutgoingMessage. Values match weld-jazzy Jazzy.
+// empty TypeHash in OutgoingMessage. Values match ros-jazzy Jazzy.
 func sedpTypeHashForIDL(idlName, given string) string {
 	if given != "" {
 		return given
@@ -4362,7 +4450,9 @@ func waitForTimerOrCancel(ctx context.Context, timer *time.Timer, interval time.
 // after receiving SEDP DATA. Sending user DATA immediately arrives as no
 // readers out-of-sync and is dropped. This fixed 200ms pause keeps SEDP
 // ahead of DATA for single shot publishers; use waitForMatchingReader when
-// polling for a reader match is needed. Context cancellation aborts early.
+// polling for a reader match is needed. Callers with an observed match
+// skip this pause since the matching reader proves the peer processed
+// SEDP. Context cancellation aborts early.
 func (b *Backend) pauseForPeerProcessing(ctx context.Context) error {
 	timer := time.NewTimer(200 * time.Millisecond)
 	defer timer.Stop()
@@ -4806,13 +4896,21 @@ func (b *Backend) preparePublishLocked(ctx context.Context, msg transports.Outgo
 //
 // It runs without publishMu across waits, then re-locks to re-snapshot
 // routes and re-align before sending so concurrent publishes cannot flap
-// the shared GUID while waits never block them.
+// the shared GUID while waits never block them. The 200ms peer pause
+// applies only while no matching reader is observed: single-shot
+// publishers keep the SEDP-ahead-of-DATA backstop, while steady-state
+// publishers with an established match send without the per-message tax.
 func (b *Backend) publishPlainAfterWait(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot, ep SEDPEndpoint, writer WriterGUID) error {
 	b.waitForMatchingReader(ctx, ep)
 
-	err := b.pauseForPeerProcessing(ctx)
-	if err != nil {
-		return err
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("dds: publish: %w", err)
+	}
+	if !b.hasMatchingRemoteReader(ep) {
+		err := b.pauseForPeerProcessing(ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	b.publishMu.Lock()
@@ -4827,7 +4925,7 @@ func (b *Backend) publishPlainAfterWait(ctx context.Context, msg transports.Outg
 		b.alignPublisherGUID(snap.publisher, writer)
 	}
 
-	err = b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
+	err := b.publishPlainWithPorts(ctx, msg, snap, writer, ports)
 	b.publishMu.Unlock()
 	if err != nil {
 		return err

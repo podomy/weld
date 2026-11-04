@@ -350,7 +350,7 @@ func TestLiveCaptureSPDP(t *testing.T) {
 	}
 }
 
-// ensureTestbed skips when docker or weld-jazzy is unavailable.
+// ensureTestbed skips when docker or ros-jazzy is unavailable.
 func ensureTestbed(t *testing.T) {
 	t.Helper()
 
@@ -359,8 +359,8 @@ func ensureTestbed(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "docker", "exec", "weld-jazzy", "true").Run(); err != nil {
-		t.Skipf("testbed weld-jazzy unavailable: %v", err)
+	if err := exec.CommandContext(ctx, "docker", "exec", "ros-jazzy", "true").Run(); err != nil {
+		t.Skipf("testbed ros-jazzy unavailable: %v", err)
 	}
 }
 
@@ -393,7 +393,7 @@ func captureDatagram(t *testing.T, conn net.PacketConn) []byte {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-	pub := exec.CommandContext(ctx, "docker", "exec", "weld-jazzy", "bash", "-lc", "source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp timeout 8 ros2 topic pub /chatter std_msgs/msg/String 'data: live' --rate 5")
+	pub := exec.CommandContext(ctx, "docker", "exec", "ros-jazzy", "bash", "-lc", "source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp timeout 8 ros2 topic pub /chatter std_msgs/msg/String 'data: live' --rate 5")
 	if err := pub.Start(); err != nil {
 		t.Fatalf("start publisher with docker present: %v", err)
 	}

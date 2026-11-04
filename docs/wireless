@@ -1,6 +1,6 @@
 Wireless for Weld
 
-Weld is robotics middleware in Go. It speaks ROS 2 on the wire (DDS RTPS with XCDR1 CDR) so Go programs join ROS 2 systems as first-class nodes. One Go core owns matching, routing, and supervision. Transports sit at the border behind one backend interface: DDS in v1 against CycloneDDS peers directly, Zenoh and MQTT after v1. See docs/design, docs/transports, docs/qos.
+Weld is robotics middleware in Go. It speaks ROS 2 on the wire (DDS RTPS with XCDR1 CDR) so Go programs join ROS 2 systems as first-class nodes. One Go core owns matching, routing, and supervision. Transports sit at the border behind one backend interface: DDS against CycloneDDS peers directly. See docs/design, docs/transports, docs/qos.
 
 This file answers one question: what does the radio do to a fleet, and what must Weld do about it.
 
@@ -230,7 +230,7 @@ Equalizers undo time smearing when signal is wider than coherence bandwidth. Lin
 
 Diversity gets independent looks with no extra power or spectrum. Space (separate antennas), polarization (scrambled components fade independently), frequency (carriers spaced wider than coherence bandwidth), time (repeat after a gap wider than coherence time). Combining: selection connects the strongest branch; maximal-ratio aligns and weights each branch by its own quality then adds, so output quality is the sum; scanning settles for first good-enough branch with one receiver. With M independent Rayleigh branches, chance all sit below threshold is single-branch outage raised to M. The chapter 4-branch example at mean 20 dB and threshold 10 dB falls from about 0.095 to about 0.00008. That is three orders of magnitude from adding looks, not power.
 
-Weld diversity above the radio: two radios, two access points, or parallel DDS plus Zenoh paths are independent branches. Treat backup as a live diversity branch with decorrelated failure (different NIC, AP, or path). Selection maps to deliver-first-wins with dedupe by origin GID plus sequence plus epoch. Combining maps to path confidence scores such as recent loss, latency, and gap count, used for path choice or prefetch, not bit combining.
+Weld diversity above the radio: two radios or two access points are independent branches. Treat backup as a live diversity branch with decorrelated failure (different NIC, AP, or path). Selection maps to deliver-first-wins with dedupe by origin GID plus sequence plus epoch. Combining maps to path confidence scores such as recent loss, latency, and gap count, used for path choice or prefetch, not bit combining.
 
 Coding plus interleaving: detection-only codes ask for a repeat on error. Correction codes add parity up front so the receiver fixes limited errors with no round trip, at always-on overhead. Retransmit wins when loss is rare and round trip fits budget. Proactive redundancy wins when feedback is slow, loss is bursty, or fanout makes NACK storms likely. Interleaving spreads neighbors apart so a burst hits scattered positions the code can fix, at pure delay cost: the receiver cannot decode until the full block arrives. The voice bound of about 40 ms has a Weld analog: every transform tail or scan sweep has a deadline. Size redundancy backward from that deadline.
 

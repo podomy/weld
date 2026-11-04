@@ -114,7 +114,7 @@ const (
 // the ros2 argv directly with -e flags and no shell wrapper.
 var ImageEnv = [][2]string{
 	{"AMENT_PREFIX_PATH", "/opt/ros/jazzy"},
-	{"LD_LIBRARY_PATH", "/opt/ros/jazzy/opt/zenoh_cpp_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/lib"},
+	{"LD_LIBRARY_PATH", "/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/lib"},
 	{"PATH", "/opt/ros/jazzy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 	{"PYTHONPATH", "/opt/ros/jazzy/lib/python3.12/site-packages"},
 	{"ROS_DISTRO", "jazzy"},

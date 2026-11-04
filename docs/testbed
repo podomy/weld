@@ -4,11 +4,11 @@ Reproducible ROS peers for the conformance gates: one container per supported di
 
 Images
 
-- ros-humble: ros:humble-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
-- ros-jazzy: ros:jazzy-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
-- ros-rolling: ros:rolling-ros-base plus rmw-cyclonedds-cpp plus rmw-zenoh-cpp
+- ros-humble: ros:humble-ros-base plus rmw-cyclonedds-cpp
+- ros-jazzy: ros:jazzy-ros-base plus rmw-cyclonedds-cpp
+- ros-rolling: ros:rolling-ros-base plus rmw-cyclonedds-cpp
 
-FastDDS ships in each base image. Dockerfiles pin nothing beyond the ROS apt snapshots.
+Dockerfiles pin nothing beyond the ROS apt snapshots.
 
 Runtime
 

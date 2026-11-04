@@ -38,7 +38,7 @@ Non-goals for v1
 - No intra process transport
 - No zero copy loans or shared memory, except in-process loan honesty: the SDK and DDS loan paths detect loan-eligible types and refuse loudly elsewhere, with no shared-memory transport yet
 - No bag storage engine, only exchange formats
-- No FastDDS, Zenoh, or MQTT transports; the direct RTPS backend against CycloneDDS is the reference peer
+- Direct RTPS backend against CycloneDDS peers is the transport
 
 One binary
 
@@ -53,7 +53,6 @@ Build order
 5. Calls: services with deadlines
 6. Configuration: versioned store
 7. Long tasks: action workflows
-8. Second transport (post v1): Zenoh, then FastDDS and MQTT
-9. Supervision, fidelity, soak
+8. Supervision, fidelity, soak
 
 Each feature ships with three gates: unit tables with fake clocks, interop runs against rclcpp on CycloneDDS with ros2cli, chaos runs under race detection.

@@ -6,8 +6,7 @@ Weld is robotics middleware written in Go. One unified core moves
 topics, services, actions, and parameters across transports, with
 structured delivery, copy once handling, and a leaderless data plane
 that stays correct under partition. Version one ships the DDS backend
-against CycloneDDS; FastDDS, Zenoh, and MQTT transports follow after
-v1 behind the same interface.
+against CycloneDDS, the only supported DDS.
 
 Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as
 first-class nodes, verified by mixed fleet behavior.

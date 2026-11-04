@@ -40,6 +40,5 @@ context cancellation and require a prior JoinDiscovery.
 Code: internal/transports/dds/sidecar.go for the stub,
 internal/transports/dds/backend.go for the live RTPS backend.
 
-Post v1
-
-FastDDS, Zenoh, and MQTT land after v1 behind the same interface with interop tests. No plugin registry, no dynamic loading. Core never imports transport packages; the backend interface stays the only crossing.
+No plugin registry, no dynamic loading. Core never imports transport packages; the backend
+interface stays the only crossing.

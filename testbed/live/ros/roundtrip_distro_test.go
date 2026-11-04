@@ -19,9 +19,7 @@ import (
 // Jazzy on domain 42 is the canonical gate peer. Humble on domain 43 and
 // Rolling on domain 44 extend the same String round trip with no cross
 // talk because each distro has its own domain. RMW is always
-// rmw_cyclonedds_cpp. FastDDS stays out of the gates because v1 scope is
-// Cyclone only: FastDDS discovery and type handling are outside the v1
-// backend claim, so gating on it would test unimplemented behavior.
+// rmw_cyclonedds_cpp: CycloneDDS is the only supported DDS.
 const (
 	matrixEchoWait    = 10 * time.Second
 	matrixPollWait    = 20 * time.Second

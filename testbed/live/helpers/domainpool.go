@@ -38,7 +38,7 @@ import (
 //     32650 and domain 232 would use 65400; the pool stays far below the
 //     65535 UDP ceiling. The 101 cap is structural: it is pinned by
 //     transports.MaxDomainID (see internal/transports/transport.go) and
-//     rechecked by every backend (mqtt, zenoh, fastdds, dds sidecar,
+//     rechecked by every backend (dds sidecar,
 //     SPDP, SEDP), so the pool cannot expand past 101 without a wire
 //     change and stays at 32 domains.
 //   - Exclusive: each domain is handed out at most once concurrently,

@@ -1,6 +1,6 @@
 CDR
 
-Weld uses XCDR1 only on DDS paths. XCDR2 is never emitted. FastDDS forces XCDR1 on every reader and writer. Cyclone advertises XCDR1 allowed.
+Weld uses XCDR1 only. XCDR2 is never emitted. Cyclone advertises XCDR1 allowed.
 
 Envelope
 

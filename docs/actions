@@ -20,7 +20,9 @@ A receding horizon goal stamped with the wall clock against sim time must not fr
 
 Wire
 
-The wire stays standard: goal plus cancel plus feedback plus result plus status topics with preempt and terminal states. Weld speaks that exchange; users see only the workflow (docs/design:116). Hash is part of the key on Zenoh paths with no separate type negotiation (docs/invariants:133), so type plus hash must match before first byte.
+The wire stays standard: goal plus cancel plus feedback plus result plus status topics with preempt
+and terminal states. Weld speaks that exchange; users see only the workflow (docs/design:116).
+Type plus hash must match before first byte (docs/invariants:133).
 
 Proof
 

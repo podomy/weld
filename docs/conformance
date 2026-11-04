@@ -7,7 +7,7 @@ Scope
 
 v1 gates cover CycloneDDS only. Design pins bit level compatibility
 with CycloneDDS peers in v1 (docs/design:31, docs/overview:31)
-and lists FastDDS, Zenoh, and MQTT as post v1
+and the product scope stays CycloneDDS-only
 (docs/design:41, docs/transports:38). The live backend speaks RTPS
 directly; the Sidecar type is a validator stub only
 (docs/transports:30).

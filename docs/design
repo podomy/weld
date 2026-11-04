@@ -13,10 +13,10 @@ error reporting, and supervision. That split is the whole book. Compatibility li
 Quality lives inside Weld.
 
 What stays compatible is the wire and the surface that tools touch. This includes DDS RTPS with
-XCDR1 CDR, Zenoh keys with liveliness tokens and attachments, SPDP and SEDP discovery, topic and
-type naming, type hashes, graph queries, standard messages, services, actions, parameters, TF
-topics, /clock, bags on disk, launch arguments, and every ros2cli verb. A Weld node and an rclcpp
-node on the same domain discover each other and exchange data with no forked protocol.
+XCDR1 CDR, SPDP and SEDP discovery, topic and type naming, type hashes, graph queries, standard
+messages, services, actions, parameters, TF topics, /clock, bags on disk, launch arguments, and
+every ros2cli verb. A Weld node and an rclcpp node on the same domain discover each other and
+exchange data with no forked protocol.
 
 What gets thrown away is everything that never appeared on the wire. This includes the rmw handle
 model, the rcl wait set mechanics, the executor plus callback group split, the Node versus
@@ -30,7 +30,7 @@ drift, silent mismatch, and daemon cached graphs. None of that is wire. All of i
     rviz2 rendering /tf                daemon cached graph
            |                                    |
            v                                    v
-    wire bytes (RTPS, CDR, Zenoh keys)  Go core (matching, routing, supervision)
+    wire bytes (RTPS, CDR)  Go core (matching, routing, supervision)
 
 The diagram states the contract. Above the line, bytes and verbs stay fixed. Below the line, Weld is
 free to design.
@@ -43,7 +43,7 @@ project explicitly defers so the first release stays coherent.
 The goals are:
 
 - A Go native system an operator would choose even with no ROS present: one node model, one config model, one clock model, one error model, observable by default.
-- Bit level wire compatibility with CycloneDDS peers in v1, verified by interop gates, not by sharing code. FastDDS, rmw_zenoh, and MQTT transports follow after v1 behind the same backend interface.
+- Bit level wire compatibility with CycloneDDS peers in v1, verified by interop gates, not by sharing code.
 - Nav2 and MoveIt 2 run on Weld unmodified, because the surface they touch is compatible, not because Weld imitates ROS internals.
 - Every recurring ROS 2 failure class is structurally impossible in Weld, not merely handled.
 
@@ -53,13 +53,13 @@ The non goals for the first version are deliberate limits:
 - No intra process transport in version one. Local delivery honors QoS or rejects at creation; that work follows network interop.
 - No zero copy loans or shared memory in version one, except in-process loan honesty: loan-eligible types are detected and refused loudly outside the in-process path, with no shared-memory transport yet. Shared pointer delivery plus the byte path covers throughput first.
 - No bag storage engine in version one. Weld reads and writes the exchange formats.
-- No FastDDS, Zenoh, or MQTT transports in version one. The direct RTPS backend against CycloneDDS peers is the v1 reference path; the other backends exist in tree as stubs behind the same interface and land after first interop.
+- Direct RTPS backend against CycloneDDS peers is the v1 reference path.
 
 Consider what this means for a perception pipeline. A camera node named usb_cam publishes
 sensor_msgs/msg/Image on /image_raw at 30 Hz with a 640 by 480 frame. Weld does not promise zero
 copy delivery of that frame in version one. It does promise that the bytes on the wire decode
-identically against CycloneDDS (FastDDS follows after v1), that a late joining recorder still reads
-the bag, and that a QoS disagreement surfaces loudly instead of producing silence.
+identically against CycloneDDS, that a late joining recorder still reads the bag, and that a QoS
+disagreement surfaces loudly instead of producing silence.
 
 Invariants
 
@@ -92,31 +92,26 @@ Three layers carry those jobs.
     config store, clock domain, graph index
     |
     v
-  internal/transports/      /three industry buses in the box/
-    dds/        zenoh/       mqtt/
-    RTPS/CDR    keys/tokens  topics/retained
-                attachments  will/QoS mapping
+  internal/transports/      /the CycloneDDS bus in the box/
+    dds/
+    RTPS/CDR
     ^
-    | all three fed by
+    | fed by
   internal/types/  (schema registry, type hashes, serialization codec)
 
 The rule that keeps vendor drift out is simple to state. internal/core never imports a transport
-package. Transports implement a small backend interface: publish bytes, take bytes, join discovery,
-report liveliness. All matching, QoS, routing, timeouts, retries, and state machines live once in
-core, so each backend (DDS in v1, then Zenoh and MQTT) behaves identically by construction. Vendor
-drift, the largest ROS interop cost, has nowhere to hide.
+package. The transport implements a small backend interface: publish bytes, take bytes, join
+discovery, report liveliness. All matching, QoS, routing, timeouts, retries, and state machines
+live once in core, so the backend behaves identically by construction. Vendor drift, the largest
+ROS interop cost, has nowhere to hide.
 
-Each backend is a translator at the border, both directions. Inbound it turns ROS bytes into core
+The backend is a translator at the border, both directions. Inbound it turns ROS bytes into core
 messages: parse the CDR, check the type hash, match the QoS, deliver. Outbound it turns core
 messages into ROS bytes: serialize, announce in discovery the way ROS peers expect. Core never sees
-a ROS-ism and ROS peers never see Weld internals, which is why one core can sit behind three buses
-at once.
+a ROS-ism and ROS peers never see Weld internals, which is why one core sits behind the DDS bus.
 
-Three buses cover the industry: DDS, Zenoh, and MQTT share one core interface. Version one ships the
-DDS backend against CycloneDDS only; FastDDS, Zenoh, and MQTT land later. Anything else arrives the
-same way everything else in this project arrives: a pull request adding a backend behind the
-interface, with interop tests. No plugin registry, no dynamic loading, no out of tree drivers to
-version skew against.
+The DDS backend against CycloneDDS only ships as the transport behind one core interface. No plugin
+registry, no dynamic loading, no out of tree drivers to version skew against.
 
 Core Designs
 
@@ -312,7 +307,7 @@ The whole list reduces further. Everything ROS is collapses to eight jobs: match
 versus request plus type hash before first byte), packaging, sending, discovery plus graph, sequence
 paired services, action state machines, versioned parameters, and one clock domain. Serialization is
 standard and boring by design: a schema declares the shape, the codec flattens it to bytes, the
-bytes feed Zenoh or DDS. On the ROS wire the schema language is IDL and the bytes are CDR, but those
+bytes feed DDS. On the ROS wire the schema language is IDL and the bytes are CDR, but those
 are just the local names for the same two jobs. There is no other machinery. One Go core does the
 eight jobs. Transports integrate with existing implementations rather than reimplementing protocols:
 pure Go libraries where they are mature, C libraries behind a quarantined cgo boundary where they
@@ -352,7 +347,7 @@ Packages
 Packages follow the architecture diagram. Each package has one job and one direction of dependency.
 
 - internal/types: schema registry, hashes, descriptions, serialization codec, dynamic access, fuzz corpus.
-- internal/transports: backend interface plus dds in v1 (zenoh and mqtt follow after). No core logic. New buses arrive as pull requests against the interface, with interop tests, never as plugins.
+- internal/transports: backend interface plus dds. No core logic. No plugin registry, no dynamic loading; interop tests pin the wire.
 - internal/core: entities, RxO matcher, router, service calls, action workflows, config store, clock domain, graph index, supervision groups.
 - internal/time: clock sources, fake clocks, jump handling, rate policies.
 - internal/graph: snapshots, compatibility reporting, tool queries.
@@ -364,7 +359,7 @@ Proof Plan
 Each feature ships with three gates, all green before merge. First comes unit tables with fake
 clocks, where time jumps and partitions are deterministic. Then come interop runs against rclcpp
 nodes on CycloneDDS with ros2cli as the harness, for example echoing /chatter as strings at 10 Hz
-across implementations. FastDDS and Zenoh peers join the harness after v1. A cgo harness that calls
+across implementations. A cgo harness that calls
 rcl directly from Go verifies Weld's bytes against the C stack. cgo is a tool, not a sin: permitted
 in conformance tooling and inside transport backends that wrap vendor C libraries, forbidden in
 core. Core stays pure Go with no C linkage; the backend interface stays the only crossing. Finally
@@ -379,7 +374,7 @@ Build Order in Named Phases
 
 Work proceeds in phases that each end with a demonstrable interop check. The order respects
 dependencies: bytes before matching, matching before tools, tools before workflows, workflows before
-alternate transports, everything before full system soaks.
+supervision, everything before full system soaks.
 
 First, foundations. Types plus CDR with hash and fuzz tests prove that bytes encode and decode
 exactly.
@@ -403,9 +398,6 @@ files plus CLI plus code once.
 Then, long tasks. Action workflows land with buffered feedback and cached results, demonstrated with
 a navigation goal that survives late attachment.
 
-Then, second transport (post v1). The Zenoh backend lands behind the same core, reusing matching and
-supervision unchanged. FastDDS and MQTT follow the same path after.
-
 Then, supervision. Supervision groups land with ordering tests for serial and pooled modes.
 
 Finally, fidelity and soak. Bags, launch args, TF exactness, and /clock land together, followed by
@@ -417,11 +409,10 @@ These are decisions recorded early so later work does not reopen them silently. 
 default and the test that will settle it. Resolved items move to the invariants; what remains here
 is genuinely open.
 
-- RESOLVED: Zenoh domain isolation is key prefix per domain within one session per ROS context, pinned by unit tests on the prefix scheme. Live interop proof against a Zenoh peer is still pending and tracked with the other post-v1 transports.
 - RESOLVED: v1 interoperates with Humble, Jazzy, and Rolling against CycloneDDS as the reference peer. Humble pins the pre hash wire variants; Jazzy and Rolling pin current behavior.
 - RESOLVED: Weld links no C code and needs no C toolchain in builds. The Sidecar type stays a validator stub returning ErrSidecarNotImplemented except Close; the live backend speaks RTPS directly over UDP.
 - RESOLVED: v1 scope is CDR plus types plus DDS unreliable round trip plus CLI echo plus one green interop test.
-- RESOLVED: FastDDS, Zenoh, and MQTT ship past v1. DDS via CycloneDDS only in v1; the FastDDS, Zenoh, and MQTT mappings (topics, retained messages, will messages, QoS mapping) are designed alongside the CycloneDDS backend, built after.
+- RESOLVED: DDS via CycloneDDS only.
 - RESOLVED: static transform overwrite is replace on rebroadcast, clear is sticky across clear. Tests pin both.
 - RESOLVED: /tf reliability default is reliable volatile depth 100. Revisit with loss matrix results.
 - RESOLVED: action goal timeout defaults to 60 s when the client sets none. Explicit values win. No silent infinite waits.

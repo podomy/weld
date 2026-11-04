@@ -20,9 +20,10 @@ Close. The live backend speaks RTPS directly over UDP. No license
 mixing, no C toolchain in Weld builds, and core stays pure Go with
 no C linkage.
 
-Why do FastDDS, Zenoh, and MQTT come later?
+Why is CycloneDDS the only transport?
 
-v1 must prove bytes, matching, tools, and one green interop test first. The backend interface already reserves their place (type hash, QoS offer, GID, sequence as v2 extensions). They land as pull requests with interop tests, never as plugins.
+Weld speaks RTPS directly against CycloneDDS peers. One transport keeps matching, routing, and
+supervision identical by construction with no vendor drift.
 
 Why is mismatch loud?
 

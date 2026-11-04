@@ -89,7 +89,7 @@ func DistroEnv(distro string) [][2]string {
 	}
 	return [][2]string{
 		{"AMENT_PREFIX_PATH", prefix},
-		{"LD_LIBRARY_PATH", prefix + "/opt/zenoh_cpp_vendor/lib:" + prefix + "/lib/x86_64-linux-gnu:" + prefix + "/lib"},
+		{"LD_LIBRARY_PATH", prefix + "/lib/x86_64-linux-gnu:" + prefix + "/lib"},
 		{"PATH", prefix + "/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		{"PYTHONPATH", pythonPath},
 		{"ROS_DISTRO", distro},
@@ -103,10 +103,7 @@ func DistroEnv(distro string) [][2]string {
 // The argv starts with exec and carries ROS_DOMAIN_ID plus the RMW
 // implementation and the distro setup as -e flags, then the container name
 // and the command. No shell is used at any point. RMW is always
-// rmw_cyclonedds_cpp. FastDDS stays out of the gates because v1 scope is
-// Cyclone only: FastDDS uses distinct discovery and type negotiation that
-// the v1 backend does not claim, so gating on it would pin behavior Weld
-// does not implement.
+// rmw_cyclonedds_cpp: CycloneDDS is the only supported DDS.
 func DistroDockerArgs(peer DistroPeer, cmd ...string) []string {
 	return dockerExecArgs([]string{"exec"}, peer.Domain, DistroEnv(peer.Distro), peer.Container, cmd...)
 }

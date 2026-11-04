@@ -15,8 +15,8 @@ Scope
 
   Weld is consolidated, not expanding. CycloneDDS is the only
   transport and no others will be added. All work goes inward:
-  correctness, reliability, and verification of what is already
-  here. No new surface, fixes only.
+  correctness, reliability, verification, and optimization of what
+  is already here. No new surface, fixes only.
 
 Weld is faster than ROS 2 on the same host: up to 68% lower latency.
 

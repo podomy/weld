@@ -47,6 +47,53 @@ const userRepairWindow = 64
 // userAckBitsMax caps ACKNACK bits to bound decode work. Larger receipts are rejected as invalid.
 const userAckBitsMax = 1024
 
+// selectiveNackBitmap builds a bitmap requesting only missing sequences in
+// base through last. Sequences at or below contiguity or in the out-of-order
+// seen set are already received, so their bits stay clear to avoid duplicate
+// retransmits that fill the demux queue and never advance contiguity.
+// Bits use MSB packing matching sedpNackBitmap so CycloneDDS queues repair:
+// base is the MSB of the first word. The range caps at userAckBitsMax like
+// the full-range path. A nil tracker requests the full range.
+func selectiveNackBitmap(base, last uint64, tracker *remoteTracker) ([]uint32, uint32) {
+	if last < base {
+		return nil, 0
+	}
+
+	n := min(last-base+1, userAckBitsMax)
+
+	bits := uint32(n) //nolint:gosec // G115: n capped by userAckBitsMax 1024, fits uint32
+	words := (bits + 31) / 32
+	out := make([]uint32, words)
+
+	if tracker == nil {
+		for i := range out {
+			out[i] = 0xFFFFFFFF
+		}
+	} else {
+		for i := range n {
+			seq := base + i
+			if seq <= tracker.contig {
+				continue
+			}
+
+			if _, ok := tracker.seen[seq]; ok {
+				continue
+			}
+
+			word := i / 32
+			bit := 31 - (i % 32)
+			out[word] |= 1 << bit
+		}
+	}
+
+	if rem := bits % 32; rem != 0 {
+		mask := ^uint32(0) << (32 - rem)
+		out[len(out)-1] &= mask
+	}
+
+	return out, bits
+}
+
 // userPromptNackMaxAttempts caps prompt NACK sends per remote writer for an
 // initial gap. Heartbeat driven ACKs continue for convergence while prompt
 // sends stay capped so a late joiner cannot cause a storm.
@@ -2571,6 +2618,40 @@ func (b *Backend) ackUserHeartbeat(
 		return
 	}
 
+	b.sendSelectiveHeartbeatAck(remote, beat)
+}
+
+// selectiveBitmapForHeartbeat snapshots contiguity and builds a selective bitmap.
+//
+// It copies contiguity plus the out-of-order set under RLock so bitmap work
+// never holds the backend lock. A missing tracker requests the full range
+// through a nil tracker snapshot.
+func (b *Backend) selectiveBitmapForHeartbeat(remote WriterGUID, base, last uint64) ([]uint32, uint32) {
+	b.mu.RLock()
+	trackerSnap, seen := b.remoteTrack[remote]
+	var contig uint64
+	var seenCopy map[uint64]struct{}
+	if seen && trackerSnap != nil {
+		contig = trackerSnap.contig
+		if len(trackerSnap.seen) != 0 {
+			seenCopy = make(map[uint64]struct{}, len(trackerSnap.seen))
+			for s := range trackerSnap.seen {
+				seenCopy[s] = struct{}{}
+			}
+		}
+	}
+	b.mu.RUnlock()
+
+	snap := &remoteTracker{contig: contig, seen: seenCopy}
+	return selectiveNackBitmap(base, last, snap)
+}
+
+// sendSelectiveHeartbeatAck computes the NACK base and sends a selective receipt.
+//
+// It returns early on zero base. A caught-up heartbeat stays base-only.
+// Queueing failures from a closed backend stay silent for teardown; other
+// failures count a demux error loudly.
+func (b *Backend) sendSelectiveHeartbeatAck(remote WriterGUID, beat rtps.Heartbeat) {
 	base := max(
 		b.remoteBase(remote, beat.FirstSequence),
 		beat.FirstSequence,
@@ -2580,17 +2661,22 @@ func (b *Backend) ackUserHeartbeat(
 		return
 	}
 
-	// Bitmap the full heartbeat range: base-only NACKs draw heartbeats
-	// while explicit missing bits queue retransmit on Cyclone peers.
-	// A caught-up heartbeat (Last below base) stays base-only.
+	// Bitmap only missing sequences: full-range requests resend already
+	// received out-of-order samples as duplicates that fill the demux queue
+	// and never advance contiguity. Selective bits request repairs that
+	// converge. A caught-up heartbeat (Last below base) stays base-only.
 	var bitmap []uint32
 	var numBits uint32
 	if beat.LastSequence >= base {
-		bitmap, numBits = sedpNackBitmap(beat.LastSequence - base + 1)
+		bitmap, numBits = b.selectiveBitmapForHeartbeat(remote, base, beat.LastSequence)
 	}
 
 	err := b.queueUserAck(remote, b.readerEntityForWriter(remote), base, numBits, bitmap)
 	if err != nil {
+		if errors.Is(err, transports.ErrBackendClosed) {
+			return
+		}
+
 		b.bumpDemuxError()
 		log.Printf("dds: demux ack queue: %v", err)
 	}
@@ -2655,15 +2741,12 @@ func (b *Backend) sendPromptNack(
 
 	err := b.queueUserAck(remote, b.readerEntityForWriter(remote), base, 0, nil)
 	if err != nil {
-		if errors.Is(err, ErrDataPathNotWired) {
+		if errors.Is(err, ErrDataPathNotWired) || errors.Is(err, transports.ErrBackendClosed) || errors.Is(err, ErrNoRoute) {
 			return
 		}
 		if errors.Is(err, ErrRepairBackpressure) {
 			b.bumpDemuxError()
 			log.Printf("dds: demux prompt ack queue full: %v", err)
-			return
-		}
-		if errors.Is(err, ErrNoRoute) {
 			return
 		}
 

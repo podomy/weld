@@ -689,7 +689,10 @@ func (h Heartbeat) Encode(littleEndian bool) []byte {
 }
 
 // DecodeHeartbeat parses a HEARTBEAT body, ignoring trailing bytes for
-// tolerance. Short bodies and first above last drop with a counter increment.
+// tolerance. Short bodies and first above last plus one drop with a counter increment.
+// An empty range with first equal to last plus one is valid: CycloneDDS
+// sends first last plus one when the writer holds no new sample, so it
+// parses without error and callers treat it as a silent no-op.
 func DecodeHeartbeat(body []byte, flags uint8, drops *Counter) (Heartbeat, error) {
 	var out Heartbeat
 	if len(body) < heartbeatSize {
@@ -701,7 +704,7 @@ func DecodeHeartbeat(body []byte, flags uint8, drops *Counter) (Heartbeat, error
 	copy(out.WriterID[:], body[gapWriterOff:gapWriterOff+entityIDSize])
 	out.FirstSequence = seqNumberValue(body[heartbeatFirstOff:heartbeatFirstOff+dataSeqSize], littleEndian)
 	out.LastSequence = seqNumberValue(body[heartbeatLastOff:heartbeatLastOff+dataSeqSize], littleEndian)
-	if out.FirstSequence > out.LastSequence {
+	if out.FirstSequence > out.LastSequence && out.FirstSequence != out.LastSequence+1 {
 		drops.RecordDrop()
 		return Heartbeat{}, fmt.Errorf("rtps: heartbeat first %d above last %d", out.FirstSequence, out.LastSequence)
 	}

@@ -2525,7 +2525,18 @@ func (b *Backend) ackUserHeartbeat(
 		return
 	}
 
-	if beat.FirstSequence == 0 || beat.LastSequence < beat.FirstSequence {
+	if beat.FirstSequence == 0 {
+		b.bumpDemuxError()
+		log.Printf("dds: demux user heartbeat range first=%d last=%d", beat.FirstSequence, beat.LastSequence)
+
+		return
+	}
+
+	if beat.LastSequence < beat.FirstSequence {
+		if beat.FirstSequence == beat.LastSequence+1 {
+			return
+		}
+
 		b.bumpDemuxError()
 		log.Printf("dds: demux user heartbeat range first=%d last=%d", beat.FirstSequence, beat.LastSequence)
 

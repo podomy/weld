@@ -638,14 +638,28 @@ func TestMarshalDisposeGoldenShape(t *testing.T) {
 	guid := testGUID(0x22)
 	data := mustMarshalDispose(t, guid, 0, 7)
 
-	if len(data) != 80 {
-		t.Fatalf("len = %d, want 80", len(data))
+	if len(data) != 92 {
+		t.Fatalf("len = %d, want 92", len(data))
 	}
 
 	_, d := decodeSPDPData(t, data)
 
 	if !d.Key {
 		t.Fatalf("dispose misses key flag")
+	}
+
+	if len(d.InlineQoS) != 1 {
+		t.Fatalf("dispose inline count = %d, want 1 status info", len(d.InlineQoS))
+	}
+
+	status := d.InlineQoS[0]
+	if status.ID != rtps.PIDStatusInfo {
+		t.Fatalf("dispose inline id = %#04x, want status info %#04x", status.ID, rtps.PIDStatusInfo)
+	}
+
+	wantStatus := []byte{0x00, 0x00, 0x00, 0x03}
+	if !bytes.Equal(status.Value, wantStatus) {
+		t.Fatalf("dispose status = % X, want % X", status.Value, wantStatus)
 	}
 
 	if d.SequenceNumber != 7 {

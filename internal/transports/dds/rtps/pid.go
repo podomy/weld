@@ -83,6 +83,8 @@ const (
 	PIDTypeInformation uint16 = 0x0075
 	// PIDBuiltinEndpointQos carries the 4 byte builtin endpoint QoS mask.
 	PIDBuiltinEndpointQos uint16 = 0x0077
+	// PIDStatusInfo carries the 4 byte dispose plus unregister status.
+	PIDStatusInfo uint16 = 0x0071
 	// PIDVendorAdlinkWriterDataLifecycle is vendor 0x8003.
 	PIDVendorAdlinkWriterDataLifecycle uint16 = 0x8003
 	// PIDVendorAdlinkParticipantVersionInfo is vendor 0x8007.

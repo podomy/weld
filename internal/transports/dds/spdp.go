@@ -637,7 +637,10 @@ func marshalAliveWithPorts(guid GUID, domain uint32, seq uint64, lease time.Dura
 //
 // It carries the same RTPS header and DATA endpoints as an alive packet
 // but sets the key flag and carries only the GUID plus domain tag, so a
-// peer removes the participant instead of refreshing its lease.
+// peer removes the participant instead of refreshing its lease. It also
+// carries inline status info marking dispose plus unregister, matching
+// CycloneDDS on the wire: without it Cyclone logs no/invalid payload
+// and never removes the participant.
 func MarshalDisposePacket(guid GUID, domain uint32, seq uint64) ([]byte, error) {
 	err := validatePacketHeader(guid, domain, seq)
 	if err != nil {
@@ -660,8 +663,11 @@ func MarshalDisposePacket(guid GUID, domain uint32, seq uint64) ([]byte, error) 
 		ReaderID:       rtps.EntityUnknown,
 		WriterID:       rtps.EntitySPDPWriter,
 		SequenceNumber: seq,
-		Payload:        encoded,
-		Key:            true,
+		InlineQoS: []rtps.Parameter{
+			{ID: rtps.PIDStatusInfo, Value: []byte{0x00, 0x00, 0x00, 0x03}},
+		},
+		Payload: encoded,
+		Key:     true,
 	}
 
 	return frameSPDP(guid.Prefix, data)

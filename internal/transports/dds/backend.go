@@ -352,6 +352,12 @@ type Backend struct {
 	fragSend map[fragKey]*fragSendEntry
 	// publishMu serializes framed publishes from find through PublishTo.
 	publishMu sync.Mutex
+	// plainPauseDone records whether the SEDP-ahead-of-DATA pause already
+	// ran for one plain publish. The first publish pauses so a freshly
+	// matched peer finishes connecting before DATA arrives; steady-state
+	// publishers skip the pause. It needs no mutex: CompareAndSwap settles
+	// exactly one pauser.
+	plainPauseDone atomic.Bool
 	// repairQueue holds pending per-backend repair tasks.
 	repairQueue chan repairTask
 	// repairDone closes when the backend closes so the repair worker exits
@@ -4374,8 +4380,9 @@ func (b *Backend) HasRemoteEndpoint(topic string) bool {
 // no readers out-of-sync. Waiting here keeps SEDP ahead of DATA: after
 // the synchronous announce above, the peer still needs one announce
 // interval to process SEDP and match. It polls every 20ms up to 1s. On
-// timeout it still returns so the caller sends best-effort for Weld-to-Weld
-// peers that never announce readers. Context cancellation aborts early.
+// timeout it still returns so the caller can fail loudly with no route
+// instead of blind-sending a sample the peer would drop. Context
+// cancellation aborts early.
 // A single stopped timer with Reset paces polls instead of a fresh timer
 // per tick. Deadline timing uses the backend clock so fake-clock tests
 // control it; the 20ms poll ticker keeps wall-clock intentionally because
@@ -4896,10 +4903,12 @@ func (b *Backend) preparePublishLocked(ctx context.Context, msg transports.Outgo
 //
 // It runs without publishMu across waits, then re-locks to re-snapshot
 // routes and re-align before sending so concurrent publishes cannot flap
-// the shared GUID while waits never block them. The 200ms peer pause
-// applies only while no matching reader is observed: single-shot
-// publishers keep the SEDP-ahead-of-DATA backstop, while steady-state
-// publishers with an established match send without the per-message tax.
+// the shared GUID while waits never block them. The first plain publish
+// per backend pauses 200ms after the wait so a freshly matched peer
+// finishes connecting before DATA arrives; steady-state publishers skip
+// the pause. If no matching reader is observed it fails loudly with
+// ErrNoRoute instead of blind-sending a sample the peer would drop, so the
+// CLI retry loop covers cold discovery.
 func (b *Backend) publishPlainAfterWait(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot, ep SEDPEndpoint, writer WriterGUID) error {
 	b.waitForMatchingReader(ctx, ep)
 
@@ -4907,9 +4916,15 @@ func (b *Backend) publishPlainAfterWait(ctx context.Context, msg transports.Outg
 		return fmt.Errorf("dds: publish: %w", err)
 	}
 	if !b.hasMatchingRemoteReader(ep) {
+		return routeError(msg.TopicName, snap.domain, ErrNoRoute)
+	}
+	if b.plainPauseDone.CompareAndSwap(false, true) {
 		err := b.pauseForPeerProcessing(ctx)
 		if err != nil {
 			return err
+		}
+		if !b.hasMatchingRemoteReader(ep) {
+			return routeError(msg.TopicName, snap.domain, ErrNoRoute)
 		}
 	}
 

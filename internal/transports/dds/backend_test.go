@@ -2037,17 +2037,34 @@ func TestBackendPublishPlainSkipsPauseWithMatchingReader(t *testing.T) {
 		Payload:   payload,
 	}
 
+	// The first publish pauses once so a freshly matched peer finishes
+	// connecting; it must still succeed well inside the wait budget.
 	start := time.Now()
 
 	err := backend.PublishBytes(context.Background(), msg)
 	if err != nil {
-		t.Fatalf("publish with match: %v", err)
+		t.Fatalf("first publish with match: %v", err)
 	}
 
 	elapsed := time.Since(start)
 
+	if elapsed >= 2*time.Second {
+		t.Fatalf("first publish with match took %v, want under 2s", elapsed)
+	}
+
+	// The second publish is the steady state: the pause already happened,
+	// so it must send without the 200ms tax.
+	start = time.Now()
+
+	err = backend.PublishBytes(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("second publish with match: %v", err)
+	}
+
+	elapsed = time.Since(start)
+
 	if elapsed >= 200*time.Millisecond {
-		t.Fatalf("publish with match took %v, want under 200ms", elapsed)
+		t.Fatalf("second publish with match took %v, want under 200ms", elapsed)
 	}
 }
 

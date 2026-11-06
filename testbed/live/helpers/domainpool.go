@@ -332,6 +332,33 @@ func WaitForContainerProcGone(ctx context.Context, container, pattern string, bo
 // may reap it without risking parallel or sequential suites.
 const stalePeerAgeSeconds = "900"
 
+// fleetReachable reports whether any fleet container is running.
+//
+// It probes with the same docker inspect path the skip gates use, so purge
+// and skip agree on fleet presence. A missing docker binary, an unreachable
+// daemon, or zero running peers all report unreachable with a nil error:
+// there is no residue to reap and the caller skips cleanly through
+// SkipIfNoPeer. Inspect failures stay loud so a flaky daemon never hands
+// out a possibly dirty domain.
+func fleetReachable(ctx context.Context) (bool, error) {
+	if !DockerAvailable(ctx) {
+		return false, nil
+	}
+
+	for _, container := range fleetContainers() {
+		running, err := ContainerRunning(ctx, container)
+		if err != nil {
+			return false, err
+		}
+
+		if running {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // purgeDomainResidue stops ros2 CLI daemons plus topic peers for one domain
 // on every fleet peer, verifying each kill with SIGKILL escalation.
 //
@@ -344,13 +371,23 @@ const stalePeerAgeSeconds = "900"
 // so the purge only removes residue. Only a domain environ match is
 // signaled, so parallel suites are never disturbed. A survivor or an
 // inconclusive kill fails loudly instead of handing out a dirty domain.
-// Ancient topic peers for the same domain are still reaped as a backup
+// When no fleet peer is reachable there is nothing to purge and it succeeds
+// so the caller skips cleanly. Ancient topic peers for the same domain are still reaped as a backup
 // for crashes that predate the current purge.
 //
 //nolint:contextcheck,nolintlint // cleanup contexts intentionally outlive test cancellation, the purge runs at allocate time with a bounded Background timeout
 func purgeDomainResidue(domain int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	reachable, err := fleetReachable(ctx)
+	if err != nil {
+		return fmt.Errorf("helpers: purge domain %d fleet probe: %w", domain, err)
+	}
+
+	if !reachable {
+		return nil
+	}
+
 	daemonPattern := "daemonize.*ros-domain-id " + strconv.Itoa(domain) + " "
 	for _, container := range fleetContainers() {
 		err := KillAndWaitContainerProc(ctx, container, daemonPattern)

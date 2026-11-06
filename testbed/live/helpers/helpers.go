@@ -404,7 +404,7 @@ func ContainerRunning(ctx context.Context, name string) (bool, error) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		text := strings.TrimSpace(string(out))
-		if strings.Contains(text, "No such object") {
+		if strings.Contains(strings.ToLower(text), "no such object") {
 			return false, nil
 		}
 		if probeCtx.Err() != nil {

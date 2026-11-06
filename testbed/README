@@ -53,6 +53,12 @@ Never run compose up per test.
 Bring the fleet up once with cd testbed && docker compose up -d and reuse it.
 Restart a stale fleet with cd testbed && docker compose down && docker compose up -d.
 
+CI decision: the fleet stays out of commit and CI gates. Host-networked
+multicast Docker with pooled domains and 20-60m budgets is not feasible
+in hosted runners, so automated gates cover fast packages only and live
+suites skip without a peer. Measure coverage on fast packages and verify
+live manually with the fleet up.
+
 Domains
 
 - 42: ROS std_msgs/String on per-run topics from /chatter.

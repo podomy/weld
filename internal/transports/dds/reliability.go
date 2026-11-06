@@ -47,21 +47,24 @@ const userRepairWindow = 64
 // userAckBitsMax caps ACKNACK bits to bound decode work. Larger receipts are rejected as invalid.
 const userAckBitsMax = 1024
 
-// selectiveNackBitmap builds a bitmap requesting only missing sequences in
-// base through last. Sequences at or below contiguity or in the out-of-order
-// seen set are already received, so their bits stay clear to avoid duplicate
-// retransmits that fill the demux queue and never advance contiguity.
-// Bits use MSB packing matching sedpNackBitmap so CycloneDDS queues repair:
-// base is the MSB of the first word. The range caps at userAckBitsMax like
-// the full-range path. A nil tracker requests the full range.
-func selectiveNackBitmap(base, last uint64, tracker *remoteTracker) ([]uint32, uint32) {
-	if last < base {
+// selectiveNackBitmap builds a bitmap requesting only missing sequences for
+// n sequences from base. Sequences at or below contiguity or in the
+// out-of-order seen set are already received, so their bits stay clear to
+// avoid duplicate retransmits that fill the demux queue and never advance
+// contiguity. Bits use MSB packing matching sedpNackBitmap so CycloneDDS
+// queues repair: base is the MSB of the first word. Counts cap at
+// userAckBitsMax like the full-range path. A nil tracker requests the full
+// range. Zero counts request nothing.
+func selectiveNackBitmap(n, base uint64, tracker *remoteTracker) ([]uint32, uint32) {
+	if n == 0 {
 		return nil, 0
 	}
 
-	n := min(last-base+1, userAckBitsMax)
+	if n > userAckBitsMax {
+		n = userAckBitsMax
+	}
 
-	bits := uint32(n) //nolint:gosec // G115: n capped by userAckBitsMax 1024, fits uint32
+	bits := uint32(n)
 	words := (bits + 31) / 32
 	out := make([]uint32, words)
 
@@ -2643,7 +2646,7 @@ func (b *Backend) selectiveBitmapForHeartbeat(remote WriterGUID, base, last uint
 	b.mu.RUnlock()
 
 	snap := &remoteTracker{contig: contig, seen: seenCopy}
-	return selectiveNackBitmap(base, last, snap)
+	return selectiveNackBitmap(last-base+1, base, snap)
 }
 
 // sendSelectiveHeartbeatAck computes the NACK base and sends a selective receipt.

@@ -18,10 +18,11 @@ Security
   scope and refused loudly instead of attempted, so a secured peer
   never degrades silently. Encryption and authentication in transit
   come from the deployment, not the middleware. On Concord-coordinated
-  machines every node-to-node link runs over mutually authenticated
-  Noise IK channels, with fleet membership checked before a single
-  byte flows, so the fleet is secured by default by the platform
-  Weld runs on. See docs/interop for the refused-with-reason list.
+  machines node-to-node links run inside the encrypted WireGuard mesh,
+  and Concord sync sessions add mutually authenticated Noise IK channels
+  with fleet membership checked before a single byte flows, so the fleet
+  is secured by default by the platform Weld runs on. See docs/interop
+  for the refused-with-reason list.
 
 Scope
 

@@ -11,6 +11,18 @@ against CycloneDDS, the only supported DDS.
 Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as
 first-class nodes, verified by mixed fleet behavior.
 
+Security
+
+  Weld implements no transport crypto. DDS Security handshake, crypto
+  transforms, access control, and revocation are explicitly out of
+  scope and refused loudly instead of attempted, so a secured peer
+  never degrades silently. Encryption and authentication in transit
+  come from the deployment, not the middleware. On Concord-coordinated
+  machines every node-to-node link runs over mutually authenticated
+  Noise IK channels, with fleet membership checked before a single
+  byte flows, so the fleet is secured by default by the platform
+  Weld runs on. See docs/interop for the refused-with-reason list.
+
 Scope
 
   Weld is consolidated, not expanding. CycloneDDS is the only

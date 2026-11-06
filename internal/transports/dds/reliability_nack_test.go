@@ -860,3 +860,47 @@ func TestDecodeUserNackFragRejectsBadBodies(t *testing.T) {
 		t.Fatalf("zero seq frags = %v, want none", req.fragNums)
 	}
 }
+
+// TestSelectiveNackBitmapRequestsOnlyMissing pins selective repair.
+//
+// A tracker with contiguity plus out-of-order seen must request only the
+// gaps in base through last, clearing bits for already received sequences
+// so retransmits converge instead of filling the demux queue with duplicates.
+// A nil tracker requests the full range like the legacy path. Empty ranges
+// request nothing.
+func TestSelectiveNackBitmapRequestsOnlyMissing(t *testing.T) {
+	t.Parallel()
+
+	tracker := &remoteTracker{contig: 5, seen: map[uint64]struct{}{7: {}, 8: {}}}
+
+	bitmap, numBits := selectiveNackBitmap(6, 10, tracker)
+	if numBits != 5 {
+		t.Fatalf("numBits = %d, want 5 for base 6 last 10", numBits)
+	}
+
+	if len(bitmap) != 1 {
+		t.Fatalf("bitmap words = %d, want 1", len(bitmap))
+	}
+
+	// Base 6 missing, 7 seen, 8 seen, 9 missing, 10 missing. MSB packing
+	// puts base at bit 31: bits 31, 28, 27 set, bits 30 and 29 clear.
+	// Top 5 bits 10011 is 0x98000000.
+	want := uint32(0x98000000)
+	if bitmap[0] != want {
+		t.Fatalf("bitmap = %08X, want %08X", bitmap[0], want)
+	}
+
+	full, fullBits := selectiveNackBitmap(6, 10, nil)
+	if fullBits != 5 {
+		t.Fatalf("nil tracker bits = %d, want 5", fullBits)
+	}
+
+	if len(full) != 1 || full[0] != 0xF8000000 {
+		t.Fatalf("nil tracker bitmap = % X, want F8000000", full)
+	}
+
+	empty, emptyBits := selectiveNackBitmap(11, 10, tracker)
+	if emptyBits != 0 || empty != nil {
+		t.Fatalf("empty range bits = %d bitmap = %v, want 0 nil", emptyBits, empty)
+	}
+}

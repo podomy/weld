@@ -2068,6 +2068,97 @@ func TestBackendPublishPlainSkipsPauseWithMatchingReader(t *testing.T) {
 	}
 }
 
+// TestBackendPublishPlainFirstPublishPausesForPeerSettle pins the
+// single-shot settle pause.
+//
+// A fresh backend with a pre-installed matching reader still pauses once
+// before the first send: the match may have arrived microseconds ago while
+// the peer is still connecting its reader, and DATA sent immediately is
+// dropped as out-of-sync while reporting sent. Without the pause the first
+// publish returns in well under 200ms and the sample is silently lost.
+func TestBackendPublishPlainFirstPublishPausesForPeerSettle(t *testing.T) {
+	// Domain 38 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 38
+
+	backend := newLiveBackend(t, domain, "plain-first-pause")
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	injectLoopbackRouteForPlainFastTest(t, backend)
+
+	const topic = "/chatter_plain_first_pause_38"
+
+	writerEp := upsertMatchingReaderForPlainFastTest(t, backend, domain, topic)
+
+	if !backend.hasMatchingRemoteReader(writerEp) {
+		t.Fatalf("matching reader not observed after upsert, want true")
+	}
+
+	payload := encodeTestString(t, "hello first")
+
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  "std_msgs__msg__String",
+		TypeHash:  StringTypeHash,
+		Payload:   payload,
+	}
+
+	start := time.Now()
+
+	err := backend.PublishBytes(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("first publish with match: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if elapsed < 200*time.Millisecond {
+		t.Fatalf("first publish with match took %v, want at least 200ms settle pause", elapsed)
+	}
+}
+
+// TestBackendPublishPlainNoMatchFailsLoudly pins loud failure instead of
+// silent drops.
+//
+// Publishing with routes but no matching remote reader must return
+// ErrNoRoute so the CLI retry loop covers cold discovery instead of
+// sending a sample the peer would drop while reporting sent. Without the
+// recheck the publish succeeds and the sample is silently lost.
+func TestBackendPublishPlainNoMatchFailsLoudly(t *testing.T) {
+	// Domain 38 sits outside every live range (fixed 42-48, ephemeral 60-69, pooled 70-101).
+	const domain uint32 = 38
+
+	backend := newLiveBackend(t, domain, "plain-no-match")
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	injectLoopbackRouteForPlainFastTest(t, backend)
+
+	const topic = "/chatter_plain_no_match_38"
+
+	payload := encodeTestString(t, "hello nowhere")
+
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  "std_msgs__msg__String",
+		TypeHash:  StringTypeHash,
+		Payload:   payload,
+	}
+
+	err := backend.PublishBytes(context.Background(), msg)
+	if !errors.Is(err, ErrNoRoute) {
+		t.Fatalf("publish without match = %v, want ErrNoRoute", err)
+	}
+}
+
 // TestBackendSweepOnceExpiresPendingEvict pins the stub-path sweeper unit.
 func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
 	t.Parallel()

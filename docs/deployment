@@ -1,0 +1,35 @@
+Deployment
+
+Weld is intended to be used as the Go supervisor beside minimal C++ control loops. The Go program owns everything except the hard real-time inner loop: telemetry, mission logic, services, actions, parameters, bags, and supervision. The inner loop stays in C++ and stays minimal: sense, control, actuate at a fixed rate, nothing else. Go never touches inner-loop timing, and C++ never carries fleet logic. All processes run on one host in one DDS domain.
+
+The layout looks like this:
+
+  same host, one DDS domain (for example 38)
+
+  C++ control loop (one process)         Weld Go program (one process)
+    links libddsc only                     links Weld SDK only (pure Go)
+    no ROS, no rcl, no colcon              no cgo, static binary
+
+  -- discovery, automatic both ways --
+  SPDP  -->  multicast 239.255.0.1  <--  SPDP
+  SEDP  -->  unicast 127.0.0.1      <--  SEDP
+
+  -- telemetry, C++ to Weld --
+  pub /joint_states  --RTPS/XCDR1-->  sub TakeBytes
+
+  -- commands, Weld to C++ --
+  sub TakeBytes  <--RTPS/XCDR1--  pub /cmd_vel
+
+  -- observer, read-only, any terminal --
+  weld topic list --domain 38     (shows the C++ endpoints)
+  weld echo --topic /joint_states (prints the telemetry)
+
+The C++ side needs no ROS install. It links libddsc only, joins the domain, and publishes plus subscribes the same IDL types Weld uses. Discovery finds both sides with no other configuration.
+
+Use ROS 2 default QoS on the C++ side: reliable, volatile, keep-last with depth at or under 100. That matches what Weld offers and requests by default, so pairs connect without negotiation surprises. Keep publishers reliable: a best-effort publisher against a default Weld subscriber is a loud mismatch with no delivery, and the gates pin that. Leave deadline and liveliness at their defaults and enforce loop timing in application code. Use transient-local on both sides only when a restarted peer must catch up on history; volatile deliberately carries none, so a late joiner starts at live data.
+
+A lone first publish waits for the peer before sending and fails loudly with no route instead of silently missing, and the first plain publish per backend pauses briefly so a freshly matched peer finishes connecting before DATA arrives. Steady loop traffic skips the pause. After that the loop itself is the steady state the benchmarks measure: zero loss with sub-millisecond p50 on loopback.
+
+Do not add sockets between the loop and the Go program by default. Topics already connect them over loopback, and socket traffic is invisible to discovery, typing, history, bags, and every CLI verb. A Unix socket is a bypass for a measured reason only, never the primary link.
+
+Boundaries that still hold: transport is loopback-bound today, so keep both processes on one host. Services are volatile on the Weld side, so keep service QoS volatile on the C++ side too. Secured DDS peers are detected and refused loudly, never decrypted; a fleet with security enabled everywhere cannot use Weld endpoints.

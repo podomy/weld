@@ -1,6 +1,6 @@
 Why Weld Exists
 
-Weld is a superior robotics middleware that happens to be ROS 2 compatible. The relationship is
+Weld is a superior middleware for distributed communication that happens to be ROS 2 compatible. The relationship is
 CockroachDB to Postgres: same wire protocol, same observable surface, entirely different system
 behind it.
 

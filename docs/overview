@@ -1,6 +1,6 @@
 Overview
 
-Weld is robotics middleware written in Go. It speaks ROS 2 on the wire so Go programs join ROS 2 systems as first-class nodes.
+Weld is middleware for distributed communication written in Go. It speaks ROS 2 on the wire so Go programs join ROS 2 systems as first-class nodes.
 
 The relation is CockroachDB to Postgres: same wire protocol and observable surface, different system behind it. Compatibility lives on the wire. Quality lives inside Weld.
 

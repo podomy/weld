@@ -2,7 +2,7 @@ Weld
 
 License: GNU Affero General Public License v3.0 or later (/LICENSE)
 
-Weld is robotics middleware written in Go. One unified core moves
+Weld is middleware for distributed communication written in Go. One unified core moves
 topics, services, actions, and parameters across transports, with
 structured delivery, copy once handling, and a leaderless data plane
 that stays correct under partition. Version one ships the DDS backend

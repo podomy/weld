@@ -41,11 +41,6 @@ Scope
   in the diff proves nothing. Anything adding a flag, a verb, or a
   field is expansion, and the answer is no until the freeze lifts.
 
-  The project is feature-complete; the scope stays frozen. Progress
-  from here is measured in understanding, not volume: one small,
-  proven change at a time. There is no need for bulk generation,
-  AI or otherwise; unexplained code is not contribution.
-
 Weld is faster than ROS 2 on the same host: up to 68% lower latency.
 
 It also scales further: zero packet loss where ROS starts dropping,

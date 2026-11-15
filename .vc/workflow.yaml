@@ -1,0 +1,6 @@
+# Built by vc on every push. Testbed bench image only;
+# deployment is manual via the testbed compose setup.
+images:
+  - name: vc/weld-bench
+    dockerfile: Dockerfile
+    context: .

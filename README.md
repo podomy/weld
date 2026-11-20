@@ -18,7 +18,7 @@ Full docs live in [docs/](/docs).
 
 ## Contributing
 
-Weld takes no pull requests or GitHub Issues. Propose first, patch second, both by email to [contact@podomy.com](mailto:contact@podomy.com): an RFC describing the problem, then a `git format-patch` series. Your Author name stays on the commit.
+Weld takes no pull requests or GitHub Issues. Propose first, patch second, both by email to [contact@podomy.com](mailto:contact@podomy.com): an RFC describing the problem, then a `git format-patch` series.
 
 ## License
 

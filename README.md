@@ -1,5 +1,9 @@
 <h1 align="center">Weld</h1>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/podomy/weld" alt="License"></a>
+</p>
+
 Weld is middleware for distributed communication written in Go. One unified core moves
 topics, services, actions, and parameters across transports, with
 structured delivery, copy once handling, and a **leaderless data plane**

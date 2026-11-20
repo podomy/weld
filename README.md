@@ -10,11 +10,15 @@ Weld is Go robotics middleware, wire-compatible with ROS 2, for fleets that must
 
 Proven by a 110-row benchmark matrix, green end to end: lower p50 latency at every payload size, zero loss to 100 kHz where ROS first drops at 10 kHz.
 
+<p align="center">
+  <img src="testbed/bench/latency-vs-throughput.svg" alt="Latency vs throughput">
+</p>
+
 Full docs live in [docs/](/docs).
 
 ## Contributing
 
-Weld takes no pull requests. Propose first, patch second, both by email to [contact@podomy.com](mailto:contact@podomy.com): an RFC describing the problem, then a `git format-patch` series.
+Weld takes no pull requests or GitHub Issues. Propose first, patch second, both by email to [contact@podomy.com](mailto:contact@podomy.com): an RFC describing the problem, then a `git format-patch` series. Your Author name stays on the commit.
 
 ## License
 

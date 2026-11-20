@@ -8,7 +8,7 @@
 // translator at the border: inbound it turns wire bytes into core
 // messages, outbound it turns core messages into wire bytes.
 //
-// Backends arrive as pull requests implementing Backend with interop
+// Backends arrive as mailed patch series implementing Backend with interop
 // tests, never as plugins. There is no plugin registry and no dynamic
 // loading, so version skew has nowhere to hide.
 package transports

@@ -4,111 +4,22 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/podomy/weld" alt="License"></a>
 </p>
 
-Weld is middleware for distributed communication written in Go. One unified core moves
-topics, services, actions, and parameters across transports, with
-structured delivery, copy once handling, and a **leaderless data plane**
-that stays correct under partition. Version one ships the DDS backend
-against CycloneDDS, the only supported DDS.
+Up to 68% lower latency than ROS 2 on the same host, with zero loss where ROS drops.
 
-Weld speaks ROS 2 on the wire, so Go programs join ROS 2 systems as
-first-class nodes, verified by mixed fleet behavior.
+Weld is Go robotics middleware, wire-compatible with ROS 2, for fleets that must coordinate where links die. One leaderless data plane carries topics, services, actions, and parameters; version one ships the CycloneDDS backend.
 
-## Security
-
-Weld implements no transport crypto. DDS Security handshake, crypto
-transforms, access control, and revocation are **explicitly out of
-scope and refused loudly** instead of attempted, so a secured peer
-never degrades silently. Encryption and authentication in transit
-come from the deployment, not the middleware. On Concord-coordinated
-machines node-to-node links run inside the encrypted WireGuard mesh,
-and Concord sync sessions add mutually authenticated Noise IK channels
-with fleet membership checked before a single byte flows, so the fleet
-is secured by default by the platform Weld runs on. See [/docs/interop](/docs/interop)
-for the refused-with-reason list.
+Proven by a 110-row benchmark matrix, green end to end: lower p50 latency at every payload size, zero loss to 100 kHz where ROS first drops at 10 kHz.
 
 ## Scope
 
-Weld is consolidated, not expanding. CycloneDDS is the only
-transport and no others will be added. All work goes inward:
-correctness, reliability, verification, and optimization of what
-is already here. **No new surface, fixes only.**
+Consolidated, not expanding: CycloneDDS is the only transport. No new surface, fixes only. Every change keeps behavior identical and is measured before and after.
 
-The bar, same for every change: **externally identical behavior**.
-Optimization needs a measurement before and after, not a hunch.
-Replacement needs the same wire format, CLI surface, and journal
-semantics, proven by the existing gate plus a Resonance run, not
-by reading the diff. Fixes need a failing gate first, then the
-smallest patch that turns it green without moving any other
-number. Cleanup needs the full gate green on both sides; elegance
-in the diff proves nothing. Anything adding a flag, a verb, or a
-field is expansion, and the answer is no until the freeze lifts.
+Full docs live in [docs/](/docs).
 
-Weld is **faster than ROS 2 on the same host: up to 68% lower latency**.
+## Contributing
 
-It also **scales further: zero packet loss** where ROS starts dropping,
-with about 25% more throughput.
-
-## Benchmarks
-
-Weld versus ROS 2 (ros-jazzy/CycloneDDS), same host and bytes, full
-matrix green (110 rows, exit 0; reports in testbed/logs/bench-*.html).
-Weld-to-weld latency is lower than ros-to-ros at every payload size
-(16 to 68% lower p50 from 64 B to 1 MiB) and every lossless rate
-(about 50% lower through 100 to 800 Hz at 1 KiB). Weld legs hold 0%
-loss from 50 Hz to 100 kHz offered; ros-to-ros first drops at 10 kHz.
-Full tables, the latency-vs-throughput chart, and caveats live in
-[testbed/bench/README](testbed/bench/README).
-
-Chart (testbed/bench/latency-vs-throughput.svg): latency vs achieved
-throughput, 1 KiB sweep, one p50 curve per leg in leg colors with
-circle markers, p99 dashed with triangles; red rings mark lossy rates.
-
-## Documentation
-
-Start here:
-
-- [Overview](/docs/overview)
-- [Weld design](/docs/design)
-- [Weld invariants](/docs/invariants)
-- [Glossary](/docs/glossary)
-- [FAQ](/docs/faq)
-- [Deployment](/docs/deployment)
-
-Wire and types:
-
-- [Types](/docs/types)
-- [Type hashes](/docs/hash)
-- [CDR](/docs/cdr)
-- [Introspection and bounds](/docs/introspection)
-- [Corpus](/docs/corpus)
-- [QoS](/docs/qos)
-- [Transports](/docs/transports)
-- [Interop](/docs/interop)
-
-System:
-
-- [Actions](/docs/actions)
-- [Services](/docs/services)
-- [Config](/docs/config)
-- [Supervision](/docs/supervision)
-- [Time](/docs/time)
-
-Fleet and tools:
-
-- [Testbed](/docs/testbed)
-- [Testbed Go](/docs/testbed-go)
-- [Conformance](/docs/conformance)
-- [Wireless](/docs/wireless)
-- [CLI](/docs/cli)
-
-
-Announcements and engineering updates on distributed systems, consensus
-algorithms, and robotic fleet coordination are shared via our newsletter
-at [https://podomy.com](https://podomy.com).
-
-- Commit message format: [/COMMITS](/COMMITS)
+Weld takes no pull requests. Propose first, patch second, both by email to [contact@podomy.com](mailto:contact@podomy.com): an RFC describing the problem, then a `git format-patch` series.
 
 ## License
 
-Weld is distributed under the GNU Affero General Public License v3.0 or
-later. See [/LICENSE](/LICENSE).
+GNU Affero General Public License v3.0 or later. See [LICENSE](/LICENSE). Questions: [contact@podomy.com](mailto:contact@podomy.com).

@@ -10,10 +10,6 @@ Weld is Go robotics middleware, wire-compatible with ROS 2, for fleets that must
 
 Proven by a 110-row benchmark matrix, green end to end: lower p50 latency at every payload size, zero loss to 100 kHz where ROS first drops at 10 kHz.
 
-## Scope
-
-Consolidated, not expanding: CycloneDDS is the only transport. No new surface, fixes only. Every change keeps behavior identical and is measured before and after.
-
 Full docs live in [docs/](/docs).
 
 ## Contributing

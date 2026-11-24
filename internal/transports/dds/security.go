@@ -833,7 +833,7 @@ func DropProtectedSubmessage(r *DataReceiver, id byte) error {
 //     SecurityInfo on SEDPEndpoint.
 //   - backend.go routeBuiltinSub/dispatchRTPS: before DecodeSubmessage,
 //     call HandleProtectedSubmessage and continue when handled is true.
-//   - sdk/cli config plumbing: construct SecurityConfig from flags or
+//   - cli config plumbing: construct SecurityConfig from flags or
 //     files, call Validate, pass into backend construction. No call site
 //     exists yet.
 func HandleProtectedSubmessage(r *DataReceiver, sub rtps.RawSubmessage) (bool, error) {

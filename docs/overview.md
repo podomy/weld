@@ -36,5 +36,5 @@ Weld ships no C ABI. One Go binary talks to Humble, Jazzy, and Rolling by negoti
 
 - Design: `docs/design.md`.
 - Wire encoding and transport: `docs/wire.md`, `docs/conformance.md`.
-- Core system: `docs/core.md`, `internal/core/`, SDK at `sdk/`.
+- Core system: `docs/core.md`, `internal/core/`.
 - Peers and live gates: `docs/testbed.md`.

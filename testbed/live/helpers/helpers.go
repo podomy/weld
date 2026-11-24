@@ -482,7 +482,7 @@ func MustHavePeer(t *testing.T, ctx context.Context, container string) {
 	}
 }
 
-// RepoRoot returns the repository root holding cmd/weld.
+// RepoRoot returns the repository root holding go.mod.
 func RepoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -491,14 +491,14 @@ func RepoRoot(t *testing.T) string {
 	}
 	dir := filepath.Dir(file)
 	for {
-		candidate := filepath.Join(dir, "cmd", "weld")
+		candidate := filepath.Join(dir, "go.mod")
 		info, err := os.Stat(candidate)
-		if err == nil && info.IsDir() {
+		if err == nil && !info.IsDir() {
 			return dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("repo root with cmd/weld not found above %s", file)
+			t.Fatalf("repo root with go.mod not found above %s", file)
 		}
 		dir = parent
 	}
@@ -511,6 +511,10 @@ var (
 )
 
 // BuildWeld builds the weld CLI once per test binary process and returns its path.
+//
+// Deprecated: use stock ros2cli via RunRosEcho and RosPubUntilSeen instead
+// of the weld binary. Kept for other gates during migration, do not use in
+// new ROS to ROS tests.
 //
 // The CLI lives in its own module, so the build runs with GOWORK=off in
 // cmd/weld with the same flags as a per-test build. The build uses
@@ -561,6 +565,9 @@ func EnvWithDomain(domain int) []string {
 
 // RunWeldEcho runs weld echo and returns captured stdout and stderr.
 //
+// Deprecated: use stock ros2cli via RunRosEcho instead of the weld binary.
+// Kept for other gates during migration.
+//
 // The echo timeout bounds the run. EchoMargin lets weld exit on its
 // own timeout and flush before the outer context fires. The echo requests
 // volatile durability, matching ros2 topic echo interop.
@@ -569,6 +576,9 @@ func RunWeldEcho(ctx context.Context, bin, topic string, domain int, echoTimeout
 }
 
 // RunWeldEchoWithDurability runs weld echo with explicit requested durability.
+//
+// Deprecated: use stock ros2cli via RunRosEcho instead of the weld binary.
+// Kept for other gates during migration.
 //
 // Transient local refuses volatile writers through peer side RxO matching,
 // which is how QoS gates prove incompatible pairs stay silent. All other
@@ -590,6 +600,9 @@ func RunWeldEchoWithDurability(ctx context.Context, bin, topic string, domain in
 }
 
 // RunWeldPub runs weld pub once and returns captured output.
+//
+// Deprecated: use stock ros2cli via RosPubUntilSeen instead of the weld
+// binary. Kept for other gates during migration.
 //
 // Weld pub waits for SPDP routes internally before publishing, so the
 // caller only needs a generous outer timeout and no extra retry loop.

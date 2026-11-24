@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
+//nolint:dupl // publish retry helpers share shape across weld and ros2 paths, splitting would obscure live gate flow
 package helpers
 
 import (
@@ -179,6 +180,9 @@ func attemptPollWait(ctx context.Context, pollWait time.Duration, attemptsLeft i
 }
 
 // PublishUntilSeen publishes one weld message and polls the ROS echo log until it holds the payload.
+//
+// Deprecated: use stock ros2cli via RosPubUntilSeen instead of the weld
+// binary. Kept for other gates during migration.
 //
 // It calls RunWeldPub then WaitForFileContains for payload in echoPath, retrying the publish on miss up to maxPubs times.
 // A pub error returns immediately as err with seen false and the last stdout and stderr.

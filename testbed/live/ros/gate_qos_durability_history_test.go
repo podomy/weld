@@ -1,10 +1,12 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
+//nolint:dupl // live gate take helpers repeat similar wire checks across QoS gates
 package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +17,9 @@ import (
 	"time"
 
 	"github.com/podomy/weld/internal/core"
+	"github.com/podomy/weld/internal/transports"
+	"github.com/podomy/weld/internal/transports/dds"
+	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -35,6 +40,9 @@ const (
 	qosDHProbeWait   = 15 * time.Second
 	qosDHCleanWait   = 10 * time.Second
 	qosDHMismatchDur = 8 * time.Second
+	qosDHRepubWait   = 2 * time.Second
+	qosDHPubRetry    = 5 * time.Second
+	qosDHPubInterval = 50 * time.Millisecond
 )
 
 // qosDHCase describes one live durability plus history plus depth combination.
@@ -236,30 +244,6 @@ func qosDHCheckCore(t *testing.T, c qosDHCase) {
 	qosDHCheckIncompatible(t, c, report, offered, requested, publisher, subscriber)
 }
 
-// qosDHAssertCompatibleFlow fails when a compatible echo misses the payload.
-//
-// A clean weld echo with no backend error plus a missing live ID is a flow
-// failure, not a skip. Only no-peer and unsupported flag cases skip.
-func qosDHAssertCompatibleFlow(t *testing.T, c qosDHCase, stdout, stderr, live, payload string) {
-	t.Helper()
-	if !strings.Contains(stdout, live) {
-		t.Fatalf("case %s: weld echo missed live payload %q, want flow for compatible pair\nstdout:\n%s\nstderr:\n%s", c.name, payload, stdout, stderr)
-	}
-}
-
-// qosDHAssertIncompatibleSilent fails when an incompatible pair delivers.
-//
-// Callers pin core.CheckCompatibility incompatible first via qosDHCheckCore,
-// so live delivery must be absent. Silence with a loud core error is the
-// required result.
-func qosDHAssertIncompatibleSilent(t *testing.T, c qosDHCase, stdout, live, payload string) {
-	t.Helper()
-	if strings.Contains(stdout, live) {
-		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow (core.CheckCompatibility reports incompatible)", c.name, payload)
-	}
-	t.Logf("case %s: incompatible pair stayed silent on live ID as required, core error is loud above", c.name)
-}
-
 // qosDHAssertReverseDelivered fails when ROS echo misses the payload.
 //
 // A clean weld pub with sent confirmation plus a missing live ID is a flow
@@ -279,17 +263,89 @@ func qosDHArgv(c qosDHCase) []string {
 	return []string{"--qos-reliability", "reliable", "--qos-durability", c.durability, "--qos-history", c.history, "--qos-depth", c.depth}
 }
 
+// qosDHEncodeString encodes one String sample as XCDR1.
+func qosDHEncodeString(t *testing.T, text string) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	err := enc.WriteString(text)
+	if err != nil {
+		t.Fatalf("qos durability history encode: %v", err)
+	}
+	return enc.Bytes()
+}
+
+// qosDHDecodeString decodes one XCDR1 String sample.
+func qosDHDecodeString(payload []byte) (string, error) {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return "", fmt.Errorf("qos durability history decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("qos durability history decode data: %w", err)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return "", fmt.Errorf("qos durability history finish: %w", err)
+	}
+	return got, nil
+}
+
+// qosDHTakeFailure classifies one TakeBytes error.
+func qosDHTakeFailure(t *testing.T, c qosDHCase, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("case %s: weld take backend error: %v", c.name, terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("case %s: weld take backend error: %v", c.name, terr)
+	}
+	return false
+}
+
+// qosDHTakeForPayload takes until one sample decodes to the payload.
+func qosDHTakeForPayload(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration, c qosDHCase) bool {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if qosDHTakeFailure(t, c, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		got, derr := qosDHDecodeString(msg.Payload)
+		if derr != nil {
+			continue
+		}
+		if got == payload {
+			return true
+		}
+	}
+	return false
+}
+
 // qosDHRunForward runs ROS pub with durability history depth flags.
 //
-// Domain is the allocated exclusive domain plumbed to DockerArgs and weld
-// --domain flags, so parallel workers never share a domain.
+// Domain is the allocated exclusive domain plumbed to DockerArgs, so
+// parallel workers never share a domain.
 //
 // It starts ros2 topic pub with the probed flags, waits for settle, then
-// checks weld echo output for the live ID. Compatible cases must deliver and
-// a missing payload with a clean echo fails. Incompatible cases must stay
-// silent on the live ID and delivery fails; core.CheckCompatibility pins the
-// mismatch loudly first via qosDHCheckCore.
-func qosDHRunForward(t *testing.T, ctx context.Context, bin string, domain int, c qosDHCase) {
+// subscribes via the Weld backend requesting transient_local and takes
+// until one sample decodes to the live payload. Compatible cases must
+// deliver and a missing payload fails. Incompatible cases must stay
+// silent on the live ID and delivery fails; core.CheckCompatibility pins
+// the mismatch loudly first via qosDHCheckCore.
+func qosDHRunForward(t *testing.T, ctx context.Context, domain int, c qosDHCase) {
 	t.Helper()
 	live := helpers.LiveID("qos-dh-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -327,38 +383,39 @@ func qosDHRunForward(t *testing.T, ctx context.Context, bin string, domain int, 
 	helpers.Sleep(ctx, qosDHForwardNap)
 	err = ctx.Err()
 	if err != nil {
-		t.Fatalf("case %s: context ended before echo: %v", c.name, err)
+		t.Fatalf("case %s: context ended before take: %v", c.name, err)
 	}
-	stdout, stderr, err := helpers.RunWeldEchoWithDurability(ctx, bin, topic, domain, qosDHEchoWait, "transient_local")
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "qos-dh-fwd-"+live, "qos-dh") //nolint:gosec // G115: pooled domain fits uint32
+	err = backend.SubscribeWithDurability(ctx, topic, helpers.ForwardStringIDL, helpers.ForwardStringHash, false)
 	if err != nil {
-		t.Fatalf("case %s: weld echo: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+		t.Fatalf("case %s: weld subscribe %s: %v", c.name, topic, err)
 	}
-	combined := stdout + "\n" + stderr
-	if strings.Contains(combined, "not implemented") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
-	}
-	if strings.Contains(combined, "not wired") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
-	}
+	helpers.WaitForTopicDiscovery(ctx, backend, topic)
+	found := qosDHTakeForPayload(t, ctx, backend, topic, payload, qosDHEchoWait, c)
 	if c.compatible {
-		qosDHAssertCompatibleFlow(t, c, stdout, stderr, live, payload)
+		if !found {
+			t.Fatalf("case %s: weld take missed live payload %q, want flow for compatible pair", c.name, payload)
+		}
 		return
 	}
 	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "qos-dh")
-	qosDHAssertIncompatibleSilent(t, c, stdout, live, payload)
+	if found {
+		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow (core.CheckCompatibility reports incompatible)", c.name, payload)
+	}
+	t.Logf("case %s: incompatible pair stayed silent on live ID as required, core error is loud above", c.name)
 }
 
 // qosDHRunReverse runs ROS echo with durability history depth flags.
 //
-// Domain is the allocated exclusive domain plumbed to DockerArgs and weld
-// --domain flags, so parallel workers never share a domain.
+// Domain is the allocated exclusive domain plumbed to DockerArgs, so
+// parallel workers never share a domain.
 //
 // It starts ros2 topic echo with the probed flags, waits for settle, then
-// publishes one weld message and polls the echo log for the live ID.
+// publishes via the Weld backend and polls the echo log for the live ID.
 // Compatible cases must deliver and a missing payload fails. This path is
 // only used for compatible cases because facade transient_local satisfies
 // every reverse request.
-func qosDHRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c qosDHCase) {
+func qosDHRunReverse(t *testing.T, ctx context.Context, domain int, c qosDHCase) {
 	t.Helper()
 	live := helpers.LiveID("qos-dh-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -397,14 +454,20 @@ func qosDHRunReverse(t *testing.T, ctx context.Context, bin string, domain int, 
 	if err != nil {
 		t.Fatalf("case %s: context ended before pub: %v", c.name, err)
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, domain, payload, echoPath, qosDHPollWait, 3)
-	if err != nil {
-		t.Fatalf("case %s: weld pub: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "qos-dh-rev-"+live, "qos-dh") //nolint:gosec // G115: pooled domain fits uint32
+	encoded := qosDHEncodeString(t, payload)
+	got, derr := qosDHDecodeString(encoded)
+	if derr != nil || got != payload {
+		t.Fatalf("case %s: local codec mismatch: %v", c.name, derr)
 	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("case %s: weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", c.name, stdout, stderr)
+	typeHash := helpers.ForwardStringHash
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   encoded,
+		TypeHash:  typeHash,
 	}
-	if !found {
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, qosDHPollWait, qosDHRepubWait, qosDHPubRetry, qosDHPubInterval, "qos-dh") {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("case %s: ros echo missed live payload %q: %v", c.name, payload, rerr)
@@ -418,7 +481,7 @@ func qosDHRunReverse(t *testing.T, ctx context.Context, bin string, domain int, 
 // It skips keep_all live cases with a reason when the peer help probe shows
 // keep_all unsupported. Core truth for keep_all is still pinned by the
 // core-only test which needs no peer flags.
-func qosDHRunCase(t *testing.T, ctx context.Context, bin string, domain int, c qosDHCase, keepAllOk bool) {
+func qosDHRunCase(t *testing.T, ctx context.Context, domain int, c qosDHCase, keepAllOk bool) {
 	t.Helper()
 	t.Cleanup(func() {
 		helpers.AssertNoExcessSkips(t)
@@ -428,10 +491,10 @@ func qosDHRunCase(t *testing.T, ctx context.Context, bin string, domain int, c q
 		qosDHBudgetedSkip(t, fmt.Sprintf("case %s: peer ros-jazzy Jazzy lacks keep_all value, distro pin Jazzy", c.name))
 	}
 	if c.direction == "forward" {
-		qosDHRunForward(t, ctx, bin, domain, c)
+		qosDHRunForward(t, ctx, domain, c)
 		return
 	}
-	qosDHRunReverse(t, ctx, bin, domain, c)
+	qosDHRunReverse(t, ctx, domain, c)
 }
 
 // checkDHCompatibleTable pins all compatible cases stay compatible.
@@ -516,7 +579,6 @@ func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	keepAllOk := qosDHRequireFlags(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
@@ -524,7 +586,7 @@ func TestROSQoSDurabilityHistoryCompatibleDelivers(t *testing.T) {
 	for _, c := range qosDHCompatibleCases() {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
-			qosDHRunCase(t, ctx, bin, subdomain, c, keepAllOk)
+			qosDHRunCase(t, ctx, subdomain, c, keepAllOk)
 		})
 	}
 }
@@ -547,7 +609,6 @@ func TestROSQoSDurabilityHistoryIncompatibleLoud(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	keepAllOk := qosDHRequireFlags(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test.
@@ -557,7 +618,7 @@ func TestROSQoSDurabilityHistoryIncompatibleLoud(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			subCtx, subCancel := context.WithTimeout(ctx, qosDHMismatchDur+2*qosDHEchoWait)
 			defer subCancel()
-			qosDHRunCase(t, subCtx, bin, subdomain, c, keepAllOk)
+			qosDHRunCase(t, subCtx, subdomain, c, keepAllOk)
 		})
 	}
 }

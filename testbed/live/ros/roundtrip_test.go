@@ -38,7 +38,9 @@ const (
 // entry exists. Expires is the fail closed date: before expiry a missing
 // payload with a healthy peer fails with an ALLOWLISTED prefix so it can
 // be counted separately, after expiry the same miss fails with an
-// ALLOWLIST EXPIRED prefix. Both paths fail, never skip.
+// ALLOWLIST EXPIRED prefix. Both paths fail, never skip. Kept for the
+// distro matrix which still exercises weld interop; the ROS to ROS
+// round trip below fails directly without this list.
 type rosPayloadGap struct {
 	distro    string
 	direction string
@@ -79,7 +81,8 @@ func rosPayloadGapEntry(distro, direction string) (rosPayloadGap, bool) {
 // misses. An expired entry fails closed with an ALLOWLIST EXPIRED prefix.
 // A distro and direction pair with no entry fails as an unexpected miss.
 // The caller passes direction as forward or reverse and detail as the peer
-// output for triage.
+// output for triage. Used by the distro matrix; the ROS to ROS tests below
+// fail directly.
 func failOnMissingPayload(t *testing.T, distro, direction, payload, detail string) {
 	t.Helper()
 	now := time.Now()
@@ -94,16 +97,16 @@ func failOnMissingPayload(t *testing.T, distro, direction, payload, detail strin
 	t.Fatalf("missing live payload %q distro %s direction %s with healthy peer:\n%s", payload, distro, direction, detail)
 }
 
-// TestROSForwardWeldEchoSeesROSTalker checks weld echo receives a ROS talker.
+// TestROSForwardWeldEchoSeesROSTalker checks ROS echo receives a ROS talker.
 //
 // It starts ros2 topic pub detached via docker exec -d writing to
 // /testbed/logs/<run-id>.out inside the peer, which is the host file
-// testbed/logs/<run-id>.out through the compose bind mount. It runs weld
-// echo and asserts the echo output holds this run live ID. Topic, payload,
-// and log name all carry the per-run ID so stale runs never mix. Cleanup
-// kills the pidfile PID plus one scoped pkill for the run ID. It skips
-// cleanly when no daemon or peer container is present and never runs in
-// parallel because the allocated domain is exclusive.
+// testbed/logs/<run-id>.out through the compose bind mount. It runs stock
+// ros2 topic echo and asserts the echo output holds this run live ID.
+// Topic, payload, and log name all carry the per-run ID so stale runs never
+// mix. Cleanup kills the pidfile PID plus one scoped pkill for the run ID.
+// It skips cleanly when no daemon or peer container is present and never
+// runs in parallel because the allocated domain is exclusive.
 func TestROSForwardWeldEchoSeesROSTalker(t *testing.T) {
 	t.Parallel()
 	domain := helpers.MustAllocateDomain(t)
@@ -111,7 +114,6 @@ func TestROSForwardWeldEchoSeesROSTalker(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	helpers.SkipIfNoTypeInterface(t, ctx, helpers.Container, domain, helpers.RosBin, rosType, typeProbe)
-	bin := helpers.BuildWeld(t, ctx)
 	live := helpers.LiveID("ros")
 	topic := helpers.LiveTopic(live)
 	payload := "hello forward " + live
@@ -130,33 +132,25 @@ func TestROSForwardWeldEchoSeesROSTalker(t *testing.T) {
 	if ctx.Err() != nil {
 		t.Fatalf("context ended before echo: %v", ctx.Err())
 	}
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, topic, domain, echoWait)
+	stdout, stderr, err := helpers.RunRosEcho(ctx, helpers.Container, topic, domain, echoWait)
 	if err != nil {
-		t.Fatalf("weld echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
-	combined := stdout + "\n" + stderr
-	if strings.Contains(combined, "not implemented") {
-		t.Fatalf("weld echo backend error:\n%s", combined)
-	}
-	if strings.Contains(combined, "not wired") {
-		t.Fatalf("weld echo backend error:\n%s", combined)
+		t.Fatalf("ros echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
 	if !strings.Contains(stdout, live) {
-		detail := fmt.Sprintf("stdout:\n%s\nstderr:\n%s", stdout, stderr)
-		failOnMissingPayload(t, "jazzy", "forward", payload, detail)
+		t.Fatalf("missing live payload %q distro jazzy direction forward with healthy peer:\nstdout:\n%s\nstderr:\n%s", payload, stdout, stderr)
 	}
 }
 
-// TestROSReverseROSEchoSeesWeldPub checks ros2 topic echo receives weld pub.
+// TestROSReverseROSEchoSeesWeldPub checks ros2 topic echo receives ros2 pub.
 //
 // It starts ros2 topic echo detached via docker exec -d writing to
 // /testbed/logs/<run-id>.out inside the peer, which is the host file
 // testbed/logs/<run-id>.out through the compose bind mount. It publishes
-// one weld message that waits for routes internally, then polls the host
-// file directly with no docker exec cat per poll. Topic, payload, and log
-// name all carry the per-run ID, and cleanup kills the pidfile PID plus
-// one scoped pkill for the topic. It skips cleanly when no daemon or peer
-// container is present and never runs in parallel.
+// via stock ros2 topic pub then polls the host file directly with no docker
+// exec cat per poll. Topic, payload, and log name all carry the per-run ID,
+// and cleanup kills the pidfile PID plus one scoped pkill for the topic. It
+// skips cleanly when no daemon or peer container is present and never runs
+// in parallel.
 func TestROSReverseROSEchoSeesWeldPub(t *testing.T) {
 	t.Parallel()
 	domain := helpers.MustAllocateDomain(t)
@@ -164,7 +158,6 @@ func TestROSReverseROSEchoSeesWeldPub(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	helpers.SkipIfNoTypeInterface(t, ctx, helpers.Container, domain, helpers.RosBin, rosType, typeProbe)
-	bin := helpers.BuildWeld(t, ctx)
 	live := helpers.LiveID("ros")
 	topic := helpers.LiveTopic(live)
 	payload := "hello reverse " + live
@@ -183,18 +176,15 @@ func TestROSReverseROSEchoSeesWeldPub(t *testing.T) {
 	if ctx.Err() != nil {
 		t.Fatalf("context ended before pub: %v", ctx.Err())
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, domain, payload, echoPath, pollWait, 3)
+	found, stdout, stderr, err := helpers.RosPubUntilSeen(ctx, helpers.Container, topic, domain, payload, echoPath, pollWait, 3)
 	if err != nil {
-		t.Fatalf("weld pub: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		t.Fatalf("ros pub: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
 	if !found {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads/writes controlled temp or repo file path
 		if rerr != nil {
 			t.Fatalf("ros2 topic echo did not see live payload %q: %v", payload, rerr)
 		}
-		failOnMissingPayload(t, "jazzy", "reverse", payload, "echo output:\n"+string(data))
+		t.Fatalf("missing live payload %q distro jazzy direction reverse with healthy peer:\necho output:\n%s", payload, string(data))
 	}
 }

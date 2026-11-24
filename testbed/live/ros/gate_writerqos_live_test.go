@@ -21,10 +21,13 @@
 // CheckWireCompatibility leg proves the translated best effort offer
 // itself is compatible. The volatile leg uses a topic exchange with the
 // same durability wire value (kind 0) that service endpoints announce.
+//
+//nolint:dupl // live gate take helpers repeat similar wire checks across QoS gates
 package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,7 +37,9 @@ import (
 	"time"
 
 	"github.com/podomy/weld/internal/core"
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds"
+	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -54,6 +59,9 @@ const (
 	wqProbeWait    = 15 * time.Second
 	wqCleanWait    = 10 * time.Second
 	wqMismatchWait = 8 * time.Second
+	wqPubRetry     = 5 * time.Second
+	wqPubInterval  = 50 * time.Millisecond
+	wqRepubWait    = 2 * time.Second
 )
 
 // wqReliability sets reliability from its flag name.
@@ -162,9 +170,101 @@ func wqRequireQoSFlags(t *testing.T, ctx context.Context, domain int) {
 	}
 }
 
-// wqSetup allocates one exclusive domain, skips without a peer or flags,
-// and builds weld once per test binary process.
-func wqSetup(t *testing.T) (context.Context, context.CancelFunc, string, int) {
+// wqEncodeString encodes one String payload as XCDR1 for Weld publish.
+func wqEncodeString(t *testing.T, text string) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	err := enc.WriteString(text)
+	if err != nil {
+		t.Fatalf("writerqos encode: %v", err)
+	}
+	return enc.Bytes()
+}
+
+// wqDecodeString decodes one String payload and checks the live payload.
+func wqDecodeString(payload []byte, want string) error {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return fmt.Errorf("writerqos decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return fmt.Errorf("writerqos decode data: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("writerqos data %q wants %q", got, want)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return fmt.Errorf("writerqos finish: %w", err)
+	}
+	return nil
+}
+
+// wqTakeFailure classifies one TakeBytes error for the take loops.
+func wqTakeFailure(t *testing.T, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("writerqos take backend error: %v", terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("writerqos take backend error: %v", terr)
+	}
+	return false
+}
+
+// wqTakeUntilLive takes until one sample decodes to the live payload.
+func wqTakeUntilLive(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration) {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if wqTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if wqDecodeString(msg.Payload, payload) != nil {
+			continue
+		}
+		return
+	}
+	t.Fatalf("weld take did not see writerqos payload %q on %s after %v", payload, topic, timeout)
+}
+
+// wqAssertSilent takes for a bounded window and fails on live delivery.
+func wqAssertSilent(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration) {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if wqTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if wqDecodeString(msg.Payload, payload) == nil {
+			t.Fatalf("incompatible pair delivered payload %q, want no flow", payload)
+		}
+	}
+}
+
+// wqSetup allocates one exclusive domain and skips without a peer or flags.
+func wqSetup(t *testing.T) (context.Context, context.CancelFunc, int) {
 	t.Helper()
 	t.Cleanup(func() {
 		helpers.AssertNoExcessSkips(t)
@@ -174,9 +274,8 @@ func wqSetup(t *testing.T) (context.Context, context.CancelFunc, string, int) {
 	ctx, cancel := context.WithTimeout(context.Background(), wqTestTimeout)
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	wqRequireQoSFlags(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 
-	return ctx, cancel, bin, domain
+	return ctx, cancel, domain
 }
 
 // wqRunRosPub starts a ROS talker with explicit QoS flags and a per-run payload.
@@ -279,7 +378,7 @@ func wqRunRosEcho(t *testing.T, ctx context.Context, domain int, topic, echoRel,
 // direction flows while the inline leg pins the translated best effort
 // offer itself.
 func TestWriterQoSLiveBestEffortOfferFlows(t *testing.T) {
-	ctx, cancel, bin, domain := wqSetup(t)
+	ctx, cancel, domain := wqSetup(t)
 	defer cancel()
 
 	offered, err := wqProfile("best_effort", "volatile")
@@ -309,16 +408,23 @@ func TestWriterQoSLiveBestEffortOfferFlows(t *testing.T) {
 		t.Fatalf("context ended before pub: %v", ctx.Err())
 	}
 
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, liveTopic, domain, payload, echoPath, wqPollWait, 3)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, liveTopic, helpers.ForwardStringHash, wqProbeWait, "writerqos")
 	if err != nil {
-		t.Fatalf("weld pub: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Fatalf("hash unavailable for topic %s: %v", liveTopic, err)
 	}
-
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	t.Logf("writerqos reverse topic %s hash %s", liveTopic, typeHash)
+	encoded := wqEncodeString(t, payload)
+	err = wqDecodeString(encoded, payload)
+	if err != nil {
+		t.Fatalf("local codec: %v", err)
 	}
-
-	if !found {
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "wq-best-effort-"+live, "writerqos") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	msg := transports.OutgoingMessage{
+		TopicName: liveTopic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   encoded,
+	}
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, wqPollWait, wqRepubWait, wqPubRetry, wqPubInterval, "writerqos-best-effort") {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("ros echo missed live payload %q: %v", payload, rerr)
@@ -336,7 +442,7 @@ func TestWriterQoSLiveBestEffortOfferFlows(t *testing.T) {
 // volatile talker to weld echo with volatile durability and requires
 // delivery with the same wire durability value service endpoints announce.
 func TestWriterQoSLiveVolatileServiceEquivalent(t *testing.T) {
-	ctx, cancel, bin, domain := wqSetup(t)
+	ctx, cancel, domain := wqSetup(t)
 	defer cancel()
 
 	offered := core.ResolveSystemDefaults(core.ServicesDefaultQoS())
@@ -358,20 +464,20 @@ func TestWriterQoSLiveVolatileServiceEquivalent(t *testing.T) {
 	helpers.Sleep(ctx, wqForwardNap)
 
 	if ctx.Err() != nil {
-		t.Fatalf("context ended before echo: %v", ctx.Err())
+		t.Fatalf("context ended before take: %v", ctx.Err())
 	}
 
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, liveTopic, domain, wqEchoWait)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, liveTopic, helpers.ForwardStringHash, wqProbeWait, "writerqos")
 	if err != nil {
-		t.Fatalf("weld echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Fatalf("hash unavailable for topic %s: %v", liveTopic, err)
 	}
-
-	combined := stdout + "\n" + stderr
-	helpers.AssertNoBackendError(t, "volatile-service-equivalent", combined)
-
-	if !strings.Contains(stdout, payload) {
-		t.Fatalf("weld echo missed live payload %q, want flow for compatible pair\nstdout:\n%s\nstderr:\n%s", payload, stdout, stderr)
+	t.Logf("writerqos forward topic %s hash %s", liveTopic, typeHash)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "wq-volatile-live", "writerqos") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	err = helpers.SubscribeLiveReader(ctx, backend, liveTopic, helpers.ForwardStringIDL, typeHash, "writerqos")
+	if err != nil {
+		t.Fatalf("subscribe %s: %v", liveTopic, err)
 	}
+	wqTakeUntilLive(t, ctx, backend, liveTopic, payload, wqEchoWait)
 }
 
 // TestWriterQoSLiveIncompatibleRefusedLoudly proves the blocking direction is refused loudly.
@@ -382,7 +488,7 @@ func TestWriterQoSLiveVolatileServiceEquivalent(t *testing.T) {
 // weld echo with a reliable requester and requires silence on the live ID:
 // delivery would mean the incompatible pair flowed.
 func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
-	ctx, cancel, bin, domain := wqSetup(t)
+	ctx, cancel, domain := wqSetup(t)
 	defer cancel()
 
 	offered, err := wqProfile("best_effort", "transient_local")
@@ -406,16 +512,8 @@ func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
 	helpers.Sleep(subCtx, wqForwardNap)
 
 	if subCtx.Err() != nil {
-		t.Fatalf("context ended before echo: %v", subCtx.Err())
+		t.Fatalf("context ended before take: %v", subCtx.Err())
 	}
-
-	stdout, stderr, err := helpers.RunWeldEcho(subCtx, bin, liveTopic, domain, wqEchoWait)
-	if err != nil {
-		t.Fatalf("weld echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
-
-	combined := stdout + "\n" + stderr
-	helpers.AssertNoBackendError(t, "reliable-requester-vs-best-effort-offer", combined)
 
 	if talker.Process == nil {
 		t.Fatalf("ROS talker missing process, cannot judge silence as refusal")
@@ -423,15 +521,23 @@ func TestWriterQoSLiveIncompatibleRefusedLoudly(t *testing.T) {
 	if talker.ProcessState != nil && talker.ProcessState.Exited() {
 		t.Fatalf("ROS talker exited, cannot judge silence as refusal")
 	}
+	typeHash, err := helpers.ResolveTopicHash(subCtx, helpers.Container, domain, helpers.RosBin, liveTopic, helpers.ForwardStringHash, wqProbeWait, "writerqos")
+	if err != nil {
+		t.Fatalf("hash unavailable for topic %s: %v", liveTopic, err)
+	}
+	t.Logf("writerqos mismatch topic %s hash %s", liveTopic, typeHash)
+	backend := helpers.MustOpenLiveBackend(t, subCtx, uint32(domain), "wq-mismatch-"+live, "writerqos") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	err = helpers.SubscribeLiveReader(subCtx, backend, liveTopic, helpers.ForwardStringIDL, typeHash, "writerqos")
+	if err != nil {
+		t.Fatalf("subscribe %s: %v", liveTopic, err)
+	}
 	probe := helpers.MustOpenLiveBackend(t, subCtx, uint32(domain), "wq-probe-"+live, "wq-probe") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
 	probeErr := probe.Subscribe(subCtx, liveTopic, helpers.ForwardStringIDL, helpers.ForwardStringHash)
 	if probeErr != nil {
 		t.Fatalf("probe subscribe for SEDP visibility: %v", probeErr)
 	}
 	helpers.WaitForSEDPRemote(t, subCtx, probe, liveTopic, "ROS talker writer", helpers.SEDPRemoteTimeout)
-	if strings.Contains(stdout, payload) {
-		t.Fatalf("incompatible pair delivered payload %q, want no flow (gate reports incompatible with reliability named)", payload)
-	}
+	wqAssertSilent(t, subCtx, backend, liveTopic, payload, wqMismatchWait)
 
 	t.Logf("incompatible pair stayed silent on live ID as required, reliability refusal is loud above")
 }

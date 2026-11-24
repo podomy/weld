@@ -1,10 +1,12 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
+//nolint:dupl // live gate take helpers repeat similar wire checks across QoS gates
 package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +17,9 @@ import (
 	"time"
 
 	"github.com/podomy/weld/internal/core"
+	"github.com/podomy/weld/internal/transports"
+	"github.com/podomy/weld/internal/transports/dds"
+	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -33,6 +38,9 @@ const (
 	qosProbeWait    = 15 * time.Second
 	qosCleanWait    = 10 * time.Second
 	qosMismatchWait = 8 * time.Second
+	qosPubRetry     = 5 * time.Second
+	qosPubInterval  = 50 * time.Millisecond
+	qosRepubWait    = 2 * time.Second
 )
 
 // qosCase describes one live QoS combination.
@@ -224,7 +232,100 @@ func qosArgv(c qosCase) []string {
 	return []string{"--qos-reliability", c.reliability, "--qos-durability", c.durability, "--qos-history", c.history, "--qos-depth", c.depth}
 }
 
-// qosRunForward runs ROS pub with QoS flags and checks weld echo output.
+// qosEncodeString encodes one String payload as XCDR1 for Weld publish.
+func qosEncodeString(t *testing.T, text string) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	err := enc.WriteString(text)
+	if err != nil {
+		t.Fatalf("qos encode: %v", err)
+	}
+	return enc.Bytes()
+}
+
+// qosDecodeString decodes one String payload and checks the live payload.
+func qosDecodeString(payload []byte, want string) error {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return fmt.Errorf("qos decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return fmt.Errorf("qos decode data: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("qos data %q wants %q", got, want)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return fmt.Errorf("qos finish: %w", err)
+	}
+	return nil
+}
+
+// qosTakeFailure classifies one TakeBytes error for the take loops.
+func qosTakeFailure(t *testing.T, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("qos take backend error: %v", terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("qos take backend error: %v", terr)
+	}
+	return false
+}
+
+// qosTakeUntilLive takes until one sample decodes to the live payload.
+func qosTakeUntilLive(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration) {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if qosTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if qosDecodeString(msg.Payload, payload) != nil {
+			continue
+		}
+		return
+	}
+	t.Fatalf("weld take did not see qos payload %q on %s after %v", payload, topic, timeout)
+}
+
+// qosAssertSilent takes for a bounded window and fails on live delivery.
+func qosAssertSilent(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration) {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if qosTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if qosDecodeString(msg.Payload, payload) == nil {
+			t.Fatalf("incompatible pair delivered payload %q, want no flow", payload)
+		}
+	}
+}
+
+// qosRunForward runs ROS pub with QoS flags and checks Weld backend take.
 // requireTalkerAliveForSilence proves the ROS talker is running and visible
 // on SEDP before judging silence as refusal. A dead or undiscovered talker
 // would also stay silent, so the check fails loudly instead of passing a
@@ -245,7 +346,7 @@ func requireTalkerAliveForSilence(t *testing.T, ctx context.Context, domain int,
 	helpers.WaitForSEDPRemote(t, ctx, probe, topic, "ROS talker writer", helpers.SEDPRemoteTimeout)
 }
 
-func qosRunForward(t *testing.T, ctx context.Context, bin string, domain int, c qosCase) {
+func qosRunForward(t *testing.T, ctx context.Context, domain int, c qosCase) {
 	t.Helper()
 	live := helpers.LiveID("qos-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -282,34 +383,29 @@ func qosRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 	})
 	helpers.Sleep(ctx, qosForwardNap)
 	if ctx.Err() != nil {
-		t.Fatalf("case %s: context ended before echo: %v", c.name, ctx.Err())
+		t.Fatalf("case %s: context ended before take: %v", c.name, ctx.Err())
 	}
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, topic, domain, qosEchoWait)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, helpers.ForwardStringHash, qosProbeWait, "qos")
 	if err != nil {
-		t.Fatalf("case %s: weld echo: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+		t.Fatalf("case %s: hash unavailable for topic %s: %v", c.name, topic, err)
 	}
-	combined := stdout + "\n" + stderr
-	if strings.Contains(combined, "not implemented") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
-	}
-	if strings.Contains(combined, "not wired") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
+	t.Logf("case %s: forward topic %s hash %s", c.name, topic, typeHash)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "qos-"+c.name+"-"+live, "qos") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	err = helpers.SubscribeLiveReader(ctx, backend, topic, helpers.ForwardStringIDL, typeHash, "qos")
+	if err != nil {
+		t.Fatalf("case %s: subscribe %s: %v", c.name, topic, err)
 	}
 	if c.compatible {
-		if !strings.Contains(stdout, live) {
-			t.Fatalf("case %s: weld echo missed live payload %q\nstdout:\n%s\nstderr:\n%s", c.name, payload, stdout, stderr)
-		}
+		qosTakeUntilLive(t, ctx, backend, topic, payload, qosEchoWait)
 		return
 	}
 	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "qos")
-	if strings.Contains(stdout, live) {
-		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow", c.name, payload)
-	}
+	qosAssertSilent(t, ctx, backend, topic, payload, qosMismatchWait)
 	t.Logf("case %s: incompatible pair stayed silent on live ID as required, core error is loud above", c.name)
 }
 
-// qosRunReverse runs ROS echo with QoS flags and checks weld pub delivery.
-func qosRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c qosCase) {
+// qosRunReverse runs ROS echo with QoS flags and checks Weld backend publish delivery.
+func qosRunReverse(t *testing.T, ctx context.Context, domain int, c qosCase) {
 	t.Helper()
 	live := helpers.LiveID("qos-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -347,14 +443,23 @@ func qosRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 	if ctx.Err() != nil {
 		t.Fatalf("case %s: context ended before pub: %v", c.name, ctx.Err())
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, domain, payload, echoPath, qosPollWait, 3)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, helpers.ForwardStringHash, qosProbeWait, "qos")
 	if err != nil {
-		t.Fatalf("case %s: weld pub: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+		t.Fatalf("case %s: hash unavailable for topic %s: %v", c.name, topic, err)
 	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("case %s: weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", c.name, stdout, stderr)
+	t.Logf("case %s: reverse topic %s hash %s", c.name, topic, typeHash)
+	encoded := qosEncodeString(t, payload)
+	err = qosDecodeString(encoded, payload)
+	if err != nil {
+		t.Fatalf("case %s: local codec: %v", c.name, err)
 	}
-	if !found {
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "qos-rev-"+c.name+"-"+live, "qos") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   encoded,
+	}
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, qosPollWait, qosRepubWait, qosPubRetry, qosPubInterval, "qos-"+c.name) {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("case %s: ros echo missed live payload %q: %v", c.name, payload, rerr)
@@ -364,14 +469,14 @@ func qosRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 }
 
 // qosRunCase checks core loudly then runs the live direction.
-func qosRunCase(t *testing.T, ctx context.Context, bin string, domain int, c qosCase) {
+func qosRunCase(t *testing.T, ctx context.Context, domain int, c qosCase) {
 	t.Helper()
 	qosCheckCore(t, c)
 	if c.direction == "forward" {
-		qosRunForward(t, ctx, bin, domain, c)
+		qosRunForward(t, ctx, domain, c)
 		return
 	}
-	qosRunReverse(t, ctx, bin, domain, c)
+	qosRunReverse(t, ctx, domain, c)
 }
 
 // TestROSQoSFacadeProfile pins the single advertised facade profile.
@@ -477,7 +582,6 @@ func TestROSQoSCompatibleDelivers(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	qosRequireFlags(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test. Matrix subtests then
@@ -495,7 +599,7 @@ func TestROSQoSCompatibleDelivers(t *testing.T) {
 	for _, c := range selected {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
-			qosRunCase(t, ctx, bin, subdomain, c)
+			qosRunCase(t, ctx, subdomain, c)
 		})
 	}
 }
@@ -517,7 +621,6 @@ func TestROSQoSIncompatibleLoud(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	qosRequireFlags(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 	// The outer domain served only the flag probe. Release it before the
 	// subtests so concurrent workers share the 32-domain pool instead of
 	// each holding two domains for the whole test. Matrix mismatch subtests
@@ -536,7 +639,7 @@ func TestROSQoSIncompatibleLoud(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			subCtx, subCancel := context.WithTimeout(ctx, qosMismatchWait+2*qosEchoWait)
 			defer subCancel()
-			qosRunCase(t, subCtx, bin, subdomain, c)
+			qosRunCase(t, subCtx, subdomain, c)
 		})
 	}
 }

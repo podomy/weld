@@ -5,6 +5,7 @@ package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -66,14 +67,76 @@ func durPythonTransientPub(topic, live string) []string {
 	return []string{"python3", "-c", script}
 }
 
+// durDecodeBacklogSample decodes one XCDR String sample.
+func durDecodeBacklogSample(payload []byte) (string, error) {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return "", fmt.Errorf("durability backlog decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("durability backlog decode data: %w", err)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return "", fmt.Errorf("durability backlog finish: %w", err)
+	}
+	return got, nil
+}
+
+// durTakeBacklogFailure classifies one TakeBytes error.
+func durTakeBacklogFailure(t *testing.T, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("durability backlog take backend error: %v", terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("durability backlog take backend error: %v", terr)
+	}
+	return false
+}
+
+// durCollectBacklog takes until every distinct sample arrives at least once.
+func durCollectBacklog(t *testing.T, ctx context.Context, backend *dds.Backend, topic, live string, timeout time.Duration) map[string]int {
+	t.Helper()
+	counts := make(map[string]int)
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if durTakeBacklogFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		got, derr := durDecodeBacklogSample(msg.Payload)
+		if derr != nil {
+			continue
+		}
+		if !strings.Contains(got, live) {
+			continue
+		}
+		counts[got]++
+	}
+	return counts
+}
+
 // TestDurabilityLateJoinerSeesCycloneBacklog checks a late Weld reader replays Cyclone backlog.
 //
 // A keep-all rclpy publisher on the Cyclone stack emits six distinct
 // samples, then keeps the writer alive with a slow identical tail that
-// never evicts. Heartbeats keep flowing, so the late Weld echo NACKs the
+// never evicts. Heartbeats keep flowing, so the late Weld reader NACKs the
 // gap and repairs the full backlog; the gate asserts every distinct
-// sample arrives at least once. A waiter echo runs alongside publishing
-// only to unlock ros2-style matching promptly; the assertion echo joins
+// sample arrives at least once. A waiter reader runs alongside publishing
+// only to unlock ros2-style matching promptly; the assertion reader joins
 // after the freeze. It skips only for no peer or a missing std_msgs type.
 func TestDurabilityLateJoinerSeesCycloneBacklog(t *testing.T) {
 	t.Parallel()
@@ -83,7 +146,6 @@ func TestDurabilityLateJoinerSeesCycloneBacklog(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	helpers.SkipIfNoTypeInterface(t, ctx, helpers.Container, domain, helpers.RosBin, helpers.RosType, durBacklogTypeProbe)
-	bin := helpers.BuildWeld(t, ctx)
 
 	live := helpers.LiveID("dur-backlog-fwd")
 	topic := helpers.LiveTopic(live)
@@ -101,6 +163,13 @@ func TestDurabilityLateJoinerSeesCycloneBacklog(t *testing.T) {
 		helpers.StopPeerProcAndWait(cleanupCtx, helpers.Container, domain, pubPid, pubID)
 	})
 
+	waiter := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "dur-backlog-waiter-"+live, "durability-backlog") //nolint:gosec // G115: pooled domain fits uint32
+	err = waiter.SubscribeWithDurability(ctx, topic, helpers.ForwardStringIDL, helpers.ForwardStringHash, false)
+	if err != nil {
+		t.Fatalf("waiter subscribe %s: %v", topic, err)
+	}
+	helpers.WaitForTopicDiscovery(ctx, waiter, topic)
+
 	published := make(chan struct{})
 	go func() {
 		defer close(published)
@@ -111,30 +180,41 @@ func TestDurabilityLateJoinerSeesCycloneBacklog(t *testing.T) {
 	waiterDone := make(chan struct{})
 	go func() {
 		defer close(waiterDone)
-		_, _, _ = helpers.RunWeldEchoWithDurability(waiterCtx, bin, topic, domain, durBacklogTimeout, "transient_local") //nolint:errcheck // waiter output is intentionally discarded
+		for waiterCtx.Err() == nil {
+			_, terr := waiter.TakeBytes(waiterCtx)
+			if terr != nil {
+				return
+			}
+		}
 	}()
 
 	<-published
 	waiterCancel()
 	<-waiterDone
 	if ctx.Err() != nil {
-		t.Fatalf("context ended before late echo: %v", ctx.Err())
+		t.Fatalf("context ended before late take: %v", ctx.Err())
 	}
-
-	stdout, stderr, err := helpers.RunWeldEchoWithDurability(ctx, bin, topic, domain, durBacklogEchoWait, "transient_local")
+	err = waiter.Close()
 	if err != nil {
-		t.Fatalf("late weld echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Logf("close waiter backend: %v", err)
 	}
 
-	helpers.AssertNoBackendError(t, "dur-backlog-fwd", stdout+"\n"+stderr)
+	late := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "dur-backlog-fwd-"+live, "durability-backlog") //nolint:gosec // G115: pooled domain fits uint32
+	err = late.SubscribeWithDurability(ctx, topic, helpers.ForwardStringIDL, helpers.ForwardStringHash, false)
+	if err != nil {
+		t.Fatalf("late subscribe %s: %v", topic, err)
+	}
+	helpers.WaitForTopicDiscovery(ctx, late, topic)
 
-	// Keep-all never evicts, so the late echo must see every distinct
+	counts := durCollectBacklog(t, ctx, late, topic, live, durBacklogEchoWait)
+
+	// Keep-all never evicts, so the late reader must see every distinct
 	// sample at least once; the slow tail keeps heartbeats flowing so
 	// the NACK repair fires deterministically.
 	for i := range durForwardSamples {
 		want := fmt.Sprintf("hello-%d-%s", i, live)
-		if got := strings.Count(stdout, want); got < 1 {
-			t.Fatalf("late weld echo saw %q %d times, want at least once\nstdout:\n%s\nstderr:\n%s", want, got, stdout, stderr)
+		if got := counts[want]; got < 1 {
+			t.Fatalf("late weld take saw %q %d times, want at least once counts %v", want, got, counts)
 		}
 	}
 }

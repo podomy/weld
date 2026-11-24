@@ -20,9 +20,8 @@
 FROM golang:1.26-bookworm AS builder
 WORKDIR /src
 # No go.sum in the repo (stdlib only); copy the tree and build static.
-# CGO_ENABLED=0 is safe: internal/transports/dds is pure Go, and the repo
-# contains no `import "C"` (verified by grep; only the letter C in test
-# data matched).
+# CGO_ENABLED=0 is safe: the bench agent pulls no cgo package, and cgo
+# stays confined to internal/rmwbridge for the future rmw_weld shim.
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /bench-agent ./testbed/bench/agent
 

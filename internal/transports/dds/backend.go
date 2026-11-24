@@ -4342,6 +4342,24 @@ func (b *Backend) hasMatchingRemoteReader(ep SEDPEndpoint) bool {
 	return false
 }
 
+// RemoteEndpoints returns a sorted copy of remote SEDP endpoints.
+//
+// It merges nothing and filters nothing: callers decide topic versus
+// service use by Kind. A nil SEDP index reports nil so callers before
+// JoinDiscovery see an empty view without a nil panic. It self-locks
+// with RLock through the SEDP snapshot and is safe for concurrent use.
+func (b *Backend) RemoteEndpoints() []SEDPEndpoint {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return nil
+	}
+
+	return sedpIdx.RemoteEndpoints()
+}
+
 // HasRemoteEndpoint reports whether a remote endpoint for topic exists.
 //
 // It scans remote SEDP endpoints for equal ROS topic and returns true on

@@ -7,10 +7,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -28,21 +28,26 @@ const (
 	matrixTestTimeout = 2 * time.Minute
 	matrixCleanWait   = 10 * time.Second
 	matrixTypeProbe   = 5 * time.Second
+	matrixPubRetry    = 5 * time.Second
+	matrixPubInterval = 50 * time.Millisecond
+	matrixRepubWait   = 2 * time.Second
 )
 
-// matrixRunForward checks weld echo sees a ROS talker for one distro peer.
+// matrixRunForward checks Weld backend take sees a ROS talker for one distro peer.
 //
-// It starts ros2 topic pub detached via docker exec -d writing to
+// It starts ros2 topic pub detached via StartDistroPeerProc writing to
 // /testbed/logs/<run-id>.out inside the peer, which is the host file
-// testbed/logs/<run-id>.out through the compose bind mount. It runs weld
-// echo and asserts the echo output holds this run live ID. Container,
-// setup, and domain all come from peer so Humble and Rolling reuse this
-// path with no duplication. Cleanup kills the pidfile PID plus one scoped
-// pkill for the run ID. It skips cleanly when the peer container is absent
-// as verified by docker inspect, and it skips when the peer lacks the
-// std_msgs String interface. A healthy echo that misses the live payload
-// fails through the shared allowlist path, never skips.
-func matrixRunForward(t *testing.T, ctx context.Context, bin string, peer helpers.DistroPeer) {
+// testbed/logs/<run-id>.out through the compose bind mount. It subscribes
+// via the Weld backend and takes until one sample decodes to the live
+// payload. Container, setup, and domain all come from peer so Humble and
+// Rolling reuse this path with no duplication. Cleanup kills the pidfile
+// PID plus one scoped pkill for the run ID. It skips cleanly when the peer
+// container is absent as verified by docker inspect, and it skips when the
+// peer lacks the std_msgs String interface. A healthy take that misses the
+// live payload fails through the shared allowlist path, never skips.
+//
+//nolint:gocognit,cyclop // live forward gate sequences talker, take, and payload verdict in one run, splitting would obscure intent
+func matrixRunForward(t *testing.T, ctx context.Context, peer helpers.DistroPeer) {
 	t.Helper()
 	helpers.SkipIfNoDistroPeer(t, ctx, peer)
 	helpers.SkipIfNoDistroTypeInterface(t, ctx, peer, helpers.RosType, matrixTypeProbe)
@@ -69,39 +74,54 @@ func matrixRunForward(t *testing.T, ctx context.Context, bin string, peer helper
 	})
 	helpers.Sleep(ctx, matrixForwardNap)
 	if ctx.Err() != nil {
-		t.Fatalf("context ended before echo: %v", ctx.Err())
+		t.Fatalf("context ended before take: %v", ctx.Err())
 	}
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, topic, peer.Domain, matrixEchoWait)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(peer.Domain), "ros-"+peer.Distro+"-fwd-"+live, peer.Distro+"-fwd") //nolint:gosec // G115: distro domains 42 through 44 fit uint32
+	typeHash, err := helpers.ResolveTopicHash(ctx, peer.Container, peer.Domain, peer.RosBin, topic, helpers.ForwardStringHash, matrixTypeProbe, peer.Distro+"-fwd")
 	if err != nil {
-		t.Fatalf("weld echo %s: %v\nstdout:\n%s\nstderr:\n%s", peer.Distro, err, stdout, stderr)
+		t.Fatalf("matrix hash unavailable for topic %s: %v", topic, err)
 	}
-	combined := stdout + "\n" + stderr
-	if strings.Contains(combined, "not implemented") {
-		t.Fatalf("weld echo backend error:\n%s", combined)
+	err = helpers.SubscribeLiveReader(ctx, backend, topic, helpers.ForwardStringIDL, typeHash, peer.Distro+"-fwd")
+	if err != nil {
+		t.Fatalf("matrix subscribe %s: %v", topic, err)
 	}
-	if strings.Contains(combined, "not wired") {
-		t.Fatalf("weld echo backend error:\n%s", combined)
+	takeCtx, takeCancel := context.WithTimeout(ctx, matrixEchoWait)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if keyedLiveTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if keyedLiveDecodeString(msg.Payload, payload) != nil {
+			continue
+		}
+		return
 	}
-	if !strings.Contains(stdout, live) {
-		detail := fmt.Sprintf("distro %s stdout:\n%s\nstderr:\n%s", peer.Distro, stdout, stderr)
-		failOnMissingPayload(t, peer.Distro, "forward", payload, detail)
-	}
+	detail := fmt.Sprintf("distro %s topic %s hash %s", peer.Distro, topic, typeHash)
+	failOnMissingPayload(t, peer.Distro, "forward", payload, detail)
 }
 
-// matrixRunReverse checks ros2 topic echo sees weld pub for one distro peer.
+// matrixRunReverse checks ros2 topic echo sees Weld backend pub for one distro peer.
 //
-// It starts ros2 topic echo detached via docker exec -d writing to
+// It starts ros2 topic echo detached via StartDistroPeerProc writing to
 // /testbed/logs/<run-id>.out inside the peer, which is the host file
-// testbed/logs/<run-id>.out through the compose bind mount. It publishes
-// one weld message that waits for routes internally, then polls the host
-// file directly with no docker exec cat per poll. Container, setup, and
-// domain all come from peer so Humble and Rolling reuse this path with no
-// duplication. Cleanup kills the pidfile PID plus one scoped pkill for the
-// topic. It skips cleanly when the peer container is absent as verified by
-// docker inspect, and it skips when the peer lacks the std_msgs String
-// interface. A healthy pub that the peer echo misses fails through the
-// shared allowlist path, never skips.
-func matrixRunReverse(t *testing.T, ctx context.Context, bin string, peer helpers.DistroPeer) {
+// testbed/logs/<run-id>.out through the compose bind mount. It encodes the
+// live payload as XCDR1 String and publishes via the Weld backend with
+// publish until echo retry, then polls the host file directly with no
+// docker exec cat per poll. Container, setup, and domain all come from peer
+// so Humble and Rolling reuse this path with no duplication. Cleanup kills
+// the pidfile PID plus one scoped pkill for the topic. It skips cleanly
+// when the peer container is absent as verified by docker inspect, and it
+// skips when the peer lacks the std_msgs String interface. A healthy pub
+// that the peer echo misses fails through the shared allowlist path, never
+// skips.
+func matrixRunReverse(t *testing.T, ctx context.Context, peer helpers.DistroPeer) {
 	t.Helper()
 	helpers.SkipIfNoDistroPeer(t, ctx, peer)
 	helpers.SkipIfNoDistroTypeInterface(t, ctx, peer, helpers.RosType, matrixTypeProbe)
@@ -130,14 +150,22 @@ func matrixRunReverse(t *testing.T, ctx context.Context, bin string, peer helper
 	if ctx.Err() != nil {
 		t.Fatalf("context ended before pub: %v", ctx.Err())
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, peer.Domain, payload, echoPath, matrixPollWait, 3)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(peer.Domain), "ros-"+peer.Distro+"-rev-"+live, peer.Distro+"-rev") //nolint:gosec // G115: distro domains 42 through 44 fit uint32
+	typeHash, err := helpers.ResolveTopicHash(ctx, peer.Container, peer.Domain, peer.RosBin, topic, helpers.ForwardStringHash, matrixTypeProbe, peer.Distro+"-rev")
 	if err != nil {
-		t.Fatalf("weld pub %s: %v\nstdout:\n%s\nstderr:\n%s", peer.Distro, err, stdout, stderr)
+		t.Fatalf("matrix hash unavailable for topic %s: %v", topic, err)
 	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	payloadBytes := keyedLiveEncodeString(t, payload)
+	if err := keyedLiveDecodeString(payloadBytes, payload); err != nil {
+		t.Fatalf("matrix local codec: %v", err)
 	}
-	if !found {
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   payloadBytes,
+		TypeHash:  typeHash,
+	}
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, matrixPollWait, matrixRepubWait, matrixPubRetry, matrixPubInterval, peer.Distro+"-rev") {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads/writes controlled temp or repo file path
 		if rerr != nil {
 			t.Fatalf("ros2 topic echo did not see live payload %q on %s: %v", payload, peer.Distro, rerr)
@@ -146,7 +174,7 @@ func matrixRunReverse(t *testing.T, ctx context.Context, bin string, peer helper
 	}
 }
 
-// TestROSDistroMatrixForward checks weld echo sees each distro talker.
+// TestROSDistroMatrixForward checks Weld backend take sees each distro talker.
 //
 // It drives the shared forward helper over Jazzy domain 42, Humble domain
 // 43, and Rolling domain 44. Each entry skips cleanly when its container
@@ -156,15 +184,14 @@ func TestROSDistroMatrixForward(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), matrixTestTimeout)
 	defer cancel()
-	bin := helpers.BuildWeld(t, ctx)
 	for _, peer := range helpers.DistroPeers() {
 		t.Run(peer.Distro+"/forward", func(t *testing.T) {
-			matrixRunForward(t, ctx, bin, peer)
+			matrixRunForward(t, ctx, peer)
 		})
 	}
 }
 
-// TestROSDistroMatrixReverse checks each distro echo sees weld pub.
+// TestROSDistroMatrixReverse checks each distro echo sees Weld backend pub.
 //
 // It drives the shared reverse helper over Jazzy domain 42, Humble domain
 // 43, and Rolling domain 44. Each entry skips cleanly when its container
@@ -174,10 +201,9 @@ func TestROSDistroMatrixReverse(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), matrixTestTimeout)
 	defer cancel()
-	bin := helpers.BuildWeld(t, ctx)
 	for _, peer := range helpers.DistroPeers() {
 		t.Run(peer.Distro+"/reverse", func(t *testing.T) {
-			matrixRunReverse(t, ctx, bin, peer)
+			matrixRunReverse(t, ctx, peer)
 		})
 	}
 }

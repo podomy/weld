@@ -45,6 +45,24 @@
 #if __has_include("rmw/get_service_names_and_types.h")
 #include "rmw/get_service_names_and_types.h"
 #endif
+#if __has_include("rmw/get_node_info_and_types.h")
+#include "rmw/get_node_info_and_types.h"
+#endif
+#if __has_include("rmw/get_topic_endpoint_info.h")
+#include "rmw/get_topic_endpoint_info.h"
+#endif
+#if __has_include("rmw/get_network_flow_endpoints.h")
+#include "rmw/get_network_flow_endpoints.h"
+#endif
+#if __has_include("rmw/features.h")
+#include "rmw/features.h"
+#endif
+#if __has_include("rmw/dynamic_message_type_support.h")
+#include "rmw/dynamic_message_type_support.h"
+#endif
+#if __has_include("rmw/event_callback_type.h")
+#include "rmw/event_callback_type.h"
+#endif
 #if __has_include("rmw/time.h")
 #include "rmw/time.h"
 #endif
@@ -88,6 +106,14 @@ extern int weld_ffi_pub_set_type(
   long long handle, const char * type_name, const char * type_hash)
   __attribute__((weak));
 
+// Subscription type report matches the publisher path: the create
+// signature carries no type, so the introspection handle follows
+// separately right after sub create. Weak for the same old-library
+// reason as the publisher form.
+extern int weld_ffi_sub_set_type(
+  long long handle, const char * type_name, const char * type_hash)
+  __attribute__((weak));
+
 // Process-global FFI bridge handle.
 //
 // The bridge is created on the first rmw_init and joined with the
@@ -104,6 +130,7 @@ struct weld_node_data
   long long bridge;
   char * node_name;
   size_t domain;
+  rmw_guard_condition_t * graph_guard;
 };
 
 struct weld_pub_data
@@ -112,6 +139,7 @@ struct weld_pub_data
   const rosidl_message_type_support_t * type_support;
   char * topic;
   size_t domain;
+  rmw_qos_profile_t qos;
 };
 
 struct weld_sub_data
@@ -120,6 +148,15 @@ struct weld_sub_data
   const rosidl_message_type_support_t * type_support;
   char * topic;
   size_t domain;
+  rmw_qos_profile_t qos;
+  rmw_event_callback_t on_new_callback;
+  const void * on_new_user_data;
+  // Wait stash holds one wire sample consumed by rmw_wait so the next
+  // rmw_take returns it instead of polling again. Wait and take run on
+  // the same thread in rcl executors, so no lock is needed.
+  uint8_t * wait_buf;
+  size_t wait_len;
+  bool has_wait;
 };
 
 static rmw_ret_t weld_fail_ffi(const char * what, int code)
@@ -202,6 +239,25 @@ static void weld_report_type(
   (void)weld_ffi_pub_set_type(handle, name, "");
 }
 
+// weld_report_sub_type reports a subscription type the same way the
+// publisher form does. Call sites check for NULL and skip silently when
+// the Go library predates the symbol.
+static void weld_report_sub_type(
+  long long handle,
+  const rosidl_message_type_support_t * type_support)
+{
+  char name[512];
+  if (weld_ffi_sub_set_type == NULL) {
+    return;
+  }
+  if (weld_type_name(weld_resolve_members(type_support), name,
+    sizeof(name)) != 0)
+  {
+    return;
+  }
+  (void)weld_ffi_sub_set_type(handle, name, "");
+}
+
 // Poll one payload without blocking.
 //
 // Returns 0 with malloc owned bytes on data, 1 when no data is ready, and
@@ -271,6 +327,75 @@ static int weld_poll_payload(long long handle, uint8_t ** out, size_t * out_len)
   }
 }
 
+// Take a stashed wait sample if present.
+//
+// Wait consumes one sample to prove readiness and parks it here so the
+// next take returns the same bytes instead of polling again. Returns
+// true with malloc owned bytes on hit, false when no stash exists.
+static bool weld_sub_consume_wait(struct weld_sub_data * sd, uint8_t ** out, size_t * out_len)
+{
+  if (sd == NULL || out == NULL || out_len == NULL) {
+    return false;
+  }
+  if (!sd->has_wait) {
+    return false;
+  }
+  *out = sd->wait_buf;
+  *out_len = sd->wait_len;
+  sd->wait_buf = NULL;
+  sd->wait_len = 0;
+  sd->has_wait = false;
+  return true;
+}
+
+// Take one wire sample, preferring the wait stash.
+//
+// Wait parks one sample per subscription so readiness survives until
+// take. This helper returns the stashed sample first and polls only
+// when no stash exists, keeping wait plus take paired. Returns 0 with
+// malloc owned bytes on data (zero bytes allowed as empty sample),
+// 1 when no data is ready, and -1 with the rmw error set on failure.
+static int weld_take_wire(struct weld_sub_data * sd, uint8_t ** out, size_t * out_len)
+{
+  if (sd == NULL || out == NULL || out_len == NULL) {
+    return -1;
+  }
+  if (weld_sub_consume_wait(sd, out, out_len)) {
+    return 0;
+  }
+  return weld_poll_payload(sd->handle, out, out_len);
+}
+
+// Poll one subscription for wait readiness without losing data.
+//
+// A stash hit reports ready immediately. Otherwise one non-blocking
+// poll runs; data is parked in the subscription stash and reports
+// ready, empty reports not ready, and poll errors report not ready so
+// wait keeps polling until the budget expires and take can report the
+// error later.
+static bool weld_sub_wait_poll(struct weld_sub_data * sd)
+{
+  uint8_t * wire = NULL;
+  size_t wire_len = 0;
+  int empty = 0;
+  if (sd == NULL) {
+    return false;
+  }
+  if (sd->has_wait) {
+    return true;
+  }
+  empty = weld_poll_payload(sd->handle, &wire, &wire_len);
+  if (empty != 0) {
+    return false;
+  }
+  // Empty sample (zero bytes) still counts as data ready: the take
+  // path delivers zero bytes with taken true.
+  sd->wait_buf = wire;
+  sd->wait_len = wire_len;
+  sd->has_wait = true;
+  return true;
+}
+
 static rmw_ret_t weld_unimplemented(const char * what)
 {
   rmw_reset_error();
@@ -318,40 +443,64 @@ struct weld_node_entry
 static pthread_mutex_t g_weld_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct weld_node_entry * g_weld_nodes = NULL;
 
+// Graph generation plus per-node graph guard list.
+//
+// g_weld_graph_generation counts node join plus leave events in this
+// process. Each node owns at most one graph guard (see weld_node_data)
+// returned by rmw_node_get_graph_guard_condition. The guard list holds
+// those live guards so a generation bump can wake every waiter. The
+// list and the counter share g_weld_graph_mutex with the node list.
+static unsigned long long g_weld_graph_generation = 0;
+
+struct weld_graph_guard_entry
+{
+  const rmw_guard_condition_t * guard;
+  struct weld_graph_guard_entry * next;
+};
+
+static struct weld_graph_guard_entry * g_weld_graph_guards = NULL;
+
+static void weld_graph_bump_and_trigger(void);
+
 static bool weld_context_ok(const rmw_context_t * context)
 {
   return context != NULL &&
     context->implementation_identifier == kImplementationIdentifier;
 }
 
+static bool weld_impl_eq(const char * got)
+{
+  return got == kImplementationIdentifier;
+}
+
 static bool weld_node_ok(const rmw_node_t * node)
 {
-  return node != NULL &&
-    node->implementation_identifier == kImplementationIdentifier;
+  return node != NULL && weld_impl_eq(node->implementation_identifier);
 }
 
 static bool weld_pub_ok(const rmw_publisher_t * pub)
 {
-  return pub != NULL &&
-    pub->implementation_identifier == kImplementationIdentifier;
+  return pub != NULL && weld_impl_eq(pub->implementation_identifier);
 }
 
 static bool weld_sub_ok(const rmw_subscription_t * sub)
 {
-  return sub != NULL &&
-    sub->implementation_identifier == kImplementationIdentifier;
+  return sub != NULL && weld_impl_eq(sub->implementation_identifier);
 }
 
 static bool weld_svc_ok(const rmw_service_t * svc)
 {
-  return svc != NULL &&
-    svc->implementation_identifier == kImplementationIdentifier;
+  return svc != NULL && weld_impl_eq(svc->implementation_identifier);
 }
 
 static bool weld_cli_ok(const rmw_client_t * cli)
 {
-  return cli != NULL &&
-    cli->implementation_identifier == kImplementationIdentifier;
+  return cli != NULL && weld_impl_eq(cli->implementation_identifier);
+}
+
+static bool weld_waitset_ok(const rmw_wait_set_t * ws)
+{
+  return ws != NULL && weld_impl_eq(ws->implementation_identifier);
 }
 
 // Service take header compat: Humble, Jazzy, and Rolling all declare
@@ -468,6 +617,7 @@ static void weld_node_register(
   e->next = g_weld_nodes;
   g_weld_nodes = e;
   weld_graph_unlock();
+  weld_graph_bump_and_trigger();
 }
 
 static void weld_node_unregister(
@@ -492,6 +642,69 @@ static void weld_node_unregister(
       *link = dead->next;
       free(dead->name);
       free(dead->namespace_);
+      free(dead);
+      break;
+    } else {
+      link = &(*link)->next;
+    }
+  }
+  weld_graph_unlock();
+  weld_graph_bump_and_trigger();
+}
+
+// Bump the graph generation and wake every live graph guard.
+//
+// Call after the node list changes with the list already updated. The
+// trigger runs outside the trigger path error handling: a failed FFI
+// mirror keeps the local wakeup. Guards are triggered under the graph
+// mutex so add plus remove plus bump stay atomic.
+static void weld_graph_bump_and_trigger(void)
+{
+  weld_graph_lock();
+  g_weld_graph_generation++;
+  for (struct weld_graph_guard_entry * e = g_weld_graph_guards;
+    e != NULL; e = e->next)
+  {
+    if (e->guard != NULL) {
+      rmw_ret_t bump_rc = rmw_trigger_guard_condition(e->guard);
+      (void)bump_rc;
+    }
+  }
+  weld_graph_unlock();
+}
+
+// Track one per-node graph guard. The caller holds no locks. Returns 0
+// on success and -1 on alloc failure.
+static int weld_graph_guard_add(const rmw_guard_condition_t * guard)
+{
+  struct weld_graph_guard_entry * e = NULL;
+  if (guard == NULL) {
+    return -1;
+  }
+  e = (struct weld_graph_guard_entry *)malloc(sizeof(*e));
+  if (e == NULL) {
+    return -1;
+  }
+  e->guard = guard;
+  weld_graph_lock();
+  e->next = g_weld_graph_guards;
+  g_weld_graph_guards = e;
+  weld_graph_unlock();
+  return 0;
+}
+
+// Drop one graph guard from the wake list. Missing entries are ignored.
+static void weld_graph_guard_remove(const rmw_guard_condition_t * guard)
+{
+  if (guard == NULL) {
+    return;
+  }
+  weld_graph_lock();
+  struct weld_graph_guard_entry ** link = &g_weld_graph_guards;
+  while (*link != NULL) {
+    if ((*link)->guard == guard) {
+      struct weld_graph_guard_entry * dead = *link;
+      *link = dead->next;
       free(dead);
       break;
     } else {
@@ -1160,6 +1373,7 @@ rmw_node_t * rmw_create_node(
   nd->bridge = bridge;
   nd->node_name = ffi_name;
   nd->domain = eff_domain;
+  nd->graph_guard = NULL;
   node->implementation_identifier = kImplementationIdentifier;
   node->data = nd;
   node->name = name_copy;
@@ -1194,6 +1408,15 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
     }
   }
   if (nd != NULL) {
+    if (nd->graph_guard != NULL) {
+      rmw_guard_condition_t * doomed = nd->graph_guard;
+      nd->graph_guard = NULL;
+      weld_graph_guard_remove(doomed);
+      {
+        rmw_ret_t fini_rc = rmw_destroy_guard_condition(doomed);
+        (void)fini_rc;
+      }
+    }
     free(nd->node_name);
     free(nd);
   }
@@ -1615,6 +1838,7 @@ rmw_publisher_t * rmw_create_publisher(
   pd->type_support = type_support;
   pd->topic = data_topic;
   pd->domain = nd->domain;
+  pd->qos = *qos_profile;
   // Report the ROS type for graph interop. Best effort: a missing
   // symbol or bad name skips silently and creation still succeeds.
   weld_report_type(handle, type_support);
@@ -1833,9 +2057,15 @@ rmw_subscription_t * rmw_create_subscription(
   sd->type_support = type_support;
   sd->topic = data_topic;
   sd->domain = nd->domain;
+  sd->qos = *qos_profile;
+  sd->on_new_callback = NULL;
+  sd->on_new_user_data = NULL;
+  sd->wait_buf = NULL;
+  sd->wait_len = 0;
+  sd->has_wait = false;
   // Report the ROS type for graph interop. Best effort: a missing
   // symbol or bad name skips silently and creation still succeeds.
-  weld_report_type(handle, type_support);
+  weld_report_sub_type(handle, type_support);
   sub->implementation_identifier = kImplementationIdentifier;
   sub->data = sd;
   sub->topic_name = topic_copy;
@@ -1866,6 +2096,10 @@ rmw_ret_t rmw_destroy_subscription(rmw_node_t * node, rmw_subscription_t * subsc
   if (sd != NULL) {
     rc = weld_ffi_sub_destroy(sd->handle);
     free(sd->topic);
+    free(sd->wait_buf);
+    sd->wait_buf = NULL;
+    sd->wait_len = 0;
+    sd->has_wait = false;
     free(sd);
   }
   subscription->data = NULL;
@@ -1885,7 +2119,7 @@ rmw_ret_t rmw_take(
   // Bridge: poll once without blocking and decode the copy-once payload
   // with weld_cdr_decode_members through the subscription introspection
   // handle. An empty queue reports taken false with RMW_RET_OK.
-  const struct weld_sub_data * sd = NULL;
+  struct weld_sub_data * sd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
   uint8_t * wire = NULL;
   size_t wire_len = 0;
@@ -1899,7 +2133,7 @@ rmw_ret_t rmw_take(
   if (!weld_sub_ok(subscription)) {
     return weld_fail_impl("rmw_weld: rmw_take wrong implementation");
   }
-  sd = (const struct weld_sub_data *)subscription->data;
+  sd = (struct weld_sub_data *)subscription->data;
   if (sd == NULL) {
     rmw_reset_error();
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take no subscription data");
@@ -1912,7 +2146,7 @@ rmw_ret_t rmw_take(
       "rmw_weld: rmw_take type support is not introspection");
     return RMW_RET_ERROR;
   }
-  empty = weld_poll_payload(sd->handle, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -1946,7 +2180,7 @@ rmw_ret_t rmw_take_with_info(
   // local metadata. The FFI layer carries no source timestamp or sequence,
   // so those report zero and unsupported while the receive stamp uses the
   // local clock.
-  const struct weld_sub_data * sd = NULL;
+  struct weld_sub_data * sd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
   uint8_t * wire = NULL;
   size_t wire_len = 0;
@@ -1964,7 +2198,7 @@ rmw_ret_t rmw_take_with_info(
   if (!weld_sub_ok(subscription)) {
     return weld_fail_impl("rmw_weld: rmw_take_with_info wrong implementation");
   }
-  sd = (const struct weld_sub_data *)subscription->data;
+  sd = (struct weld_sub_data *)subscription->data;
   if (sd == NULL) {
     rmw_reset_error();
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_with_info no subscription data");
@@ -1977,7 +2211,7 @@ rmw_ret_t rmw_take_with_info(
       "rmw_weld: rmw_take_with_info type support is not introspection");
     return RMW_RET_ERROR;
   }
-  empty = weld_poll_payload(sd->handle, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -2024,7 +2258,7 @@ rmw_ret_t rmw_take_serialized_message(
 {
   // The CDR wire bytes pass through with copy semantics into the caller
   // buffer, growing it when the sample does not fit.
-  const struct weld_sub_data * sd = NULL;
+  struct weld_sub_data * sd = NULL;
   uint8_t * wire = NULL;
   size_t wire_len = 0;
   int empty = 0;
@@ -2035,13 +2269,13 @@ rmw_ret_t rmw_take_serialized_message(
   if (!weld_sub_ok(subscription)) {
     return weld_fail_impl("rmw_weld: rmw_take_serialized_message wrong implementation");
   }
-  sd = (const struct weld_sub_data *)subscription->data;
+  sd = (struct weld_sub_data *)subscription->data;
   if (sd == NULL) {
     rmw_reset_error();
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_serialized_message no data");
     return RMW_RET_ERROR;
   }
-  empty = weld_poll_payload(sd->handle, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -2106,6 +2340,18 @@ extern int weld_ffi_service_serve_nb(
 extern int weld_ffi_service_respond(
   long long handle, long long seq, const char * resp,
   int resp_len) __attribute__((weak));
+// Matched-entity queries match the internal/rmwbridge/weldffi/matched.go
+// exports. They stay weak so counts fail loudly when the Go core is not
+// linked instead of crashing. Counts sum local same-bridge endpoints
+// with remote SEDP peers; absence of a linked core yields an error,
+// never a silent zero.
+extern int weld_ffi_pub_matched_subs(long long handle, int * out_n)
+  __attribute__((weak));
+extern int weld_ffi_sub_matched_pubs(long long handle, int * out_n)
+  __attribute__((weak));
+extern int weld_ffi_service_remote_available(
+  long long bridge, const char * name, int * out_n)
+  __attribute__((weak));
 extern int weld_ffi_guard_create(long long * out_handle)
   __attribute__((weak));
 extern int weld_ffi_guard_trigger(long long handle)
@@ -2137,11 +2383,14 @@ enum
 struct weld_rpc_state
 {
   long long ffi_handle;
+  rmw_qos_profile_t qos;
   char * name;
   pthread_mutex_t mutex;
   int64_t next_seq;
   int64_t pending[WELD_RPC_PENDING_MAX];
   size_t n_pending;
+  rmw_event_callback_t on_new_callback;
+  const void * on_new_user_data;
 };
 
 // Write one sequence id as 8 little endian bytes.
@@ -2214,6 +2463,7 @@ struct weld_svc_shared
   char * name;
   long long ffi_handle;
   size_t refs;
+  size_t servers;
   struct weld_svc_shared * next;
 };
 
@@ -2277,6 +2527,7 @@ static rmw_ret_t weld_svc_acquire(
   }
   e->ffi_handle = fresh;
   e->refs = 1;
+  e->servers = 0;
   e->next = g_weld_svc_shared;
   g_weld_svc_shared = e;
   *out = fresh;
@@ -2373,6 +2624,7 @@ rmw_service_t * rmw_create_service(
     return NULL;
   }
   st->next_seq = 1;
+  st->qos = *qos_profile;
   rmw_service_t * svc = (rmw_service_t *)malloc(sizeof(*svc));
   if (svc == NULL) {
     (void)pthread_mutex_destroy(&st->mutex);
@@ -2389,6 +2641,19 @@ rmw_service_t * rmw_create_service(
     free(svc);
     return NULL;
   }
+  // Record the local server so rmw_service_server_is_available answers
+  // from local state plus remote SEDP peers. Clients share the entry
+  // without touching this count.
+  (void)pthread_mutex_lock(&g_weld_svc_mutex);
+  for (struct weld_svc_shared * e = g_weld_svc_shared; e != NULL;
+    e = e->next)
+  {
+    if (strcmp(e->name, service_name) == 0) {
+      e->servers++;
+      break;
+    }
+  }
+  (void)pthread_mutex_unlock(&g_weld_svc_mutex);
   svc->implementation_identifier = kImplementationIdentifier;
   svc->data = st;
   // service_name aliases the endpoint name; destroy frees it once
@@ -2413,6 +2678,18 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
   // the Go service. Local state is freed on every path.
   rmw_ret_t rc = RMW_RET_OK;
   if (st->name != NULL) {
+    (void)pthread_mutex_lock(&g_weld_svc_mutex);
+    for (struct weld_svc_shared * e = g_weld_svc_shared; e != NULL;
+      e = e->next)
+    {
+      if (strcmp(e->name, st->name) == 0) {
+        if (e->servers > 0) {
+          e->servers--;
+        }
+        break;
+      }
+    }
+    (void)pthread_mutex_unlock(&g_weld_svc_mutex);
     rc = weld_svc_release(st->name);
   } else {
     rc = weld_fail_invalid("rmw_weld: rmw_destroy_service no name");
@@ -2589,6 +2866,7 @@ rmw_client_t * rmw_create_client(
     return NULL;
   }
   st->next_seq = 1;
+  st->qos = *qos_profile;
   rmw_client_t * cli = (rmw_client_t *)malloc(sizeof(*cli));
   if (cli == NULL) {
     (void)pthread_mutex_destroy(&st->mutex);
@@ -2761,67 +3039,54 @@ struct weld_wait_state
   size_t max_conditions;
 };
 
-static bool weld_guard_is_triggered(const rmw_guard_condition_t * guard)
+static bool weld_guard_state_triggered(const struct weld_guard_state * st)
 {
-  struct weld_guard_state * st =
-    (struct weld_guard_state *)guard->data;
   bool out = false;
-  if (st != NULL) {
-    (void)pthread_mutex_lock(&st->mutex);
-    out = st->triggered;
-    (void)pthread_mutex_unlock(&st->mutex);
+  struct weld_guard_state * mut = (struct weld_guard_state *)st;
+  if (mut != NULL) {
+    (void)pthread_mutex_lock(&mut->mutex);
+    out = mut->triggered;
+    (void)pthread_mutex_unlock(&mut->mutex);
   }
   return out;
 }
 
-static bool weld_any_guard_triggered(
-  const rmw_guard_conditions_t * guards)
+// Resolve one wait subscription entry to its data.
+//
+// rcl stores rmw_handle->data per SET_ADD_RMW in rcl/wait.c, so entries
+// arriving through rcl are already weld_sub_data. Direct C callers pass
+// the rmw wrapper instead. Wrappers carry the implementation identifier
+// at offset zero while data carries a small FFI handle there, so pointer
+// equality against the identifier string tells them apart with no string
+// reads and no address guessing.
+static struct weld_sub_data * weld_wait_sub_entry(void * entry)
 {
-  if (guards == NULL) {
-    return false;
+  const rmw_subscription_t * sub = NULL;
+  if (entry == NULL) {
+    return NULL;
   }
-  if (guards->guard_condition_count > 0 &&
-    guards->guard_conditions == NULL)
-  {
-    return false;
+  sub = (const rmw_subscription_t *)entry;
+  if (weld_impl_eq(sub->implementation_identifier)) {
+    return (struct weld_sub_data *)sub->data;
   }
-  for (size_t i = 0; i < guards->guard_condition_count; i++) {
-    const rmw_guard_condition_t * guard =
-      (const rmw_guard_condition_t *)guards->guard_conditions[i];
-    if (guard != NULL && weld_guard_is_triggered(guard)) {
-      return true;
-    }
-  }
-  return false;
+  return (struct weld_sub_data *)entry;
 }
 
-// Count triggered guards and clear the rest.
+// Resolve one wait guard entry to its state.
 //
-// rmw_wait reports readiness by leaving only ready entries set: every
-// guard without a set flag is replaced with NULL. Only guards are
-// filtered here; subscription, service, client, and event arrays stay
-// untouched until their peers land. Guards carry FFI handles (see
-// weld_guard_state) and the local flags mirror them, so polling the
-// flags observes both local and FFI triggers.
-static size_t weld_guard_ready_count(rmw_guard_conditions_t * guards)
+// Same dual convention as subscriptions: rcl passes weld_guard_state
+// while direct C callers pass the rmw wrapper.
+static struct weld_guard_state * weld_wait_guard_entry(void * entry)
 {
-  if (guards == NULL) {
-    return 0;
+  const rmw_guard_condition_t * guard = NULL;
+  if (entry == NULL) {
+    return NULL;
   }
-  if (guards->guard_condition_count > 0 && guards->guard_conditions == NULL) {
-    return 0;
+  guard = (const rmw_guard_condition_t *)entry;
+  if (weld_impl_eq(guard->implementation_identifier)) {
+    return (struct weld_guard_state *)guard->data;
   }
-  size_t ready = 0;
-  for (size_t i = 0; i < guards->guard_condition_count; i++) {
-    const rmw_guard_condition_t * guard =
-      (const rmw_guard_condition_t *)guards->guard_conditions[i];
-    if (guard != NULL && weld_guard_is_triggered(guard)) {
-      ready++;
-    } else {
-      guards->guard_conditions[i] = NULL;
-    }
-  }
-  return ready;
+  return (struct weld_guard_state *)entry;
 }
 
 static uint64_t weld_timeout_ns(const rmw_time_t * timeout)
@@ -3000,7 +3265,7 @@ rmw_ret_t rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
   if (wait_set == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_destroy_wait_set null argument");
   }
-  if (wait_set->implementation_identifier != kImplementationIdentifier) {
+  if (!weld_waitset_ok(wait_set)) {
     return weld_fail_impl("rmw_weld: rmw_destroy_wait_set wrong impl");
   }
   free(wait_set->data);
@@ -3014,88 +3279,166 @@ rmw_ret_t rmw_wait(
   rmw_services_t * services, rmw_clients_t * clients, rmw_events_t * events,
   rmw_wait_set_t * wait_set, const rmw_time_t * wait_timeout)
 {
-  (void)subscriptions;
-  (void)services;
-  (void)clients;
-  (void)events;
+  // Wait reports readiness by leaving only ready entries set: every
+  // non-ready subscription, guard, service, client, and event is
+  // replaced with NULL. Entries are implementation data pointers, not
+  // rmw wrappers: rcl stores rmw_handle->data per SET_ADD_RMW in
+  // rcl/wait.c, so subscriptions carry weld_sub_data and guards carry
+  // weld_guard_state. Subscriptions are ready when a wire or in-memory
+  // sample is available (polled into the wait stash so the next take
+  // returns it); guards are ready when triggered. Services, clients,
+  // and events are not ready yet: service traffic stays in-memory
+  // single-process and cross-process service wait is out of scope, so
+  // they always filter to NULL. NULL slots are empty from a previous
+  // wait filter and skip. This is what lets ros2 topic echo wake on
+  // weld pub: the old stub ignored subscriptions and always timed out
+  // even when data had arrived.
+  uint64_t budget = 0;
+  uint64_t start_ns = 0;
+  uint64_t deadline_ns = 0;
+  bool infinite = false;
+  struct timespec ts;
   if (wait_set == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_wait null argument");
   }
-  if (wait_set->implementation_identifier != kImplementationIdentifier) {
+  if (!weld_waitset_ok(wait_set)) {
     return weld_fail_impl("rmw_weld: rmw_wait wrong implementation");
   }
-  if (weld_any_guard_triggered(guard_conditions)) {
-    (void)weld_guard_ready_count(guard_conditions);
-    return RMW_RET_OK;
-  }
-  uint64_t budget = weld_timeout_ns(wait_timeout);
-  if (budget == 0) {
-    (void)weld_guard_ready_count(guard_conditions);
-    return RMW_RET_TIMEOUT;
-  }
-  (void)pthread_once(&g_weld_wait_once, weld_wait_cond_init);
-  if (wait_timeout == NULL) {
-    (void)pthread_mutex_lock(&g_weld_wait_mutex);
-    for (;;) {
-      if (weld_any_guard_triggered(guard_conditions)) {
-        (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-        (void)weld_guard_ready_count(guard_conditions);
-        return RMW_RET_OK;
-      }
-      int rc = pthread_cond_wait(&g_weld_wait_cond, &g_weld_wait_mutex);
-      if (rc != 0 && rc != EINTR) {
-        (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-        if (weld_guard_ready_count(guard_conditions) > 0) {
-          return RMW_RET_OK;
-        }
-        rmw_reset_error();
-        RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_wait wait failed");
-        return RMW_RET_ERROR;
-      }
+  if (subscriptions != NULL) {
+    if (subscriptions->subscriber_count > 0 && subscriptions->subscribers == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_wait null subscribers");
     }
   }
-  struct timespec now;
-  (void)clock_gettime(CLOCK_MONOTONIC, &now);
-  uint64_t now_ns =
-    (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-  uint64_t deadline_ns =
-    (budget > UINT64_MAX - now_ns) ? UINT64_MAX : now_ns + budget;
-  struct timespec deadline;
-  deadline.tv_sec = (time_t)(deadline_ns / 1000000000ULL);
-  deadline.tv_nsec = (long)(deadline_ns % 1000000000ULL);
-  (void)pthread_mutex_lock(&g_weld_wait_mutex);
+  if (guard_conditions != NULL) {
+    if (guard_conditions->guard_condition_count > 0 &&
+      guard_conditions->guard_conditions == NULL)
+    {
+      return weld_fail_invalid("rmw_weld: rmw_wait null guard conditions");
+    }
+  }
+  if (services != NULL) {
+    if (services->service_count > 0 && services->services == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_wait null services");
+    }
+  }
+  if (clients != NULL) {
+    if (clients->client_count > 0 && clients->clients == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_wait null clients");
+    }
+  }
+  if (events != NULL) {
+    if (events->event_count > 0 && events->events == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_wait null events");
+    }
+  }
+  budget = weld_timeout_ns(wait_timeout);
+  infinite = (wait_timeout == NULL);
+  (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+  start_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  if (infinite) {
+    deadline_ns = UINT64_MAX;
+  } else if (budget > UINT64_MAX - start_ns) {
+    deadline_ns = UINT64_MAX;
+  } else {
+    deadline_ns = start_ns + budget;
+  }
   for (;;) {
-    if (weld_any_guard_triggered(guard_conditions)) {
-      (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-      (void)weld_guard_ready_count(guard_conditions);
+    size_t ready = 0;
+    if (guard_conditions != NULL) {
+      for (size_t i = 0; i < guard_conditions->guard_condition_count; i++) {
+        struct weld_guard_state * st =
+          weld_wait_guard_entry(guard_conditions->guard_conditions[i]);
+        if (st != NULL && weld_guard_state_triggered(st)) {
+          ready++;
+        }
+      }
+    }
+    if (subscriptions != NULL) {
+      for (size_t i = 0; i < subscriptions->subscriber_count; i++) {
+        struct weld_sub_data * sd =
+          weld_wait_sub_entry(subscriptions->subscribers[i]);
+        if (sd == NULL) {
+          continue;
+        }
+        if (weld_sub_wait_poll(sd)) {
+          ready++;
+        }
+      }
+    }
+    if (ready > 0) {
+      if (subscriptions != NULL) {
+        for (size_t i = 0; i < subscriptions->subscriber_count; i++) {
+          struct weld_sub_data * sd =
+            weld_wait_sub_entry(subscriptions->subscribers[i]);
+          if (sd == NULL || !sd->has_wait) {
+            subscriptions->subscribers[i] = NULL;
+          }
+        }
+      }
+      if (guard_conditions != NULL) {
+        for (size_t i = 0; i < guard_conditions->guard_condition_count; i++) {
+          struct weld_guard_state * st = weld_wait_guard_entry(
+            guard_conditions->guard_conditions[i]);
+          if (st == NULL || !weld_guard_state_triggered(st)) {
+            guard_conditions->guard_conditions[i] = NULL;
+          }
+        }
+      }
+      if (services != NULL) {
+        for (size_t i = 0; i < services->service_count; i++) {
+          services->services[i] = NULL;
+        }
+      }
+      if (clients != NULL) {
+        for (size_t i = 0; i < clients->client_count; i++) {
+          clients->clients[i] = NULL;
+        }
+      }
+      if (events != NULL) {
+        for (size_t i = 0; i < events->event_count; i++) {
+          events->events[i] = NULL;
+        }
+      }
       return RMW_RET_OK;
     }
-    int rc = pthread_cond_timedwait(
-      &g_weld_wait_cond, &g_weld_wait_mutex, &deadline);
-    if (rc == ETIMEDOUT) {
-      bool ready = weld_any_guard_triggered(guard_conditions);
-      (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-      (void)weld_guard_ready_count(guard_conditions);
-      return ready ? RMW_RET_OK : RMW_RET_TIMEOUT;
-    }
-    if (rc != 0 && rc != EINTR) {
-      (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-      if (weld_guard_ready_count(guard_conditions) > 0) {
-        return RMW_RET_OK;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    {
+      uint64_t now_ns =
+        (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+      if (!infinite && now_ns >= deadline_ns) {
+        if (subscriptions != NULL) {
+          for (size_t i = 0; i < subscriptions->subscriber_count; i++) {
+            subscriptions->subscribers[i] = NULL;
+          }
+        }
+        if (guard_conditions != NULL) {
+          for (size_t i = 0; i < guard_conditions->guard_condition_count; i++) {
+            guard_conditions->guard_conditions[i] = NULL;
+          }
+        }
+        if (services != NULL) {
+          for (size_t i = 0; i < services->service_count; i++) {
+            services->services[i] = NULL;
+          }
+        }
+        if (clients != NULL) {
+          for (size_t i = 0; i < clients->client_count; i++) {
+            clients->clients[i] = NULL;
+          }
+        }
+        if (events != NULL) {
+          for (size_t i = 0; i < events->event_count; i++) {
+            events->events[i] = NULL;
+          }
+        }
+        return RMW_RET_TIMEOUT;
       }
-      rmw_reset_error();
-      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_wait timedwait failed");
-      return RMW_RET_ERROR;
     }
-    struct timespec cur;
-    (void)clock_gettime(CLOCK_MONOTONIC, &cur);
-    uint64_t cur_ns =
-      (uint64_t)cur.tv_sec * 1000000000ULL + (uint64_t)cur.tv_nsec;
-    if (cur_ns >= deadline_ns) {
-      bool ready = weld_any_guard_triggered(guard_conditions);
-      (void)pthread_mutex_unlock(&g_weld_wait_mutex);
-      (void)weld_guard_ready_count(guard_conditions);
-      return ready ? RMW_RET_OK : RMW_RET_TIMEOUT;
+    {
+      struct timespec sleep_ts;
+      sleep_ts.tv_sec = 0;
+      sleep_ts.tv_nsec = 10 * 1000 * 1000L;
+      (void)nanosleep(&sleep_ts, NULL);
     }
   }
 }
@@ -3203,7 +3546,27 @@ rmw_ret_t rmw_publisher_count_matched_subscriptions(
     return weld_fail_impl(
       "rmw_weld: rmw_publisher_count_matched_subscriptions wrong implementation");
   }
-  return weld_unimplemented("rmw_publisher_count_matched_subscriptions");
+  {
+    const struct weld_pub_data * pd =
+      (const struct weld_pub_data *)publisher->data;
+    long long handle = 0;
+    int n = 0;
+    if (pd == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_publisher_count_matched_subscriptions no data");
+    }
+    handle = pd->handle;
+    if (weld_ffi_pub_matched_subs == NULL) {
+      return weld_fail_error(
+        "rmw_weld: rmw_publisher_count_matched_subscriptions FFI not linked");
+    }
+    if (weld_ffi_pub_matched_subs(handle, &n) != 0) {
+      return weld_fail_error(
+        "rmw_weld: rmw_publisher_count_matched_subscriptions backend failed");
+    }
+    *subscription_count = (size_t)n;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_subscription_count_matched_publishers(
@@ -3220,37 +3583,71 @@ rmw_ret_t rmw_subscription_count_matched_publishers(
     return weld_fail_impl(
       "rmw_weld: rmw_subscription_count_matched_publishers wrong implementation");
   }
-  return weld_unimplemented("rmw_subscription_count_matched_publishers");
+  {
+    const struct weld_sub_data * sd =
+      (const struct weld_sub_data *)subscription->data;
+    long long handle = 0;
+    int n = 0;
+    if (sd == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_subscription_count_matched_publishers no data");
+    }
+    handle = sd->handle;
+    if (weld_ffi_sub_matched_pubs == NULL) {
+      return weld_fail_error(
+        "rmw_weld: rmw_subscription_count_matched_publishers FFI not linked");
+    }
+    if (weld_ffi_sub_matched_pubs(handle, &n) != 0) {
+      return weld_fail_error(
+        "rmw_weld: rmw_subscription_count_matched_publishers backend failed");
+    }
+    *publisher_count = (size_t)n;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_publisher_get_actual_qos(
   const rmw_publisher_t * publisher, rmw_qos_profile_t * qos)
 {
-  // Bridge: Publisher.ActualQoS returns the stored passthrough QoS
-  // unchanged. The bridge never interprets depth and never contacts the
-  // core. No Go mapping exists yet, so validate only.
+  // Actual QoS is the profile stored at creation. No Go mapping is
+  // needed: the profile never changes after creation.
   if (publisher == NULL || qos == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_publisher_get_actual_qos null argument");
   }
   if (!weld_pub_ok(publisher)) {
     return weld_fail_impl("rmw_weld: rmw_publisher_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_publisher_get_actual_qos");
+  {
+    const struct weld_pub_data * pd =
+      (const struct weld_pub_data *)publisher->data;
+    if (pd == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_publisher_get_actual_qos no data");
+    }
+    *qos = pd->qos;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_subscription_get_actual_qos(
   const rmw_subscription_t * subscription, rmw_qos_profile_t * qos)
 {
-  // Bridge: Subscription.ActualQoS returns the stored passthrough QoS
-  // unchanged. The bridge never interprets depth and never contacts the
-  // core. No Go mapping exists yet, so validate only.
+  // Actual QoS is the profile stored at creation. No Go mapping is
+  // needed: the profile never changes after creation.
   if (subscription == NULL || qos == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_subscription_get_actual_qos null argument");
   }
   if (!weld_sub_ok(subscription)) {
     return weld_fail_impl("rmw_weld: rmw_subscription_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_subscription_get_actual_qos");
+  {
+    const struct weld_sub_data * sd =
+      (const struct weld_sub_data *)subscription->data;
+    if (sd == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_subscription_get_actual_qos no data");
+    }
+    *qos = sd->qos;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_service_server_is_available(
@@ -3262,7 +3659,41 @@ rmw_ret_t rmw_service_server_is_available(
   if (!weld_node_ok(node) || !weld_cli_ok(client)) {
     return weld_fail_impl("rmw_weld: rmw_service_server_is_available wrong implementation");
   }
-  return weld_unimplemented("rmw_service_server_is_available");
+  {
+    const struct weld_rpc_state * st =
+      (const struct weld_rpc_state *)client->data;
+    long long bridge = 0;
+    size_t local = 0;
+    int remote = 0;
+    if (st == NULL || st->name == NULL) {
+      return weld_fail_invalid("rmw_weld: rmw_service_server_is_available no data");
+    }
+    // Local servers come from this process registry; clients share the
+    // entry without touching the count.
+    (void)pthread_mutex_lock(&g_weld_svc_mutex);
+    for (struct weld_svc_shared * e = g_weld_svc_shared; e != NULL;
+      e = e->next)
+    {
+      if (strcmp(e->name, st->name) == 0) {
+        local = e->servers;
+        break;
+      }
+    }
+    (void)pthread_mutex_unlock(&g_weld_svc_mutex);
+    if (weld_ffi_service_remote_available == NULL) {
+      return weld_fail_error(
+        "rmw_weld: rmw_service_server_is_available FFI not linked");
+    }
+    if (weld_ffi_bridge_borrow(&bridge) != RMW_RET_OK) {
+      return weld_fail_error("rmw_weld: rmw_service_server_is_available no bridge");
+    }
+    if (weld_ffi_service_remote_available(bridge, st->name, &remote) != 0) {
+      return weld_fail_error(
+        "rmw_weld: rmw_service_server_is_available backend failed");
+    }
+    *is_available = (local > 0 || remote > 0);
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_service_request_subscription_get_actual_qos(
@@ -3276,7 +3707,16 @@ rmw_ret_t rmw_service_request_subscription_get_actual_qos(
     return weld_fail_impl(
       "rmw_weld: rmw_service_request_subscription_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_service_request_subscription_get_actual_qos");
+  {
+    const struct weld_rpc_state * st =
+      (const struct weld_rpc_state *)service->data;
+    if (st == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_service_request_subscription_get_actual_qos no data");
+    }
+    *qos = st->qos;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_service_response_publisher_get_actual_qos(
@@ -3290,7 +3730,16 @@ rmw_ret_t rmw_service_response_publisher_get_actual_qos(
     return weld_fail_impl(
       "rmw_weld: rmw_service_response_publisher_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_service_response_publisher_get_actual_qos");
+  {
+    const struct weld_rpc_state * st =
+      (const struct weld_rpc_state *)service->data;
+    if (st == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_service_response_publisher_get_actual_qos no data");
+    }
+    *qos = st->qos;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_client_request_publisher_get_actual_qos(
@@ -3304,7 +3753,16 @@ rmw_ret_t rmw_client_request_publisher_get_actual_qos(
     return weld_fail_impl(
       "rmw_weld: rmw_client_request_publisher_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_client_request_publisher_get_actual_qos");
+  {
+    const struct weld_rpc_state * st =
+      (const struct weld_rpc_state *)client->data;
+    if (st == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_client_request_publisher_get_actual_qos no data");
+    }
+    *qos = st->qos;
+  }
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_client_response_subscription_get_actual_qos(
@@ -3318,7 +3776,16 @@ rmw_ret_t rmw_client_response_subscription_get_actual_qos(
     return weld_fail_impl(
       "rmw_weld: rmw_client_response_subscription_get_actual_qos wrong implementation");
   }
-  return weld_unimplemented("rmw_client_response_subscription_get_actual_qos");
+  {
+    const struct weld_rpc_state * st =
+      (const struct weld_rpc_state *)client->data;
+    if (st == NULL) {
+      return weld_fail_invalid(
+        "rmw_weld: rmw_client_response_subscription_get_actual_qos no data");
+    }
+    *qos = st->qos;
+  }
+  return RMW_RET_OK;
 }
 
 // QoS stub scope: this shim stores passthrough QoS and never contacts the
@@ -3390,4 +3857,1114 @@ rmw_ret_t rmw_get_serialized_message_size(
     return weld_fail_invalid("rmw_weld: rmw_get_serialized_message_size null argument");
   }
   return weld_unimplemented("rmw_get_serialized_message_size: type lookup not linked yet");
+}
+
+// Context finalize plus serialization format plus GID compare plus log
+// severity plus liveliness plus ack plus allocation plus take variants
+// plus client GID. Single process in memory shim, so every path validates
+// only and never contacts the Go core except where the take helpers poll.
+
+rmw_ret_t rmw_context_fini(rmw_context_t * context)
+{
+  if (context == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_context_fini null argument");
+  }
+  if (weld_context_ok(context)) {
+    (void)memset(context, 0, sizeof(*context));
+    return RMW_RET_OK;
+  }
+  if (context->implementation_identifier == NULL) {
+    (void)memset(context, 0, sizeof(*context));
+    return RMW_RET_OK;
+  }
+  return weld_fail_impl("rmw_weld: rmw_context_fini wrong implementation");
+}
+
+const char * rmw_get_serialization_format(void)
+{
+  return "cdr";
+}
+
+rmw_ret_t rmw_compare_gids_equal(
+  const rmw_gid_t * gid1, const rmw_gid_t * gid2, bool * result)
+{
+  if (gid1 == NULL || gid2 == NULL || result == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_compare_gids_equal null argument");
+  }
+  if (gid1->implementation_identifier != kImplementationIdentifier ||
+    gid2->implementation_identifier != kImplementationIdentifier)
+  {
+    return weld_fail_impl("rmw_weld: rmw_compare_gids_equal wrong implementation");
+  }
+  *result = memcmp(gid1->data, gid2->data, sizeof(gid1->data)) == 0;
+  return RMW_RET_OK;
+}
+
+static rmw_log_severity_t g_weld_log_severity = RMW_LOG_SEVERITY_INFO;
+
+rmw_ret_t rmw_set_log_severity(rmw_log_severity_t severity)
+{
+  g_weld_log_severity = severity;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_node_assert_liveliness(const rmw_node_t * node)
+{
+  if (node == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_node_assert_liveliness null argument");
+  }
+  if (!weld_node_ok(node)) {
+    return weld_fail_impl("rmw_weld: rmw_node_assert_liveliness wrong implementation");
+  }
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_publisher_assert_liveliness(const rmw_publisher_t * publisher)
+{
+  if (publisher == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_publisher_assert_liveliness null argument");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl("rmw_weld: rmw_publisher_assert_liveliness wrong implementation");
+  }
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_publisher_wait_for_all_acked(
+  const rmw_publisher_t * publisher, rmw_time_t wait_timeout)
+{
+  if (publisher == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_publisher_wait_for_all_acked null argument");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl("rmw_weld: rmw_publisher_wait_for_all_acked wrong implementation");
+  }
+  (void)wait_timeout;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_init_publisher_allocation(
+  const rosidl_message_type_support_t * type_support,
+  const rosidl_runtime_c__Sequence__bound * message_bounds,
+  rmw_publisher_allocation_t * allocation)
+{
+  if (type_support == NULL || message_bounds == NULL || allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_init_publisher_allocation null argument");
+  }
+  (void)type_support;
+  (void)message_bounds;
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_fini_publisher_allocation(rmw_publisher_allocation_t * allocation)
+{
+  if (allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_fini_publisher_allocation null argument");
+  }
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_init_subscription_allocation(
+  const rosidl_message_type_support_t * type_support,
+  const rosidl_runtime_c__Sequence__bound * message_bounds,
+  rmw_subscription_allocation_t * allocation)
+{
+  if (type_support == NULL || message_bounds == NULL || allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_init_subscription_allocation null argument");
+  }
+  (void)type_support;
+  (void)message_bounds;
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_fini_subscription_allocation(rmw_subscription_allocation_t * allocation)
+{
+  if (allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_fini_subscription_allocation null argument");
+  }
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_publisher_allocation_init(
+  const rosidl_message_type_support_t * type_support,
+  const rosidl_runtime_c__Sequence__bound * message_bounds,
+  rmw_publisher_allocation_t * allocation)
+{
+  if (type_support == NULL || message_bounds == NULL || allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_publisher_allocation_init null argument");
+  }
+  (void)type_support;
+  (void)message_bounds;
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_subscription_allocation_init(
+  const rosidl_message_type_support_t * type_support,
+  const rosidl_runtime_c__Sequence__bound * message_bounds,
+  rmw_subscription_allocation_t * allocation)
+{
+  if (type_support == NULL || message_bounds == NULL || allocation == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_subscription_allocation_init null argument");
+  }
+  (void)type_support;
+  (void)message_bounds;
+  (void)memset(allocation, 0, sizeof(*allocation));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_take_sequence(
+  const rmw_subscription_t * subscription, size_t count,
+  rmw_message_sequence_t * message_sequence,
+  rmw_message_info_sequence_t * message_info_sequence, size_t * taken,
+  rmw_subscription_allocation_t * allocation)
+{
+  struct weld_sub_data * sd = NULL;
+  const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
+  size_t n = 0;
+  size_t i = 0;
+  (void)allocation;
+  if (subscription == NULL || message_sequence == NULL ||
+    message_info_sequence == NULL || taken == NULL)
+  {
+    return weld_fail_invalid("rmw_weld: rmw_take_sequence null argument");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl("rmw_weld: rmw_take_sequence wrong implementation");
+  }
+  if (count == 0) {
+    return weld_fail_invalid("rmw_weld: rmw_take_sequence zero count");
+  }
+  if (message_sequence->capacity < count ||
+    message_info_sequence->capacity < count)
+  {
+    return weld_fail_invalid("rmw_weld: rmw_take_sequence capacity too small");
+  }
+  if (message_sequence->data == NULL || message_info_sequence->data == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_take_sequence null sequence data");
+  }
+  sd = (struct weld_sub_data *)subscription->data;
+  if (sd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_sequence no subscription data");
+    return RMW_RET_ERROR;
+  }
+  members = weld_resolve_members(sd->type_support);
+  if (members == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_take_sequence type support is not introspection");
+    return RMW_RET_ERROR;
+  }
+  *taken = 0;
+  message_sequence->size = 0;
+  message_info_sequence->size = 0;
+  for (i = 0; i < count; i++) {
+    uint8_t * wire = NULL;
+    size_t wire_len = 0;
+    char errbuf[256];
+    weld_cdr_status_t st;
+    struct timespec now;
+    uint64_t now_ns = 0;
+    rmw_message_info_t * info = NULL;
+    int empty = 0;
+    if (message_sequence->data[i] == NULL) {
+      *taken = n;
+      message_sequence->size = n;
+      message_info_sequence->size = n;
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_sequence null message slot");
+      return RMW_RET_ERROR;
+    }
+    empty = weld_take_wire(sd, &wire, &wire_len);
+    if (empty == 1) {
+      break;
+    }
+    if (empty != 0) {
+      *taken = n;
+      message_sequence->size = n;
+      message_info_sequence->size = n;
+      return RMW_RET_ERROR;
+    }
+    errbuf[0] = '\0';
+    st = weld_cdr_decode_members(
+      members, wire, wire_len, message_sequence->data[i], errbuf, sizeof(errbuf));
+    free(wire);
+    if (st != WELD_CDR_OK) {
+      *taken = n;
+      message_sequence->size = n;
+      message_info_sequence->size = n;
+      rmw_reset_error();
+      if (errbuf[0] != '\0') {
+        RCUTILS_SET_ERROR_MSG(errbuf);
+      } else {
+        RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_sequence decode failed");
+      }
+      return RMW_RET_ERROR;
+    }
+    (void)clock_gettime(CLOCK_REALTIME, &now);
+    now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    info = &message_info_sequence->data[n];
+    info->source_timestamp = 0;
+    info->received_timestamp = (rmw_time_point_value_t)now_ns;
+    info->publication_sequence_number =
+      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
+    info->reception_sequence_number =
+      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
+    info->publisher_gid.implementation_identifier = kImplementationIdentifier;
+    (void)memset(
+      info->publisher_gid.data, 0, sizeof(info->publisher_gid.data));
+    info->from_intra_process = false;
+    n++;
+  }
+  *taken = n;
+  message_sequence->size = n;
+  message_info_sequence->size = n;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_take_serialized_message_with_info(
+  const rmw_subscription_t * subscription,
+  rmw_serialized_message_t * serialized_message, bool * taken,
+  rmw_message_info_t * message_info, rmw_subscription_allocation_t * allocation)
+{
+  struct weld_sub_data * sd = NULL;
+  uint8_t * wire = NULL;
+  size_t wire_len = 0;
+  int empty = 0;
+  (void)allocation;
+  if (subscription == NULL || serialized_message == NULL || taken == NULL ||
+    message_info == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_take_serialized_message_with_info null argument");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_take_serialized_message_with_info wrong implementation");
+  }
+  sd = (struct weld_sub_data *)subscription->data;
+  if (sd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_take_serialized_message_with_info no data");
+    return RMW_RET_ERROR;
+  }
+  empty = weld_take_wire(sd, &wire, &wire_len);
+  if (empty == 1) {
+    *taken = false;
+    return RMW_RET_OK;
+  }
+  if (empty != 0) {
+    return RMW_RET_ERROR;
+  }
+  if (wire_len > serialized_message->buffer_capacity) {
+    rcutils_ret_t rc = rmw_serialized_message_resize(
+      serialized_message, wire_len);
+    if (rc != RCUTILS_RET_OK) {
+      free(wire);
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG(
+        "rmw_weld: rmw_take_serialized_message_with_info resize failed");
+      return RMW_RET_BAD_ALLOC;
+    }
+  }
+  if (wire_len > 0) {
+    if (serialized_message->buffer == NULL) {
+      free(wire);
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG(
+        "rmw_weld: rmw_take_serialized_message_with_info null buffer");
+      return RMW_RET_ERROR;
+    }
+    (void)memcpy(serialized_message->buffer, wire, wire_len);
+  }
+  free(wire);
+  serialized_message->buffer_length = wire_len;
+  (void)memset(message_info, 0, sizeof(*message_info));
+  *taken = true;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_get_gid_for_client(const rmw_client_t * client, rmw_gid_t * gid)
+{
+  const struct weld_rpc_state * st = NULL;
+  uint64_t handle_u = 0;
+  uint32_t domain_u = 0;
+  size_t i = 0;
+  if (client == NULL || gid == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_get_gid_for_client null argument");
+  }
+  if (!weld_cli_ok(client)) {
+    return weld_fail_impl("rmw_weld: rmw_get_gid_for_client wrong implementation");
+  }
+  st = (const struct weld_rpc_state *)client->data;
+  if (st == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_get_gid_for_client no data");
+    return RMW_RET_ERROR;
+  }
+  domain_u = 0;
+  handle_u = (uint64_t)st->ffi_handle;
+  (void)memset(gid->data, 0, sizeof(gid->data));
+  gid->data[0] = (uint8_t)(domain_u & 0xFFU);
+  gid->data[1] = (uint8_t)((domain_u >> 8) & 0xFFU);
+  gid->data[2] = (uint8_t)((domain_u >> 16) & 0xFFU);
+  gid->data[3] = (uint8_t)((domain_u >> 24) & 0xFFU);
+  for (i = 0; i < 8; i++) {
+    gid->data[4 + i] = (uint8_t)((handle_u >> (8 * i)) & 0xFFU);
+  }
+  gid->implementation_identifier = kImplementationIdentifier;
+  return RMW_RET_OK;
+}
+
+// Graph extended plus loan plus event plus content filter plus network
+// flow plus feature query.
+//
+// Graph snapshots merge the local node registry with the Go bridge
+// registry. Per-node endpoint maps plus per-endpoint QoS plus GID are
+// not tracked by this shim, so by-node queries return an empty
+// names_and_types with RMW_RET_OK when the node exists and
+// RMW_RET_NODE_NAME_NON_EXISTENT otherwise, and info-by-topic queries
+// return an empty array with RMW_RET_OK. The empty snapshot documents
+// the unknown choice: the transport copies bytes and never reports a
+// best-known QoS, so callers must not infer absence of peers from size.
+// Loans are never claimed: the transport copies once at ingress, so
+// every loan path reports RMW_RET_UNSUPPORTED with NULL plus false
+// outputs. Events are not produced, content filter C wiring is out of
+// scope although the transport can filter, and network flow endpoints
+// are not reported.
+
+// Report whether a node name plus namespace is known locally or via FFI.
+static bool weld_node_known(const char * name, const char * ns)
+{
+  long long bridge = 0;
+  if (name == NULL || ns == NULL) {
+    return false;
+  }
+  weld_graph_lock();
+  for (struct weld_node_entry * e = g_weld_nodes; e != NULL; e = e->next) {
+    const char * e_name = e->name != NULL ? e->name : "";
+    const char * e_ns = e->namespace_ != NULL ? e->namespace_ : "";
+    if (strcmp(e_name, name) == 0 && strcmp(e_ns, ns) == 0) {
+      weld_graph_unlock();
+      return true;
+    }
+  }
+  weld_graph_unlock();
+  bridge = weld_graph_bridge();
+  if (bridge != 0 && weld_ffi_graph_node_count != NULL &&
+    weld_ffi_graph_node_at != NULL)
+  {
+    long long n = 0;
+    if (weld_ffi_graph_node_count(bridge, &n) == 0 && n > 0) {
+      long long i = 0;
+      for (i = 0; i < n; i++) {
+        char name_buf[WELD_GRAPH_NAME_MAX];
+        char ns_buf[WELD_GRAPH_NAME_MAX];
+        long long domain = 0;
+        int rc = weld_ffi_graph_node_at(
+          bridge, i, name_buf, (int)sizeof(name_buf), ns_buf,
+          (int)sizeof(ns_buf), &domain);
+        if (rc != 0) {
+          continue;
+        }
+        if (strcmp(name_buf, name) == 0 && strcmp(ns_buf, ns) == 0) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Fill an empty names_and_types snapshot for a known node.
+static rmw_ret_t weld_by_node_empty(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * node_name, const char * node_namespace,
+  rmw_names_and_types_t * out, const char * what)
+{
+  rmw_ret_t rc = RMW_RET_OK;
+  if (node == NULL || allocator == NULL || node_name == NULL ||
+    node_namespace == NULL || out == NULL)
+  {
+    return weld_fail_invalid("rmw_weld: by_node null argument");
+  }
+  if (!weld_node_ok(node)) {
+    return weld_fail_impl("rmw_weld: by_node wrong implementation");
+  }
+  if (node_name[0] == '\0' || node_namespace[0] == '\0') {
+    return weld_fail_invalid("rmw_weld: by_node empty name");
+  }
+#ifdef WELD_HAVE_NAMES_AND_TYPES
+  if (rmw_names_and_types_check_zero(out) != RMW_RET_OK) {
+    return weld_fail_invalid("rmw_weld: by_node not zero");
+  }
+  if (!weld_node_known(node_name, node_namespace)) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(what);
+    return RMW_RET_NODE_NAME_NON_EXISTENT;
+  }
+  rc = rmw_names_and_types_init(out, 0, allocator);
+  if (rc != RMW_RET_OK) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(what);
+    return RMW_RET_BAD_ALLOC;
+  }
+  return RMW_RET_OK;
+#else
+  (void)rc;
+  (void)what;
+  (void)allocator;
+  (void)out;
+  return weld_unimplemented("rmw_weld: by_node names_and_types unavailable");
+#endif
+}
+
+rmw_ret_t rmw_get_node_names_with_enclaves(
+  const rmw_node_t * node, rcutils_string_array_t * node_names,
+  rcutils_string_array_t * node_namespaces, rcutils_string_array_t * enclaves)
+{
+  rmw_ret_t rc = RMW_RET_OK;
+  rcutils_allocator_t allocator = rcutils_get_default_allocator();
+  if (node == NULL || node_names == NULL || node_namespaces == NULL ||
+    enclaves == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_get_node_names_with_enclaves null argument");
+  }
+  if (!weld_node_ok(node)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_get_node_names_with_enclaves wrong implementation");
+  }
+  if (node_names->size != 0 || node_names->data != NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_get_node_names_with_enclaves names not zero");
+  }
+  if (node_namespaces->size != 0 || node_namespaces->data != NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_get_node_names_with_enclaves spaces not zero");
+  }
+  if (enclaves->size != 0 || enclaves->data != NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_get_node_names_with_enclaves enclaves not zero");
+  }
+  rc = rmw_get_node_names(node, node_names, node_namespaces);
+  if (rc != RMW_RET_OK) {
+    return rc;
+  }
+  if (node_names->size == 0) {
+    return RMW_RET_OK;
+  }
+  if (node_names->size != node_namespaces->size) {
+    rcutils_ret_t fini_rc = rcutils_string_array_fini(node_names);
+    (void)fini_rc;
+    fini_rc = rcutils_string_array_fini(node_namespaces);
+    (void)fini_rc;
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_get_node_names_with_enclaves size mismatch");
+    return RMW_RET_ERROR;
+  }
+  if (rcutils_string_array_init(
+      enclaves, node_names->size, &allocator) != RCUTILS_RET_OK)
+  {
+    rcutils_ret_t fini_rc = rcutils_string_array_fini(node_names);
+    (void)fini_rc;
+    fini_rc = rcutils_string_array_fini(node_namespaces);
+    (void)fini_rc;
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_get_node_names_with_enclaves alloc failed");
+    return RMW_RET_BAD_ALLOC;
+  }
+  for (size_t i = 0; i < enclaves->size; i++) {
+    enclaves->data[i] = weld_dup_str("/");
+    if (enclaves->data[i] == NULL) {
+      rcutils_ret_t fini_rc = rcutils_string_array_fini(node_names);
+      (void)fini_rc;
+      fini_rc = rcutils_string_array_fini(node_namespaces);
+      (void)fini_rc;
+      fini_rc = rcutils_string_array_fini(enclaves);
+      (void)fini_rc;
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG(
+        "rmw_weld: rmw_get_node_names_with_enclaves alloc failed");
+      return RMW_RET_BAD_ALLOC;
+    }
+  }
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_get_publisher_names_and_types_by_node(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * node_name, const char * node_namespace, bool no_demangle,
+  rmw_names_and_types_t * topic_names_and_types)
+{
+  (void)no_demangle;
+  return weld_by_node_empty(
+    node, allocator, node_name, node_namespace, topic_names_and_types,
+    "rmw_weld: rmw_get_publisher_names_and_types_by_node unknown node");
+}
+
+rmw_ret_t rmw_get_subscriber_names_and_types_by_node(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * node_name, const char * node_namespace, bool no_demangle,
+  rmw_names_and_types_t * topic_names_and_types)
+{
+  (void)no_demangle;
+  return weld_by_node_empty(
+    node, allocator, node_name, node_namespace, topic_names_and_types,
+    "rmw_weld: rmw_get_subscriber_names_and_types_by_node unknown node");
+}
+
+rmw_ret_t rmw_get_service_names_and_types_by_node(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * node_name, const char * node_namespace,
+  rmw_names_and_types_t * service_names_and_types)
+{
+  return weld_by_node_empty(
+    node, allocator, node_name, node_namespace, service_names_and_types,
+    "rmw_weld: rmw_get_service_names_and_types_by_node unknown node");
+}
+
+rmw_ret_t rmw_get_client_names_and_types_by_node(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * node_name, const char * node_namespace,
+  rmw_names_and_types_t * service_names_and_types)
+{
+  return weld_by_node_empty(
+    node, allocator, node_name, node_namespace, service_names_and_types,
+    "rmw_weld: rmw_get_client_names_and_types_by_node unknown node");
+}
+
+// Fill an empty topic endpoint array. Unknown topics are allowed and
+// report empty with RMW_RET_OK. Known topics also report empty because
+// per-endpoint QoS plus GID are not tracked by this shim.
+static rmw_ret_t weld_info_by_topic_empty(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * topic_name,
+  rmw_topic_endpoint_info_array_t * out, const char * what)
+{
+  rmw_ret_t rc = RMW_RET_OK;
+  if (node == NULL || allocator == NULL || topic_name == NULL || out == NULL) {
+    return weld_fail_invalid("rmw_weld: info_by_topic null argument");
+  }
+  if (!weld_node_ok(node)) {
+    return weld_fail_impl("rmw_weld: info_by_topic wrong implementation");
+  }
+  if (topic_name[0] == '\0') {
+    return weld_fail_invalid("rmw_weld: info_by_topic empty topic");
+  }
+  if (rmw_topic_endpoint_info_array_check_zero(out) != RMW_RET_OK) {
+    return weld_fail_invalid("rmw_weld: info_by_topic not zero");
+  }
+  (void)what;
+  rc = rmw_topic_endpoint_info_array_init_with_size(out, 0, allocator);
+  if (rc != RMW_RET_OK) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: info_by_topic init failed");
+    return RMW_RET_BAD_ALLOC;
+  }
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_get_publishers_info_by_topic(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * topic_name, bool no_mangle,
+  rmw_topic_endpoint_info_array_t * publishers_info)
+{
+  (void)no_mangle;
+  return weld_info_by_topic_empty(
+    node, allocator, topic_name, publishers_info,
+    "rmw_weld: rmw_get_publishers_info_by_topic");
+}
+
+rmw_ret_t rmw_get_subscriptions_info_by_topic(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * topic_name, bool no_mangle,
+  rmw_topic_endpoint_info_array_t * subscriptions_info)
+{
+  (void)no_mangle;
+  return weld_info_by_topic_empty(
+    node, allocator, topic_name, subscriptions_info,
+    "rmw_weld: rmw_get_subscriptions_info_by_topic");
+}
+
+// Weld forward-compat service endpoint queries.
+//
+// Jazzy RMW has no rmw_get_servers_info_by_service or
+// rmw_get_clients_info_by_service, so these symbols are weld extensions
+// with the topic info array shape. They validate like info-by-topic and
+// return an empty array with RMW_RET_OK because per-endpoint service
+// QoS plus GID are not tracked.
+rmw_ret_t rmw_get_servers_info_by_service(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * service_name, rmw_topic_endpoint_info_array_t * servers_info)
+{
+  return weld_info_by_topic_empty(
+    node, allocator, service_name, servers_info,
+    "rmw_weld: rmw_get_servers_info_by_service");
+}
+
+rmw_ret_t rmw_get_clients_info_by_service(
+  const rmw_node_t * node, rcutils_allocator_t * allocator,
+  const char * service_name, rmw_topic_endpoint_info_array_t * clients_info)
+{
+  return weld_info_by_topic_empty(
+    node, allocator, service_name, clients_info,
+    "rmw_weld: rmw_get_clients_info_by_service");
+}
+
+const rmw_guard_condition_t * rmw_node_get_graph_guard_condition(
+  const rmw_node_t * node)
+{
+  struct weld_node_data * nd = NULL;
+  rmw_guard_condition_t * guard = NULL;
+  if (node == NULL) {
+    (void)weld_fail_invalid(
+      "rmw_weld: rmw_node_get_graph_guard_condition null argument");
+    return NULL;
+  }
+  if (!weld_node_ok(node)) {
+    (void)weld_fail_impl(
+      "rmw_weld: rmw_node_get_graph_guard_condition wrong implementation");
+    return NULL;
+  }
+  nd = (struct weld_node_data *)node->data;
+  if (nd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_node_get_graph_guard_condition no node data");
+    return NULL;
+  }
+  if (node->context == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_node_get_graph_guard_condition no context");
+    return NULL;
+  }
+  weld_graph_lock();
+  guard = nd->graph_guard;
+  weld_graph_unlock();
+  if (guard != NULL) {
+    return guard;
+  }
+  guard = rmw_create_guard_condition(node->context);
+  if (guard == NULL) {
+    return NULL;
+  }
+  if (weld_graph_guard_add(guard) != 0) {
+    {
+      rmw_ret_t fini_rc = rmw_destroy_guard_condition(guard);
+      (void)fini_rc;
+    }
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_node_get_graph_guard_condition no memory");
+    return NULL;
+  }
+  weld_graph_lock();
+  if (nd->graph_guard == NULL) {
+    nd->graph_guard = guard;
+  } else {
+    weld_graph_unlock();
+    weld_graph_guard_remove(guard);
+    {
+      rmw_ret_t fini_rc = rmw_destroy_guard_condition(guard);
+      (void)fini_rc;
+    }
+    weld_graph_lock();
+    guard = nd->graph_guard;
+    weld_graph_unlock();
+    return guard;
+  }
+  weld_graph_unlock();
+  return guard;
+}
+
+// Loan family: the transport copies once at ingress and shares by
+// reference internally, so no middleware loan is ever handed out.
+// Every path validates per the RMW header and reports
+// RMW_RET_UNSUPPORTED without claiming a loan.
+
+rmw_ret_t rmw_borrow_loaned_message(
+  const rmw_publisher_t * publisher,
+  const rosidl_message_type_support_t * type_support, void ** ros_message)
+{
+  if (publisher == NULL || type_support == NULL || ros_message == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_borrow_loaned_message null arg");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl("rmw_weld: rmw_borrow_loaned_message wrong impl");
+  }
+  if (*ros_message != NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_borrow_loaned_message not null");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_publish_loaned_message(
+  const rmw_publisher_t * publisher, void * ros_message,
+  rmw_publisher_allocation_t * allocation)
+{
+  (void)allocation;
+  if (publisher == NULL || ros_message == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_publish_loaned_message null arg");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl("rmw_weld: rmw_publish_loaned_message wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_take_loaned_message(
+  const rmw_subscription_t * subscription, void ** loaned_message,
+  bool * taken, rmw_subscription_allocation_t * allocation)
+{
+  (void)allocation;
+  if (subscription == NULL || loaned_message == NULL || taken == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_take_loaned_message null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl("rmw_weld: rmw_take_loaned_message wrong impl");
+  }
+  if (*loaned_message != NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_take_loaned_message not null");
+  }
+  *loaned_message = NULL;
+  *taken = false;
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_take_loaned_message_with_info(
+  const rmw_subscription_t * subscription, void ** loaned_message,
+  bool * taken, rmw_message_info_t * message_info,
+  rmw_subscription_allocation_t * allocation)
+{
+  (void)allocation;
+  if (subscription == NULL || loaned_message == NULL || taken == NULL ||
+    message_info == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_take_loaned_message_with_info null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_take_loaned_message_with_info wrong impl");
+  }
+  if (*loaned_message != NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_take_loaned_message_with_info not null");
+  }
+  *loaned_message = NULL;
+  *taken = false;
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_return_loaned_message_from_publisher(
+  const rmw_publisher_t * publisher, void * loaned_message)
+{
+  if (publisher == NULL || loaned_message == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_return_loaned_message_from_publisher null arg");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_return_loaned_message_from_publisher wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_return_loaned_message_from_subscription(
+  const rmw_subscription_t * subscription, void * loaned_message)
+{
+  if (subscription == NULL || loaned_message == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_return_loaned_message_from_subscription null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_return_loaned_message_from_subscription wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: loaned messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+// On-new callbacks: stored on the endpoint for polling callers. The shim
+// has no background dispatch thread, so a stored callback is never
+// invoked by the middleware. Clearing with NULL is allowed.
+
+rmw_ret_t rmw_subscription_set_on_new_message_callback(
+  rmw_subscription_t * subscription, rmw_event_callback_t callback,
+  const void * user_data)
+{
+  struct weld_sub_data * sd = NULL;
+  if (subscription == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_subscription_set_on_new_message_callback null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_subscription_set_on_new_message_callback wrong impl");
+  }
+  sd = (struct weld_sub_data *)subscription->data;
+  if (sd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_subscription_set_on_new_message_callback no data");
+    return RMW_RET_ERROR;
+  }
+  sd->on_new_callback = callback;
+  sd->on_new_user_data = user_data;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_service_set_on_new_request_callback(
+  rmw_service_t * service, rmw_event_callback_t callback,
+  const void * user_data)
+{
+  struct weld_rpc_state * st = NULL;
+  if (service == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_service_set_on_new_request_callback null arg");
+  }
+  if (!weld_svc_ok(service)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_service_set_on_new_request_callback wrong impl");
+  }
+  st = (struct weld_rpc_state *)service->data;
+  if (st == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_service_set_on_new_request_callback no data");
+    return RMW_RET_ERROR;
+  }
+  (void)pthread_mutex_lock(&st->mutex);
+  st->on_new_callback = callback;
+  st->on_new_user_data = user_data;
+  (void)pthread_mutex_unlock(&st->mutex);
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_client_set_on_new_response_callback(
+  rmw_client_t * client, rmw_event_callback_t callback,
+  const void * user_data)
+{
+  struct weld_rpc_state * st = NULL;
+  if (client == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_client_set_on_new_response_callback null arg");
+  }
+  if (!weld_cli_ok(client)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_client_set_on_new_response_callback wrong impl");
+  }
+  st = (struct weld_rpc_state *)client->data;
+  if (st == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_client_set_on_new_response_callback no data");
+    return RMW_RET_ERROR;
+  }
+  (void)pthread_mutex_lock(&st->mutex);
+  st->on_new_callback = callback;
+  st->on_new_user_data = user_data;
+  (void)pthread_mutex_unlock(&st->mutex);
+  return RMW_RET_OK;
+}
+
+// Events: no event source exists in this shim, so init reports
+// UNSUPPORTED, take reports UNSUPPORTED with taken false, set_callback
+// reports UNSUPPORTED, and no type is ever supported. Fini clears the
+// handle and reports OK so a zero-initialized event stays finalizable.
+
+rmw_ret_t rmw_take_event(
+  const rmw_event_t * event_handle, void * event_info, bool * taken)
+{
+  if (event_handle == NULL || event_info == NULL || taken == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_take_event null argument");
+  }
+  if (event_handle->implementation_identifier != kImplementationIdentifier) {
+    return weld_fail_impl("rmw_weld: rmw_take_event wrong implementation");
+  }
+  *taken = false;
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: events not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_event_set_callback(
+  rmw_event_t * event, rmw_event_callback_t callback, const void * user_data)
+{
+  (void)callback;
+  (void)user_data;
+  if (event == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_event_set_callback null argument");
+  }
+  if (event->implementation_identifier != kImplementationIdentifier) {
+    return weld_fail_impl("rmw_weld: rmw_event_set_callback wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: events not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+bool rmw_event_type_is_supported(rmw_event_type_t rmw_event_type)
+{
+  (void)rmw_event_type;
+  return false;
+}
+
+// Dynamic message take: the CDR path requires static introspection
+// members, so deferred dynamic types are out of scope. Humble predates
+// the dynamic typesupport API entirely, so these entry points exist only
+// where rmw/dynamic_message_type_support.h does.
+#if defined(__has_include) && __has_include("rmw/dynamic_message_type_support.h")
+
+rmw_ret_t rmw_take_dynamic_message(
+  const rmw_subscription_t * subscription,
+  rosidl_dynamic_typesupport_dynamic_data_t * dynamic_message, bool * taken,
+  rmw_subscription_allocation_t * allocation)
+{
+  (void)allocation;
+  if (subscription == NULL || dynamic_message == NULL || taken == NULL) {
+    return weld_fail_invalid("rmw_weld: rmw_take_dynamic_message null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl("rmw_weld: rmw_take_dynamic_message wrong impl");
+  }
+  *taken = false;
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: dynamic messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_take_dynamic_message_with_info(
+  const rmw_subscription_t * subscription,
+  rosidl_dynamic_typesupport_dynamic_data_t * dynamic_message, bool * taken,
+  rmw_message_info_t * message_info, rmw_subscription_allocation_t * allocation)
+{
+  (void)allocation;
+  if (subscription == NULL || dynamic_message == NULL || taken == NULL ||
+    message_info == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_take_dynamic_message_with_info null arg");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_take_dynamic_message_with_info wrong impl");
+  }
+  *taken = false;
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: dynamic messages not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+#endif /* dynamic message typesupport available */
+
+// Content filters: the transport can filter, but no C wiring exists yet
+// to attach an expression to a subscription, so both paths report
+// UNSUPPORTED loudly and leave outputs untouched.
+
+rmw_ret_t rmw_subscription_set_content_filter(
+  rmw_subscription_t * subscription,
+  const rmw_subscription_content_filter_options_t * options)
+{
+  if (subscription == NULL || options == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_subscription_set_content_filter null argument");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_subscription_set_content_filter wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG(
+    "rmw_weld: content filters not supported in C wiring yet");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_subscription_get_content_filter(
+  const rmw_subscription_t * subscription, rcutils_allocator_t * allocator,
+  rmw_subscription_content_filter_options_t * options)
+{
+  if (subscription == NULL || allocator == NULL || options == NULL) {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_subscription_get_content_filter null argument");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_subscription_get_content_filter wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG(
+    "rmw_weld: content filters not supported in C wiring yet");
+  return RMW_RET_UNSUPPORTED;
+}
+
+// Network flow endpoints are not reported by this transport.
+
+rmw_ret_t rmw_publisher_get_network_flow_endpoints(
+  const rmw_publisher_t * publisher, rcutils_allocator_t * allocator,
+  rmw_network_flow_endpoint_array_t * network_flow_endpoint_array)
+{
+  if (publisher == NULL || allocator == NULL ||
+    network_flow_endpoint_array == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_publisher_get_network_flow_endpoints null argument");
+  }
+  if (!weld_pub_ok(publisher)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_publisher_get_network_flow_endpoints wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: network flow endpoints not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_subscription_get_network_flow_endpoints(
+  const rmw_subscription_t * subscription, rcutils_allocator_t * allocator,
+  rmw_network_flow_endpoint_array_t * network_flow_endpoint_array)
+{
+  if (subscription == NULL || allocator == NULL ||
+    network_flow_endpoint_array == NULL)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_subscription_get_network_flow_endpoints null argument");
+  }
+  if (!weld_sub_ok(subscription)) {
+    return weld_fail_impl(
+      "rmw_weld: rmw_subscription_get_network_flow_endpoints wrong impl");
+  }
+  rmw_reset_error();
+  RCUTILS_SET_ERROR_MSG("rmw_weld: network flow endpoints not supported");
+  return RMW_RET_UNSUPPORTED;
+}
+
+// Feature query: no middleware optional feature is supported. QoS
+// compatibility itself is real through rmw_qos_profile_check_compatible,
+// but rmw_feature_supported only covers the rmw_feature_t enum and
+// stays false for every member.
+bool rmw_feature_supported(rmw_feature_t feature)
+{
+  (void)feature;
+  return false;
 }

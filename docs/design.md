@@ -44,7 +44,7 @@ Above the line bytes and verbs stay fixed. Below the line Weld is free to design
 
 ## Architecture
 
-Three layers: `sdk/` is the designed Go API; `internal/core/` is the transport free system with entities, matching, routing, state machines, config, clock, graph index; `internal/transports/` holds the DDS RTPS backend fed by `internal/types/` for schema, hashes, and codec.
+Three layers: `internal/core/` is the transport free system with entities, matching, routing, state machines, config, clock, graph index; `internal/transports/` holds the DDS RTPS backend fed by `internal/types/` for schema, hashes, and codec.
 The rule that keeps vendor drift out: `internal/core/` never imports a transport package. The backend implements publish bytes, take bytes, join discovery, and report liveliness; all matching, routing, timeouts, retries, and state machines live once in core.
 The backend is a translator at the border. Inbound it parses CDR, checks type hash, matches QoS, and delivers. Outbound it serializes and announces in discovery as ROS peers expect. Past vendor drift notes are archived in `docs/interop.md`; v1 targets CycloneDDS only.
 
@@ -136,8 +136,6 @@ Weld ships no C ABI. Per peer negotiation covers type hash presence, introspecti
 - `internal/core/`: entities, matcher, router, services, workflows, config, clock, graph, supervision.
 - `internal/time/`: clock sources, fake clocks, jump handling, rate policies.
 - `internal/graph/`: snapshots, compatibility reporting, tool queries.
-- `sdk/`: Node, Topics, Services, Workflows, Config, Time, Supervision; no transport imports.
-- `cmd/weld/`: conformance CLI covering the compatibility list.
 
 ## Proof plan
 

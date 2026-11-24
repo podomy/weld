@@ -16,14 +16,10 @@ package ros_test
 import (
 	"context"
 	"errors"
-	"os"
-	"os/exec"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds"
@@ -42,61 +38,12 @@ const rosTestTopic = "/chatter"
 // checkTransportDomainRejects pins transport layer caller domain rejection.
 //
 // Caller values above maximum fail without process env, so the check stays
-// parallel safe. Environment override rejection is covered via the weld CLI
-// child env checks below with explicit --domain flags and child env.
+// parallel safe.
 func checkTransportDomainRejects(t *testing.T) {
 	t.Helper()
 	_, err := transports.ResolveDomainID(999)
 	if err == nil {
 		t.Fatalf("caller 999 accepted, want rejection above maximum")
-	}
-}
-
-// checkWeldFlagDomainRejects pins weld echo and pub flag domain rejection.
-func checkWeldFlagDomainRejects(t *testing.T, ctx context.Context, bin string) {
-	t.Helper()
-	runCtx, runCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer runCancel()
-	flagCmd := exec.CommandContext(runCtx, bin, "echo", "--topic", rosTestTopic, "--domain", "999", "--timeout", "1s")
-	flagOut, err := flagCmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("weld echo domain 999 succeeded, want rejection")
-	}
-	if !strings.Contains(string(flagOut), "weld:") {
-		t.Fatalf("weld echo domain 999 output misses weld prefix:\n%s", string(flagOut))
-	}
-	pubCtx, pubCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer pubCancel()
-	pubCmd := exec.CommandContext(pubCtx, bin, "pub", "--topic", rosTestTopic, "--domain", "999", "--text", "hello")
-	pubCmd.Env = append(os.Environ(), "ROS_DOMAIN_ID=")
-	pubOut, err := pubCmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("weld pub domain 999 succeeded, want rejection")
-	}
-	if !strings.Contains(string(pubOut), "weld:") {
-		t.Fatalf("weld pub domain 999 output misses weld prefix:\n%s", string(pubOut))
-	}
-}
-
-// checkWeldEnvDomainCase pins one weld echo env domain rejection.
-//
-// Domain is the allocated exclusive domain plumbed to the weld --domain
-// flag, so parallel workers never share a domain. It runs weld echo with
-// explicit --domain plus child env ROS_DOMAIN_ID set to raw, and requires
-// rejection with the weld prefix. The context bounds the run with a 15
-// second per case timeout.
-func checkWeldEnvDomainCase(t *testing.T, ctx context.Context, bin string, domain int, raw string) {
-	t.Helper()
-	envCtx, envCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer envCancel()
-	envCmd := exec.CommandContext(envCtx, bin, "echo", "--topic", rosTestTopic, "--domain", strconv.Itoa(domain), "--timeout", "1s") //nolint:gosec // live harness runs built weld binary with fixed test argv and no shell
-	envCmd.Env = append(os.Environ(), "ROS_DOMAIN_ID="+raw)
-	envOut, err := envCmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("weld echo with ROS_DOMAIN_ID %q succeeded, want rejection", raw)
-	}
-	if !strings.Contains(string(envOut), "weld:") {
-		t.Fatalf("weld echo bad env %q output misses weld prefix:\n%s", raw, string(envOut))
 	}
 }
 
@@ -112,35 +59,17 @@ func checkWeldEnvDomainValid(t *testing.T, domain int) {
 	}
 }
 
-// checkWeldEnvDomainRejects pins weld echo env domain rejection.
+// TestROSBadDomainRejected checks out of range domains fail at the transport layer.
 //
-// Domain is the allocated exclusive domain plumbed to the weld --domain
-// flag and EnvWithDomain. It covers 999, malformed, and 102 via child env
-// with explicit --domain flags, plus valid delivery via EnvWithDomain,
-// never via process env.
-func checkWeldEnvDomainRejects(t *testing.T, ctx context.Context, bin string, domain int) {
-	t.Helper()
-	checkWeldEnvDomainCase(t, ctx, bin, domain, "999")
-	checkWeldEnvDomainCase(t, ctx, bin, domain, "not-a-domain")
-	checkWeldEnvDomainCase(t, ctx, bin, domain, "102")
-	checkWeldEnvDomainValid(t, domain)
-}
-
-// TestROSBadDomainRejected checks out of range domains fail with weld prefix.
-//
-// It covers the caller value at the transport layer plus the weld CLI
-// surface with an invalid flag domain and invalid environment domains via
-// child env with explicit --domain flags. No peer is needed, so this test
-// never skips.
+// It covers the caller value at the transport layer plus valid child env
+// delivery via EnvWithDomain. The weld CLI flag and env rejection checks
+// were removed with the deleted cmd/weld binary. No peer is needed, so
+// this test never skips.
 func TestROSBadDomainRejected(t *testing.T) {
 	t.Parallel()
 	domain := helpers.MustAllocateDomain(t)
 	checkTransportDomainRejects(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	bin := helpers.BuildWeld(t, ctx)
-	checkWeldFlagDomainRejects(t, ctx, bin)
-	checkWeldEnvDomainRejects(t, ctx, bin, domain)
+	checkWeldEnvDomainValid(t, domain)
 }
 
 // TestROSEmptyPayloadAllowed checks an empty String sample stays valid.

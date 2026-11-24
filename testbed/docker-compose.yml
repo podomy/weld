@@ -1,6 +1,8 @@
 services:
   ros-humble:
-    build: ./humble
+    build:
+      context: ..
+      dockerfile: testbed/ros2/humble/Dockerfile
     container_name: ros-humble
     network_mode: host
     command: ["sleep", "infinity"]
@@ -8,7 +10,9 @@ services:
       - ./logs:/testbed/logs
 
   ros-jazzy:
-    build: ./jazzy
+    build:
+      context: ..
+      dockerfile: testbed/ros2/jazzy/Dockerfile
     container_name: ros-jazzy
     network_mode: host
     command: ["sleep", "infinity"]
@@ -16,7 +20,9 @@ services:
       - ./logs:/testbed/logs
 
   ros-rolling:
-    build: ./rolling
+    build:
+      context: ..
+      dockerfile: testbed/ros2/rolling/Dockerfile
     container_name: ros-rolling
     network_mode: host
     command: ["sleep", "infinity"]

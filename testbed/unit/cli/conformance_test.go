@@ -3,15 +3,18 @@
 
 // Package unit_cli holds pure Go CLI checks with no peer and no network.
 //
-// CLI flag and exit path conformance lives in cmd/weld/main_test.go (real
-// product functions in package main) plus testbed/live/cli/gate_cli_test.go
-// (real built binary with peer). This file keeps only same-module
+// Ros2 CLI flag and echo/pub conformance lives in
+// testbed/live/helpers/roscli.go (RunRosEcho plus RosPubUntilSeen over
+// stock ros2 topic echo and pub). This file keeps only same-module
 // product-path coverage by calling the product directly (core endpoints,
 // transports domain IDs, dds publishers and SEDP, types codecs) and does
-// not import cmd/weld: cmd/weld is a separate module with GOWORK=off (see
-// cmd/weld/go.mod), so unit_cli cannot import its flag helpers and must
-// not exec a binary from hermetic unit tests. Local cli* helpers below
+// not import testbed/live/helpers: helpers is a live harness with docker
+// and peer dependencies, so unit_cli must not import it and must not exec
+// a binary or peer from hermetic unit tests. Local cli* helpers below
 // are test doubles for pure-Go shape checks only, not product flag paths.
+// Static pins below read testbed/live/helpers/roscli.go as text to keep
+// the ros2 topic echo and pub argv shapes aligned without importing the
+// live package.
 package unit_cli
 
 import (
@@ -40,7 +43,7 @@ const (
 	cliLostLogInterval = time.Second
 )
 
-// cliRepoRoot returns the repository root holding cmd/weld.
+// cliRepoRoot returns the repository root holding go.mod.
 func cliRepoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -49,26 +52,26 @@ func cliRepoRoot(t *testing.T) string {
 	}
 	dir := filepath.Dir(file)
 	for {
-		candidate := filepath.Join(dir, "cmd", "weld")
+		candidate := filepath.Join(dir, "go.mod")
 		info, err := os.Stat(candidate)
-		if err == nil && info.IsDir() {
+		if err == nil && !info.IsDir() {
 			return dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("repo root with cmd/weld not found above %s", file)
+			t.Fatalf("repo root with go.mod not found above %s", file)
 		}
 		dir = parent
 	}
 }
 
-// cliReadMain returns the text of cmd/weld/main.go.
-func cliReadMain(t *testing.T) string {
+// cliReadRosCLI returns the text of testbed/live/helpers/roscli.go.
+func cliReadRosCLI(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(cliRepoRoot(t), "cmd", "weld", "main.go")
+	path := filepath.Join(cliRepoRoot(t), "testbed", "live", "helpers", "roscli.go")
 	data, err := os.ReadFile(path) //nolint:gosec // test reads repo-controlled source file
 	if err != nil {
-		t.Fatalf("read main.go: %v", err)
+		t.Fatalf("read roscli.go: %v", err)
 	}
 	return string(data)
 }
@@ -570,11 +573,10 @@ func TestCLIInvalidDomainExit2(t *testing.T) {
 
 // TestCLITimeoutNegativeAndZero checks zero runs until interrupt.
 //
-// Negative timeout rejection lives in cmd/weld/main_test.go
-// TestWithEchoTimeoutNegative via the real runEchoCommand flag path
-// plus live gates; this package cannot import cmd/weld (separate module
-// with GOWORK=off, see cmd/weld/go.mod), so it does not reassert the
-// negative flag path here and does not exec a binary from unit tests.
+// Negative timeout rejection lives in the live ros2 topic echo path
+// (RunRosEcho clamps non-positive echoTimeout to EchoTimeout); this
+// package does not exec a peer from unit tests, so it pins only the
+// pure context bound shape here.
 func TestCLITimeoutNegativeAndZero(t *testing.T) {
 	ctx := context.Background()
 	got, cancel := cliWithEchoTimeout(ctx, 0)
@@ -633,14 +635,16 @@ func TestCLITextSelectionPure(t *testing.T) {
 }
 
 // TestCLIHelpStdoutExit0 checks help goes to stdout with exit 0.
+//
+// The static pin covers the ros2 topic echo and pub argv shapes in
+// testbed/live/helpers/roscli.go (RunRosEcho plus RosPubUntilSeen via
+// runRosPubOnce). The help recognition shape below stays pure Go with no
+// peer and no exec.
 func TestCLIHelpStdoutExit0(t *testing.T) {
-	text := cliReadMain(t)
-	if !strings.Contains(text, "Usage:") {
-		t.Fatalf("main.go misses Usage:")
-	}
-	for _, flag := range []string{"--topic", "--domain", "--text", "--timeout"} {
-		if !strings.Contains(text, flag) {
-			t.Fatalf("main.go misses flag %s", flag)
+	text := cliReadRosCLI(t)
+	for _, want := range []string{"RunRosEcho", "RosPubUntilSeen", `"topic"`, `"echo"`, `"pub"`, "RosType", `"--timeout"`, `"--once"`, "DockerArgs"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("roscli.go misses %s", want)
 		}
 	}
 	cases := [][]string{
@@ -731,24 +735,14 @@ func TestCLIGapDropCounters(t *testing.T) {
 	checkPubTakeNoLoss(t)
 }
 
-// checkGapMainText pins throttle and weld log strings in main.go.
+// checkGapMainText pins ros2 topic echo bound shape in roscli.go.
 func checkGapMainText(t *testing.T) {
 	t.Helper()
-	text := cliReadMain(t)
-	if !strings.Contains(text, "lostLogInterval") {
-		t.Fatalf("main.go misses lostLogInterval")
-	}
-	if !strings.Contains(text, "time.Second") {
-		t.Fatalf("main.go misses time.Second for throttle")
-	}
-	if !strings.Contains(text, "now.Sub(t.lastLog) < lostLogInterval") {
-		t.Fatalf("main.go misses throttle guard")
-	}
-	if !strings.Contains(text, "weld: lost") {
-		t.Fatalf("main.go misses weld lost line")
-	}
-	if !strings.Contains(text, "weld: dropped") {
-		t.Fatalf("main.go misses weld dropped line")
+	text := cliReadRosCLI(t)
+	for _, want := range []string{"RunRosEcho", `"--timeout"`, "EchoMargin", "strconv.Itoa", "echoTimeout+EchoMargin"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("roscli.go misses %s", want)
+		}
 	}
 }
 
@@ -940,27 +934,14 @@ func TestCLIPubWaitsForRouteViaFake(t *testing.T) {
 	checkCanceledRouteWait(t, ctx, msg)
 }
 
-// checkRouteWaitMainText pins route retry constants in main.go.
+// checkRouteWaitMainText pins ros2 pub retry shape in roscli.go.
 func checkRouteWaitMainText(t *testing.T) {
 	t.Helper()
-	text := cliReadMain(t)
-	if !strings.Contains(text, "pubRouteRetryInterval") {
-		t.Fatalf("main.go misses pubRouteRetryInterval")
-	}
-	if !strings.Contains(text, "50 * time.Millisecond") {
-		t.Fatalf("main.go misses 50ms retry interval")
-	}
-	if !strings.Contains(text, "pubRouteRetryTimeout") {
-		t.Fatalf("main.go misses pubRouteRetryTimeout")
-	}
-	if !strings.Contains(text, "5 * time.Second") {
-		t.Fatalf("main.go misses 5s retry timeout")
-	}
-	if !strings.Contains(text, "ErrNoRoute") {
-		t.Fatalf("main.go misses ErrNoRoute")
-	}
-	if !strings.Contains(text, "ctx.Done()") {
-		t.Fatalf("main.go misses ctx cancel in route wait")
+	text := cliReadRosCLI(t)
+	for _, want := range []string{"RosPubUntilSeen", "runRosPubOnce", "normalizePublishBounds", "WaitForFileContains", "maxPubs", `"--once"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("roscli.go misses %s", want)
+		}
 	}
 }
 
@@ -1121,28 +1102,21 @@ func TestCLIEchoDeclaresSEDPReader(t *testing.T) {
 	checkEchoSEDPReader(t)
 }
 
-// checkEchoMainText pins echo reader wiring strings in main.go.
+// checkEchoMainText pins ros2 echo argv plus SEDP type identity.
 func checkEchoMainText(t *testing.T) {
 	t.Helper()
-	cliText := cliReadMain(t)
-	if !strings.Contains(cliText, cliTypeHash) {
-		t.Fatalf("main.go misses type hash %s", cliTypeHash)
-	}
-	if !strings.Contains(cliText, "Subscribe") {
-		t.Fatalf("main.go misses Subscribe")
-	}
-	if !strings.Contains(cliText, "stringTypeName, stringTypeHash") {
-		t.Fatalf("main.go misses reader type and hash args")
-	}
-	if !strings.Contains(cliText, "echoSubscriber") {
-		t.Fatalf("main.go misses echoSubscriber")
+	cliText := cliReadRosCLI(t)
+	for _, want := range []string{`"topic"`, `"echo"`, "RosType", "RunRosEcho"} {
+		if !strings.Contains(cliText, want) {
+			t.Fatalf("roscli.go misses %s", want)
+		}
 	}
 	sedpText := cliReadSEDP(t)
 	if !strings.Contains(sedpText, cliTypeHash) {
 		t.Fatalf("sedp.go misses type hash %s", cliTypeHash)
 	}
-	if !strings.Contains(cliText, cliTypeName) {
-		t.Fatalf("main.go misses type name %s", cliTypeName)
+	if !strings.Contains(cliText, `"pub"`) {
+		t.Fatalf("roscli.go misses pub verb")
 	}
 }
 

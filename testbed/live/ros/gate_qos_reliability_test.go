@@ -1,10 +1,12 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
+//nolint:dupl // live gate take helpers repeat similar wire checks across QoS gates
 package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +16,9 @@ import (
 	"time"
 
 	"github.com/podomy/weld/internal/core"
+	"github.com/podomy/weld/internal/transports"
+	"github.com/podomy/weld/internal/transports/dds"
+	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -35,6 +40,9 @@ const (
 	relProbeWait    = 15 * time.Second
 	relCleanWait    = 10 * time.Second
 	relMismatchWait = 8 * time.Second
+	relRepubWait    = 2 * time.Second
+	relPubRetry     = 5 * time.Second
+	relPubInterval  = 50 * time.Millisecond
 )
 
 // relLiveCase describes one live reliability combination.
@@ -220,30 +228,6 @@ func relCheckCore(t *testing.T, c relLiveCase) {
 	relCheckIncompatible(t, c.name, report, offered, requested, publisher, subscriber)
 }
 
-// relAssertCompatibleFlow fails when a compatible echo misses the payload.
-//
-// A clean weld echo with no backend error plus a missing live ID is a flow
-// failure, not a skip. Only no-peer and unsupported flag cases skip.
-func relAssertCompatibleFlow(t *testing.T, c relLiveCase, stdout, stderr, live, payload string) {
-	t.Helper()
-	if !strings.Contains(stdout, live) {
-		t.Fatalf("case %s: weld echo missed live payload %q, want flow for compatible pair\nstdout:\n%s\nstderr:\n%s", c.name, payload, stdout, stderr)
-	}
-}
-
-// relAssertIncompatibleSilent fails when an incompatible pair delivers.
-//
-// Callers pin core.CheckCompatibility incompatible first via relCheckCore,
-// so live delivery must be absent. Silence with a loud core error is the
-// required result.
-func relAssertIncompatibleSilent(t *testing.T, c relLiveCase, stdout, live, payload string) {
-	t.Helper()
-	if strings.Contains(stdout, live) {
-		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow (core.CheckCompatibility reports incompatible)", c.name, payload)
-	}
-	t.Logf("case %s: incompatible pair stayed silent on live ID as required, core error is loud above", c.name)
-}
-
 // relAssertReverseDelivered fails when ROS echo misses the payload.
 //
 // A clean weld pub with sent confirmation plus a missing live ID is a flow
@@ -255,17 +239,89 @@ func relAssertReverseDelivered(t *testing.T, c relLiveCase, echoOutput, live, pa
 	}
 }
 
-// relRunForward runs ROS pub with a reliability flag and checks weld echo.
+// relEncodeString encodes one String sample as XCDR1.
+func relEncodeString(t *testing.T, text string) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	err := enc.WriteString(text)
+	if err != nil {
+		t.Fatalf("reliability encode: %v", err)
+	}
+	return enc.Bytes()
+}
+
+// relDecodeString decodes one XCDR1 String sample.
+func relDecodeString(payload []byte) (string, error) {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return "", fmt.Errorf("reliability decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("reliability decode data: %w", err)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return "", fmt.Errorf("reliability finish: %w", err)
+	}
+	return got, nil
+}
+
+// relTakeFailure classifies one TakeBytes error.
+func relTakeFailure(t *testing.T, c relLiveCase, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("case %s: weld take backend error: %v", c.name, terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("case %s: weld take backend error: %v", c.name, terr)
+	}
+	return false
+}
+
+// relTakeForPayload takes until one sample decodes to the payload.
+func relTakeForPayload(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration, c relLiveCase) bool {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if relTakeFailure(t, c, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		got, derr := relDecodeString(msg.Payload)
+		if derr != nil {
+			continue
+		}
+		if got == payload {
+			return true
+		}
+	}
+	return false
+}
+
+// relRunForward runs ROS pub with a reliability flag and checks Weld take.
 //
-// Domain is the allocated exclusive domain plumbed to DockerArgs and weld
-// --domain flags, so parallel workers never share a domain.
+// Domain is the allocated exclusive domain plumbed to DockerArgs, so
+// parallel workers never share a domain.
 //
-// It starts ROS pub with the reliability flag, waits for settle, then checks
-// weld echo output for the live ID. Compatible cases must deliver and a
-// missing payload with a clean echo fails. Incompatible cases must stay
-// silent on the live ID and delivery fails; core.CheckCompatibility pins the
-// mismatch loudly first via relCheckCore.
-func relRunForward(t *testing.T, ctx context.Context, bin string, domain int, c relLiveCase) {
+// It starts ROS pub with the reliability flag, waits for settle, then
+// subscribes via the Weld backend and takes until one sample decodes to
+// the live payload. Compatible cases must deliver and a missing payload
+// fails. Incompatible cases must stay silent on the live ID and delivery
+// fails; core.CheckCompatibility pins the mismatch loudly first via
+// relCheckCore.
+func relRunForward(t *testing.T, ctx context.Context, domain int, c relLiveCase) {
 	t.Helper()
 	live := helpers.LiveID("rel-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -301,36 +357,36 @@ func relRunForward(t *testing.T, ctx context.Context, bin string, domain int, c 
 	})
 	helpers.Sleep(ctx, relForwardNap)
 	if ctx.Err() != nil {
-		t.Fatalf("case %s: context ended before echo: %v", c.name, ctx.Err())
+		t.Fatalf("case %s: context ended before take: %v", c.name, ctx.Err())
 	}
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, topic, domain, relEchoWait)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "rel-fwd-"+live, "reliability") //nolint:gosec // G115: pooled domain fits uint32
+	err = helpers.SubscribeLiveReader(ctx, backend, topic, helpers.ForwardStringIDL, helpers.ForwardStringHash, "reliability")
 	if err != nil {
-		t.Fatalf("case %s: weld echo: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+		t.Fatalf("case %s: weld subscribe %s: %v", c.name, topic, err)
 	}
-	combined := stdout + "\n" + stderr
-	if strings.Contains(combined, "not implemented") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
-	}
-	if strings.Contains(combined, "not wired") {
-		t.Fatalf("case %s: weld echo backend error:\n%s", c.name, combined)
-	}
+	found := relTakeForPayload(t, ctx, backend, topic, payload, relEchoWait, c)
 	if c.compatible {
-		relAssertCompatibleFlow(t, c, stdout, stderr, live, payload)
+		if !found {
+			t.Fatalf("case %s: weld take missed live payload %q, want flow for compatible pair", c.name, payload)
+		}
 		return
 	}
 	requireTalkerAliveForSilence(t, ctx, domain, topic, live, c.name, talker, "reliability")
-	relAssertIncompatibleSilent(t, c, stdout, live, payload)
+	if found {
+		t.Fatalf("case %s: incompatible pair delivered payload %q, want no flow (core.CheckCompatibility reports incompatible)", c.name, payload)
+	}
+	t.Logf("case %s: incompatible pair stayed silent on live ID as required, core error is loud above", c.name)
 }
 
-// relRunReverse runs ROS echo with a reliability flag and checks weld pub.
+// relRunReverse runs ROS echo with a reliability flag and checks Weld pub.
 //
-// Domain is the allocated exclusive domain plumbed to DockerArgs and weld
-// --domain flags, so parallel workers never share a domain.
+// Domain is the allocated exclusive domain plumbed to DockerArgs, so
+// parallel workers never share a domain.
 //
 // It starts ROS echo with the reliability flag, waits for settle, then
-// checks weld pub delivery. Compatible cases must deliver and a missing
-// payload fails.
-func relRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c relLiveCase) {
+// publishes via the Weld backend until the echo sees the live payload.
+// Compatible cases must deliver and a missing payload fails.
+func relRunReverse(t *testing.T, ctx context.Context, domain int, c relLiveCase) {
 	t.Helper()
 	live := helpers.LiveID("rel-" + c.name)
 	topic := helpers.LiveTopic(live)
@@ -367,14 +423,20 @@ func relRunReverse(t *testing.T, ctx context.Context, bin string, domain int, c 
 	if ctx.Err() != nil {
 		t.Fatalf("case %s: context ended before pub: %v", c.name, ctx.Err())
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, domain, payload, echoPath, relPollWait, 3)
-	if err != nil {
-		t.Fatalf("case %s: weld pub: %v\nstdout:\n%s\nstderr:\n%s", c.name, err, stdout, stderr)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "rel-rev-"+live, "reliability") //nolint:gosec // G115: pooled domain fits uint32
+	encoded := relEncodeString(t, payload)
+	got, derr := relDecodeString(encoded)
+	if derr != nil || got != payload {
+		t.Fatalf("case %s: local codec mismatch: %v", c.name, derr)
 	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("case %s: weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", c.name, stdout, stderr)
+	typeHash := helpers.ForwardStringHash
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   encoded,
+		TypeHash:  typeHash,
 	}
-	if !found {
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, relPollWait, relRepubWait, relPubRetry, relPubInterval, "reliability") {
 		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads controlled temp file path
 		if rerr != nil {
 			t.Fatalf("case %s: ros echo missed live payload %q: %v", c.name, payload, rerr)
@@ -475,14 +537,14 @@ func relRunRosToRos(t *testing.T, ctx context.Context, domain int, c relLiveCase
 }
 
 // relRunCase checks core loudly then runs the live direction.
-func relRunCase(t *testing.T, ctx context.Context, bin string, domain int, c relLiveCase) {
+func relRunCase(t *testing.T, ctx context.Context, domain int, c relLiveCase) {
 	t.Helper()
 	relCheckCore(t, c)
 	switch c.direction {
 	case "forward":
-		relRunForward(t, ctx, bin, domain, c)
+		relRunForward(t, ctx, domain, c)
 	case "reverse":
-		relRunReverse(t, ctx, bin, domain, c)
+		relRunReverse(t, ctx, domain, c)
 	case "ros_to_ros":
 		relRunRosToRos(t, ctx, domain, c)
 	default:
@@ -528,11 +590,11 @@ func TestROSQoSReliabilityCore(t *testing.T) {
 // relGateSetup runs the outer reliability probe and returns the subtest context.
 //
 // It allocates one exclusive domain for the reliability flag probe, skips
-// cleanly without a peer or flag, builds weld once, then releases the outer
-// domain so parallel workers reuse the 32-domain pool. Subtests allocate
-// fresh exclusive domains for their live directions. The caller defers the
+// cleanly without a peer or flag, then releases the outer domain so
+// parallel workers reuse the 32-domain pool. Subtests allocate fresh
+// exclusive domains for their live directions. The caller defers the
 // returned cancel.
-func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
+func relGateSetup(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
 	t.Cleanup(func() {
 		helpers.AssertNoExcessSkips(t)
@@ -541,12 +603,11 @@ func relGateSetup(t *testing.T) (context.Context, context.CancelFunc, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), relTestTimeout)
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	relRequireFlag(t, ctx, domain)
-	bin := helpers.BuildWeld(t, ctx)
 	// The outer domain covered only the reliability probe. Free it now so
 	// parallel workers reuse the 32-domain pool instead of pinning two
 	// domains per worker for the whole test.
 	helpers.ReleaseDomainLease(domain, token)
-	return ctx, cancel, bin
+	return ctx, cancel
 }
 
 func TestROSQoSReliabilityCompatibleDelivers(t *testing.T) {
@@ -554,7 +615,7 @@ func TestROSQoSReliabilityCompatibleDelivers(t *testing.T) {
 	t.Cleanup(func() {
 		helpers.AssertNoExcessSkips(t)
 	})
-	ctx, cancel, bin := relGateSetup(t)
+	ctx, cancel := relGateSetup(t)
 	defer cancel()
 	// Reliability compatible cases span three entries: forward reliable to
 	// reliable, ros_to_ros best effort to best effort without weld, and
@@ -564,7 +625,7 @@ func TestROSQoSReliabilityCompatibleDelivers(t *testing.T) {
 	for _, c := range relCompatibleCases() {
 		t.Run(c.name, func(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
-			relRunCase(t, ctx, bin, subdomain, c)
+			relRunCase(t, ctx, subdomain, c)
 		})
 	}
 }
@@ -581,7 +642,7 @@ func TestROSQoSReliabilityIncompatibleLoud(t *testing.T) {
 	t.Cleanup(func() {
 		helpers.AssertNoExcessSkips(t)
 	})
-	ctx, cancel, bin := relGateSetup(t)
+	ctx, cancel := relGateSetup(t)
 	defer cancel()
 	// Reliability incompatible cases pin the single best-effort offer against
 	// the facade reliable request. It needs a fresh domain so parallel
@@ -592,7 +653,7 @@ func TestROSQoSReliabilityIncompatibleLoud(t *testing.T) {
 			subdomain := helpers.MustAllocateDomain(t)
 			subCtx, subCancel := context.WithTimeout(ctx, relMismatchWait+2*relEchoWait)
 			defer subCancel()
-			relRunCase(t, subCtx, bin, subdomain, c)
+			relRunCase(t, subCtx, subdomain, c)
 		})
 	}
 }

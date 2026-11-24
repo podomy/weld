@@ -3,29 +3,24 @@
 
 // Package unit_launch pins weld launch argument acceptance with fixtures.
 //
-// Runner gap: the launch path helper runLaunchCommand lives in package
-// main of the separate cmd-weld module, so this package cannot import it
-// without product changes. The test shells out to go run on cmd/weld
-// with GOWORK=off, following cmd/weld/go.mod, then diffs the canonical
-// dump section of stdout against expected files. No live ROS is needed.
+// The launch path builds node options in process through internal/launch
+// instead of shelling out to the removed cmd/weld helper, then diffs the
+// canonical dump section of the rendered output against expected files.
+// No live ROS is needed.
 package unit_launch
 
 import (
-	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
-	"time"
-)
 
-// launchTimeout bounds one weld launch shell out including compilation.
-const launchTimeout = 2 * time.Minute
+	"github.com/podomy/weld/internal/core"
+	"github.com/podomy/weld/internal/launch"
+)
 
 // launchCase describes one weld launch invocation plus expectations.
 type launchCase struct {
@@ -43,6 +38,18 @@ type launchCase struct {
 	expected string
 }
 
+// launchFlags holds parsed flags left of --ros-args.
+type launchFlags struct {
+	// node is the base node name.
+	node string
+	// namespace is the node namespace.
+	namespace string
+	// paramsFiles lists params files in order.
+	paramsFiles []string
+	// sdf is the SDF file path.
+	sdf string
+}
+
 // corpusDir returns the directory holding this test plus fixtures.
 func corpusDir(t *testing.T) string {
 	t.Helper()
@@ -53,42 +60,172 @@ func corpusDir(t *testing.T) string {
 	return filepath.Dir(file)
 }
 
-// repoRoot returns the repository root holding cmd/weld.
-func repoRoot(t *testing.T) string {
-	t.Helper()
-	dir := corpusDir(t)
-	for {
-		info, err := os.Stat(filepath.Join(dir, "cmd", "weld"))
-		if err == nil && info.IsDir() {
-			return dir
+// splitLaunchArgs splits args at the first --ros-args marker.
+func splitLaunchArgs(args []string) ([]string, []string) {
+	for i, a := range args {
+		if a == "--ros-args" {
+			return args[:i], args[i:]
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatalf("repo root with cmd/weld not found above %s", dir)
-		}
-		dir = parent
 	}
+	return args, []string{}
 }
 
-// runWeldLaunch shells out to the existing weld launch command.
-func runWeldLaunch(t *testing.T, ctx context.Context, args []string) string {
+// parseLaunchFlags parses flags left of --ros-args.
+func parseLaunchFlags(t *testing.T, left []string) launchFlags {
 	t.Helper()
-	root := repoRoot(t)
-	argv := append([]string{"run", ".", "launch"}, args...)
-	cmd := exec.CommandContext(ctx, "go", argv...) //nolint:gosec // G204: test harness runs fixed go run argv from code, no user input
-	cmd.Dir = filepath.Join(root, "cmd", "weld")
-	env := os.Environ()
-	env = append(env, "GOWORK=off", "ROS_LOG_DIR=")
-	cmd.Env = env
-	out, err := cmd.Output()
-	if err != nil {
-		exit, ok := errors.AsType[*exec.ExitError](err)
-		if ok {
-			t.Fatalf("weld launch %v: %v stderr %q", args, err, string(exit.Stderr))
+	var cfg launchFlags
+	i := 0
+	for i < len(left) {
+		tok := left[i]
+		next, ok := consumeLaunchFlag(t, &cfg, left, i, tok)
+		if !ok {
+			t.Fatalf("unknown launch flag %q", tok)
 		}
-		t.Fatalf("weld launch %v: %v", args, err)
+		i = next
 	}
-	return string(out)
+	return cfg
+}
+
+// consumeLaunchFlag handles one left side flag at position i.
+func consumeLaunchFlag(t *testing.T, cfg *launchFlags, left []string, i int, tok string) (int, bool) {
+	t.Helper()
+	if next, ok := consumeLaunchString(t, &cfg.node, left, i, tok, "node"); ok {
+		return next, true
+	}
+	if next, ok := consumeLaunchString(t, &cfg.namespace, left, i, tok, "namespace"); ok {
+		return next, true
+	}
+	if next, ok := consumeLaunchString(t, &cfg.sdf, left, i, tok, "sdf"); ok {
+		return next, true
+	}
+	if next, ok := consumeLaunchRepeated(t, &cfg.paramsFiles, left, i, tok, "params-file"); ok {
+		return next, true
+	}
+	return 0, false
+}
+
+// consumeLaunchString handles one --name value or --name=value flag.
+func consumeLaunchString(t *testing.T, dst *string, left []string, i int, tok, name string) (int, bool) {
+	t.Helper()
+	if tok == "--"+name {
+		if i+1 >= len(left) {
+			t.Fatalf("launch flag --%s needs a value", name)
+		}
+		*dst = left[i+1]
+		return i + 2, true
+	}
+	rest, ok := strings.CutPrefix(tok, "--"+name+"=")
+	if ok {
+		*dst = rest
+		return i + 1, true
+	}
+	return 0, false
+}
+
+// consumeLaunchRepeated handles one repeatable --name value flag.
+func consumeLaunchRepeated(t *testing.T, dst *[]string, left []string, i int, tok, name string) (int, bool) {
+	t.Helper()
+	if tok == "--"+name {
+		if i+1 >= len(left) {
+			t.Fatalf("launch flag --%s needs a value", name)
+		}
+		*dst = append(*dst, left[i+1])
+		return i + 2, true
+	}
+	rest, ok := strings.CutPrefix(tok, "--"+name+"=")
+	if ok {
+		*dst = append(*dst, rest)
+		return i + 1, true
+	}
+	return 0, false
+}
+
+// resolveLaunchParams loads YAML files and merges files plus CLI.
+func resolveLaunchParams(t *testing.T, opts launch.NodeOptions) map[string]core.ParamValue {
+	t.Helper()
+	fqn, err := launch.ResolveNodeFQN(opts.NodeName, opts.Namespace)
+	if err != nil {
+		t.Fatalf("resolve node %q: %v", opts.NodeName, err)
+	}
+	var sections []map[string]map[string]core.ParamValue
+	for _, path := range opts.ParamsFiles {
+		loaded, err := launch.LoadParamsFile(path)
+		if err != nil {
+			t.Fatalf("load params file %q: %v", path, err)
+		}
+		sections = append(sections, loaded)
+	}
+	merged := launch.MergeFileSections(sections)
+	resolved := launch.ResolveNodeParams(fqn, merged, opts.Params, nil)
+	return resolved
+}
+
+// renderLaunchStdout runs the launch pipeline in process and renders stdout.
+func renderLaunchStdout(t *testing.T, args []string) string {
+	t.Helper()
+	t.Setenv(launch.ROSLogDirEnv, "")
+	left, right := splitLaunchArgs(args)
+	cfg := parseLaunchFlags(t, left)
+	base, err := launch.NewNodeOptions(cfg.node, cfg.namespace, cfg.node == "")
+	if err != nil {
+		t.Fatalf("launch options: %v", err)
+	}
+	base.ParamsFiles = append([]string{}, cfg.paramsFiles...)
+	forwarded, err := launch.ForwardArgs(base, right)
+	if err != nil {
+		t.Fatalf("launch forward args: %v", err)
+	}
+	if strings.TrimSpace(forwarded.NodeName) == "" {
+		t.Fatalf("weld: launch needs --node or -r __node:=name")
+	}
+	fqn, err := launch.ResolveNodeFQN(forwarded.NodeName, forwarded.Namespace)
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	resolved := resolveLaunchParams(t, forwarded)
+	final, err := launch.RewriteParamsForNamespace(resolved, forwarded.Namespace, map[string]string{}, false)
+	if err != nil {
+		t.Fatalf("rewrite params: %v", err)
+	}
+	sdfPath := strings.TrimSpace(cfg.sdf)
+	if sdfPath != "" {
+		validated, err := launch.AppendSDFParams(forwarded, sdfPath)
+		if err != nil {
+			t.Fatalf("append sdf params: %v", err)
+		}
+		final[launch.SimTimeParam] = validated.Params[launch.SimTimeParam]
+	}
+	dump, err := launch.CanonicalDump(fqn, final)
+	if err != nil {
+		t.Fatalf("canonical dump: %v", err)
+	}
+	return formatLaunchStdout(fqn, forwarded.Remaps, dump, sdfPath)
+}
+
+// formatLaunchStdout renders node, remaps, dump, SDF note, and log dir.
+func formatLaunchStdout(fqn string, remaps []launch.RemapRule, dump, sdfPath string) string {
+	var b strings.Builder
+	b.WriteString("node: " + fqn + "\n")                 //nolint:errcheck // strings.Builder writes never fail
+	b.WriteString("remaps: " + itoa(len(remaps)) + "\n") //nolint:errcheck // strings.Builder writes never fail
+	sorted := append([]launch.RemapRule{}, remaps...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].From == sorted[j].From {
+			return sorted[i].To < sorted[j].To
+		}
+		return sorted[i].From < sorted[j].From
+	})
+	for _, r := range sorted {
+		b.WriteString("  " + r.From + " -> " + r.To + "\n") //nolint:errcheck // strings.Builder writes never fail
+	}
+	b.WriteString(dump) //nolint:errcheck // strings.Builder writes never fail
+	if strings.TrimSpace(sdfPath) != "" {
+		b.WriteString("sdf: " + strings.TrimSpace(sdfPath) + "\n") //nolint:errcheck // strings.Builder writes never fail
+	}
+	dir, ok := launch.ResolveLogDir()
+	if ok {
+		b.WriteString("log_dir: " + dir + "\n") //nolint:errcheck // strings.Builder writes never fail
+	}
+	return b.String()
 }
 
 // checkHeader asserts node plus remap plus sdf lines in stdout.
@@ -251,9 +388,7 @@ func TestLaunchCorpusAcceptance(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), launchTimeout)
-			defer cancel()
-			stdout := runWeldLaunch(t, ctx, tc.args)
+			stdout := renderLaunchStdout(t, tc.args)
 			checkHeader(t, stdout, tc)
 			got := dumpSection(t, stdout, tc.node)
 			raw, err := os.ReadFile(filepath.Join(dir, tc.expected)) //nolint:gosec // G304: test reads fixture from its own dir by fixed case name

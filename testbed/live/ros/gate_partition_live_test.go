@@ -1,16 +1,22 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
+//nolint:dupl // live gate take helpers repeat similar wire checks across QoS gates
 package ros_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	"github.com/podomy/weld/internal/types"
 	"github.com/podomy/weld/testbed/live/helpers"
 )
 
@@ -41,8 +47,88 @@ import (
 // per-run topic and live ID, skips only when no peer container is present,
 // and fails loudly otherwise.
 
+// Partition live publish retry bounds for Weld backend reverse legs.
+const (
+	partitionLivePubRetry      = 5 * time.Second
+	partitionLivePubInterval   = 50 * time.Millisecond
+	partitionLiveRepubWait     = 2 * time.Second
+	partitionLiveTakeWait      = 45 * time.Second
+	partitionLiveHashProbeWait = 5 * time.Second
+)
+
+// partitionLiveEncodeString encodes one String payload as XCDR1.
+func partitionLiveEncodeString(t *testing.T, text string) []byte {
+	t.Helper()
+	enc := types.NewEncoder(true)
+	err := enc.WriteString(text)
+	if err != nil {
+		t.Fatalf("partition encode: %v", err)
+	}
+	return enc.Bytes()
+}
+
+// partitionLiveDecodeString decodes one String payload and checks the live payload.
+func partitionLiveDecodeString(payload []byte, want string) error {
+	dec, err := types.NewDecoder(payload)
+	if err != nil {
+		return fmt.Errorf("partition decode header: %w", err)
+	}
+	got, err := dec.ReadString()
+	if err != nil {
+		return fmt.Errorf("partition decode data: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("partition data %q wants %q", got, want)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return fmt.Errorf("partition finish: %w", err)
+	}
+	return nil
+}
+
+// partitionLiveTakeFailure classifies one TakeBytes error.
+func partitionLiveTakeFailure(t *testing.T, terr error) bool {
+	t.Helper()
+	if errors.Is(terr, context.DeadlineExceeded) || errors.Is(terr, context.Canceled) {
+		return true
+	}
+	text := terr.Error()
+	if strings.Contains(text, "not implemented") {
+		t.Fatalf("partition take backend error: %v", terr)
+	}
+	if strings.Contains(text, "not wired") {
+		t.Fatalf("partition take backend error: %v", terr)
+	}
+	return false
+}
+
+// partitionLiveTakeUntilLive takes until one sample decodes to the live payload.
+func partitionLiveTakeUntilLive(t *testing.T, ctx context.Context, backend *dds.Backend, topic, payload string, timeout time.Duration) {
+	t.Helper()
+	takeCtx, takeCancel := context.WithTimeout(ctx, timeout)
+	defer takeCancel()
+	for takeCtx.Err() == nil {
+		msg, terr := backend.TakeBytes(takeCtx)
+		if terr != nil {
+			if partitionLiveTakeFailure(t, terr) {
+				break
+			}
+			continue
+		}
+		if msg.TopicName != "" && msg.TopicName != topic {
+			continue
+		}
+		if partitionLiveDecodeString(msg.Payload, payload) != nil {
+			continue
+		}
+		return
+	}
+	t.Fatalf("weld take did not see partition payload %q on %s after %v", payload, topic, timeout)
+}
+
 // TestGatePartitionDefaultFlowLive checks a Cyclone talker on the default
-// partition reaches weld echo on a per-run topic.
+// partition reaches Weld backend take on a per-run topic.
 func TestGatePartitionDefaultFlowLive(t *testing.T) {
 	t.Parallel()
 	domain := helpers.MustAllocateDomain(t)
@@ -50,7 +136,6 @@ func TestGatePartitionDefaultFlowLive(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	helpers.SkipIfNoTypeInterface(t, ctx, helpers.Container, domain, helpers.RosBin, rosType, typeProbe)
-	bin := helpers.BuildWeld(t, ctx)
 	live := helpers.LiveID("part")
 	topic := helpers.LiveTopic(live)
 	payload := "hello partition default " + live
@@ -67,18 +152,22 @@ func TestGatePartitionDefaultFlowLive(t *testing.T) {
 	})
 	helpers.Sleep(ctx, forwardNap)
 	if ctx.Err() != nil {
-		t.Fatalf("context ended before echo: %v", ctx.Err())
+		t.Fatalf("context ended before take: %v", ctx.Err())
 	}
-	stdout, stderr, err := helpers.RunWeldEcho(ctx, bin, topic, domain, echoWait)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, helpers.ForwardStringHash, partitionLiveHashProbeWait, "part")
 	if err != nil {
-		t.Fatalf("weld echo: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Fatalf("hash unavailable for topic %s: %v", topic, err)
 	}
-	if !strings.Contains(stdout, live) {
-		t.Fatalf("weld echo missed default-partition payload %q:\nstdout:\n%s\nstderr:\n%s", payload, stdout, stderr)
+	t.Logf("partition forward topic %s hash %s", topic, typeHash)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "part-forward-"+live, "part") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	err = helpers.SubscribeLiveReader(ctx, backend, topic, helpers.ForwardStringIDL, typeHash, "part")
+	if err != nil {
+		t.Fatalf("subscribe %s: %v", topic, err)
 	}
+	partitionLiveTakeUntilLive(t, ctx, backend, topic, payload, partitionLiveTakeWait)
 }
 
-// TestGatePartitionReverseFlowLive checks weld pub on the default partition
+// TestGatePartitionReverseFlowLive checks Weld backend publish on the default partition
 // reaches ros2 topic echo on a per-run topic.
 func TestGatePartitionReverseFlowLive(t *testing.T) {
 	t.Parallel()
@@ -87,7 +176,6 @@ func TestGatePartitionReverseFlowLive(t *testing.T) {
 	defer cancel()
 	helpers.SkipIfNoPeer(t, ctx, helpers.Container)
 	helpers.SkipIfNoTypeInterface(t, ctx, helpers.Container, domain, helpers.RosBin, rosType, typeProbe)
-	bin := helpers.BuildWeld(t, ctx)
 	live := helpers.LiveID("part")
 	topic := helpers.LiveTopic(live)
 	payload := "hello partition reverse " + live
@@ -106,15 +194,28 @@ func TestGatePartitionReverseFlowLive(t *testing.T) {
 	if ctx.Err() != nil {
 		t.Fatalf("context ended before pub: %v", ctx.Err())
 	}
-	found, stdout, stderr, err := helpers.PublishUntilSeen(ctx, bin, topic, domain, payload, echoPath, pollWait, 3)
+	typeHash, err := helpers.ResolveTopicHash(ctx, helpers.Container, domain, helpers.RosBin, topic, helpers.ForwardStringHash, partitionLiveHashProbeWait, "part")
 	if err != nil {
-		t.Fatalf("weld pub: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Fatalf("hash unavailable for topic %s: %v", topic, err)
 	}
-	if !strings.Contains(stdout, "sent:") {
-		t.Fatalf("weld pub missing confirmation:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	t.Logf("partition reverse topic %s hash %s", topic, typeHash)
+	encoded := partitionLiveEncodeString(t, payload)
+	err = partitionLiveDecodeString(encoded, payload)
+	if err != nil {
+		t.Fatalf("local codec: %v", err)
 	}
-	if !found {
-		t.Fatalf("ros2 topic echo missed default-partition payload %q", payload)
+	backend := helpers.MustOpenLiveBackend(t, ctx, uint32(domain), "part-reverse-"+live, "part") //nolint:gosec // G115: pooled domain 70 through 101 fits uint32
+	msg := transports.OutgoingMessage{
+		TopicName: topic,
+		TypeName:  helpers.ForwardStringIDL,
+		Payload:   encoded,
+	}
+	if !helpers.PublishUntilEcho(ctx, t, backend, msg, echoPath, payload, typeHash, pollWait, partitionLiveRepubWait, partitionLivePubRetry, partitionLivePubInterval, "part") {
+		data, rerr := os.ReadFile(echoPath) //nolint:gosec // test reads controlled logs path
+		if rerr != nil {
+			t.Fatalf("ros2 topic echo missed default-partition payload %q: %v", payload, rerr)
+		}
+		t.Fatalf("ros2 topic echo missed default-partition payload %q\necho output:\n%s", payload, string(data))
 	}
 }
 

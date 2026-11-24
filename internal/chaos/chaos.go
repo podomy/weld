@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Podomy.
+// Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
 // Package chaos provides a deterministic chaos harness for wireless profiles.

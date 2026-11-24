@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Podomy.
+// Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
 // Command hook runs fast verification by default with a full live gate on request.

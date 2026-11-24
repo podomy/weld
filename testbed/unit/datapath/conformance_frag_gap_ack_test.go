@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Podomy.
+// Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
 // Package unit_datapath holds DATA_FRAG plus GAP plus ACKNACK conformance pins.

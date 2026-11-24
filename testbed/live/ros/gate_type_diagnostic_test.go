@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Podomy.
+// Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
 //nolint:dupl // diag status pins independent topic shape with same wire checks as rest2

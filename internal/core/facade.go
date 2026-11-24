@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 // QoS worn as a facade: Weld speaks QoS on the wire and does not run a QoS
 // engine inside.

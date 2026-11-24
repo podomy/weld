@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 //nolint:cyclop // chaos conformance holds sequential wireless matrix assertions, high average reflects breadth
 package unit_chaos

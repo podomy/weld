@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 // Command bench-agent is the containerized Weld counterpart of the rclpy
 // bench probe at testbed/bench/probes/bench_probe.py.

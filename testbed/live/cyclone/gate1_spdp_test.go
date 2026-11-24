@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 // Package cyclone proves Gate 1 SPDP ST0 non-local discovery on an allocated domain
 // with direct Go RTPS and no log file parsing.

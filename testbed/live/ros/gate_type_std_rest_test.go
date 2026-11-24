@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 //nolint:cyclop,dupl,gocognit // test breadth pins many similar wire checks in one file
 package ros_test

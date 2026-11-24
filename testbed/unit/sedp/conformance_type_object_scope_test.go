@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Podomy.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BUSL-1.1
 
 // Full XTypes TypeObject exchange with dependency resolution and
 // validation is v2 and out of scope for v1. V1 keeps raw TypeObject

@@ -10,15 +10,15 @@ Weld is Go robotics middleware, wire-compatible with ROS 2, for fleets that must
 
 Proven by a 110-row benchmark matrix, green end to end: lower p50 latency at every payload size, zero loss to 100 kHz where ROS first drops at 10 kHz.
 
-## Commercial Licensing
-
-Commercial licenses are available. Contact [contact@podomy.com](mailto:contact@podomy.com).
-
 <p align="center">
   <img src="testbed/bench/latency-vs-throughput.svg" alt="Latency vs throughput">
 </p>
 
 Full docs live in [docs/](/docs).
+
+## Commercial Licensing
+
+Commercial licenses are available. Contact [contact@podomy.com](mailto:contact@podomy.com).
 
 ## Contributing
 

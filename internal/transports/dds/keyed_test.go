@@ -530,3 +530,28 @@ func TestKeyedDescriptorsValidate(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointKeyedsedp3BuiltinExcluded pins builtin 0xC2 never keyed.
+//
+// RTPS EntityKind with the 0xC0 builtin bits set (such as SEDP 0xC2
+// writers) is explicitly excluded before the kind comparison, so builtin
+// discovery traffic never reads as keyed even though the check reads only
+// the kind byte.
+func TestEndpointKeyedsedp3BuiltinExcluded(t *testing.T) {
+	t.Parallel()
+
+	builtin := SEDPEndpoint{ID: SEDPGUID{Entity: SEDPEntityID{0x00, 0x00, 0x00, 0xC2}}}
+	if EndpointKeyed(builtin) {
+		t.Fatalf("builtin kind 0xC2 reads keyed, want unkeyed")
+	}
+
+	secure := SEDPEndpoint{ID: SEDPGUID{Entity: SEDPEntityID{0xFF, 0x00, 0x03, 0xC2}}}
+	if EndpointKeyed(secure) {
+		t.Fatalf("secure builtin kind 0xC2 reads keyed, want unkeyed")
+	}
+
+	keyed := SEDPEndpoint{ID: SEDPGUID{Entity: KeyedUserEntity(0x001000, false)}}
+	if !EndpointKeyed(keyed) {
+		t.Fatalf("keyed writer kind 0x02 reads unkeyed")
+	}
+}

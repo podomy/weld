@@ -16,6 +16,13 @@ Proven by a 110-row benchmark matrix, green end to end: lower p50 latency at eve
 
 Full docs live in [docs/](/docs).
 
+## Protocol support
+
+| Transport | Spec | Status |
+|-----------|------|--------|
+| DDS | DDSI-RTPS 2.5, DDS 1.4, DDS-XTypes 1.4, DDS-SECURITY 1.2 | Fully supported |
+| MQTT | MQTT v5 | Fully supported |
+
 ## Commercial Licensing
 
 Commercial licenses are available. See [podomy.com/projects](https://podomy.com/projects/) for pricing, or contact [contact@podomy.com](mailto:contact@podomy.com).

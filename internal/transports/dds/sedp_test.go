@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
 )
 
 // mustSEDPIndexWithPrefix returns an index with a distinct prefix for tests.
@@ -975,6 +976,11 @@ func waitForSEDPLoopCancel(t *testing.T, cancel context.CancelFunc, errCh <-chan
 }
 
 // collectSEDPGUIDs parses samples and returns GUID strings.
+//
+// Topics announce samples carry no endpoint GUID and are skipped: the
+// announce loop sends TopicBuiltinTopicData alongside endpoint DATA, so
+// callers asserting endpoint coverage must not trip on topic samples.
+// Genuinely malformed samples still fail the test.
 func collectSEDPGUIDs(t *testing.T, raws [][]byte) map[string]bool {
 	t.Helper()
 
@@ -983,6 +989,10 @@ func collectSEDPGUIDs(t *testing.T, raws [][]byte) map[string]bool {
 	for _, raw := range raws {
 		ep, err := ParseSEDPDATA(raw)
 		if err != nil {
+			if _, topicErr := ParseSEDPTopicsDATA(raw); topicErr == nil {
+				continue
+			}
+
 			t.Fatalf("parse announced: %v", err)
 		}
 
@@ -1224,7 +1234,7 @@ func TestSEDPSerializeBuiltinEntities(t *testing.T) {
 		t.Fatalf("serialize reader: %v", err)
 	}
 
-	checkSEDPDATAHeader(t, writerData, sedpPublicationsWriterCyclone)
+	checkSEDPDATAHeader(t, writerData, sedpPublicationsWriter)
 	checkSEDPDATAHeader(t, readerData, sedpSubscriptionsWriter)
 }
 
@@ -1282,8 +1292,8 @@ func checkSEDPDATAHeader(t *testing.T, raw []byte, wantWriter SEDPEntityID) {
 	}
 }
 
-// TestSEDPParseAcceptsCyclonePubsWriter checks the observed writer entity.
-func TestSEDPParseAcceptsCyclonePubsWriter(t *testing.T) {
+// TestSEDPParseAcceptsPubsWriter checks the spec publications writer entity.
+func TestSEDPParseAcceptsPubsWriter(t *testing.T) {
 	t.Parallel()
 
 	idx := mustSEDPIndexWithPrefix(t, 0xE1)
@@ -1296,17 +1306,17 @@ func TestSEDPParseAcceptsCyclonePubsWriter(t *testing.T) {
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(ep.ID)},
 	}
 
-	body := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	body := mustSEDPDataBody(sedpPublicationsWriter, params)
 
 	raw := mustSEDPMessage(t, ep.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, body)
 
 	decoded, err := ParseSEDPDATA(raw)
 	if err != nil {
-		t.Fatalf("parse cyclone writer: %v", err)
+		t.Fatalf("parse pubs writer: %v", err)
 	}
 
 	if decoded.IsReader {
-		t.Fatalf("cyclone pubs writer parsed as reader")
+		t.Fatalf("pubs writer parsed as reader")
 	}
 
 	if !decoded.ID.Equal(ep.ID) {
@@ -1528,9 +1538,10 @@ func checkSEDPUserdataEmpty(t *testing.T) {
 // Observed wire facts pinned by these fixtures:
 //   - RTPS version 2.1 with vendor id 01:10.
 //   - Publications writer entity 0x000003c2, subscriptions writer
-//     entity 0x000004c2, readers 0x000003c7 and 0x000004c7. Note the
-//     publications writer differs from the spec value 0x000002c2, which
-//     this package still sends; parsing accepts both.
+//     entity 0x000004c2, readers 0x000003c7 and 0x000004c7, all per
+//     DDSI-RTPS 2.5 section 8.5.4.3. The Topics writer 0x000002c2
+//     carries TopicBuiltinTopicData, never endpoint DATA, and endpoint
+//     ingest skips it quietly.
 //   - DATA flags 0x05 (little endian plus data present) with the
 //     unknown reader 0x00000000 and no inline QoS: endpoint params live
 //     in the payload behind the PL_CDR_LE encapsulation 0x00030000.
@@ -2958,7 +2969,7 @@ func TestSEDPBatchedDatagramIsolatesBadEntry(t *testing.T) {
 
 	subs = append(subs, mustSEDPDataSubmessage(t, firstSample))
 
-	badBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, []rtps.Param{
+	badBody := mustSEDPDataBody(sedpPublicationsWriter, []rtps.Param{
 		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString("std_msgs::msg::dds_::String_")},
 	})
 	badFlags := sedpFlagLittleEndian | sedpFlagInlineQoS | sedpFlagDataPresent
@@ -3244,7 +3255,7 @@ func TestSEDPSeqGatingAfterUpsert(t *testing.T) {
 		binary.LittleEndian.PutUint32(body[sedpDATASeqOff+4:sedpDATASeqOff+8], uint32(seq)) //nolint:gosec // G115: test sequences are small
 	}
 
-	badBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, invalidParams)
+	badBody := mustSEDPDataBody(sedpPublicationsWriter, invalidParams)
 	setSeq(badBody, 9)
 	bad := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, badBody)
 
@@ -3253,7 +3264,7 @@ func TestSEDPSeqGatingAfterUpsert(t *testing.T) {
 		t.Fatalf("invalid ingest succeeded, want error")
 	}
 
-	goodBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, validParams)
+	goodBody := mustSEDPDataBody(sedpPublicationsWriter, validParams)
 	setSeq(goodBody, 9)
 	good := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, goodBody)
 
@@ -3282,7 +3293,7 @@ func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
 	}
 
-	zeroBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	zeroBody := mustSEDPDataBody(sedpPublicationsWriter, params)
 	binary.LittleEndian.PutUint64(zeroBody[sedpDATASeqOff:sedpDATASeqOff+8], 0)
 	zero := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, zeroBody)
 
@@ -3303,7 +3314,7 @@ func TestSEDPSeqZeroNeverAdvances(t *testing.T) {
 		t.Fatalf("gen = %d, want 0 after seq 0 rejection", got)
 	}
 
-	oneBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	oneBody := mustSEDPDataBody(sedpPublicationsWriter, params)
 	binary.LittleEndian.PutUint64(oneBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
 	one := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, oneBody)
 
@@ -3332,7 +3343,7 @@ func TestSEDPDuplicateReannounceCancelsGraceEvict(t *testing.T) {
 		{ID: rtps.PIDEndpointGUIDWire, Value: sedpEncodeEndpointGUID(writer.ID)},
 	}
 
-	firstBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	firstBody := mustSEDPDataBody(sedpPublicationsWriter, params)
 	binary.LittleEndian.PutUint64(firstBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
 	first := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, firstBody)
 	if err := local.ingestSample(first); err != nil {
@@ -3341,7 +3352,7 @@ func TestSEDPDuplicateReannounceCancelsGraceEvict(t *testing.T) {
 
 	local.SchedulePrefixEvict(writer.ID.Prefix, time.Now())
 
-	secondBody := mustSEDPDataBody(sedpPublicationsWriterCyclone, params)
+	secondBody := mustSEDPDataBody(sedpPublicationsWriter, params)
 	binary.LittleEndian.PutUint64(secondBody[sedpDATASeqOff:sedpDATASeqOff+8], 1)
 	second := mustSEDPMessage(t, writer.ID.Prefix, sedpFlagLittleEndian|sedpFlagInlineQoS|sedpFlagDataPresent, secondBody)
 	if err := local.ingestSample(second); err != nil {
@@ -3368,7 +3379,7 @@ func TestSEDPHeartbeatReplay(t *testing.T) {
 		prefix[i] = 0xF7 + byte(i)
 	}
 
-	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriter}
 
 	if !idx.sedpHeartbeatNote(key, 5, 10) {
 		t.Fatalf("first heartbeat not processed")
@@ -3411,7 +3422,7 @@ func TestSEDGapFullListClampAndCap(t *testing.T) {
 		prefix[i] = 0xF8 + byte(i)
 	}
 
-	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+	key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriter}
 
 	idx.sedpApplyGapList(key, []uint64{0, 5})
 	idx.mu.Lock()
@@ -3860,7 +3871,7 @@ func TestSEDPHeartbeatCapEvicts(t *testing.T) {
 		var prefix SEDPGUIDPrefix
 		binary.BigEndian.PutUint32(prefix[0:4], uint32(i))
 		binary.BigEndian.PutUint32(prefix[4:8], uint32(i+1))
-		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriter}
 		idx.sedpHeartbeatNote(key, int32(i+1), uint64(i+1))
 	}
 
@@ -3870,7 +3881,7 @@ func TestSEDPHeartbeatCapEvicts(t *testing.T) {
 	var newest SEDPGUIDPrefix
 	binary.BigEndian.PutUint32(newest[0:4], uint32(sedpAuxCap+4))
 	binary.BigEndian.PutUint32(newest[4:8], uint32(sedpAuxCap+5))
-	_, lastSeen := idx.hbLast[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriterCyclone}]
+	_, lastSeen := idx.hbLast[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriter}]
 	idx.mu.Unlock()
 
 	if nLast > sedpAuxCap {
@@ -3895,7 +3906,7 @@ func TestSEDPWriterHighCapEvicts(t *testing.T) {
 	for i := range sedpAuxCap + 5 {
 		var prefix SEDPGUIDPrefix
 		binary.BigEndian.PutUint32(prefix[0:4], uint32(5000+i))
-		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriterCyclone}
+		key := sedpWriterKey{prefix: prefix, writer: sedpPublicationsWriter}
 		idx.sedpApplyGapList(key, []uint64{uint64(i + 1)})
 	}
 
@@ -3903,7 +3914,7 @@ func TestSEDPWriterHighCapEvicts(t *testing.T) {
 	n := len(idx.writerHigh)
 	var newest SEDPGUIDPrefix
 	binary.BigEndian.PutUint32(newest[0:4], uint32(5000+sedpAuxCap+4))
-	_, newestSeen := idx.writerHigh[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriterCyclone}]
+	_, newestSeen := idx.writerHigh[sedpWriterKey{prefix: newest, writer: sedpPublicationsWriter}]
 	idx.mu.Unlock()
 
 	if n > sedpAuxCap {
@@ -4009,7 +4020,7 @@ func TestSEDPBigEndianPartitionRefusedLoudly(t *testing.T) {
 		{ID: PIDPartition, Value: []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 'A', 0x00}},
 	}
 
-	body := mustSEDPDataBodyOrder(sedpPublicationsWriterCyclone, params, false)
+	body := mustSEDPDataBodyOrder(sedpPublicationsWriter, params, false)
 	raw := mustSEDPMessageOrder(t, writer.ID.Prefix, sedpFlagInlineQoS|sedpFlagDataPresent, body, false)
 
 	err := local.ingestSample(raw)
@@ -4018,5 +4029,903 @@ func TestSEDPBigEndianPartitionRefusedLoudly(t *testing.T) {
 	}
 	if len(local.RemoteEndpoints()) != 0 {
 		t.Fatalf("remotes = %d, want 0 after BE partition refusal", len(local.RemoteEndpoints()))
+	}
+}
+
+// TestPartitionDeclaresedp3FailClosed pins declare fail-closed on bad partitions.
+//
+// Malformed partition params must reject the declare loudly instead of
+// degrading to the default partition, so a truncated list or a bad name
+// never silently meets the wrong peers. Valid partition QoS still declares
+// with the set carried.
+func TestPartitionDeclaresedp3FailClosed(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF1)
+
+	validParam, err := PartitionParam([]string{"A"})
+	if err != nil {
+		t.Fatalf("partition param: %v", err)
+	}
+
+	validQoS, err := rtps.EncodeParams([]rtps.Param{validParam})
+	if err != nil {
+		t.Fatalf("encode valid qos: %v", err)
+	}
+
+	ep, err := idx.DeclareWriter("/sedp3part", "std_msgs__msg__String", "RIHS01_sedp3", validQoS)
+	if err != nil {
+		t.Fatalf("valid partition declare: %v", err)
+	}
+
+	if len(ep.Partitions) != 1 || ep.Partitions[0] != "A" {
+		t.Fatalf("partitions = %q, want [A]", ep.Partitions)
+	}
+
+	badValue := []byte{
+		0x01, 0x00, 0x00, 0x00,
+		0x04, 0x00, 0x00, 0x00,
+		'A', ',', 0x00, 0x00,
+	}
+
+	badQoS, err := rtps.EncodeParams([]rtps.Param{{ID: PIDPartition, Value: badValue}})
+	if err != nil {
+		t.Fatalf("encode bad qos: %v", err)
+	}
+
+	if _, err = idx.DeclareWriter("/sedp3bad", "std_msgs__msg__String", "RIHS01_sedp3", badQoS); err == nil {
+		t.Fatal("comma partition declare succeeded, want loud reject")
+	}
+
+	shortValue := []byte{0x01, 0x00}
+
+	shortQoS, err := rtps.EncodeParams([]rtps.Param{{ID: PIDPartition, Value: shortValue}})
+	if err != nil {
+		t.Fatalf("encode short qos: %v", err)
+	}
+
+	if _, err = idx.DeclareReader("/sedp3short", "std_msgs__msg__String", "RIHS01_sedp3", shortQoS); err == nil {
+		t.Fatal("truncated partition declare succeeded, want loud reject")
+	}
+
+	if _, err = idx.DeclareWriter("/sedp3opaque", "std_msgs__msg__String", "RIHS01_sedp3", []byte{0xFF}); err == nil {
+		t.Fatal("undecodable qos declare succeeded, want loud reject")
+	}
+}
+
+// TestStampLocalPartitionssedp3WritersExempt documents why writers stay exempt.
+//
+// StampLocalPartitions backfills only readers: the subscribe path carries
+// partitions while the publish path has no partition API, and stamping
+// writers on a subscribe would leak subscription state into publication.
+// Writers join partitions only through declare QoS, never through this
+// reader-only backfill, so a writer on the same topic keeps the default
+// partition while the reader moves.
+// checkStampedWriterExempt pins that the writer keeps default partitions.
+func checkStampedWriterExempt(t *testing.T, ep SEDPEndpoint, writer SEDPEndpoint) bool {
+	t.Helper()
+
+	if !ep.ID.Equal(writer.ID) {
+		return false
+	}
+
+	if len(ep.Partitions) != 0 {
+		t.Fatalf("writer partitions = %q, want default (exempt)", ep.Partitions)
+	}
+
+	return true
+}
+
+// checkStampedReaderMoved pins that the reader carries partition A.
+func checkStampedReaderMoved(t *testing.T, ep SEDPEndpoint) bool {
+	t.Helper()
+
+	if !ep.IsReader || ep.ROSTopic != "/sedp3stamp" {
+		return false
+	}
+
+	if len(ep.Partitions) != 1 || ep.Partitions[0] != "A" {
+		t.Fatalf("reader partitions = %q, want [A]", ep.Partitions)
+	}
+
+	return true
+}
+
+func TestStampLocalPartitionssedp3WritersExempt(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF2)
+
+	writer := mustSEDPWriter(t, idx, "/sedp3stamp", "RIHS01_sedp3")
+	mustSEDPReader(t, idx, "/sedp3stamp", "RIHS01_sedp3")
+
+	idx.StampLocalPartitions("/sedp3stamp", "std_msgs__msg__String", []string{"A"})
+
+	var foundWriter, foundReader bool
+
+	for _, ep := range idx.LocalEndpoints() {
+		if checkStampedWriterExempt(t, ep, writer) {
+			foundWriter = true
+		}
+		if checkStampedReaderMoved(t, ep) {
+			foundReader = true
+		}
+	}
+
+	if !foundWriter || !foundReader {
+		t.Fatalf("locals miss writer=%v reader=%v", foundWriter, foundReader)
+	}
+}
+
+// TestPayloadQoSsedp3MalformedMarks pins malformed QoS fail-closed ingest.
+//
+// A present-but-malformed QoS value must mark RxOMalformed instead of
+// silently falling back to inline-only params, so the endpoint stays
+// visible for INCOMPATIBLE status but never matches. Absent QoS decodes to
+// DDS spec defaults, and valid QoS parses cleanly.
+func TestPayloadQoSsedp3MalformedMarks(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF3)
+	ep := mustSEDPWriter(t, idx, "/sedp3qos", "RIHS01_sedp3")
+	identity := mustSEDPIdentityParams(t, ep)
+
+	malformed := append(append([]rtps.Param(nil), identity...),
+		rtps.Param{ID: rtps.PIDReliability, Value: []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}})
+
+	fields, err := sedpEndpointFields(malformed, true)
+	if err != nil {
+		t.Fatalf("malformed qos fields: %v", err)
+	}
+
+	if !fields.wireQoSMalformed || fields.hasWireQoS {
+		t.Fatalf("malformed flags = (malformed=%v has=%v), want (true false)", fields.wireQoSMalformed, fields.hasWireQoS)
+	}
+
+	blank, err := sedpEndpointFields(identity, true)
+	if err != nil {
+		t.Fatalf("blank qos fields: %v", err)
+	}
+
+	if blank.wireQoSMalformed || !blank.hasWireQoS {
+		t.Fatalf("blank flags = (malformed=%v has=%v), want (false true)", blank.wireQoSMalformed, blank.hasWireQoS)
+	}
+
+	if blank.wireQoS.ReliabilityKind != writerQoSReliabilityBestEffort || blank.wireQoS.DurabilityKind != sedpDurabilityVolatile || blank.wireQoS.Depth != 1 {
+		t.Fatalf("blank qos = %+v, want best-effort volatile depth 1", blank.wireQoS)
+	}
+}
+
+// mustSEDPHeartbeatFirst extracts the first heartbeat first and last
+// sequences for one writer from a serialized sample.
+func mustSEDPHeartbeatFirst(t *testing.T, raw []byte, wantWriter SEDPEntityID) (uint64, uint64) {
+	t.Helper()
+
+	off := sedpRTPSHeaderLen
+	for off < len(raw) {
+		if len(raw)-off < sedpSubmessageHeaderLen {
+			t.Fatalf("submessage header truncated at %d", off)
+		}
+
+		id := raw[off]
+		flags := raw[off+sedpSubmessageFlagsOff]
+
+		if flags&sedpFlagLittleEndian == 0 {
+			t.Fatalf("submessage %#02x flags %#02x miss LE", id, flags)
+		}
+
+		length := int(binary.LittleEndian.Uint16(raw[off+sedpSubmessageLengthOff : off+sedpSubmessageHeaderLen]))
+		end := off + sedpSubmessageHeaderLen + length
+
+		if end > len(raw) {
+			t.Fatalf("submessage %#02x length %d overruns %d", id, length, len(raw)-off)
+		}
+
+		body := raw[off+sedpSubmessageHeaderLen : end]
+		off = end
+
+		if id != sedpSubmessageHeartbeat {
+			continue
+		}
+
+		if len(body) != sedpHeartbeatSize {
+			t.Fatalf("heartbeat body = %d, want %d", len(body), sedpHeartbeatSize)
+		}
+
+		var writer SEDPEntityID
+
+		copy(writer[:], body[sedpHeartbeatWriterOff:sedpHeartbeatWriterOff+sedpEntityLen])
+
+		if writer != wantWriter {
+			continue
+		}
+
+		first := uint64(binary.LittleEndian.Uint32(body[8:12]))<<32 | uint64(binary.LittleEndian.Uint32(body[12:16]))
+		last := uint64(binary.LittleEndian.Uint32(body[16:20]))<<32 | uint64(binary.LittleEndian.Uint32(body[20:24]))
+
+		return first, last
+	}
+
+	t.Fatalf("no heartbeat for writer %x", wantWriter)
+
+	return 0, 0
+}
+
+// TestSEDPHeartbeatFirstTracksLowestAvailable pins tracked heartbeat first.
+//
+// Heartbeats advertise the tracked lowest-available sequence per writer
+// instead of a constant: streams start at 1 with no pruning, so fresh
+// streams advertise 1 and repeated serializes keep the low while last
+// advances. Publications, subscriptions, and topics streams track
+// independently.
+func TestSEDPHeartbeatFirstTracksLowestAvailable(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF7)
+	writer := mustSEDPWriter(t, idx, "/chatter", "RIHS01_low")
+	reader := mustSEDPReader(t, idx, "/chatter", "RIHS01_low")
+
+	firstRaw, err := SerializeSEDPDATA(writer)
+	if err != nil {
+		t.Fatalf("serialize first: %v", err)
+	}
+
+	firstFirst, firstLast := mustSEDPHeartbeatFirst(t, firstRaw, sedpPublicationsWriter)
+	if firstFirst != 1 {
+		t.Fatalf("first heartbeat first = %d, want tracked low 1", firstFirst)
+	}
+
+	secondRaw, err := SerializeSEDPDATA(writer)
+	if err != nil {
+		t.Fatalf("serialize second: %v", err)
+	}
+
+	secondFirst, secondLast := mustSEDPHeartbeatFirst(t, secondRaw, sedpPublicationsWriter)
+	if secondFirst != firstFirst {
+		t.Fatalf("second heartbeat first = %d, want tracked low %d", secondFirst, firstFirst)
+	}
+
+	if secondLast <= firstLast {
+		t.Fatalf("second heartbeat last = %d, want above %d", secondLast, firstLast)
+	}
+
+	if got := sedpWriterFirstAvailable(writer.ID.Prefix, sedpPublicationsWriter); got != firstFirst {
+		t.Fatalf("tracked low = %d, want %d", got, firstFirst)
+	}
+
+	readerRaw, err := SerializeSEDPDATA(reader)
+	if err != nil {
+		t.Fatalf("serialize reader: %v", err)
+	}
+
+	readerFirst, _ := mustSEDPHeartbeatFirst(t, readerRaw, sedpSubscriptionsWriter)
+	if readerFirst != 1 {
+		t.Fatalf("reader heartbeat first = %d, want independent low 1", readerFirst)
+	}
+
+	if got := sedpWriterFirstAvailable(reader.ID.Prefix, sedpSubscriptionsWriter); got != 1 {
+		t.Fatalf("reader tracked low = %d, want 1", got)
+	}
+}
+
+// TestSEDPWriterFirstAvailableDefaultsOne pins the unseen-stream fallback.
+func TestSEDPWriterFirstAvailableDefaultsOne(t *testing.T) {
+	t.Parallel()
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xF6 + byte(i)
+	}
+
+	if got := sedpWriterFirstAvailable(prefix, sedpPublicationsWriter); got != 1 {
+		t.Fatalf("unseen low = %d, want 1", got)
+	}
+}
+
+// mustSerializeTopics builds one topics sample and fails the test on error.
+func mustSerializeTopics(t *testing.T, prefix SEDPGUIDPrefix, topic SEDPTopic) []byte {
+	t.Helper()
+
+	raw, err := SerializeSEDPTopicsDATA(prefix, topic)
+	if err != nil {
+		t.Fatalf("serialize topics: %v", err)
+	}
+
+	return raw
+}
+
+// mustParseTopicsSample parses one topics sample and fails the test on error.
+func mustParseTopicsSample(t *testing.T, raw []byte) SEDPTopic {
+	t.Helper()
+
+	back, err := ParseSEDPTopicsDATA(raw)
+	if err != nil {
+		t.Fatalf("parse topics: %v", err)
+	}
+
+	return back
+}
+
+// checkTopicsWriter asserts the Topics DATA writer entity.
+func checkTopicsWriter(t *testing.T, raw []byte) {
+	t.Helper()
+
+	body, _, err := sedpFindTopicsDATA(raw)
+	if err != nil {
+		t.Fatalf("find topics DATA: %v", err)
+	}
+
+	writer, err := sedpDATAWriter(body)
+	if err != nil {
+		t.Fatalf("topics writer: %v", err)
+	}
+
+	if writer != sedpTopicsWriter {
+		t.Fatalf("topics writer = %x, want %x", writer, sedpTopicsWriter)
+	}
+}
+
+// TestSEDPTopicsRoundTrip pins topics announce and parse mirroring.
+func TestSEDPTopicsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xF5 + byte(i)
+	}
+
+	topic := SEDPTopic{DDSTopic: "rt/chatter", TypeDDS: "std_msgs::msg::dds_::String_", TypeIDL: "std_msgs__msg__String"}
+
+	raw := mustSerializeTopics(t, prefix, topic)
+
+	checkTopicsWriter(t, raw)
+
+	if back := mustParseTopicsSample(t, raw); back != topic {
+		t.Fatalf("topics round trip = %+v, want %+v", back, topic)
+	}
+
+	batch, err := ParseSEDPTopicsDATAs(raw)
+	if err != nil {
+		t.Fatalf("parse topics batch: %v", err)
+	}
+
+	if len(batch) != 1 || batch[0] != topic {
+		t.Fatalf("topics batch = %+v, want one %+v", batch, topic)
+	}
+
+	first, last := mustSEDPHeartbeatFirst(t, raw, sedpTopicsWriter)
+	if first != 1 || last == 0 {
+		t.Fatalf("topics heartbeat first/last = %d/%d, want 1/positive", first, last)
+	}
+
+	if _, err := ParseSEDPDATA(raw); err == nil {
+		t.Fatalf("endpoint parse of topics DATA succeeded, want reject")
+	}
+}
+
+// TestSEDPTopicsValidateRejects pins fail-closed topics validation.
+func TestSEDPTopicsValidateRejects(t *testing.T) {
+	t.Parallel()
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = 0xF4 + byte(i)
+	}
+
+	for _, topic := range []SEDPTopic{
+		{DDSTopic: "", TypeDDS: "std_msgs::msg::dds_::String_"},
+		{DDSTopic: "rt/chatter", TypeDDS: ""},
+		{DDSTopic: "rt/chatter", TypeDDS: "bogus::Type"},
+		{DDSTopic: "/leading-slash", TypeDDS: "std_msgs::msg::dds_::String_"},
+		{DDSTopic: "rt//empty", TypeDDS: "std_msgs::msg::dds_::String_"},
+	} {
+		if _, err := SerializeSEDPTopicsDATA(prefix, topic); err == nil {
+			t.Fatalf("serialize topics %+v succeeded, want reject", topic)
+		}
+	}
+}
+
+// TestSEDPTopicsSkippedByEndpointIngest pins quiet skip of Topics DATA.
+//
+// A spec peer announcing TopicBuiltinTopicData sends no endpoint DATA,
+// which is a known builtin, not poison: ingest skips quietly without
+// installing or bumping generation. A mixed datagram still installs the
+// endpoint DATA it carries.
+func TestSEDPTopicsSkippedByEndpointIngest(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xF9)
+	ep := mustSEDPWriter(t, idx, "/chatter", "RIHS01_topics")
+
+	topicsRaw, err := SerializeSEDPTopicsDATA(ep.ID.Prefix, SEDPTopic{DDSTopic: "rt/chatter", TypeDDS: "std_msgs::msg::dds_::String_"})
+	if err != nil {
+		t.Fatalf("serialize topics: %v", err)
+	}
+
+	if err := idx.ingestSample(topicsRaw); err != nil {
+		t.Fatalf("ingest topics-only: %v", err)
+	}
+
+	if idx.Generation() != 0 {
+		t.Fatalf("generation = %d, want 0 for skipped topics", idx.Generation())
+	}
+
+	if got := len(idx.RemoteEndpoints()); got != 0 {
+		t.Fatalf("remotes = %d, want 0 for skipped topics", got)
+	}
+
+	endpointRaw, err := SerializeSEDPDATA(ep)
+	if err != nil {
+		t.Fatalf("serialize endpoint: %v", err)
+	}
+
+	mixed := append(append([]byte(nil), topicsRaw...), endpointRaw[sedpRTPSHeaderLen:]...)
+
+	if err := idx.ingestSample(mixed); err != nil {
+		t.Fatalf("ingest mixed: %v", err)
+	}
+
+	remotes := idx.RemoteEndpoints()
+	if len(remotes) != 1 {
+		t.Fatalf("mixed remotes = %d, want 1", len(remotes))
+	}
+
+	if remotes[0].DDSTopic != "rt/chatter" {
+		t.Fatalf("mixed topic = %q, want rt/chatter", remotes[0].DDSTopic)
+	}
+}
+
+// sedpTestEnabledSuite builds a deny-default suite for fail-closed tests.
+//
+// The fake material paths never load: NewSuite defers file reads to the
+// first decision, so every enabled check refuses while the config stays
+// valid.
+func sedpTestEnabledSuite(t *testing.T) *ddssecurity.Suite {
+	t.Helper()
+
+	suite, err := ddssecurity.NewSuite(ddssecurity.SuiteConfig{
+		Enabled:                 true,
+		IdentityCertificatePath: "test-cert",
+		IdentityPrivateKeyPath:  "test-key",
+		PermissionsCAPath:       "test-ca",
+		GovernancePath:          "test-gov",
+		PermissionsDocumentPath: "test-perms",
+	})
+	if err != nil {
+		t.Fatalf("new enabled suite: %v", err)
+	}
+
+	return suite
+}
+
+// mustSedpTestDisabledSuite builds a tolerance-mode suite.
+func mustSedpTestDisabledSuite(t *testing.T) *ddssecurity.Suite {
+	t.Helper()
+
+	suite, err := ddssecurity.NewSuite(ddssecurity.SuiteConfig{})
+	if err != nil {
+		t.Fatalf("new disabled suite: %v", err)
+	}
+
+	return suite
+}
+
+// TestSEDPUpsertRemoteSecurityRefusesWhenEnabled pins fail-closed remote install.
+//
+// An enabled suite refuses the endpoint before it enters the index: the
+// call errors, the remote never appears, and generation never moves.
+func TestSEDPUpsertRemoteSecurityRefusesWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	peer := mustSEDPIndexWithPrefix(t, 0xA0)
+	guarded := mustSEDPIndexWithPrefix(t, 0xA1)
+	guarded.SetSecuritySuite(sedpTestEnabledSuite(t))
+
+	ep := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	if err := guarded.UpsertRemote(ep); err == nil {
+		t.Fatalf("enabled suite installed remote, want refuse")
+	}
+
+	if got := len(guarded.RemoteEndpoints()); got != 0 {
+		t.Fatalf("remotes = %d, want 0 after refuse", got)
+	}
+
+	if got := guarded.Generation(); got != 0 {
+		t.Fatalf("generation = %d, want 0 after refuse", got)
+	}
+}
+
+// TestSEDPUpsertRemoteSecurityDisabledAllows pins tolerance mode.
+//
+// A nil or disabled suite installs exactly as today with byte-identical
+// behavior: the same endpoint the enabled suite refuses installs and
+// bumps generation once.
+func TestSEDPUpsertRemoteSecurityDisabledAllows(t *testing.T) {
+	t.Parallel()
+
+	peer := mustSEDPIndexWithPrefix(t, 0xA2)
+
+	ep := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	for _, suite := range []*ddssecurity.Suite{nil, mustSedpTestDisabledSuite(t)} {
+		guarded := mustSEDPIndexWithPrefix(t, 0xA3)
+
+		guarded.SetSecuritySuite(suite)
+
+		if err := guarded.UpsertRemote(ep); err != nil {
+			t.Fatalf("tolerance upsert: %v", err)
+		}
+
+		if got := len(guarded.RemoteEndpoints()); got != 1 {
+			t.Fatalf("remotes = %d, want 1 in tolerance mode", got)
+		}
+
+		if got := guarded.Generation(); got != 1 {
+			t.Fatalf("generation = %d, want 1 in tolerance mode", got)
+		}
+	}
+}
+
+// TestSEDPDeclareSecurityRefusesWhenEnabled pins fail-closed local declares.
+//
+// An enabled suite refuses the declare before the record enters the
+// index. Clearing the suite recovers tolerance mode on the same index.
+func TestSEDPDeclareSecurityRefusesWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	guarded := mustSEDPIndexWithPrefix(t, 0xA4)
+	guarded.SetSecuritySuite(sedpTestEnabledSuite(t))
+
+	if _, err := guarded.DeclareWriter("/chatter", "std_msgs__msg__String", "RIHS01_abc", nil); err == nil {
+		t.Fatalf("enabled suite declared writer, want refuse")
+	}
+
+	if _, err := guarded.DeclareReader("/chatter", "std_msgs__msg__String", "RIHS01_abc", nil); err == nil {
+		t.Fatalf("enabled suite declared reader, want refuse")
+	}
+
+	if got := len(guarded.LocalEndpoints()); got != 0 {
+		t.Fatalf("locals = %d, want 0 after refuse", got)
+	}
+
+	guarded.SetSecuritySuite(nil)
+
+	if _, err := guarded.DeclareWriter("/chatter", "std_msgs__msg__String", "RIHS01_abc", nil); err != nil {
+		t.Fatalf("tolerance declare after clear: %v", err)
+	}
+}
+
+// TestSEDPProvisionalInstallSecurityRefusesWhenEnabled pins fail-closed fast-path install.
+//
+// An enabled suite refuses the provisional placeholder before it enters
+// the index; a nil or disabled suite installs exactly as today.
+func TestSEDPProvisionalInstallSecurityRefusesWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	peer := mustSEDPIndexWithPrefix(t, 0xA5)
+	ep := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
+
+	guarded := mustSEDPIndexWithPrefix(t, 0xA6)
+	guarded.SetSecuritySuite(sedpTestEnabledSuite(t))
+
+	if err := guarded.ProvisionalInstall(ep); err == nil {
+		t.Fatalf("enabled suite installed provisional, want refuse")
+	}
+
+	if got := len(guarded.RemoteEndpoints()); got != 0 {
+		t.Fatalf("remotes = %d, want 0 after refuse", got)
+	}
+
+	if got := guarded.Generation(); got != 0 {
+		t.Fatalf("generation = %d, want 0 after refuse", got)
+	}
+
+	plain := mustSEDPIndexWithPrefix(t, 0xA7)
+
+	if err := plain.ProvisionalInstall(ep); err != nil {
+		t.Fatalf("tolerance provisional install: %v", err)
+	}
+}
+
+// TestSEDPIngestSecurityRefusesWhenEnabled pins fail-closed ingest gating.
+//
+// An enabled suite refuses the wire sample through the UpsertRemote gate
+// before install: nothing installs, generation never moves, and no sequence
+// records, so a later tolerance ingest of the same sample still installs.
+// A nil suite keeps the current ingest behavior byte-identical.
+func TestSEDPIngestSecurityRefusesWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	producer := mustSEDPIndexWithPrefix(t, 0xB0)
+	ep := mustSEDPWriter(t, producer, "/chatter", "RIHS01_abc")
+
+	raw, err := SerializeSEDPDATA(ep)
+	if err != nil {
+		t.Fatalf("serialize endpoint: %v", err)
+	}
+
+	guarded := mustSEDPIndexWithPrefix(t, 0xB1)
+	guarded.SetSecuritySuite(sedpTestEnabledSuite(t))
+
+	err = guarded.ingestSample(raw)
+	if err == nil {
+		t.Fatalf("enabled suite ingested remote sample, want refuse")
+	}
+
+	if got := len(guarded.RemoteEndpoints()); got != 0 {
+		t.Fatalf("remotes = %d, want 0 after refuse", got)
+	}
+
+	if got := guarded.Generation(); got != 0 {
+		t.Fatalf("generation = %d, want 0 after refuse", got)
+	}
+
+	guarded.SetSecuritySuite(nil)
+
+	err = guarded.ingestSample(raw)
+	if err != nil {
+		t.Fatalf("tolerance ingest after clear: %v", err)
+	}
+
+	if got := len(guarded.RemoteEndpoints()); got != 1 {
+		t.Fatalf("remotes = %d, want 1 after tolerance ingest", got)
+	}
+}
+
+// TestSEDPTopicsSnapshotDedupesLocals pins topic derivation from locals.
+//
+// A writer plus reader on one DDS topic yield one topic, and a second
+// topic adds a second entry sorted by DDS name.
+func TestSEDPTopicsSnapshotDedupesLocals(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xC0)
+
+	mustSEDPWriter(t, idx, "/chatter", "RIHS01_abc")
+	mustSEDPReader(t, idx, "/chatter", "RIHS01_abc")
+	mustSEDPWriter(t, idx, "/other", "RIHS01_other")
+
+	topics := idx.TopicsSnapshot()
+
+	if len(topics) != 2 {
+		t.Fatalf("topics = %d, want 2 deduped", len(topics))
+	}
+
+	if topics[0].DDSTopic != "rt/chatter" || topics[1].DDSTopic != "rt/other" {
+		t.Fatalf("topics = %q %q, want rt/chatter rt/other", topics[0].DDSTopic, topics[1].DDSTopic)
+	}
+
+	if topics[0].TypeDDS == "" || topics[1].TypeDDS == "" {
+		t.Fatalf("topics miss type names")
+	}
+
+	if got := len(mustSEDPIndexWithPrefix(t, 0xC1).TopicsSnapshot()); got != 0 {
+		t.Fatalf("empty index topics = %d, want 0", got)
+	}
+}
+
+// TestSEDPAnnounceTopicsSnapshotSendsTopics pins the topics send helper.
+//
+// Every snapshotted topic serializes from the index prefix and parses
+// back as Topics DATA with the matching DDS name.
+func TestSEDPAnnounceTopicsSnapshotSendsTopics(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xC4)
+
+	mustSEDPWriter(t, idx, "/chatter", "RIHS01_abc")
+	mustSEDPWriter(t, idx, "/other", "RIHS01_other")
+
+	topics := idx.TopicsSnapshot()
+	sender := &fakeSEDPSender{}
+
+	if err := sedpAnnounceTopicsSnapshot(context.Background(), sender, idx.snapshotPrefix(), topics); err != nil {
+		t.Fatalf("announce topics: %v", err)
+	}
+
+	if got := sender.count(); got != len(topics) {
+		t.Fatalf("sent = %d, want %d topics", got, len(topics))
+	}
+
+	seen := make(map[string]bool)
+
+	for _, raw := range sender.snapshot() {
+		topic, err := ParseSEDPTopicsDATA(raw)
+		if err != nil {
+			t.Fatalf("parse topics sample: %v", err)
+		}
+
+		seen[topic.DDSTopic] = true
+	}
+
+	if !seen["rt/chatter"] || !seen["rt/other"] {
+		t.Fatalf("announced topics = %v, want rt/chatter and rt/other", seen)
+	}
+
+	empty := &fakeSEDPSender{}
+
+	if err := sedpAnnounceTopicsSnapshot(context.Background(), empty, idx.snapshotPrefix(), nil); err != nil {
+		t.Fatalf("announce zero topics: %v", err)
+	}
+
+	if got := empty.count(); got != 0 {
+		t.Fatalf("sent = %d, want 0 for zero topics", got)
+	}
+}
+
+// TestSEDPAnnounceLoopIncludesTopics pins endpoint plus Topics announce.
+//
+// The loop sends endpoint DATA for every local plus Topics DATA for the
+// distinct topic, so spec peers learn TopicBuiltinTopicData alongside
+// endpoint announcements.
+func TestSEDPAnnounceLoopIncludesTopics(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xC5)
+
+	writer := mustSEDPWriter(t, idx, "/chatter", "RIHS01_abc")
+	reader := mustSEDPReader(t, idx, "/chatter", "RIHS01_abc")
+
+	sender := &fakeSEDPSender{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- idx.AnnounceLoop(ctx, sender)
+	}()
+
+	waitForSEDP(t, 2*time.Second, func() bool {
+		return sender.count() >= 3
+	}, "initial announce of 2 endpoints plus 1 topic")
+
+	waitForSEDPLoopCancel(t, cancel, errCh)
+
+	endpoints := 0
+	topics := 0
+
+	for _, raw := range sender.snapshot() {
+		if _, err := ParseSEDPTopicsDATA(raw); err == nil {
+			topics++
+
+			continue
+		}
+
+		if _, err := ParseSEDPDATA(raw); err != nil {
+			t.Fatalf("parse announced: %v", err)
+		}
+
+		endpoints++
+	}
+
+	if endpoints < 2 {
+		t.Fatalf("endpoint samples = %d, want at least 2", endpoints)
+	}
+
+	if topics < 1 {
+		t.Fatalf("topic samples = %d, want at least 1", topics)
+	}
+
+	seen := collectSEDPGUIDs(t, sender.snapshot())
+	if !seen[writer.ID.String()] {
+		t.Fatalf("announce misses writer %s", writer.ID.String())
+	}
+
+	if !seen[reader.ID.String()] {
+		t.Fatalf("announce misses reader %s", reader.ID.String())
+	}
+}
+
+// TestSEDPSharedWriterInterleavedSeqsAccepted pins per-endpoint replay gating.
+//
+// Two endpoints share one builtin writer stream with interleaved
+// per-writer sequences. Delivering the newer sibling first advances the
+// writer high past the other endpoint's newest sample; that sample must
+// still install because the replay gate is per endpoint GUID, not per
+// writer. A genuine same-endpoint replay stays quiet without moving
+// generation, proving writerHigh never gates ingest.
+func TestSEDPSharedWriterInterleavedSeqsAccepted(t *testing.T) {
+	t.Parallel()
+
+	producer := mustSEDPIndexWithPrefix(t, 0xC6)
+	consumer := mustSEDPIndexWithPrefix(t, 0xC7)
+
+	first := mustSEDPWriter(t, producer, "/chatter", "RIHS01_abc")
+	second := mustSEDPWriter(t, producer, "/other", "RIHS01_other")
+
+	rawFirst, err := SerializeSEDPDATA(first)
+	if err != nil {
+		t.Fatalf("serialize first: %v", err)
+	}
+
+	rawSecond, err := SerializeSEDPDATA(second)
+	if err != nil {
+		t.Fatalf("serialize second: %v", err)
+	}
+
+	if seqFirst, seqSecond := sedpTestSeqOf(t, rawFirst), sedpTestSeqOf(t, rawSecond); seqSecond <= seqFirst {
+		t.Fatalf("writer stream sequences %d then %d, want increasing", seqFirst, seqSecond)
+	}
+
+	if err := consumer.ingestSample(rawSecond); err != nil {
+		t.Fatalf("ingest newer sibling: %v", err)
+	}
+
+	if err := consumer.ingestSample(rawFirst); err != nil {
+		t.Fatalf("newest-per-endpoint sample below writer high must install: %v", err)
+	}
+
+	remotes := consumer.RemoteEndpoints()
+	if len(remotes) != 2 {
+		t.Fatalf("remotes = %d, want 2 after interleaved delivery", len(remotes))
+	}
+
+	gen := consumer.Generation()
+
+	if err := consumer.ingestSample(rawFirst); err != nil {
+		t.Fatalf("same-endpoint replay must stay quiet, got %v", err)
+	}
+
+	if got := consumer.Generation(); got != gen {
+		t.Fatalf("generation = %d, want %d after stale replay", got, gen)
+	}
+}
+
+// TestSEDPTopicsDecodeRejectsEndpointData pins the fail-closed Topics discriminator.
+//
+// An endpoint DATA body carries an endpoint GUID param, so the Topics
+// decoder must reject it instead of decoding a topic from shared params.
+func TestSEDPTopicsDecodeRejectsEndpointData(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xC8)
+	ep := mustSEDPWriter(t, idx, "/chatter", "RIHS01_abc")
+
+	raw, err := SerializeSEDPDATA(ep)
+	if err != nil {
+		t.Fatalf("serialize endpoint: %v", err)
+	}
+
+	body, flags, err := sedpFindEndpointDATA(raw)
+	if err != nil {
+		t.Fatalf("find endpoint data: %v", err)
+	}
+
+	if _, err := sedpDecodeTopicsBody(body, flags); !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("topics decode of endpoint data = %v, want ErrSEDPInvalidDATA", err)
+	}
+}
+
+// TestSEDPEndpointDecodeRejectsTopicsData pins the reverse discriminator.
+//
+// A Topics DATA body carries no endpoint GUID and comes from the Topics
+// writer, so the endpoint decoder must reject it instead of installing
+// a topic as an endpoint.
+func TestSEDPEndpointDecodeRejectsTopicsData(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0xC9)
+	ep := mustSEDPWriter(t, idx, "/chatter", "RIHS01_abc")
+
+	topic := SEDPTopic{DDSTopic: ep.DDSTopic, TypeDDS: ep.TypeDDS}
+
+	raw, err := SerializeSEDPTopicsDATA(ep.ID.Prefix, topic)
+	if err != nil {
+		t.Fatalf("serialize topics: %v", err)
+	}
+
+	if _, err := ParseSEDPTopicsDATA(raw); err != nil {
+		t.Fatalf("valid topics sample must still decode: %v", err)
+	}
+
+	body, flags, err := sedpFindTopicsDATA(raw)
+	if err != nil {
+		t.Fatalf("find topics data: %v", err)
+	}
+
+	if _, err := sedpDecodeEndpoint(body, flags); !errors.Is(err, ErrSEDPInvalidDATA) {
+		t.Fatalf("endpoint decode of topics data = %v, want ErrSEDPInvalidDATA", err)
 	}
 }

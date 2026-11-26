@@ -14,8 +14,13 @@ package dds
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -28,6 +33,8 @@ import (
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
+	"github.com/podomy/weld/internal/transports/dds/security/tokens"
 )
 
 // DefaultLeaseDuration is the default SPDP participant lease.
@@ -36,7 +43,7 @@ const DefaultLeaseDuration = 10 * time.Second
 // Protocol version announced in SPDP params.
 const (
 	protocolMajor = 2
-	protocolMinor = 1
+	protocolMinor = 5
 )
 
 // Vendor id announced as Eclipse CycloneDDS.
@@ -59,6 +66,15 @@ var participantEntityID = [4]byte{0x00, 0x00, 0x01, 0xC1}
 // DomainID field across the RTPS rewrite.
 const pidDomainID uint16 = 0x000f
 
+// spdp2PIDDomainTag carries the DDS domain tag string per Table 9.19.
+const spdp2PIDDomainTag uint16 = 0x4014
+
+// spdp2BestEffortParticipantMessageBit selects best-effort reader QoS.
+//
+// It is bit 0 of BuiltinEndpointQos per 9.3.2. Absent QoS means reliable
+// per 8.4.13.3.
+const spdp2BestEffortParticipantMessageBit uint32 = 1 << 0
+
 // Sentinel errors for SPDP handling.
 var (
 	// ErrInvalidSPDP reports a malformed SPDP packet.
@@ -77,7 +93,19 @@ var (
 	ErrInvalidPeriod = errors.New("dds: non positive period")
 	// ErrStaleSPDP reports a replayed sequence at or below the last accepted value.
 	ErrStaleSPDP = errors.New("dds: stale SPDP sequence")
+	// ErrSpdp2UnnegotiatedAlgo reports that no secure announce algorithm
+	// could be negotiated from the governance allow-list.
+	ErrSpdp2UnnegotiatedAlgo = errors.New("dds: unnegotiated secure algorithm")
 )
+
+// errSpdp2DomainMismatch reports a domain or tag gate reject.
+var errSpdp2DomainMismatch = errors.New("dds: spdp domain mismatch")
+
+// ErrSpdp2DomainMismatch reports a domain or tag gate reject.
+//
+// It aliases the internal gate sentinel so external callers distinguish
+// domain rejects from stale sequence rejects.
+var ErrSpdp2DomainMismatch = errSpdp2DomainMismatch
 
 // spdpParseDrops counts SPDP DATA entries skipped after a parse failure.
 var spdpParseDrops atomic.Uint64
@@ -101,6 +129,21 @@ type ParticipantInfo struct {
 	LeaseExpiry time.Time
 	// LastSeq is the last accepted SPDP sequence.
 	LastSeq uint64
+	// DomainID is the accepted DDS domain for the prefix.
+	DomainID uint32
+	// DomainTag is the accepted DDS domain tag, empty for default.
+	DomainTag string
+	// AvailableBuiltinEndpoints is the parsed 0x0058 mask.
+	AvailableBuiltinEndpoints uint32
+	// BuiltinEndpointQos is the parsed 0x0077 mask.
+	BuiltinEndpointQos uint32
+	// ManualLivelinessCount is the high-water manual count.
+	ManualLivelinessCount uint32
+	// ManualLeaseExpiry is the manual liveliness deadline, zero when the
+	// peer never asserted manual liveliness. Only a higher manual count
+	// renews it, so silence past the lease expires the peer per 8.5.3.2
+	// even while periodic automatic re-announces continue.
+	ManualLeaseExpiry time.Time
 	// Security carries the parsed DDS-Security attributes for the
 	// participant, zero when the peer announced none.
 	Security SecurityInfo
@@ -112,6 +155,8 @@ type Announcement struct {
 	GUID GUID
 	// DomainID is the DDS domain from the domain tag param.
 	DomainID uint32
+	// DomainTag is the DDS domain tag from PID 0x4014, empty when absent.
+	DomainTag string
 	// Sequence is the SPDP sequence number.
 	Sequence uint64
 	// Alive is true for DATA and false for dispose.
@@ -120,6 +165,8 @@ type Announcement struct {
 	Lease time.Duration
 	// Ports holds all UDPv4 unicast locator ports in wire order, empty for dispose.
 	Ports []uint16
+	// AvailableBuiltinEndpoints is the parsed 0x0058 mask.
+	AvailableBuiltinEndpoints uint32
 	// ManualLivelinessCount is the participant manual liveliness count, zero when absent.
 	ManualLivelinessCount uint32
 	// BuiltinEndpointQos is the builtin endpoint QoS mask, zero when absent.
@@ -161,6 +208,10 @@ type LocalParticipant struct {
 	domain uint32
 	lease  time.Duration
 	seq    uint64
+	// manual is the MANUAL_BY_PARTICIPANT count for PID 0x0034.
+	manual uint32
+	// domainTag is the local DDS domain tag, empty for default.
+	domainTag string
 	// metaPort is the bound metatraffic unicast port, zero for legacy.
 	metaPort int
 	// defaultPort is the bound user-traffic unicast port, zero for legacy.
@@ -307,6 +358,59 @@ func (p *LocalParticipant) SetAnnouncePorts(metaPort, defaultPort int) {
 	p.defaultPort = defaultPort
 }
 
+// SetSpdp2DomainTag pins the local DDS domain tag for SPDP announces.
+//
+// Empty keeps the baseline wire shape with no PID 0x4014. Non-empty adds
+// the tag param so peers gate per 8.5.5.1. It is safe for concurrent use.
+func (p *LocalParticipant) SetSpdp2DomainTag(tag string) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.domainTag = tag
+}
+
+// Spdp2ManualCount returns the current manual liveliness count.
+func (p *LocalParticipant) Spdp2ManualCount() uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.manual
+}
+
+// AssertSpdp2ManualLiveliness asserts MANUAL_BY_PARTICIPANT liveliness.
+//
+// It increments the manual count per Table 8.78 and sends a fresh alive
+// DATA with the new count so peers renew the manual lease.
+func (p *LocalParticipant) AssertSpdp2ManualLiveliness(ctx context.Context, sender Sender) error {
+	if ctx == nil {
+		return fmt.Errorf("dds: assert nil context: %w", ErrNilContext)
+	}
+
+	if sender == nil {
+		return fmt.Errorf("dds: assert nil sender: %w", ErrNilSender)
+	}
+
+	err := ctx.Err()
+	if err != nil {
+		return fmt.Errorf("dds: assert context: %w", err)
+	}
+
+	p.mu.Lock()
+	p.manual++
+	p.mu.Unlock()
+
+	err = p.Announce(ctx, sender)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // spdpAnnounce carries the next SPDP sequence plus immutable participant fields.
 //
 // It groups the snapshot taken under lock so send builds one packet from one value.
@@ -319,6 +423,10 @@ type spdpAnnounce struct {
 	domain uint32
 	// lease is the configured lease duration.
 	lease time.Duration
+	// manual is the MANUAL_BY_PARTICIPANT count for PID 0x0034.
+	manual uint32
+	// domainTag is the local domain tag, empty for default.
+	domainTag string
 	// metaPort is the bound metatraffic unicast port, zero for legacy.
 	metaPort int
 	// defaultPort is the bound user-traffic unicast port, zero for legacy.
@@ -348,11 +456,7 @@ func (p *LocalParticipant) send(ctx context.Context, sender Sender, alive bool) 
 	var packet []byte
 
 	if alive {
-		if ticket.metaPort > 0 && ticket.defaultPort > 0 {
-			packet, err = MarshalAlivePacketWithPorts(ticket.guid, ticket.domain, ticket.seq, ticket.lease, ticket.metaPort, ticket.defaultPort)
-		} else {
-			packet, err = MarshalAlivePacket(ticket.guid, ticket.domain, ticket.seq, ticket.lease)
-		}
+		packet, err = marshalSpdp2TicketAlive(ticket)
 	} else {
 		packet, err = MarshalDisposePacket(ticket.guid, ticket.domain, ticket.seq)
 	}
@@ -380,7 +484,163 @@ func (p *LocalParticipant) nextPacket() (spdpAnnounce, error) {
 
 	p.seq++
 
-	return spdpAnnounce{seq: p.seq, guid: p.guid, domain: p.domain, lease: p.lease, metaPort: p.metaPort, defaultPort: p.defaultPort}, nil
+	return spdpAnnounce{seq: p.seq, guid: p.guid, domain: p.domain, lease: p.lease, manual: p.manual, domainTag: p.domainTag, metaPort: p.metaPort, defaultPort: p.defaultPort}, nil
+}
+
+// marshalSpdp2TicketAlive builds one alive packet from a ticket.
+//
+// Baseline tickets with zero manual and empty tag use the exported
+// wrappers so goldens stay byte-identical. Tickets carrying manual or
+// tag use the detail builder.
+func marshalSpdp2TicketAlive(ticket spdpAnnounce) ([]byte, error) {
+	if ticket.manual == 0 && ticket.domainTag == "" {
+		if ticket.metaPort > 0 && ticket.defaultPort > 0 {
+			return MarshalAlivePacketWithPorts(ticket.guid, ticket.domain, ticket.seq, ticket.lease, ticket.metaPort, ticket.defaultPort)
+		}
+
+		return MarshalAlivePacket(ticket.guid, ticket.domain, ticket.seq, ticket.lease)
+	}
+
+	metaPort := ticket.metaPort
+	defaultPort := ticket.defaultPort
+
+	metaMCPort, err := rtps.MetatrafficMulticastPort(ticket.domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	defaultMCPort, err := rtps.UsertrafficMulticastPort(ticket.domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	if metaPort <= 0 || defaultPort <= 0 {
+		metaPort, err = rtps.MetatrafficUnicastPort(ticket.domain, 0)
+		if err != nil {
+			return nil, fmt.Errorf("dds: SPDP meta port: %w", errors.Join(err, ErrInvalidSPDP))
+		}
+
+		defaultPort, err = rtps.UsertrafficUnicastPort(ticket.domain, 0)
+		if err != nil {
+			return nil, fmt.Errorf("dds: SPDP default port: %w", errors.Join(err, ErrInvalidSPDP))
+		}
+	}
+
+	return marshalSpdp2AliveWithDetail(ticket.guid, ticket.domain, ticket.seq, ticket.lease, metaPort, defaultPort, metaMCPort, defaultMCPort, ticket.manual, ticket.domainTag)
+}
+
+// marshalSpdp2AliveWithDetail builds an alive packet with manual and tag.
+//
+// It mirrors marshalAliveWithPorts but carries the ticket manual count
+// in PID 0x0034 and appends PID 0x4014 when the tag is non-empty.
+func marshalSpdp2AliveWithDetail(guid GUID, domain uint32, seq uint64, lease time.Duration, metaPort, defaultPort, metaMCPort, defaultMCPort int, manual uint32, domainTag string) ([]byte, error) {
+	err := validatePacketHeader(guid, domain, seq)
+	if err != nil {
+		return nil, err
+	}
+
+	sec, nanos, err := durationToParts(lease)
+	if err != nil {
+		return nil, err
+	}
+
+	advertise := rtps.AdvertiseIPv4()
+
+	group := net.ParseIP(rtps.SPDPMulticastGroup)
+
+	domainRaw := domainRawBytes(domain)
+
+	var leaseRaw [8]byte
+
+	binary.LittleEndian.PutUint32(leaseRaw[0:4], sec)
+	binary.LittleEndian.PutUint32(leaseRaw[4:8], nanos)
+
+	var besRaw [4]byte
+
+	binary.LittleEndian.PutUint32(besRaw[:], spdpBuiltinEndpointMask)
+
+	var builtinQosRaw [4]byte
+
+	binary.LittleEndian.PutUint32(builtinQosRaw[:], 0)
+
+	var manualRaw [4]byte
+
+	binary.LittleEndian.PutUint32(manualRaw[:], manual)
+
+	userdata := []byte(spdpUserDataEnclave)
+
+	var userdataRaw []byte
+
+	userdataRaw = binary.LittleEndian.AppendUint32(userdataRaw, uint32(len(userdata))) //nolint:gosec // G115: enclave string is a short constant
+	userdataRaw = append(userdataRaw, userdata...)
+	for len(userdataRaw)%4 != 0 {
+		userdataRaw = append(userdataRaw, 0x00)
+	}
+
+	params := spdpAliveParams(guid, domainRaw, leaseRaw, besRaw, builtinQosRaw, manualRaw, userdataRaw, advertise, group, metaPort, defaultPort, metaMCPort, defaultMCPort)
+
+	if domainTag != "" {
+		params = append(params, rtps.Param{ID: spdp2PIDDomainTag, Value: spdp2EncodeDomainTag(domainTag)})
+	}
+
+	encoded, err := encodeSPDPParams(params)
+	if err != nil {
+		return nil, err
+	}
+
+	data := rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       rtps.EntitySPDPWriter,
+		SequenceNumber: seq,
+		Payload:        encoded,
+	}
+
+	return frameSPDP(guid.Prefix, data)
+}
+
+// Spdp2MarshalAliveWithManual builds an alive packet with manual and tag.
+//
+// It uses participant-zero ports and is intended for tests pinning
+// same-sequence manual refresh and domain tag gating.
+func Spdp2MarshalAliveWithManual(guid GUID, domain uint32, seq uint64, lease time.Duration, manual uint32, domainTag string) ([]byte, error) {
+	metaPort, err := rtps.MetatrafficUnicastPort(domain, 0)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	defaultPort, err := rtps.UsertrafficUnicastPort(domain, 0)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	metaMCPort, err := rtps.MetatrafficMulticastPort(domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	defaultMCPort, err := rtps.UsertrafficMulticastPort(domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	return marshalSpdp2AliveWithDetail(guid, domain, seq, lease, metaPort, defaultPort, metaMCPort, defaultMCPort, manual, domainTag)
+}
+
+// spdp2EncodeDomainTag renders a CDR string for PID 0x4014.
+//
+// Layout is 4 byte LE length including NUL plus pad, then bytes plus
+// NUL plus zero pad to 4 bytes. Length includes pad to match Cyclone.
+func spdp2EncodeDomainTag(tag string) []byte {
+	raw := make([]byte, 0, 4+len(tag)+4)
+	raw = append(raw, 0, 0, 0, 0)
+	raw = append(raw, tag...)
+	raw = append(raw, 0x00)
+	for len(raw)%4 != 0 {
+		raw = append(raw, 0x00)
+	}
+	binary.LittleEndian.PutUint32(raw[:4], uint32(len(raw)-4)) //nolint:gosec // G115: tags are short.
+
+	return raw
 }
 
 // SPDPUnicastPort returns the SPDP unicast port for a domain.
@@ -550,6 +810,29 @@ func MarshalAlivePacket(guid GUID, domain uint32, seq uint64, lease time.Duratio
 	return marshalAliveWithPorts(guid, domain, seq, lease, metaPort, defaultPort, metaMCPort, defaultMCPort)
 }
 
+// spdpAliveParams builds the shared SPDP alive parameter list.
+//
+// It carries GUID, version, vendor, domain, lease, builtin set and QoS,
+// manual count, enclave user data, plus unicast and multicast locators
+// so both alive marshal paths share one layout.
+func spdpAliveParams(guid GUID, domainRaw [4]byte, leaseRaw [8]byte, besRaw [4]byte, builtinQosRaw [4]byte, manualRaw [4]byte, userdataRaw []byte, advertise, group net.IP, metaPort, defaultPort, metaMCPort, defaultMCPort int) []rtps.Param {
+	return []rtps.Param{
+		{ID: rtps.PIDParticipantGUID, Value: guidBytes(guid)},
+		{ID: rtps.PIDProtocolVersion, Value: []byte{protocolMajor, protocolMinor, 0x00, 0x00}},
+		{ID: rtps.PIDVendorID, Value: []byte{vendorID0, vendorID1, 0x00, 0x00}},
+		{ID: pidDomainID, Value: append([]byte(nil), domainRaw[:]...)},
+		{ID: rtps.PIDParticipantLeaseDuration, Value: append([]byte(nil), leaseRaw[:]...)},
+		{ID: rtps.PIDBuiltinEndpointSet, Value: append([]byte(nil), besRaw[:]...)},
+		{ID: rtps.PIDBuiltinEndpointQos, Value: append([]byte(nil), builtinQosRaw[:]...)},
+		{ID: rtps.PIDParticipantManualLivelinessCount, Value: append([]byte(nil), manualRaw[:]...)},
+		{ID: rtps.PIDUserData, Value: userdataRaw},
+		{ID: rtps.PIDMetatrafficUnicastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(metaPort), advertise)},        //nolint:gosec // G115: ports are bounded by MaxPort 65535.
+		{ID: rtps.PIDDefaultUnicastLocatorStandard, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(defaultPort), advertise)}, //nolint:gosec // G115: ports are bounded by MaxPort 65535.
+		{ID: rtps.PIDMetatrafficMulticastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(metaMCPort), group)},        //nolint:gosec // G115: ports are bounded by MaxPort 65535.
+		{ID: rtps.PIDDefaultMulticastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(defaultMCPort), group)},         //nolint:gosec // G115: ports are bounded by MaxPort 65535.
+	}
+}
+
 // marshalAliveWithPorts builds an alive packet from explicit locator ports.
 //
 // It validates the header and lease, then encodes the shared parameter
@@ -602,21 +885,7 @@ func marshalAliveWithPorts(guid GUID, domain uint32, seq uint64, lease time.Dura
 		userdataRaw = append(userdataRaw, 0x00)
 	}
 
-	params := []rtps.Param{
-		{ID: rtps.PIDParticipantGUID, Value: guidBytes(guid)},
-		{ID: rtps.PIDProtocolVersion, Value: []byte{protocolMajor, protocolMinor, 0x00, 0x00}},
-		{ID: rtps.PIDVendorID, Value: []byte{vendorID0, vendorID1, 0x00, 0x00}},
-		{ID: pidDomainID, Value: append([]byte(nil), domainRaw[:]...)},
-		{ID: rtps.PIDParticipantLeaseDuration, Value: append([]byte(nil), leaseRaw[:]...)},
-		{ID: rtps.PIDBuiltinEndpointSet, Value: append([]byte(nil), besRaw[:]...)},
-		{ID: rtps.PIDBuiltinEndpointQos, Value: append([]byte(nil), builtinQosRaw[:]...)},
-		{ID: rtps.PIDParticipantManualLivelinessCount, Value: append([]byte(nil), manualRaw[:]...)},
-		{ID: rtps.PIDUserData, Value: userdataRaw},
-		{ID: rtps.PIDMetatrafficUnicastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(metaPort), advertise)},        //nolint:gosec // G115: ports are bounded by MaxPort 65535.
-		{ID: rtps.PIDDefaultUnicastLocatorStandard, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(defaultPort), advertise)}, //nolint:gosec // G115: ports are bounded by MaxPort 65535.
-		{ID: rtps.PIDMetatrafficMulticastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(metaMCPort), group)},        //nolint:gosec // G115: ports are bounded by MaxPort 65535.
-		{ID: rtps.PIDDefaultMulticastLocator, Value: rtps.EncodeIPv4Locator(rtps.LocatorKindUDPv4, uint32(defaultMCPort), group)},         //nolint:gosec // G115: ports are bounded by MaxPort 65535.
-	}
+	params := spdpAliveParams(guid, domainRaw, leaseRaw, besRaw, builtinQosRaw, manualRaw, userdataRaw, advertise, group, metaPort, defaultPort, metaMCPort, defaultMCPort)
 
 	encoded, err := encodeSPDPParams(params)
 	if err != nil {
@@ -684,14 +953,16 @@ const maxSPDPLease = 5 * time.Minute
 // It decodes the RTPS message, scans all submessages for DATA addressed
 // from builtin writer 0x000100c2, and selects the newest valid entry by
 // sequence: every DATA is validated, prefix mismatches and parse failures
-// drop loudly and the scan continues, and only when no entry validates
-// does it fail with ErrInvalidSPDP. Payload and inline QoS params merge
-// so live Cyclone payloads with a PL_CDR encapsulation header parse under
-// the same rules as inline QoS announcements. Non SPDP DATA is ignored.
-// Key flagged DATA is a dispose with zero lease and no ports. The GUID
-// prefix must match the RTPS header prefix; mismatches drop loudly instead
-// of installing a spoofed route. Leases above maxSPDPLease clamp loudly to
-// the cap. Zero sequences and dispose anomalies fail loudly.
+// drop loudly. A known invalid submessage drops the rest of the datagram
+// per 8.3.4.1 rule 6, preserving entries before the invalid one. Only when
+// no entry validates does it fail with ErrInvalidSPDP. Payload and inline
+// QoS params merge so live Cyclone payloads with a PL_CDR encapsulation
+// header parse under the same rules as inline QoS announcements. Non SPDP
+// DATA is ignored. Key flagged DATA is a dispose with zero lease and no
+// ports. The GUID prefix must match the RTPS header prefix; mismatches
+// drop loudly instead of installing a spoofed route. Leases above
+// maxSPDPLease clamp loudly to the cap. Zero sequences and dispose
+// anomalies fail loudly.
 // considerSPDPData validates one SPDP DATA submessage and keeps the newest.
 //
 // Prefix mismatches and parse failures drop loudly and the scan continues.
@@ -739,7 +1010,9 @@ func ParseAnnouncement(data []byte) (Announcement, error) {
 	for i := range raws {
 		sub, err := rtps.DecodeSubmessage(raws[i], &drops)
 		if err != nil {
-			continue
+			n := spdpParseDrops.Add(1)
+			log.Printf("dds: spdp invalid submessage %#02x drops rest %d: %v", raws[i].ID, n, err)
+			break
 		}
 
 		if sub.Data == nil {
@@ -782,10 +1055,16 @@ func announcementAliveFields(params []rtps.Param, out *Announcement) error {
 		return err
 	}
 
+	set, err := findSpdp2BuiltinSetParam(params)
+	if err != nil {
+		return err
+	}
+
 	out.Lease = lease
 	out.Ports = ports
 	out.ManualLivelinessCount = manual
 	out.BuiltinEndpointQos = qos
+	out.AvailableBuiltinEndpoints = set
 
 	return nil
 }
@@ -852,8 +1131,14 @@ func announcementFromData(d *rtps.Data) (Announcement, error) {
 		return out, err
 	}
 
+	tag, err := findSpdp2DomainTagParam(params)
+	if err != nil {
+		return out, err
+	}
+
 	out.GUID = guid
 	out.DomainID = domain
+	out.DomainTag = tag
 	out.Sequence = d.SequenceNumber
 
 	if d.Key {
@@ -1056,6 +1341,111 @@ func findBuiltinQosParam(params []rtps.Param) (uint32, error) {
 	}
 
 	return 0, nil
+}
+
+// findSpdp2BuiltinSetParam returns the 0x0058 builtin endpoint mask.
+//
+// Missing means zero so peers announcing no endpoints create no proxies.
+func findSpdp2BuiltinSetParam(params []rtps.Param) (uint32, error) {
+	for _, p := range params {
+		if p.ID != rtps.PIDBuiltinEndpointSet {
+			continue
+		}
+
+		if len(p.Value) != 4 {
+			return 0, fmt.Errorf("dds: builtin set length %d: %w", len(p.Value), ErrInvalidSPDP)
+		}
+
+		return binary.LittleEndian.Uint32(p.Value), nil
+	}
+
+	return 0, nil
+}
+
+// findSpdp2DomainTagParam returns the 0x4014 domain tag string.
+//
+// Missing means empty, the default tag. Present values decode as CDR
+// strings in either endian, tolerating pad in the length.
+func findSpdp2DomainTagParam(params []rtps.Param) (string, error) {
+	for _, p := range params {
+		if p.ID != spdp2PIDDomainTag {
+			continue
+		}
+
+		tag, err := spdp2DecodeDomainTag(p.Value)
+		if err != nil {
+			return "", err
+		}
+
+		return tag, nil
+	}
+
+	return "", nil
+}
+
+// spdp2TagLength reads one length prefix in the given byte order.
+func spdp2TagLength(value []byte, little bool) int {
+	if little {
+		return int(binary.LittleEndian.Uint32(value[:4]))
+	}
+
+	return int(binary.BigEndian.Uint32(value[:4]))
+}
+
+// spdp2TagString extracts the NUL terminated string from one raw field.
+func spdp2TagString(raw []byte) (string, bool) {
+	nul := -1
+
+	for i, b := range raw {
+		if b == 0x00 {
+			nul = i
+
+			break
+		}
+	}
+
+	if nul < 0 {
+		return "", false
+	}
+
+	out := string(raw[:nul])
+
+	if len(out) > 256 {
+		return "", false
+	}
+
+	return out, true
+}
+
+// spdp2DecodeEndian attempts one byte order for a domain tag value.
+func spdp2DecodeEndian(value []byte, little bool) (string, bool) {
+	length := spdp2TagLength(value, little)
+
+	if length < 1 || length > 260 {
+		return "", false
+	}
+
+	if len(value) < 4+length {
+		return "", false
+	}
+
+	return spdp2TagString(value[4 : 4+length])
+}
+
+// spdp2DecodeDomainTag decodes one CDR string value for PID 0x4014.
+func spdp2DecodeDomainTag(value []byte) (string, error) {
+	if len(value) < 4 {
+		return "", fmt.Errorf("dds: domain tag need 4 have %d: %w", len(value), ErrInvalidSPDP)
+	}
+
+	for _, little := range []bool{true, false} {
+		out, ok := spdp2DecodeEndian(value, little)
+		if ok {
+			return out, nil
+		}
+	}
+
+	return "", fmt.Errorf("dds: domain tag misses NUL terminator: %w", ErrInvalidSPDP)
 }
 
 // findUnicastPortsParam returns all UDPv4 unicast locator ports in wire order.
@@ -1406,6 +1796,14 @@ type RemoteTable struct {
 	tombstones map[GUIDPrefix]spdpTombstone
 	generation uint64
 	onChange   func(uint64)
+	// localDomain is the gate domain, valid when localSet is true.
+	localDomain uint32
+	// localTag is the gate domain tag, valid when localSet is true.
+	localTag string
+	// localSet enables the 8.5.5.1 domain and tag gate.
+	localSet bool
+	// sec holds the Phase 1 decision suite, nil for tolerance mode.
+	sec *ddssecurity.Suite
 }
 
 // spdpTombstone retains the removal high-water for one prefix.
@@ -1440,6 +1838,146 @@ func (t *RemoteTable) SetOnChange(fn func(uint64)) {
 	defer t.mu.Unlock()
 
 	t.onChange = fn
+}
+
+// SetSecuritySuite installs the Phase 1 decision suite.
+//
+// A nil suite keeps tolerance mode: alive peers install exactly as
+// today. A non-nil enabled suite refuses every alive peer before it
+// enters the participant graph. It is safe for concurrent use.
+func (t *RemoteTable) SetSecuritySuite(s *ddssecurity.Suite) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.sec = s
+}
+
+// SetSpdp2LocalDomain pins the local domain and tag gate per 8.5.5.1.
+//
+// Once set, the table never holds a prefix whose domain or tag differs;
+// mismatched announces reject loudly with errSpdp2DomainMismatch.
+// Empty tag selects the default domain tag. It is safe for concurrent use.
+func (t *RemoteTable) SetSpdp2LocalDomain(domain uint32, tag string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.localDomain = domain
+	t.localTag = tag
+	t.localSet = true
+}
+
+// Spdp2LocalDomain returns the gate domain, tag, and whether set.
+func (t *RemoteTable) Spdp2LocalDomain() (uint32, string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.localDomain, t.localTag, t.localSet
+}
+
+// spdp2CheckDomainLocked rejects foreign domains or tags. Caller holds the lock.
+func (t *RemoteTable) spdp2CheckDomainLocked(ann Announcement) error {
+	if !t.localSet {
+		return nil
+	}
+
+	if ann.DomainID != t.localDomain || ann.DomainTag != t.localTag {
+		return fmt.Errorf("dds: spdp domain %d tag %q mismatches local %d %q: %w", ann.DomainID, ann.DomainTag, t.localDomain, t.localTag, errSpdp2DomainMismatch)
+	}
+
+	return nil
+}
+
+// Spdp2BuiltinIntersection returns the proxy endpoint set per 8.5.5.1.
+//
+// Only endpoints in both local and remote create proxies.
+func Spdp2BuiltinIntersection(local, remote uint32) uint32 {
+	return local & remote
+}
+
+// Spdp2IsBestEffortParticipantMessage reports best-effort reader QoS.
+//
+// Bit 0 of builtinEndpointQos selects best-effort per 9.3.2. Absent or
+// zero QoS means reliable per 8.4.13.3.
+func Spdp2IsBestEffortParticipantMessage(qos uint32) bool {
+	return qos&spdp2BestEffortParticipantMessageBit != 0
+}
+
+// Spdp2SecureParticipantMask returns the honest secure announce mask.
+//
+// It is always valid-only and never mirrors remote masks, so attacker
+// influenced peer state cannot shape our own announcement.
+func Spdp2SecureParticipantMask() uint32 {
+	return 1 << 31
+}
+
+// spdp2CertAlgoForCert labels the identity algorithm from the key type.
+func spdp2CertAlgoForCert(cert *x509.Certificate) string {
+	if cert == nil {
+		return "unknown"
+	}
+
+	switch pub := cert.PublicKey.(type) {
+	case *ecdsa.PublicKey:
+		if pub.Curve == elliptic.P384() {
+			return "EC-prime384v1"
+		}
+
+		return "EC-prime256v1"
+	case *rsa.PublicKey:
+		return "RSA-2048"
+	default:
+		return "unknown"
+	}
+}
+
+// Spdp2CertAlgoForCert labels the identity algorithm from the key type.
+//
+// It reports EC-prime256v1, EC-prime384v1, RSA-2048, or unknown from the
+// actual public key, never a hardcoded constant. It is the identity label
+// for logging and diagnostics only; secure announce properties must use
+// Spdp2NegotiatedSecureAlgos instead, which sources the token names from
+// the governance allow-list.
+func Spdp2CertAlgoForCert(cert *x509.Certificate) string {
+	return spdp2CertAlgoForCert(cert)
+}
+
+// Spdp2NegotiatedSecureAlgos selects the secure announce algorithms.
+//
+// It intersects the local certificate capability with the governance
+// allow-list for the domain and returns the token wire names for
+// c.dsign_algo and c.kagree_algo. Only the P-256 suite maps to token
+// names today; RSA, P-384, and unknown keys fail closed because no token
+// name exists for them. An empty allow-list or a missing overlap fails
+// closed with ErrSpdp2UnnegotiatedAlgo. Peer-supplied values never enter:
+// the inputs are only the local allow-list and the local certificate,
+// so attacker masks or labels cannot shape our own announcement.
+// Announce builders must use this instead of Spdp2CertAlgoForCert.
+func Spdp2NegotiatedSecureAlgos(allowed []string, cert *x509.Certificate) (string, string, error) {
+	if cert == nil {
+		return "", "", fmt.Errorf("dds: secure announce without identity: %w", ErrSpdp2UnnegotiatedAlgo)
+	}
+
+	var dsignGovernance, kagreeGovernance, dsignToken, kagreeToken string
+
+	switch pub := cert.PublicKey.(type) {
+	case *ecdsa.PublicKey:
+		if pub.Curve != elliptic.P256() {
+			return "", "", fmt.Errorf("dds: secure announce curve unsupported: %w", ErrSpdp2UnnegotiatedAlgo)
+		}
+
+		dsignGovernance = "ECDSA+P256+SHA256"
+		kagreeGovernance = "ECDHE-CEUM+P256"
+		dsignToken = tokens.DSignAlgoECDSA
+		kagreeToken = tokens.KAgreeECDH
+	default:
+		return "", "", fmt.Errorf("dds: secure announce key type %T unsupported: %w", cert.PublicKey, ErrSpdp2UnnegotiatedAlgo)
+	}
+
+	if !slices.Contains(allowed, dsignGovernance) || !slices.Contains(allowed, kagreeGovernance) {
+		return "", "", fmt.Errorf("dds: secure announce algorithms %q and %q miss governance allow-list: %w", dsignGovernance, kagreeGovernance, ErrSpdp2UnnegotiatedAlgo)
+	}
+
+	return dsignToken, kagreeToken, nil
 }
 
 // Generation returns the current generation counter.
@@ -1528,6 +2066,11 @@ func (t *RemoteTable) TombstoneSeq(prefix GUIDPrefix) (uint64, bool) {
 // duplicate versus stale discipline and never creates a new tombstone,
 // so spoofed disposes cannot grow the map.
 func (t *RemoteTable) handleDisposeLocked(ann Announcement, now time.Time) (bool, uint64, func(uint64), error) {
+	err := t.spdp2CheckDomainLocked(ann)
+	if err != nil {
+		return false, 0, nil, err
+	}
+
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
 		tomb, seen := t.tombstones[ann.GUID.Prefix]
@@ -1579,12 +2122,37 @@ func (t *RemoteTable) handleDisposeLocked(ann Announcement, now time.Time) (bool
 // tombstone sequence is a duplicate and returns silently, a strictly older
 // alive fails loudly, and only a newer alive deletes the tombstone and
 // installs.
+// spdpManualExpiry returns the manual lease deadline for one announcement.
+//
+// A zero manual count means the peer never asserted manual liveliness,
+// so no manual lease engages and only the automatic lease expires the
+// entry. A positive count engages the manual lease at the announced
+// expiry: only a higher count renews it, so silence past the lease
+// expires the peer even while periodic automatic re-announces continue.
+func spdpManualExpiry(ann Announcement, expiry time.Time) time.Time {
+	if ann.ManualLivelinessCount == 0 {
+		return time.Time{}
+	}
+
+	return expiry
+}
+
 // installAliveLocked installs one alive announcement for a missing prefix.
 //
 // A tombstone sequence match is a duplicate and returns silently; a
 // strictly older sequence fails loudly; only a newer sequence deletes
 // the tombstone and installs. Caller holds the lock.
 func (t *RemoteTable) installAliveLocked(ann Announcement, expiry time.Time) (bool, uint64, func(uint64), error) {
+	err := t.spdp2CheckDomainLocked(ann)
+	if err != nil {
+		return false, 0, nil, err
+	}
+
+	err = t.spdpCheckSecurityLocked(ann)
+	if err != nil {
+		return false, 0, nil, err
+	}
+
 	if tomb, seen := t.tombstones[ann.GUID.Prefix]; seen {
 		if ann.Sequence == tomb.seq {
 			return false, 0, nil, nil
@@ -1598,24 +2166,122 @@ func (t *RemoteTable) installAliveLocked(ann Announcement, expiry time.Time) (bo
 		delete(t.tombstones, ann.GUID.Prefix)
 	}
 	t.entries[ann.GUID.Prefix] = ParticipantInfo{
-		GUID:        ann.GUID,
-		LeaseExpiry: expiry,
-		LastSeq:     ann.Sequence,
-		Security:    ann.Security,
+		GUID:                      ann.GUID,
+		LeaseExpiry:               expiry,
+		LastSeq:                   ann.Sequence,
+		DomainID:                  ann.DomainID,
+		DomainTag:                 ann.DomainTag,
+		AvailableBuiltinEndpoints: ann.AvailableBuiltinEndpoints,
+		BuiltinEndpointQos:        ann.BuiltinEndpointQos,
+		ManualLivelinessCount:     ann.ManualLivelinessCount,
+		ManualLeaseExpiry:         spdpManualExpiry(ann, expiry),
+		Security:                  ann.Security,
 	}
 	t.generation++
 
 	return true, t.generation, t.onChange, nil
 }
 
+// spdpCheckSecurityLocked enforces the Phase 1 decision suite on install
+// and refresh.
+//
+// A nil or disabled suite keeps tolerance mode and allows exactly as
+// today, preserving table behavior. An enabled suite refuses peers that
+// fail CheckRemoteParticipant, fail-closed, so the discovery,
+// liveliness, and RTPS protection kinds decided by governance per 9.4.2.4
+// are enforced at the participant graph instead of only decided. Install
+// and every refresh (newer sequence and same-sequence lease renewal)
+// re-check; dispose needs no check. Caller holds the lock.
+func (t *RemoteTable) spdpCheckSecurityLocked(ann Announcement) error {
+	suite := t.sec
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+
+	err := suite.CheckRemoteParticipant(spdpPeerDescriptor(ann))
+	if err != nil {
+		return fmt.Errorf("dds: spdp refuse peer: %w", err)
+	}
+
+	return nil
+}
+
+// spdpPeerDescriptor builds the Phase 1 decision input for one announcement.
+//
+// Identity is the hex participant prefix. Class follows the parsed
+// security posture: no markers means unsecured, hard-require properties
+// mean crypto, and anything else means compatible-unknown. Properties,
+// domain, and tag pass through untouched; the suite decides.
+func spdpPeerDescriptor(ann Announcement) ddssecurity.PeerDescriptor {
+	var class ddssecurity.PeerClass
+
+	switch ann.Security.Classification {
+	case SecurityUnsecured:
+		class = ddssecurity.PeerUnsecured
+	case SecurityRequiresCrypto:
+		class = ddssecurity.PeerRequiresCrypto
+	case SecurityCompatibleUnknown:
+		class = ddssecurity.PeerCompatible
+	default:
+		class = ddssecurity.PeerUnsecured
+	}
+
+	return ddssecurity.PeerDescriptor{
+		Identity:   hex.EncodeToString(ann.GUID.Prefix[:]),
+		Class:      class,
+		Properties: ann.Security.Properties,
+		DomainID:   ann.DomainID,
+		Tag:        ann.DomainTag,
+	}
+}
+
+// evictHostileLocked removes one entry that failed the refresh security
+// re-check. Caller holds the lock.
+//
+// The entry deletes at once and leaves a tombstone at the hostile
+// sequence until now plus maxSPDPLease, so identical re-announces stay
+// quiet duplicates instead of reinstalling the refused peer. Generation
+// bumps once and the change hook fires through the returned values even
+// though a refusal error also returns: the caller notifies on changed
+// before surfacing the error. Dispose needs no check and never calls
+// this path.
+func (t *RemoteTable) evictHostileLocked(ann Announcement, expiry time.Time, secErr error) (bool, uint64, func(uint64), error) {
+	now := expiry.Add(-ann.Lease)
+	delete(t.entries, ann.GUID.Prefix)
+	t.tombstones[ann.GUID.Prefix] = spdpTombstone{seq: ann.Sequence, expiresAt: now.Add(maxSPDPLease)}
+	t.generation++
+
+	return true, t.generation, t.onChange, fmt.Errorf("dds: spdp refuse hostile refresh: %w", secErr)
+}
+
 func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (bool, uint64, func(uint64), error) {
+	err := t.spdp2CheckDomainLocked(ann)
+	if err != nil {
+		return false, 0, nil, err
+	}
+
 	existing, ok := t.entries[ann.GUID.Prefix]
 	if !ok {
 		return t.installAliveLocked(ann, expiry)
 	}
 
 	if ann.Sequence == existing.LastSeq {
+		// Same-sequence re-announcements re-check security: a peer
+		// admitted before the suite enabled must not renew its lease
+		// once its posture refuses. A hostile refresh evicts at once
+		// instead of renewing.
+		if err := t.spdpCheckSecurityLocked(ann); err != nil {
+			return t.evictHostileLocked(ann, expiry, err)
+		}
+
 		existing.LeaseExpiry = expiry
+		if ann.ManualLivelinessCount > existing.ManualLivelinessCount {
+			existing.ManualLivelinessCount = ann.ManualLivelinessCount
+			existing.ManualLeaseExpiry = spdpManualExpiry(ann, expiry)
+		}
+		existing.AvailableBuiltinEndpoints = ann.AvailableBuiltinEndpoints
+		existing.BuiltinEndpointQos = ann.BuiltinEndpointQos
+		existing.Security = ann.Security
 		t.entries[ann.GUID.Prefix] = existing
 		return false, 0, nil, nil
 	}
@@ -1627,9 +2293,22 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 		return false, 0, nil, fmt.Errorf("dds: spdp stale alive seq=%d last=%d: %w", ann.Sequence, existing.LastSeq, ErrStaleSPDP)
 	}
 
+	// Newer-sequence updates re-check security for the same reason: the
+	// announced posture may have turned hostile since install. A hostile
+	// update evicts instead of installing.
+	if err := t.spdpCheckSecurityLocked(ann); err != nil {
+		return t.evictHostileLocked(ann, expiry, err)
+	}
+
 	existing.GUID = ann.GUID
 	existing.LeaseExpiry = expiry
 	existing.LastSeq = ann.Sequence
+	existing.DomainID = ann.DomainID
+	existing.DomainTag = ann.DomainTag
+	existing.AvailableBuiltinEndpoints = ann.AvailableBuiltinEndpoints
+	existing.BuiltinEndpointQos = ann.BuiltinEndpointQos
+	existing.ManualLivelinessCount = ann.ManualLivelinessCount
+	existing.ManualLeaseExpiry = spdpManualExpiry(ann, expiry)
 	existing.Security = ann.Security
 	t.entries[ann.GUID.Prefix] = existing
 	t.generation++
@@ -1642,21 +2321,20 @@ func (t *RemoteTable) handleAliveLocked(ann Announcement, expiry time.Time) (boo
 // Alive packets add or refresh the entry with expiry now plus lease.
 // Same-sequence alive re-announcements refresh the lease quietly without
 // bumping generation: senders repeat the same sample on the announce tick,
-// so a duplicate is liveness, not an error. Strictly older
-// sequences fail loudly with ErrStaleSPDP without bumping generation.
-// Dispose packets remove the entry only when their sequence is newer
-// than the stored LastSeq; older disposes fail loudly like stale alive
-// packets, while same-sequence disposes are routine duplicates. A missing entry
-// for a dispose succeeds quietly with no generation bump because there
-// is no route to delete, subject to the tombstone discipline which rejects
-// at-or-below high-water. Unknown params are ignored. Generation bumps
-// once per effective change. Prefix mismatches against the RTPS header
-// already drop loudly inside ParseAnnouncement and never install.
-//
-// Single-domain contract: this standalone helper installs any domain
-// carried on the wire without filtering. The backend filters by domain
-// through snoop plus HandlePacketUnicast on unicast ingress, so direct
-// callers joining more than one domain must filter before calling.
+// so a duplicate is liveness, not an error. Same-sequence with a higher
+// manual count refreshes both expiries and stores the high-water count
+// without bumping generation. Same-sequence without a count advance
+// refreshes only the automatic lease, so manual silence still expires
+// the entry through Sweep. Strictly older sequences fail loudly with
+// ErrStaleSPDP without bumping generation. Dispose packets remove the
+// entry only when their sequence is newer than the stored LastSeq; older
+// disposes fail loudly like stale alive packets, while same-sequence
+// disposes are routine duplicates. A missing entry for a dispose succeeds
+// quietly with no generation bump and no tombstone, subject to the
+// tombstone discipline which rejects at-or-below high-water. When the
+// local domain gate is set via SetSpdp2LocalDomain, foreign domain or tag
+// announces reject loudly with errSpdp2DomainMismatch and never install.
+// Unknown params are ignored. Generation bumps once per effective change.
 func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 	if now.IsZero() {
 		return fmt.Errorf("dds: handle zero time: %w", ErrInvalidTime)
@@ -1684,10 +2362,15 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 	t.mu.Lock()
 	changed, gen, hook, herr := t.handleAliveLocked(ann, expiry)
 	t.mu.Unlock()
+	// A hostile refresh evicts with both changed and an error: fire the
+	// hook before surfacing the refusal so the removal is visible.
+	// Every other error path returns unchanged and notifies as a no-op.
+	if changed {
+		notifyChange(changed, gen, hook)
+	}
 	if herr != nil {
 		return fmt.Errorf("dds: handle packet: %w", herr)
 	}
-	notifyChange(changed, gen, hook)
 
 	return nil
 }
@@ -1747,9 +2430,10 @@ func (t *RemoteTable) HandlePacketUnicast(data []byte, now time.Time, local GUID
 // Remove deletes one prefix and bumps generation when present.
 //
 // The delete retains a tombstone with the removed LastSeq until the
-// removed lease expiry so a stale alive cannot reinstall; Sweep drops
-// the tombstone after expiry so the map stays bounded. A missing prefix
-// returns false without touching the tombstone.
+// stored lease expiry plus maxSPDPLease so a stale alive cannot
+// reinstall without wall clock use; Sweep drops the tombstone after
+// expiry so the map stays bounded. A missing prefix returns false
+// without touching the tombstone. Prefer RemoveSpdp2At with caller now.
 func (t *RemoteTable) Remove(prefix GUIDPrefix) bool {
 	t.mu.Lock()
 
@@ -1761,7 +2445,7 @@ func (t *RemoteTable) Remove(prefix GUIDPrefix) bool {
 	}
 
 	delete(t.entries, prefix)
-	t.tombstones[prefix] = spdpTombstone{seq: existing.LastSeq, expiresAt: time.Now().Add(maxSPDPLease)}
+	t.tombstones[prefix] = spdpTombstone{seq: existing.LastSeq, expiresAt: existing.LeaseExpiry.Add(maxSPDPLease)}
 	t.generation++
 
 	gen := t.generation
@@ -1773,9 +2457,54 @@ func (t *RemoteTable) Remove(prefix GUIDPrefix) bool {
 	return true
 }
 
+// RemoveSpdp2At deletes one prefix using caller supplied now.
+//
+// It retains a tombstone until now plus maxSPDPLease so the distrust
+// window stays predictable with fake clocks. Missing prefixes return
+// false without creating tombstones.
+func (t *RemoteTable) RemoveSpdp2At(prefix GUIDPrefix, now time.Time) bool {
+	t.mu.Lock()
+
+	existing, ok := t.entries[prefix]
+	if !ok {
+		t.mu.Unlock()
+
+		return false
+	}
+
+	delete(t.entries, prefix)
+	t.tombstones[prefix] = spdpTombstone{seq: existing.LastSeq, expiresAt: now.Add(maxSPDPLease)}
+	t.generation++
+
+	gen := t.generation
+	hook := t.onChange
+	t.mu.Unlock()
+
+	notifyChange(true, gen, hook)
+
+	return true
+}
+
+// spdpManualDue reports whether the manual liveliness lease elapsed.
+//
+// A zero ManualLeaseExpiry means the peer never engaged manual
+// liveliness, so only the automatic lease expires the entry. Otherwise
+// the entry is due once now reaches the manual deadline, even while the
+// automatic lease stays fresh from periodic re-announces.
+func spdpManualDue(info ParticipantInfo, now time.Time) bool {
+	if info.ManualLeaseExpiry.IsZero() {
+		return false
+	}
+
+	return !now.Before(info.ManualLeaseExpiry)
+}
+
 // Sweep removes expired entries and bumps generation once when any expire.
 //
-// An entry expires when now is at or past LeaseExpiry. Each expired entry
+// An entry expires when now is at or past LeaseExpiry, or when its manual
+// liveliness lease elapsed while engaged: spdpManualDue stays false for
+// peers that never asserted manual liveliness, so their periodic
+// re-announces keep renewing only the automatic lease. Each expired entry
 // retains a tombstone until now plus maxSPDPLease so a stale alive cannot
 // reinstall after sweep. Tombstones at or past expiry are dropped without
 // a generation bump so the map stays bounded. It returns the number of
@@ -1786,7 +2515,7 @@ func (t *RemoteTable) Sweep(now time.Time) int {
 	removed := 0
 
 	for prefix, info := range t.entries {
-		if now.Before(info.LeaseExpiry) {
+		if now.Before(info.LeaseExpiry) && !spdpManualDue(info, now) {
 			continue
 		}
 
@@ -1919,3 +2648,9 @@ func compareInfo(a, b ParticipantInfo) int {
 // transport agnostic and relies on the unicast wrapper or the backend
 // demux for INFO_DST. No rejected scaffolding remains: the legacy custom
 // locator path is gone and all framing flows through rtps.
+//
+// Lock order for joint paths is always b.mu then t.mu: backend
+// storeAnnouncementWithTableAdvancewir10 takes b.mu before remotes.mu while
+// standalone RemoteTable methods take only t.mu, so no path inverts the
+// order and every table path in this file stays atomic-safe under joint
+// backend locks. Table helpers never take b.mu themselves.

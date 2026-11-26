@@ -6,6 +6,9 @@ package dds
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -18,6 +21,7 @@ import (
 
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
 )
 
 // testGUID returns a deterministic GUID with repeated fill byte.
@@ -491,8 +495,8 @@ func checkAliveGoldenParams(t *testing.T, params []rtps.Param, guid GUID, domain
 		t.Fatalf("GUID param mismatch")
 	}
 
-	if got := findTestParam(t, params, rtps.PIDProtocolVersion); len(got) != 4 || got[0] != 2 || got[1] != 1 {
-		t.Fatalf("protocol param = %v, want 2.1 padded to 4", got)
+	if got := findTestParam(t, params, rtps.PIDProtocolVersion); len(got) != 4 || got[0] != 2 || got[1] != 5 {
+		t.Fatalf("protocol param = %v, want 2.5 padded to 4", got)
 	}
 
 	if got := findTestParam(t, params, rtps.PIDVendorID); len(got) != 4 || got[0] != vendorID0 || got[1] != vendorID1 {
@@ -684,7 +688,7 @@ func TestMarshalDisposeGoldenShape(t *testing.T) {
 //
 // Capture: bound the free domain 42 SPDP multicast port with no talker
 // running, started a domain 42 Cyclone talker in ros-jazzy, and saved
-// the first SPDP DATA datagram. RTPS 2.1, vendor 01 10, writer
+// the first SPDP DATA datagram. RTPS 2.5, vendor 01 10, writer
 // 0x000100c2, PL_CDR_LE payload with domain tag 42, 10s lease, and
 // 192.168.0.162 unicast locators.
 const liveCycloneSPDP42Hex = "525450530201011001108d197d69608b1430a12509010800bb7adf6a59a91b9c150580010000100000000000000100c20000000001000000000300002c0010000a000000656e636c6176653d2f3b000059005c00030000000e0000005f5f50726f636573734e616d6500000008000000707974686f6e3300060000005f5f5069640000000500000032373532000000000b0000005f5f486f73746e616d650000070000006665646f726100000000000015000400020100001600040001100000020008000a000000000000005000100001108d197d69608b1430a125000001c1580004003ffc00000f0004002a0000003100180001000000fd450000000000000000000000000000c0a800a24800180001000000ed450000000000000000000000000000efff00013200180001000000fc450000000000000000000000000000c0a800a23300180001000000ec450000000000000000000000000000efff000107803400000000002c0000000000000000000000000000001a0000006665646f72612f302e31302e352f4c696e75782f4c696e7578000000198004000000100001000000"
@@ -2377,7 +2381,10 @@ func TestSPDPInfoDstUnicastMismatch(t *testing.T) {
 //
 // A zero-length INFO_DST is a legal RTPS no-op and processes normally; a
 // short non-empty body is malformed and drops loudly; an all-zero 12 byte
-// prefix is unknown and processes normally.
+// prefix is unknown and processes normally. The INFO_DST trails the DATA
+// because zero octetsToNextHeader extends to the tail per 9.4.5.1.3, so a
+// leading zero-length entry would claim the DATA bytes instead of staying
+// empty.
 func TestSPDPInfoDstUnicastBodyShapes(t *testing.T) {
 	t.Parallel()
 
@@ -2397,7 +2404,7 @@ func TestSPDPInfoDstUnicastBodyShapes(t *testing.T) {
 	withBody := func(body []byte) []byte {
 		t.Helper()
 		dst := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: rtps.FlagLittleEndian, Body: body}
-		msg, err := rtps.EncodeMessage(header, append([]rtps.RawSubmessage{dst}, subs...))
+		msg, err := rtps.EncodeMessage(header, append(append([]rtps.RawSubmessage(nil), subs...), dst))
 		if err != nil {
 			t.Fatalf("encode INFO_DST: %v", err)
 		}
@@ -2624,5 +2631,475 @@ func TestRemoteTableSameSeqRefreshesLease(t *testing.T) {
 	}
 	if removed := table.Sweep(later.Add(10 * time.Second)); removed != 1 {
 		t.Fatalf("sweep at refreshed expiry removed %d, want 1", removed)
+	}
+}
+
+// TestParseInvalidDropsRest pins 8.3.4.1 rule 6 in SPDP scan.
+// A poison DATA between two valid announces must drop the trailing
+// announce, preserving the entry before the poison.
+func TestParseInvalidDropsRest(t *testing.T) {
+	t.Parallel()
+
+	guid := testGUID(0xC3)
+	lease := 10 * time.Second
+	pktFive := mustMarshalAlive(t, guid, 0, 5, lease)
+	pktNine := mustMarshalAlive(t, guid, 0, 9, lease)
+	var drops rtps.Counter
+	hdr, rawsFive, err := rtps.DecodeMessage(pktFive, &drops)
+	if err != nil {
+		t.Fatalf("decode five: %v", err)
+	}
+	_, rawsNine, err := rtps.DecodeMessage(pktNine, &drops)
+	if err != nil {
+		t.Fatalf("decode nine: %v", err)
+	}
+	poison := rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: 0x05, Body: []byte{0x01}}
+	combined, err := rtps.EncodeMessage(hdr, append(append(append([]rtps.RawSubmessage(nil), rawsFive...), poison), rawsNine...))
+	if err != nil {
+		t.Fatalf("encode combined: %v", err)
+	}
+	ann := mustParse(t, combined)
+	if ann.Sequence != 5 {
+		t.Fatalf("sequence = %d, want 5 poison drops trailing nine", ann.Sequence)
+	}
+}
+
+// mustMarshalManual marshals an alive packet with a manual count and fails on error.
+func mustMarshalManual(t *testing.T, guid GUID, domain uint32, seq uint64, lease time.Duration, manual uint32) []byte {
+	t.Helper()
+
+	data, err := Spdp2MarshalAliveWithManual(guid, domain, seq, lease, manual, "")
+	if err != nil {
+		t.Fatalf("marshal manual alive: %v", err)
+	}
+
+	return data
+}
+
+// handleSpdpPacket feeds one packet and returns the stored record.
+func handleSpdpPacket(t *testing.T, table *RemoteTable, packet []byte, at time.Time, guid GUID, what string) ParticipantInfo {
+	t.Helper()
+
+	if err := table.HandlePacket(packet, at); err != nil {
+		t.Fatalf("handle %s: %v", what, err)
+	}
+
+	info, ok := table.Get(guid.Prefix)
+	if !ok {
+		t.Fatalf("missing entry after %s", what)
+	}
+
+	return info
+}
+
+// TestRemoteTableManualLivelinessDrivesExpiry pins manual lease tracking.
+//
+// A positive manual count engages a manual lease: same-sequence
+// duplicates without a count advance renew only the automatic lease, so
+// manual silence past the lease expires the entry through Sweep even
+// while automatic re-announces stay fresh. A higher count renews both.
+func TestRemoteTableManualLivelinessDrivesExpiry(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	base := time.Unix(22000, 0).UTC()
+	guid := testGUID(0x61)
+	lease := 10 * time.Second
+
+	install := mustMarshalManual(t, guid, 0, 1, lease, 1)
+	installed := handleSpdpPacket(t, table, install, base, guid, "install")
+
+	if installed.ManualLivelinessCount != 1 {
+		t.Fatalf("manual count = %d, want 1", installed.ManualLivelinessCount)
+	}
+
+	if !installed.ManualLeaseExpiry.Equal(base.Add(lease)) {
+		t.Fatalf("manual expiry = %v, want %v", installed.ManualLeaseExpiry, base.Add(lease))
+	}
+
+	refreshed := handleSpdpPacket(t, table, install, base.Add(5*time.Second), guid, "duplicate")
+
+	if !refreshed.LeaseExpiry.Equal(base.Add(15 * time.Second)) {
+		t.Fatalf("automatic expiry = %v, want %v", refreshed.LeaseExpiry, base.Add(15*time.Second))
+	}
+
+	if !refreshed.ManualLeaseExpiry.Equal(base.Add(lease)) {
+		t.Fatalf("manual expiry moved to %v, want %v", refreshed.ManualLeaseExpiry, base.Add(lease))
+	}
+
+	if gen := table.Generation(); gen != 1 {
+		t.Fatalf("generation = %d, want 1 after quiet duplicate", gen)
+	}
+
+	if got := table.Sweep(base.Add(11 * time.Second)); got != 1 {
+		t.Fatalf("sweep manual-expired = %d, want 1", got)
+	}
+
+	if table.Len() != 0 {
+		t.Fatalf("entries = %d, want 0 after manual expiry", table.Len())
+	}
+
+	reassert := mustMarshalManual(t, guid, 0, 2, lease, 2)
+	handleSpdpPacket(t, table, reassert, base.Add(12*time.Second), guid, "reassert")
+
+	if got := table.Sweep(base.Add(15 * time.Second)); got != 0 {
+		t.Fatalf("sweep fresh = %d, want 0", got)
+	}
+
+	if got := table.Sweep(base.Add(23 * time.Second)); got != 1 {
+		t.Fatalf("sweep expired = %d, want 1", got)
+	}
+}
+
+// TestRemoteTableManualLivelinessCountZeroStaysAutomatic pins the engaged gate.
+//
+// A zero manual count never engages the manual lease, so only the
+// automatic lease expires the entry and existing tolerance behavior is
+// unchanged.
+func TestRemoteTableManualLivelinessCountZeroStaysAutomatic(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	base := time.Unix(22100, 0).UTC()
+	guid := testGUID(0x63)
+	lease := 10 * time.Second
+
+	install := mustMarshalManual(t, guid, 0, 1, lease, 0)
+	if err := table.HandlePacket(install, base); err != nil {
+		t.Fatalf("handle install: %v", err)
+	}
+
+	installed, ok := table.Get(guid.Prefix)
+	if !ok {
+		t.Fatalf("missing entry after install")
+	}
+
+	if !installed.ManualLeaseExpiry.IsZero() {
+		t.Fatalf("manual expiry = %v, want zero for count zero", installed.ManualLeaseExpiry)
+	}
+
+	if got := table.Sweep(base.Add(9 * time.Second)); got != 0 {
+		t.Fatalf("sweep fresh = %d, want 0", got)
+	}
+
+	if got := table.Sweep(base.Add(10 * time.Second)); got != 1 {
+		t.Fatalf("sweep expired = %d, want 1", got)
+	}
+}
+
+// spdpTestEnabledSuite builds a deny-default suite for refusal tests.
+func spdpTestEnabledSuite(t *testing.T) *ddssecurity.Suite {
+	t.Helper()
+
+	suite, err := ddssecurity.NewSuite(ddssecurity.SuiteConfig{
+		Enabled:                 true,
+		IdentityCertificatePath: "test-cert",
+		IdentityPrivateKeyPath:  "test-key",
+		PermissionsCAPath:       "test-ca",
+		GovernancePath:          "test-gov",
+		PermissionsDocumentPath: "test-perms",
+	})
+	if err != nil {
+		t.Fatalf("new suite: %v", err)
+	}
+
+	return suite
+}
+
+// TestRemoteTableSecuritySuiteRefusesInstall pins fail-closed install gating.
+//
+// An enabled suite refuses peers that fail CheckRemoteParticipant before
+// they enter the participant graph: the install errors, the entry never
+// appears, and no tombstone is left behind.
+func TestRemoteTableSecuritySuiteRefusesInstall(t *testing.T) {
+	t.Parallel()
+
+	table := NewRemoteTable(nil)
+	table.SetSecuritySuite(spdpTestEnabledSuite(t))
+
+	guid := testGUID(0x62)
+	base := time.Unix(23000, 0).UTC()
+	alive := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+
+	if err := table.HandlePacket(alive, base); err == nil {
+		t.Fatalf("enabled suite installed peer, want refuse")
+	}
+
+	if table.Len() != 0 {
+		t.Fatalf("entries = %d, want 0 after refuse", table.Len())
+	}
+
+	if _, seen := table.TombstoneSeq(guid.Prefix); seen {
+		t.Fatalf("refused install left a tombstone")
+	}
+}
+
+// TestRemoteTableSecuritySuiteDisabledAllowsInstall pins tolerance mode.
+//
+// A nil or disabled suite installs exactly as today, preserving
+// byte-identical table behavior.
+func TestRemoteTableSecuritySuiteDisabledAllowsInstall(t *testing.T) {
+	t.Parallel()
+
+	for _, suite := range []*ddssecurity.Suite{nil, mustSpdpTestDisabledSuite(t)} {
+		table := NewRemoteTable(nil)
+		table.SetSecuritySuite(suite)
+
+		guid := testGUID(0x64)
+		base := time.Unix(23100, 0).UTC()
+		alive := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+
+		if err := table.HandlePacket(alive, base); err != nil {
+			t.Fatalf("disabled suite handle: %v", err)
+		}
+
+		if table.Len() != 1 {
+			t.Fatalf("entries = %d, want 1 for disabled suite", table.Len())
+		}
+	}
+}
+
+// TestRemoteTableSecuritySuiteRefusesHostileRefresh pins fail-closed refresh re-check.
+//
+// Enabling the suite after install turns both same-sequence lease renewal
+// and newer-sequence updates hostile per DDS Security 9.4.2.4: each refuses
+// through CheckRemoteParticipant, evicts the entry at once, and leaves a
+// tombstone so identical re-announces stay quiet duplicates instead of
+// reinstalling the refused peer.
+func TestRemoteTableSecuritySuiteRefusesHostileRefresh(t *testing.T) {
+	t.Parallel()
+
+	same := NewRemoteTable(nil)
+	sameGUID := testGUID(0x66)
+	sameBase := time.Unix(23200, 0).UTC()
+	sameFirst := mustMarshalAlive(t, sameGUID, 0, 1, 10*time.Second)
+	err := same.HandlePacket(sameFirst, sameBase)
+	if err != nil {
+		t.Fatalf("handle install: %v", err)
+	}
+
+	same.SetSecuritySuite(spdpTestEnabledSuite(t))
+
+	sameDup := mustMarshalAlive(t, sameGUID, 0, 1, 10*time.Second)
+	err = same.HandlePacket(sameDup, sameBase.Add(time.Second))
+	if err == nil {
+		t.Fatalf("same-seq hostile refresh admitted, want refuse")
+	}
+
+	if same.Len() != 0 {
+		t.Fatalf("entries = %d, want 0 after hostile same-seq evict", same.Len())
+	}
+
+	seq, seen := same.TombstoneSeq(sameGUID.Prefix)
+	if !seen {
+		t.Fatalf("hostile same-seq refresh left no tombstone")
+	}
+
+	if seq != 1 {
+		t.Fatalf("tombstone seq = %d, want 1", seq)
+	}
+
+	newer := NewRemoteTable(nil)
+	newerGUID := testGUID(0x67)
+	newerBase := time.Unix(23300, 0).UTC()
+	newerFirst := mustMarshalAlive(t, newerGUID, 0, 1, 10*time.Second)
+	err = newer.HandlePacket(newerFirst, newerBase)
+	if err != nil {
+		t.Fatalf("handle install: %v", err)
+	}
+
+	newer.SetSecuritySuite(spdpTestEnabledSuite(t))
+
+	newerSecond := mustMarshalAlive(t, newerGUID, 0, 2, 10*time.Second)
+	err = newer.HandlePacket(newerSecond, newerBase.Add(time.Second))
+	if err == nil {
+		t.Fatalf("newer-seq hostile refresh admitted, want refuse")
+	}
+
+	if newer.Len() != 0 {
+		t.Fatalf("entries = %d, want 0 after hostile newer-seq evict", newer.Len())
+	}
+
+	seq, seen = newer.TombstoneSeq(newerGUID.Prefix)
+	if !seen {
+		t.Fatalf("hostile newer-seq refresh left no tombstone")
+	}
+
+	if seq != 2 {
+		t.Fatalf("tombstone seq = %d, want 2", seq)
+	}
+}
+
+// TestRemoteTableSecuritySuiteDisabledAllowsRefresh pins tolerance-mode refresh.
+//
+// A nil or disabled suite keeps the refresh path byte-identical: a
+// same-sequence re-announcement renews the lease without bumping
+// generation, and a newer sequence installs with one generation bump.
+func TestRemoteTableSecuritySuiteDisabledAllowsRefresh(t *testing.T) {
+	t.Parallel()
+
+	suites := []*ddssecurity.Suite{nil, mustSpdpTestDisabledSuite(t)}
+
+	for i, suite := range suites {
+		table := NewRemoteTable(nil)
+		fill := byte(0x68)
+		if i == 1 {
+			fill = 0x69
+		}
+		guid := testGUID(fill)
+		base := time.Unix(23400, 0).UTC()
+
+		first := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+		err := table.HandlePacket(first, base)
+		if err != nil {
+			t.Fatalf("handle install: %v", err)
+		}
+
+		table.SetSecuritySuite(suite)
+
+		dup := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+		err = table.HandlePacket(dup, base.Add(time.Second))
+		if err != nil {
+			t.Fatalf("tolerance same-seq refresh: %v", err)
+		}
+
+		if table.Generation() != 1 {
+			t.Fatalf("generation = %d, want 1 after tolerance same-seq refresh", table.Generation())
+		}
+
+		second := mustMarshalAlive(t, guid, 0, 2, 10*time.Second)
+		err = table.HandlePacket(second, base.Add(2*time.Second))
+		if err != nil {
+			t.Fatalf("tolerance newer-seq refresh: %v", err)
+		}
+
+		if table.Len() != 1 {
+			t.Fatalf("entries = %d, want 1 after tolerance refresh", table.Len())
+		}
+
+		if table.Generation() != 2 {
+			t.Fatalf("generation = %d, want 2 after tolerance newer-seq refresh", table.Generation())
+		}
+	}
+}
+
+// mustSpdpTestDisabledSuite builds a tolerance-mode suite.
+func mustSpdpTestDisabledSuite(t *testing.T) *ddssecurity.Suite {
+	t.Helper()
+
+	suite, err := ddssecurity.NewSuite(ddssecurity.SuiteConfig{})
+	if err != nil {
+		t.Fatalf("new disabled suite: %v", err)
+	}
+
+	return suite
+}
+
+// TestSpdp2NegotiatedSecureAlgosSelectsAllowList pins negotiated announce labels.
+//
+// The selector intersects local P-256 capability with the governance
+// allow-list and returns token wire names. It never consults peer values:
+// token-namespace labels in the allow-list select nothing and every
+// gap fails closed.
+func TestSpdp2NegotiatedSecureAlgosSelectsAllowList(t *testing.T) {
+	t.Parallel()
+
+	cert := &x509.Certificate{PublicKey: &ecdsa.PublicKey{Curve: elliptic.P256()}}
+	allowed := []string{"ECDSA+P256+SHA256", "ECDHE-CEUM+P256", "AES128+GCM"}
+
+	dsign, kagree, err := Spdp2NegotiatedSecureAlgos(allowed, cert)
+	if err != nil {
+		t.Fatalf("negotiate P-256: %v", err)
+	}
+
+	if dsign != "ECDSA-SHA256" || kagree != "ECDH+prime256v1-CEUM" {
+		t.Fatalf("negotiated = (%q, %q), want (ECDSA-SHA256, ECDH+prime256v1-CEUM)", dsign, kagree)
+	}
+
+	for name, args := range map[string]struct {
+		allowed []string
+		cert    *x509.Certificate
+	}{
+		"empty allow-list": {nil, cert},
+		"partial overlap":  {[]string{"ECDSA+P256+SHA256"}, cert},
+		"token namespace":  {[]string{"ECDSA-SHA256", "ECDH+prime256v1-CEUM"}, cert},
+		"nil identity":     {allowed, nil},
+		"p384 curve":       {[]string{"ECDSA+P384+SHA384", "ECDHE-CEUM+P384"}, &x509.Certificate{PublicKey: &ecdsa.PublicKey{Curve: elliptic.P384()}}},
+		"unknown key":      {allowed, &x509.Certificate{}},
+	} {
+		if _, _, err := Spdp2NegotiatedSecureAlgos(args.allowed, args.cert); !errors.Is(err, ErrSpdp2UnnegotiatedAlgo) {
+			t.Fatalf("%s err = %v, want ErrSpdp2UnnegotiatedAlgo", name, err)
+		}
+	}
+}
+
+// TestSpdpAtomicRouteTableAgreement pins route and table agreement.
+//
+// The atomic ingest path holds the backend plus table locks across the
+// stale check, the route write, and the table advance, so concurrent
+// reordered announces never leave a route without its table entry. The
+// legacy snoop plus HandlePacket sequence advances the two separately
+// and still needs the backend-owned unification to this path.
+func TestSpdpAtomicRouteTableAgreement(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{remotes: NewRemoteTable(nil)}
+	guid := testGUID(0x71)
+	base := time.Unix(33000, 0).UTC()
+
+	first := mustMarshalAlive(t, guid, 0, 1, 10*time.Second)
+	backend.handleSpdpBytesOnce(first, 0, nil, base)
+
+	packets := make([][]byte, 0, 8)
+	for seq := uint64(2); seq <= 9; seq++ {
+		packets = append(packets, mustMarshalAlive(t, guid, 0, seq, 10*time.Second))
+	}
+
+	var wg sync.WaitGroup
+
+	for i := range packets {
+		wg.Add(1)
+
+		go func(data []byte, at time.Time) {
+			defer wg.Done()
+			backend.handleSpdpBytesOnce(data, 0, nil, at)
+		}(packets[i], base.Add(time.Duration(i)*time.Second))
+	}
+
+	wg.Wait()
+
+	backend.mu.Lock()
+	_, routeSeen := backend.routes[guid.Prefix]
+	backend.mu.Unlock()
+
+	_, tableSeen := backend.remotes.Get(guid.Prefix)
+	if routeSeen != tableSeen {
+		t.Fatalf("route=%v table=%v disagree, want agreement", routeSeen, tableSeen)
+	}
+
+	if !tableSeen {
+		t.Fatalf("atomic ingest lost the prefix")
+	}
+
+	dispose := mustMarshalDispose(t, guid, 0, 10)
+	backend.handleSpdpBytesOnce(dispose, 0, nil, base.Add(time.Minute))
+
+	stale := mustMarshalAlive(t, guid, 0, 5, 10*time.Second)
+	backend.handleSpdpBytesOnce(stale, 0, nil, base.Add(2*time.Minute))
+
+	backend.mu.Lock()
+	_, routeAfter := backend.routes[guid.Prefix]
+	backend.mu.Unlock()
+
+	if routeAfter {
+		t.Fatalf("stale alive reinstalled the route")
+	}
+
+	if _, seen := backend.remotes.Get(guid.Prefix); seen {
+		t.Fatalf("stale alive reinstalled the entry")
+	}
+
+	if _, seen := backend.remotes.TombstoneSeq(guid.Prefix); !seen {
+		t.Fatalf("dispose left no tombstone")
 	}
 }

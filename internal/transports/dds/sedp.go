@@ -11,15 +11,17 @@
 //
 // Each endpoint announcement is one RTPS message: the RTPS header with
 // the participant prefix plus a single DATA submessage from a builtin
-// SEDP writer. Publications use writer entity 0x000002c2 and
+// SEDP writer. Publications use writer entity 0x000003c2 and
 // subscriptions use writer entity 0x000004c2, with inline QoS PID
 // params carrying the topic name, type name, endpoint GUID,
 // reliable transient local QoS with keep-last history, protocol version,
-// vendor id, and userdata with the type hash. Parsing
+// vendor id, and userdata with the type hash. Topic announcements use
+// writer entity 0x000002c2 and carry only the topic plus type names, never
+// endpoint DATA. Parsing
 // accepts the same shape from any peer and additionally tolerates the
 // observed CycloneDDS wire form, which carries endpoint params in the
-// DATA payload instead of inline QoS and announces publications from
-// writer entity 0x000003c2. See the capture notes on the Cyclone
+// DATA payload instead of inline QoS.
+// See the capture notes on the Cyclone
 // fixture tests for the observed values.
 //
 // Names here carry an SEDP prefix so parallel SPDP and datapath work in
@@ -44,6 +46,7 @@ import (
 
 	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
 )
 
 // SEDP RTPS framing constants.
@@ -61,9 +64,9 @@ const (
 	sedpOctetsToInlineQoS = 16
 	// sedpRTPSMajor is the only accepted RTPS major version.
 	sedpRTPSMajor byte = 2
-	// sedpRTPSMinor is the sent RTPS minor version. Peers may send any
-	// 2.x minor; decode accepts every minor under major 2.
-	sedpRTPSMinor byte = 1
+	// sedpRTPSMinor is the sent RTPS minor version per DDSI-RTPS 2.5.
+	// Peers may send any 2.x minor; decode accepts every minor under major 2.
+	sedpRTPSMinor byte = 5
 	// sedpVendorID0 is the first sent vendor id byte, Eclipse CycloneDDS.
 	sedpVendorID0 byte = 0x01
 	// sedpVendorID1 is the second sent vendor id byte, Eclipse CycloneDDS.
@@ -164,20 +167,23 @@ const (
 	sedpProvisionalTTL = 30 * time.Second
 )
 
-// SEDP builtin endpoint entities.
+// SEDP builtin endpoint entities per DDSI-RTPS 2.5 section 8.5.4.3.
 //
 // Publications carry writer announcements and subscriptions carry reader
-// announcements. CycloneDDS announces publications from 0x000003c2, which
-// differs from the spec value 0x000002c2. This package sends the Cyclone
-// variant for interop and parses both. Reader ids are always sent as
-// unknown and any received reader id is accepted.
+// announcements. The Topics writer carries TopicBuiltinTopicData, never
+// endpoint DATA. The entity values are the spec values, unambiguous by
+// low octet: 0x02 Topics, 0x03 publications, 0x04 subscriptions. The
+// values match the observed CycloneDDS wire form: the live captures in
+// sedp_test.go show publications from 0x000003c2 and subscriptions from
+// 0x000004c2. Reader ids are always sent as unknown and any received
+// reader id is accepted.
 var (
-	// sedpPublicationsWriter is the spec SEDP publications writer, kept
-	// for parsing peers that still send it.
-	sedpPublicationsWriter = SEDPEntityID{0x00, 0x00, 0x02, 0xC2}
-	// sedpPublicationsWriterCyclone is the sent SEDP publications writer,
-	// matching the observed CycloneDDS wire form.
-	sedpPublicationsWriterCyclone = SEDPEntityID{0x00, 0x00, 0x03, 0xC2}
+	// sedpTopicsWriter is the SEDP Topics writer for TopicBuiltinTopicData.
+	sedpTopicsWriter = SEDPEntityID{0x00, 0x00, 0x02, 0xC2}
+	// sedpTopicsReader is the SEDP Topics reader.
+	sedpTopicsReader = SEDPEntityID{0x00, 0x00, 0x02, 0xC7}
+	// sedpPublicationsWriter is the SEDP publications writer.
+	sedpPublicationsWriter = SEDPEntityID{0x00, 0x00, 0x03, 0xC2}
 	// sedpSubscriptionsWriter is the SEDP subscriptions writer.
 	sedpSubscriptionsWriter = SEDPEntityID{0x00, 0x00, 0x04, 0xC2}
 	// sedpEntityUnknown is the sent DATA reader id, also the zero GUID.
@@ -379,6 +385,16 @@ type SEDPEndpoint struct {
 	// announces WireOffer params when set and facade params otherwise,
 	// so existing paths keep byte-identical wire output.
 	WireOffer *WireQoS
+	// RxOWire carries the effective wire QoS for RxO matching. Local
+	// declares populate it from the facade or WireOffer; remote ingest
+	// populates it on successful parse and leaves it nil on failure with
+	// RxOMalformed set. Match requires both sides populated; malformed
+	// fails closed, while endpoints predating QoS capture keep legacy
+	// behavior until repopulated.
+	RxOWire *WireQoS
+	// RxOMalformed reports a failed remote QoS parse. Malformed peers
+	// never match, per fail-closed default.
+	RxOMalformed bool
 }
 
 // SEDPSender sends SEDP DATA bytes toward the discovery bus.
@@ -421,13 +437,21 @@ type SEDPIndex struct {
 	// hbCount tracks the last HEARTBEAT Count per builtin writer.
 	hbCount map[sedpWriterKey]int32
 	// writerHigh tracks the highest DATA or GAP sequence per builtin
-	// writer for heartbeat clamp bounds.
+	// writer for heartbeat clamp bounds. It is deliberately not an ingest
+	// gate: several endpoints share one writer stream with interleaved
+	// per-writer sequences, so an endpoint's newest sample can carry a
+	// lower sequence than a sibling endpoint's newer sample. Gating
+	// ingest on writerHigh would falsely drop such newest-per-endpoint
+	// samples. Replay gates only on the per-endpoint lastSeq; writerHigh
+	// only bounds GAP clamping.
 	writerHigh map[sedpWriterKey]uint64
 	// pendingEvict holds participant prefixes whose SEDP remotes drop
 	// after sedpEvictGracePeriod. SPDP dispose removes routes at once
 	// but defers endpoint removal so in-flight user DATA still takes;
 	// a re-announce cancels through UpsertRemote.
 	pendingEvict map[SEDPGUIDPrefix]time.Time
+	// sec holds the Phase 1 decision suite, nil for tolerance mode.
+	sec *ddssecurity.Suite
 }
 
 // sedpEvictGracePeriod bounds how long SEDP remotes survive their SPDP
@@ -592,6 +616,100 @@ func (idx *SEDPIndex) SetOnRemove(fn func(SEDPGUID)) {
 	defer idx.mu.Unlock()
 
 	idx.onRemove = fn
+}
+
+// SetSecuritySuite installs the Phase 1 decision suite.
+//
+// A nil suite keeps tolerance mode: endpoints install exactly as today.
+// A non-nil enabled suite refuses remote installs, provisional installs,
+// and local declares before they enter the index. It self-locks and is
+// safe for concurrent use.
+func (idx *SEDPIndex) SetSecuritySuite(s *ddssecurity.Suite) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.sec = s
+}
+
+// sedpPeerDescriptor builds the Phase 1 decision input for one endpoint.
+//
+// Identity is the hex participant prefix. Class follows the parsed
+// endpoint posture: no markers means unsecured, hard-require properties
+// mean crypto, and anything else means compatible-unknown. Properties,
+// domain, and partitions pass through untouched; the suite decides.
+// The DDS topic and reader direction travel as the check arguments, and
+// the DDS type rides in the endpoint record for match-time consistency.
+func sedpPeerDescriptor(ep SEDPEndpoint) ddssecurity.PeerDescriptor {
+	var class ddssecurity.PeerClass
+
+	switch ep.Security.Classification {
+	case SecurityUnsecured:
+		class = ddssecurity.PeerUnsecured
+	case SecurityRequiresCrypto:
+		class = ddssecurity.PeerRequiresCrypto
+	case SecurityCompatibleUnknown:
+		class = ddssecurity.PeerCompatible
+	default:
+		class = ddssecurity.PeerUnsecured
+	}
+
+	return ddssecurity.PeerDescriptor{
+		Identity:   hex.EncodeToString(ep.ID.Prefix[:]),
+		Class:      class,
+		Properties: ep.Security.Properties,
+		DomainID:   ep.DomainID,
+		Partitions: append([]string(nil), ep.Partitions...),
+	}
+}
+
+// sedpCheckRemoteSecurityLocked enforces the Phase 1 decision suite on one
+// remote endpoint. Caller holds idx.mu.
+//
+// A nil or disabled suite keeps tolerance mode: it returns nil without
+// consulting the suite, preserving byte-identical behavior. An enabled
+// suite refuses endpoints that fail CheckRemoteEndpoint fail-closed with
+// the DDS topic, reader direction, domain, partitions, and security
+// posture as inputs. The DDS type rides in the endpoint record and is
+// enforced at match time, not at install.
+func (idx *SEDPIndex) sedpCheckRemoteSecurityLocked(ep SEDPEndpoint) error {
+	suite := idx.sec
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+
+	err := suite.CheckRemoteEndpoint(sedpPeerDescriptor(ep), ep.DDSTopic, ep.IsReader)
+	if err != nil {
+		return fmt.Errorf("dds: sedp refuse remote endpoint: %w", err)
+	}
+
+	return nil
+}
+
+// sedpCheckLocalSecurityLocked enforces the Phase 1 decision suite on one
+// local declare. Caller holds idx.mu.
+//
+// A nil or disabled suite keeps tolerance mode: it returns nil without
+// consulting the suite, preserving byte-identical behavior. An enabled
+// suite refuses declares that fail the local create gate fail-closed
+// with the participant identity, DDS topic, reader direction, domain,
+// and partitions as inputs. This is the creation-time gate
+// (CheckCreateEndpointInDomainacc8Scoped); the local match gates apply at
+// match time with a live remote and stay out of the declare path. The
+// DDS type rides in the endpoint record and is enforced at match time.
+func (idx *SEDPIndex) sedpCheckLocalSecurityLocked(ep SEDPEndpoint) error {
+	suite := idx.sec
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+
+	identity := hex.EncodeToString(idx.prefix[:])
+
+	err := suite.CheckCreateEndpointInDomainacc8Scoped(identity, ep.DDSTopic, ep.IsReader, ep.DomainID, ep.Partitions, nil)
+	if err != nil {
+		return fmt.Errorf("dds: sedp refuse local declare: %w", err)
+	}
+
+	return nil
 }
 
 // Generation returns the current remote mutation generation.
@@ -816,35 +934,57 @@ func sedpTranslateDeclareOffer(rosTopic, publisherName, subscriberName string, p
 }
 
 // sedpDeclarePartitions extracts validated partition names from raw QoS.
+//
+// Fail-closed: any decode failure or any malformed partition value rejects
+// loudly instead of degrading to the default partition, so a truncated
+// param list or a bad partition name never silently meets the wrong peers.
+// A nil or empty QoS carries no partitions and maps to the default.
+// Opaque non-params QoS stays default only when it decodes to no
+// partition PID; present-but-malformed partition params always error.
 func sedpDeclarePartitions(qos []byte) ([]string, error) {
 	if len(qos) == 0 {
 		return nil, nil
 	}
 
-	params, perr := rtps.DecodeParams(qos)
-	if perr == nil {
-		return sedpValidatedPartitionNames(params)
+	params, err := rtps.DecodeParams(qos)
+	if err != nil {
+		return nil, fmt.Errorf("dds: sedp declare partitions decode: %w", err)
 	}
 
-	return nil, nil
+	return sedpValidatedPartitionNames(params)
 }
 
 // sedpValidatedPartitionNames validates partition names from decoded params.
+//
+// Fail-closed: a present-but-malformed PIDPartition value rejects loudly
+// with the partition cause preserved, so declares never fall back to the
+// default partition on bad input. Absent partition params map to nil for
+// the default partition.
 func sedpValidatedPartitionNames(params []rtps.Param) ([]string, error) {
-	names, ferr := FindPartitionParam(params)
-	if ferr == nil && len(names) != 0 {
-		if verr := ValidatePartitionList(names); verr != nil {
-			return nil, fmt.Errorf("dds: sedp declare partitions: %w", verr)
-		}
-
-		return append([]string(nil), names...), nil
+	names, err := FindPartitionParam(params)
+	if err != nil {
+		return nil, fmt.Errorf("dds: sedp declare partitions: %w", err)
 	}
 
-	return nil, nil
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	err = ValidatePartitionList(names)
+	if err != nil {
+		return nil, fmt.Errorf("dds: sedp declare partitions: %w", err)
+	}
+
+	return append([]string(nil), names...), nil
 }
 
 // sedpBuildDeclareEndpoint assembles the endpoint record before storing.
 func sedpBuildDeclareEndpoint(id SEDPGUID, inputs sedpDeclareInputs, typeHash string, qos []byte, isReader bool, domain uint32, readerVolatile bool, wireOffer *WireQoS) SEDPEndpoint {
+	rxo := sedp3FacadeWireQoSsedp3(isReader && readerVolatile)
+	if wireOffer != nil {
+		rxo = *wireOffer
+	}
+
 	return SEDPEndpoint{
 		ID:       id,
 		ROSTopic: inputs.rosTopic,
@@ -867,6 +1007,7 @@ func sedpBuildDeclareEndpoint(id SEDPGUID, inputs sedpDeclareInputs, typeHash st
 		// transient local per the facade.
 		VolatileDurability: isReader && readerVolatile,
 		WireOffer:          wireOffer,
+		RxOWire:            &rxo,
 	}
 }
 
@@ -926,6 +1067,14 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 
 	ep.Partitions = partitions
 
+	// Fail-closed local declare gate: an enabled suite refuses before the
+	// record enters the index. A refused declare consumes the entity
+	// counter but installs nothing and bumps no generation. A nil or
+	// disabled suite skips the check with byte-identical behavior.
+	if err := idx.sedpCheckLocalSecurityLocked(ep); err != nil {
+		return SEDPEndpoint{}, err
+	}
+
 	idx.locals[id] = sedpCloneEndpoint(ep)
 
 	return sedpCloneEndpoint(ep), nil
@@ -937,7 +1086,11 @@ func (idx *SEDPIndex) declareEndpointFull(isReader, keyed bool, rosTopic, idlNam
 // topic, and local stamps bump generation once when any record actually
 // changes so the next announce carries the set. Unchanged partitions bump
 // nothing and fire no hook, matching the once-per-change contract.
-// Unknown topics change nothing and report nil.
+// Unknown topics change nothing and report nil. Writers stay exempt by
+// design: the publish path carries no partition API, and stamping writers
+// on a subscribe would leak subscription state into publication, so
+// writers join partitions only through declare QoS, never through this
+// reader-only backfill.
 func (idx *SEDPIndex) StampLocalPartitions(rosTopic, typeName string, partitions []string) {
 	err := ValidatePartitionList(partitions)
 	if err != nil {
@@ -1028,6 +1181,17 @@ func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
 	ep.FirstSeen = time.Time{}
 
 	idx.mu.Lock()
+
+	// Fail-closed remote gate: an enabled suite refuses before any
+	// mutation, so a refused re-announce neither cancels a scheduled
+	// dispose eviction nor installs nor bumps generation. A nil or
+	// disabled suite skips the check with byte-identical behavior.
+	if err := idx.sedpCheckRemoteSecurityLocked(ep); err != nil {
+		idx.mu.Unlock()
+		sedpTracef("upsert security refuse guid=%s ros=%q err=%v", ep.ID.String(), ep.ROSTopic, err)
+
+		return fmt.Errorf("dds: sedp upsert remote: %w", err)
+	}
 
 	// A re-announce proves liveness even when identical, so it cancels a
 	// scheduled dispose eviction before the duplicate short-circuit below.
@@ -1223,6 +1387,16 @@ func (idx *SEDPIndex) ProvisionalInstall(ep SEDPEndpoint) error {
 
 	idx.mu.Lock()
 
+	// Fail-closed fast-path gate: an enabled suite refuses the placeholder
+	// before it enters the index, so nothing installs and nothing bumps
+	// generation. A nil or disabled suite skips the check with
+	// byte-identical behavior.
+	if err := idx.sedpCheckRemoteSecurityLocked(ep); err != nil {
+		idx.mu.Unlock()
+
+		return fmt.Errorf("dds: sedp provisional install: %w", err)
+	}
+
 	existing, seen := idx.remotes[ep.ID]
 	if seen && !existing.Provisional {
 		idx.mu.Unlock()
@@ -1330,20 +1504,37 @@ func (idx *SEDPIndex) Sweep(now time.Time) int {
 	return idx.ExpireProvisional(now)
 }
 
+// sedpAnnounceEndpointsAndTopics sends one endpoint snapshot plus one
+// topics snapshot, mapping loop errors for the announce loop.
+func sedpAnnounceEndpointsAndTopics(ctx context.Context, s SEDPSender, eps []SEDPEndpoint, prefix SEDPGUIDPrefix, topics []SEDPTopic) error {
+	err := sedpAnnounceSnapshot(ctx, s, eps)
+	if err != nil {
+		return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
+	}
+
+	err = sedpAnnounceTopicsSnapshot(ctx, s, prefix, topics)
+	if err != nil {
+		return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce topics snapshot: %w", err))
+	}
+
+	return nil
+}
+
 // AnnounceLoop publishes all local endpoints immediately then re-announces
 // on local changes until ctx is done.
 //
-// It snapshots LocalEndpoints once, sends each sample with
-// SerializeSEDPDATA through s, then polls LocalEndpoints every 200ms and
-// re-sends all locals when the snapshot differs. It also resends every
-// second with fresh DATA sequences and HEARTBEATs so reliable peers that
-// dropped the first sample still match. Generation is not polled
-// because it counts remote mutations only and local declares leave it
-// unchanged, so the loop compares local snapshots instead. Sends run
-// outside the index lock because LocalEndpoints and SerializeSEDPDATA copy
-// their inputs.
+// It snapshots LocalEndpoints plus TopicsSnapshot once, sends endpoint
+// DATA samples with SerializeSEDPDATA and topic DATA samples with
+// SerializeSEDPTopicsDATA through s, then polls LocalEndpoints every
+// 200ms and re-sends all when either snapshot differs. It also resends
+// every second with fresh DATA sequences and HEARTBEATs so reliable
+// peers that dropped the first sample still match. Generation is not
+// polled because it counts remote mutations only and local declares
+// leave it unchanged, so the loop compares local snapshots instead.
+// Sends run outside the index lock because LocalEndpoints,
+// TopicsSnapshot, and SerializeSEDPDATA copy their inputs.
 //
-// A snapshot with zero locals sends nothing.
+// A snapshot with zero endpoints and zero topics sends nothing.
 //
 // It returns ctx.Err when ctx is done and is safe for concurrent use with
 // DeclareWriter, DeclareReader, UpsertRemote, and RemoveRemote.
@@ -1366,10 +1557,12 @@ func (idx *SEDPIndex) AnnounceLoop(ctx context.Context, s SEDPSender) error {
 	}
 
 	last := idx.LocalEndpoints()
+	lastTopics := idx.TopicsSnapshot()
+	prefix := idx.snapshotPrefix()
 
-	err = sedpAnnounceSnapshot(ctx, s, last)
+	err = sedpAnnounceEndpointsAndTopics(ctx, s, last, prefix, lastTopics)
 	if err != nil {
-		return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
+		return err
 	}
 
 	lastSend := time.Now()
@@ -1382,20 +1575,35 @@ func (idx *SEDPIndex) AnnounceLoop(ctx context.Context, s SEDPSender) error {
 		case <-ctx.Done():
 			return ctx.Err() //nolint:wrapcheck // cancel semantics require unwrapped ctx.Err
 		case <-ticker.C:
-			current := idx.LocalEndpoints()
-			if sedpEndpointsSlicesEqual(last, current) && time.Since(lastSend) < sedpAnnounceResendInterval {
+			current, currentTopics, resend := idx.sedpAnnounceTickSnapshot(last, lastTopics, lastSend)
+			if !resend {
 				continue
 			}
 
-			err := sedpAnnounceSnapshot(ctx, s, current)
+			err := sedpAnnounceEndpointsAndTopics(ctx, s, current, prefix, currentTopics)
 			if err != nil {
-				return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
+				return err
 			}
 
 			last = current
+			lastTopics = currentTopics
 			lastSend = time.Now()
 		}
 	}
+}
+
+// sedpAnnounceTickSnapshot snapshots locals plus topics and reports
+// whether the tick must resend: either snapshot differs or the resend
+// interval elapsed since lastSend.
+func (idx *SEDPIndex) sedpAnnounceTickSnapshot(last []SEDPEndpoint, lastTopics []SEDPTopic, lastSend time.Time) ([]SEDPEndpoint, []SEDPTopic, bool) {
+	current := idx.LocalEndpoints()
+	currentTopics := idx.TopicsSnapshot()
+
+	if sedpEndpointsSlicesEqual(last, current) && sedpTopicsSlicesEqual(lastTopics, currentTopics) && time.Since(lastSend) < sedpAnnounceResendInterval {
+		return last, lastTopics, false
+	}
+
+	return current, currentTopics, true
 }
 
 // ListenLoop receives DATA samples until ctx is done.
@@ -1643,11 +1851,6 @@ func sedpClampGapUnbounded(seq, current uint64) uint64 {
 	return seq
 }
 
-// noteSedpHeartbeats scans one datagram for builtin SEDP HEARTBEATs.
-//
-// Malformed heartbeat bodies log loudly and skip without failing the
-// datagram, so one poison control submessage never drops valid endpoint
-// DATA in the same datagram. Replays are ignored quietly.
 // sedpHeartbeatWriterOf returns the builtin SEDP writer for a HEARTBEAT body.
 func sedpHeartbeatWriterOf(body []byte) (SEDPEntityID, bool) {
 	var writer SEDPEntityID
@@ -1659,7 +1862,11 @@ func sedpHeartbeatWriterOf(body []byte) (SEDPEntityID, bool) {
 	return writer, isEndpoint
 }
 
-func (idx *SEDPIndex) noteSedpHeartbeats(data []byte, prefix SEDPGUIDPrefix) {
+// scanSedpControl walks one datagram for want submessages.
+// It validates each sub via knownInvalidSubmessage; a known invalid drops
+// the rest per 8.3.4.1 rule 6. For each matching want sub it calls handle;
+// when handle reports true the scan stops. Split failures stop the scan.
+func scanSedpControl(data []byte, want byte, handle func(body []byte, flags byte) bool) {
 	err := sedpValidateRTPSHeader(data)
 	if err != nil {
 		return
@@ -1675,82 +1882,92 @@ func (idx *SEDPIndex) noteSedpHeartbeats(data []byte, prefix SEDPGUIDPrefix) {
 		if serr != nil {
 			return
 		}
+		raw := rtps.RawSubmessage{ID: id, Flags: flags, Body: body}
+		if knownInvalidSubmessage(raw) {
+			log.Printf("dds: sedp scan invalid submessage %#02x drops rest", id)
+			return
+		}
 		off = next
-		if id != sedpSubmessageHeartbeat {
+		if id != want {
 			continue
 		}
-		idx.noteOneHeartbeat(prefix, body, flags)
+		if handle(body, flags) {
+			return
+		}
 	}
+}
+
+// noteSedpHeartbeats scans one datagram for builtin SEDP HEARTBEATs.
+//
+// A known invalid submessage drops the rest of the datagram per 8.3.4.1
+// rule 6. Replays are ignored quietly.
+func (idx *SEDPIndex) noteSedpHeartbeats(data []byte, prefix SEDPGUIDPrefix) {
+	scanSedpControl(data, sedpSubmessageHeartbeat, func(body []byte, flags byte) bool {
+		return idx.noteOneHeartbeat(prefix, body, flags)
+	})
 }
 
 // noteOneHeartbeat records one HEARTBEAT submessage body.
 //
-// Short and undecodable bodies log loudly and skip. Replays trace quietly.
-func (idx *SEDPIndex) noteOneHeartbeat(prefix SEDPGUIDPrefix, body []byte, flags byte) {
+// It reports true when the body is RTPS-invalid so the caller drops the
+// rest of the datagram per 8.3.4.1 rule 6. Short and undecodable bodies
+// are invalid; non-endpoint writers are ignored. Replays trace quietly.
+func (idx *SEDPIndex) noteOneHeartbeat(prefix SEDPGUIDPrefix, body []byte, flags byte) bool {
+	if len(body) < sedpEntityLen*2 {
+		log.Printf("dds: sedp heartbeat short body, dropping rest")
+		return true
+	}
 	writer, ok := sedpHeartbeatWriterOf(body)
 	if !ok {
-		log.Printf("dds: sedp heartbeat short body, skipping")
-		return
+		return false
 	}
 	var drops rtps.Counter
 	beat, err := rtps.DecodeHeartbeat(body, flags, &drops)
 	if err != nil {
-		log.Printf("dds: sedp heartbeat decode skipped: %v", err)
-		return
+		log.Printf("dds: sedp heartbeat decode drops rest: %v", err)
+		return true
 	}
 	key := sedpWriterKey{prefix: prefix, writer: writer}
 	if !idx.sedpHeartbeatNote(key, beat.Count, beat.LastSequence) {
 		sedpTracef("heartbeat replay writer=%02x%02x%02x%02x count=%d last=%d", writer[0], writer[1], writer[2], writer[3], beat.Count, beat.LastSequence)
 	}
+	return false
 }
 
 // applySedpGapsFromDatagram decodes every builtin SEDP GAP list and applies it.
 //
 // The full skipped list applies via sedpApplyGapList, not just GapStart.
-// Malformed GAP bodies log loudly and skip without failing the datagram,
-// so one poison control submessage never drops valid endpoint DATA.
+// A known invalid submessage drops the rest of the datagram per 8.3.4.1
+// rule 6.
 func (idx *SEDPIndex) applySedpGapsFromDatagram(data []byte, prefix SEDPGUIDPrefix) {
-	verr := sedpValidateRTPSHeader(data)
-	if verr != nil {
-		return
-	}
-	off := sedpRTPSHeaderLen
-	seen := 0
-	for off < len(data) {
-		seen++
-		if seen > sedpMaxSubmessages {
-			return
-		}
-		id, body, flags, next, serr := sedpSplitSubmessage(data, off)
-		if serr != nil {
-			return
-		}
-		off = next
-		if id != sedpSubmessageGap {
-			continue
-		}
-		idx.applyOneGap(prefix, body, flags)
-	}
+	scanSedpControl(data, sedpSubmessageGap, func(body []byte, flags byte) bool {
+		return idx.applyOneGap(prefix, body, flags)
+	})
 }
 
 // applyOneGap applies one GAP submessage body.
 //
-// Short and undecodable bodies log loudly and skip. Non-endpoint writers
-// are ignored.
-func (idx *SEDPIndex) applyOneGap(prefix SEDPGUIDPrefix, body []byte, flags byte) {
+// It reports true when the body is RTPS-invalid so the caller drops the
+// rest of the datagram per 8.3.4.1 rule 6. Short and undecodable bodies
+// are invalid; non-endpoint writers are ignored.
+func (idx *SEDPIndex) applyOneGap(prefix SEDPGUIDPrefix, body []byte, flags byte) bool {
+	if len(body) < sedpEntityLen*2 {
+		log.Printf("dds: sedp gap short body, dropping rest")
+		return true
+	}
 	writer, ok := sedpHeartbeatWriterOf(body)
 	if !ok {
-		log.Printf("dds: sedp gap short body, skipping")
-		return
+		return false
 	}
 	var drops rtps.Counter
 	gap, err := rtps.DecodeGap(body, flags, &drops)
 	if err != nil {
-		log.Printf("dds: sedp gap decode skipped: %v", err)
-		return
+		log.Printf("dds: sedp gap decode drops rest: %v", err)
+		return true
 	}
 	key := sedpWriterKey{prefix: prefix, writer: writer}
 	idx.sedpApplyGapList(key, gap.SkippedSequences())
+	return false
 }
 
 func (idx *SEDPIndex) ingestSample(data []byte) error {
@@ -1765,7 +1982,7 @@ func (idx *SEDPIndex) ingestSample(data []byte) error {
 	bodies, flags, err := sedpFindAllEndpointDATA(data)
 	if err != nil {
 		sedpTracef("ingest parse reject len=%d err=%v", len(data), err)
-		if errors.Is(err, ErrSEDPInvalidDATA) && sedpIsSEDPControl(data) {
+		if errors.Is(err, ErrSEDPInvalidDATA) && (sedpIsSEDPControl(data) || sedpHasTopicsDATA(data)) {
 			sedpTracef("ingest control skip len=%d", len(data))
 			return nil
 		}
@@ -1822,7 +2039,10 @@ func ingestOutcomeError(installed, stale int, firstErr error) error {
 // instead of installing so endpoints never linger. Replay gates on the
 // per-endpoint DATA sequence after successful upsert: the stale check
 // runs before upsert without storing, and the sequence records only when
-// the endpoint installs. It reports whether the endpoint installed,
+// the endpoint installs. Security enforcement flows through UpsertRemote:
+// an enabled suite refuses before install, so a refused sample also
+// records no sequence and bumps no generation. Dispose and unregister
+// removals need no suite check. It reports whether the endpoint installed,
 // whether it was a stale replay, and any parse or upsert error for the
 // caller to keep as first failure.
 func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag uint8, index, total int) (bool, bool, error) {
@@ -1903,6 +2123,12 @@ func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag
 // the stored sequence cancels a scheduled dispose eviction as proof of
 // liveness and reports stale-quiet without reinstalling. Strictly older
 // sequences stay stale without cancelling anything.
+//
+// The gate is per endpoint GUID on purpose even though sequences run per
+// builtin writer: endpoints sharing one writer interleave their samples
+// on a single stream, so writerHigh can sit above an endpoint's newest
+// sample without that sample being stale. A writer-level gate would drop
+// live endpoints; only the per-endpoint high decides replays.
 func (idx *SEDPIndex) ingestStaleCheckLocked(id SEDPGUID, seq uint64) (stale, duplicate bool) {
 	last, seen := idx.sedpLastSeqLocked(id)
 	if !seen || seq > last {
@@ -2062,7 +2288,8 @@ func (idx *SEDPIndex) sedpStoreSeq(id SEDPGUID, seq uint64) {
 // The key is the header prefix plus the DATA writer entity so GAP clamping
 // has a bound even before any heartbeat arrives. Zero sequences are
 // ignored. New keys hold sedpAuxCap with oldest-eviction plus loud log.
-// It self-locks and is safe for concurrent use.
+// The high never gates ingest (see writerHigh): it only bounds GAP
+// clamping. It self-locks and is safe for concurrent use.
 func (idx *SEDPIndex) sedpNoteWriterHigh(prefix SEDPGUIDPrefix, body []byte, _ uint8, seq uint64) {
 	if seq == 0 {
 		return
@@ -2110,6 +2337,88 @@ func sedpDecodeDataSeq(body []byte, littleEndian bool) uint64 {
 //
 // New code calls sedpStaleCheck before UpsertRemote and sedpStoreSeq after,
 // so invalid endpoints never pollute lastSeq. It remains for older tests.
+
+// snapshotPrefix returns the index participant prefix for announce stamping.
+func (idx *SEDPIndex) snapshotPrefix() SEDPGUIDPrefix {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	return idx.prefix
+}
+
+// TopicsSnapshot returns a sorted copy of the distinct announced topics.
+//
+// It derives one SEDPTopic per distinct DDS topic plus type pair from the
+// local endpoints, so the Topics builtin announces what exists without
+// duplicating per-endpoint state. It self-locks and is safe for
+// concurrent use.
+func (idx *SEDPIndex) TopicsSnapshot() []SEDPTopic {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	seen := make(map[SEDPTopic]struct{})
+
+	for _, ep := range idx.locals {
+		seen[SEDPTopic{DDSTopic: ep.DDSTopic, TypeDDS: ep.TypeDDS, TypeIDL: ep.TypeIDL}] = struct{}{}
+	}
+
+	out := make([]SEDPTopic, 0, len(seen))
+	for topic := range seen {
+		out = append(out, topic)
+	}
+
+	slices.SortFunc(out, func(a, b SEDPTopic) int {
+		if a.DDSTopic != b.DDSTopic {
+			return strings.Compare(a.DDSTopic, b.DDSTopic)
+		}
+
+		if a.TypeDDS != b.TypeDDS {
+			return strings.Compare(a.TypeDDS, b.TypeDDS)
+		}
+
+		return strings.Compare(a.TypeIDL, b.TypeIDL)
+	})
+
+	return out
+}
+
+// sedpTopicsSlicesEqual reports whether two sorted topic snapshots match.
+func sedpTopicsSlicesEqual(a, b []SEDPTopic) bool {
+	return slices.Equal(a, b)
+}
+
+// sedpAnnounceTopicsSnapshot serializes and sends one topics snapshot.
+//
+// It mirrors sedpAnnounceSnapshot for the Topics builtin writer so spec
+// peers learn TopicBuiltinTopicData alongside endpoint DATA. A snapshot
+// with zero topics sends nothing.
+//
+// TODO(backend-owner): announceWithRoutes, announceTick, and
+// announceInitial in backend.go still send endpoint-only snapshots via
+// sedpAnnounceSnapshot. Wire TopicsSnapshot plus
+// sedpAnnounceTopicsSnapshot there so backend-driven announces carry
+// TopicBuiltinTopicData too.
+func sedpAnnounceTopicsSnapshot(ctx context.Context, s SEDPSender, prefix SEDPGUIDPrefix, topics []SEDPTopic) error {
+	for _, topic := range topics {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() //nolint:wrapcheck // cancel semantics require unwrapped ctx.Err
+		default:
+		}
+
+		data, err := SerializeSEDPTopicsDATA(prefix, topic)
+		if err != nil {
+			return fmt.Errorf("dds: sedp announce topics serialize: %w", err)
+		}
+
+		err = s.SendSEDP(ctx, data)
+		if err != nil {
+			return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce topics send: %w", err))
+		}
+	}
+
+	return nil
+}
 
 // sedpAnnounceSnapshot serializes and sends one local snapshot.
 func sedpAnnounceSnapshot(ctx context.Context, s SEDPSender, eps []SEDPEndpoint) error {
@@ -2287,7 +2596,38 @@ func SEDPEndpointsMatch(reader, writer SEDPEndpoint) bool {
 		return false
 	}
 
-	return sedpMatchKeyed(reader, writer)
+	if !sedpMatchKeyed(reader, writer) {
+		return false
+	}
+
+	return sedp3MatchRxOsedp3(reader, writer)
+}
+
+// sedp3MatchRxOsedp3 gates matching on offered versus requested QoS.
+//
+// Malformed QoS on either side fails closed. Endpoints predating QoS
+// capture (both sides without RxO data, as in unit literals) keep legacy
+// behavior so discovery stays visible. Otherwise the writer offer must
+// satisfy the reader request per DDS 1.4 RxO.
+func sedp3MatchRxOsedp3(reader, writer SEDPEndpoint) bool {
+	if reader.RxOMalformed || writer.RxOMalformed {
+		sedpTracef("match reject malformed qos reader=%s writer=%s", reader.ID.String(), writer.ID.String())
+
+		return false
+	}
+
+	if reader.RxOWire == nil || writer.RxOWire == nil {
+		return true
+	}
+
+	report := CheckWireCompatibility(*writer.RxOWire, *reader.RxOWire)
+	if !report.Compatible {
+		sedpTracef("match reject rxo reader=%s writer=%s", reader.ID.String(), writer.ID.String())
+
+		return false
+	}
+
+	return true
 }
 
 // sedpUserdataFields holds the parsed USER_DATA key value pairs.
@@ -2316,6 +2656,15 @@ type sedpUserdataFields struct {
 	hasClientID bool
 }
 
+// sedpWriterLow tracks the first DATA sequence issued per builtin SEDP writer.
+//
+// Heartbeats advertise the lowest available sequence per DDSI-RTPS 2.5
+// section 8.3.8.6, and this map is that tracked value: streams start at 1
+// and history is never pruned, so the low stays at the stream start. It
+// shares the sedpWriterSeq lock with sedpWriterSeqLast. Tests must not
+// assert exact values, only that first stays at the tracked low.
+var sedpWriterLow = map[sedpWriterKey]uint64{}
+
 // nextSedpSeq returns the next DATA sequence for one builtin writer.
 //
 // The stream is keyed by participant prefix plus writer entity and
@@ -2334,7 +2683,29 @@ func nextSedpSeq(prefix SEDPGUIDPrefix, writer SEDPEntityID) uint64 {
 
 	sedpWriterSeqLast[key] = seq
 
+	if _, seen := sedpWriterLow[key]; !seen {
+		sedpWriterLow[key] = seq
+	}
+
 	return seq
+}
+
+// sedpWriterFirstAvailable returns the tracked lowest available sequence
+// for one builtin writer, defaulting to 1 for unseen streams.
+//
+// The low is the first sequence ever issued on the stream, which stays
+// available because SEDP history is never pruned. Callers advertise this
+// instead of a constant so the heartbeat first field derives from tracked
+// per-writer state.
+func sedpWriterFirstAvailable(prefix SEDPGUIDPrefix, writer SEDPEntityID) uint64 {
+	sedpWriterSeq.Lock()
+	defer sedpWriterSeq.Unlock()
+
+	if low, seen := sedpWriterLow[sedpWriterKey{prefix: prefix, writer: writer}]; seen {
+		return low
+	}
+
+	return sedpHeartbeatFirstSeq
 }
 
 // nextHeartbeatCount returns the next HEARTBEAT count, never zero.
@@ -2382,9 +2753,11 @@ func sedpAppendHeartbeat(out []byte, writer SEDPEntityID, first, last uint64, co
 
 // sedpHeartbeatWriters returns the writer needing a HEARTBEAT for one DATA.
 //
-// Only the DATA writer is returned. The spec publications writer carries
-// no DATA, so a heartbeat for it would advertise sequences that never
-// exist and a reliable peer could never repair them.
+// Only the DATA writer is returned: the heartbeat covers exactly the
+// writer that carried DATA, so a reliable peer never waits on sequences
+// from a writer that sent nothing in this datagram. Writers are the
+// DDSI-RTPS 2.5 section 8.5.4.3 values, unambiguous by low octet:
+// 0x02 Topics, 0x03 publications, 0x04 subscriptions.
 func sedpHeartbeatWriters(writer SEDPEntityID) []SEDPEntityID {
 	return []SEDPEntityID{writer}
 }
@@ -2446,8 +2819,9 @@ func sedpEncodeParamListPayload(params []rtps.Param) ([]byte, error) {
 // The output is one RTPS message: the 20 byte header with the endpoint
 // participant prefix plus a DATA submessage from the builtin SEDP writer
 // followed by one HEARTBEAT submessage. Publications announce from
-// 0x000003c2 matching CycloneDDS and subscriptions from 0x000004c2, both
-// addressed to the unknown reader. The HEARTBEAT covers only the DATA
+// 0x000003c2 and subscriptions from 0x000004c2, both addressed to the
+// unknown reader; both values are the spec entities and match the
+// observed CycloneDDS wire form. The HEARTBEAT covers only the DATA
 // writer because only that writer carries DATA. Inline QoS carries the topic name, type name, endpoint GUID,
 // reliable transient local QoS with keep-last history, protocol version, vendor
 // id, userdata with the type hash, plus builtin endpoint QoS when set and
@@ -2457,8 +2831,9 @@ func sedpEncodeParamListPayload(params []rtps.Param) ([]byte, error) {
 // DataPresent (0x07). Unknown vendor PIDs such as 0x8003 and 0x800c are
 // tolerated on receive.
 // XTypes TypeObject rides as opaque passthrough; full lookup is out of scope for v1.
-// Sequence numbers increase process wide and each HEARTBEAT announces
-// first 1 to last DATA sequence with a fresh count.
+// Sequence numbers increase per builtin writer stream and each HEARTBEAT
+// announces the tracked lowest-available first to the last DATA sequence
+// with a fresh count.
 // sedpSerializeUserdata encodes endpoint or service userdata for announce.
 func sedpSerializeUserdata(ep SEDPEndpoint) (string, error) {
 	userdata, err := sedpEncodeEndpointUserdata(ep.TypeHash, ep.DDSTopic, ep.DomainID)
@@ -2540,7 +2915,7 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 		return nil, fmt.Errorf("dds: sedp serialize endpoint: %w", err)
 	}
 
-	writer := sedpPublicationsWriterCyclone
+	writer := sedpPublicationsWriter
 	if ep.IsReader {
 		writer = sedpSubscriptionsWriter
 	}
@@ -2599,10 +2974,278 @@ func SerializeSEDPDATA(ep SEDPEndpoint) ([]byte, error) {
 
 	for _, hbWriter := range sedpHeartbeatWriters(writer) {
 		count := nextHeartbeatCount()
-		out = sedpAppendHeartbeat(out, hbWriter, sedpHeartbeatFirstSeq, seq, count)
+		out = sedpAppendHeartbeat(out, hbWriter, sedpWriterFirstAvailable(ep.ID.Prefix, hbWriter), seq, count)
 	}
 
 	return out, nil
+}
+
+// SEDPTopic is one announced DDS topic for the SEDP Topics builtin.
+//
+// It mirrors the endpoint identity without endpoint state: the Topics
+// writer announces TopicBuiltinTopicData (topic plus type names) so peers
+// learn which topics exist, while endpoint matching still uses the
+// publication and subscription DATA. DomainID stays zero: topic samples
+// carry no domain echo and the transport scope implies the domain.
+type SEDPTopic struct {
+	// DDSTopic is the DDS name such as rt/chatter.
+	DDSTopic string
+	// TypeDDS is the DDS type name on the wire.
+	TypeDDS string
+	// TypeIDL is the demangled IDL name echoed back for the record.
+	TypeIDL string
+}
+
+// sedpValidateTopic checks topic mapping consistency before serializing.
+func sedpValidateTopic(topic SEDPTopic) error {
+	if strings.TrimSpace(topic.DDSTopic) == "" {
+		return fmt.Errorf("dds: sedp topics empty dds topic: %w", ErrSEDPInvalidTopic)
+	}
+
+	if strings.TrimSpace(topic.TypeDDS) == "" {
+		return fmt.Errorf("dds: sedp topics empty type: %w", ErrSEDPInvalidType)
+	}
+
+	_, _, err := ParseTopicName(topic.DDSTopic)
+	if err != nil {
+		return fmt.Errorf("dds: sedp topics parse topic: %w", err)
+	}
+
+	decodedIDL, err := DemangleTypeName(topic.TypeDDS)
+	if err != nil {
+		return fmt.Errorf("dds: sedp topics demangle type: %w", err)
+	}
+
+	if topic.TypeIDL != "" && decodedIDL != topic.TypeIDL {
+		return fmt.Errorf("dds: sedp topics type round trip %q vs %q: %w", decodedIDL, topic.TypeIDL, ErrSEDPInvalidType)
+	}
+
+	return nil
+}
+
+// SerializeSEDPTopicsDATA serializes one topic as an RTPS DATA sample.
+//
+// The output mirrors SerializeSEDPDATA: one RTPS message with the
+// participant prefix plus a DATA submessage from the Topics writer
+// 0x000002c2 followed by one HEARTBEAT submessage for the same writer.
+// Inline QoS carries the topic plus type names and the payload carries a
+// PL_CDR copy so spec peers accept the sample. Flags are always LE plus
+// InlineQoS plus DataPresent. The DATA sequence comes from the per-writer
+// stream and the heartbeat first is the tracked lowest-available value.
+//
+// Body size validates before the sequence is consumed so oversize samples
+// fail without burning a sequence and breaking contiguity for reliable
+// peers.
+func SerializeSEDPTopicsDATA(prefix SEDPGUIDPrefix, topic SEDPTopic) ([]byte, error) {
+	err := sedpValidateTopic(topic)
+	if err != nil {
+		return nil, fmt.Errorf("dds: sedp topics serialize: %w", err)
+	}
+
+	params := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpEncodeCDRString(topic.DDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpEncodeCDRString(topic.TypeDDS)},
+	}
+
+	inline, err := rtps.EncodeParams(params)
+	if err != nil {
+		return nil, fmt.Errorf("dds: encode sedp topics inline params: %w", err)
+	}
+
+	payload, err := sedpEncodeParamListPayload(params)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyLen := sedpDataFixedLen + len(inline) + len(payload)
+	if bodyLen > sedpMaxBodyLen {
+		return nil, fmt.Errorf("dds: sedp topics serialize body %d above %d: %w", bodyLen, sedpMaxBodyLen, ErrSEDPInvalidEndpoint)
+	}
+
+	seq := nextSedpSeq(prefix, sedpTopicsWriter)
+
+	body := make([]byte, 0, bodyLen)
+	body = append(body, sedpDATAReserved, sedpDATAReserved)
+	body = binary.LittleEndian.AppendUint16(body, sedpOctetsToInlineQoS)
+	body = append(body, sedpEntityUnknown[:]...)
+	body = append(body, sedpTopicsWriter[:]...)
+	body = binary.LittleEndian.AppendUint32(body, uint32(seq>>32))
+	body = binary.LittleEndian.AppendUint32(body, uint32(seq)) //nolint:gosec // G115: low word truncation is the layout
+	body = append(body, inline...)
+	body = append(body, payload...)
+
+	out := make([]byte, 0, sedpRTPSHeaderLen+sedpSubmessageHeaderLen+len(body)+2*(sedpSubmessageHeaderLen+sedpHeartbeatSize))
+	out = append(out, sedpRTPSMagic...)
+	out = append(out, sedpRTPSMajor, sedpRTPSMinor, sedpVendorID0, sedpVendorID1)
+	out = append(out, prefix[:]...)
+
+	flags := sedpFlagLittleEndian | sedpFlagInlineQoS | sedpFlagDataPresent
+
+	out = append(out, sedpSubmessageDATA, flags)
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(body))) //nolint:gosec // G115: length guarded by the sedpMaxBodyLen check above
+
+	out = append(out, body...)
+
+	for _, hbWriter := range sedpHeartbeatWriters(sedpTopicsWriter) {
+		count := nextHeartbeatCount()
+		out = sedpAppendHeartbeat(out, hbWriter, sedpWriterFirstAvailable(prefix, hbWriter), seq, count)
+	}
+
+	return out, nil
+}
+
+// sedpDecodeTopicsBody decodes one Topics DATA body into a topic record.
+//
+// It mirrors the endpoint identity path with inline plus payload params
+// and first-wins, but requires only the topic plus type names: Topics
+// DATA carries no endpoint GUID, so endpoint decode rejects it and this
+// path must run instead. Unknown ids are ignored. Fail-closed
+// discriminator: a body carrying an endpoint GUID param is endpoint
+// DATA, never Topics DATA, and rejects loudly instead of decoding as a
+// topic.
+func sedpDecodeTopicsBody(body []byte, flags byte) (SEDPTopic, error) {
+	var topic SEDPTopic
+
+	littleEndian := flags&sedpFlagLittleEndian != 0
+
+	params, _, err := sedpCollectParams(body, flags)
+	if err != nil {
+		return topic, fmt.Errorf("dds: sedp topics collect params: %w", err)
+	}
+
+	byID := sedpFirstParams(params)
+
+	if _, seen := byID[rtps.PIDEndpointGUIDWire]; seen {
+		return topic, fmt.Errorf("dds: sedp topics carries endpoint GUID: %w", ErrSEDPInvalidDATA)
+	}
+
+	if _, seen := byID[rtps.PIDEndpointGUID]; seen {
+		return topic, fmt.Errorf("dds: sedp topics carries endpoint GUID: %w", ErrSEDPInvalidDATA)
+	}
+
+	ddsTopic, err := sedpRequiredString(byID, rtps.PIDTopicName, littleEndian)
+	if err != nil {
+		return topic, fmt.Errorf("dds: sedp topics fields topic: %w", err)
+	}
+
+	typeDDS, err := sedpRequiredString(byID, rtps.PIDTypeName, littleEndian)
+	if err != nil {
+		return topic, fmt.Errorf("dds: sedp topics fields type: %w", err)
+	}
+
+	decodedIDL, err := DemangleTypeName(typeDDS)
+	if err != nil {
+		return topic, fmt.Errorf("dds: sedp topics demangle type: %w", err)
+	}
+
+	if _, _, err := ParseTopicName(ddsTopic); err != nil {
+		return topic, fmt.Errorf("dds: sedp topics parse topic: %w", err)
+	}
+
+	topic = SEDPTopic{DDSTopic: ddsTopic, TypeDDS: typeDDS, TypeIDL: decodedIDL}
+
+	return topic, nil
+}
+
+// sedpFindAllTopicsDATA validates the RTPS header and returns every DATA
+// body from the SEDP Topics writer with its flags in wire order.
+func sedpFindAllTopicsDATA(data []byte) ([][]byte, []byte, error) {
+	bodies, flags, err := sedpFindAllBuiltinDATA(data, sedpIsTopicsBuiltin, "topics")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sedpTracef("find-data datagram len=%d topics-datas=%d", len(data), len(bodies))
+
+	return bodies, flags, nil
+}
+
+// sedpFindTopicsDATA validates the RTPS header and returns the first DATA
+// body from the SEDP Topics writer with its flags.
+func sedpFindTopicsDATA(data []byte) ([]byte, byte, error) {
+	bodies, flags, err := sedpFindAllTopicsDATA(data)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return bodies[0], flags[0], nil
+}
+
+// ParseSEDPTopicsDATA parses one Topics DATA sample back into a topic.
+//
+// It validates the RTPS header, walks the submessages, and decodes the
+// first DATA from the Topics writer. Endpoint DATA and unknown
+// submessages are skipped. The topic plus type names are required;
+// sequence zero rejection is ingest-only like the endpoint path.
+func ParseSEDPTopicsDATA(data []byte) (SEDPTopic, error) {
+	body, flags, err := sedpFindTopicsDATA(data)
+	if err != nil {
+		sedpTracef("topics parse reject find-data len=%d err=%v", len(data), err)
+		return SEDPTopic{}, fmt.Errorf("dds: sedp topics parse find data: %w", err)
+	}
+
+	topic, err := sedpDecodeTopicsBody(body, flags)
+	if err != nil {
+		sedpTracef("topics parse reject decode len=%d flags=%#02x err=%v", len(data), flags, err)
+		return SEDPTopic{}, fmt.Errorf("dds: sedp topics parse decode: %w", err)
+	}
+
+	sedpTracef("topics parse accept dds=%q typeDDS=%q len=%d", topic.DDSTopic, topic.TypeDDS, len(data))
+
+	return topic, nil
+}
+
+// ParseSEDPTopicsDATAs parses all Topics DATA samples in one datagram.
+//
+// It mirrors ParseSEDPTopicsDATA per entry with per-entry isolation: one
+// malformed entry is skipped without dropping the others. It returns the
+// decoded topics in wire order, or an error when no entry decodes.
+func ParseSEDPTopicsDATAs(data []byte) ([]SEDPTopic, error) {
+	bodies, flags, err := sedpFindAllTopicsDATA(data)
+	if err != nil {
+		sedpTracef("topics parse reject find-data len=%d err=%v", len(data), err)
+		return nil, fmt.Errorf("dds: sedp topics parse find data: %w", err)
+	}
+
+	out := make([]SEDPTopic, 0, len(bodies))
+
+	var firstErr error
+
+	for i := range bodies {
+		topic, err := sedpDecodeTopicsBody(bodies[i], flags[i])
+		if err != nil {
+			sedpTracef("topics parse reject decode index=%d/%d len=%d flags=%#02x err=%v", i, len(bodies), len(data), flags[i], err)
+			if firstErr == nil {
+				firstErr = err
+			}
+
+			continue
+		}
+
+		sedpTracef("topics parse accept index=%d/%d dds=%q typeDDS=%q len=%d", i, len(bodies), topic.DDSTopic, topic.TypeDDS, len(data))
+		out = append(out, topic)
+	}
+
+	if len(out) == 0 {
+		if firstErr != nil {
+			return nil, fmt.Errorf("dds: sedp topics parse decode: %w", firstErr)
+		}
+
+		return nil, fmt.Errorf("dds: sedp topics parse finds no decodable topics DATA: %w", ErrSEDPInvalidDATA)
+	}
+
+	return out, nil
+}
+
+// sedpHasTopicsDATA reports whether a datagram carries Topics DATA.
+//
+// Endpoint ingest uses it to skip Topics-only datagrams quietly: a spec
+// peer announcing TopicBuiltinTopicData sends no endpoint DATA, which is
+// a known builtin, not poison.
+func sedpHasTopicsDATA(data []byte) bool {
+	_, _, err := sedpFindAllTopicsDATA(data)
+
+	return err == nil
 }
 
 // ParseSEDPDATA parses an RTPS DATA sample back into an endpoint.
@@ -2683,11 +3326,18 @@ func ParseSEDPDATAs(data []byte) ([]SEDPEndpoint, error) {
 	return out, nil
 }
 
-// sedpCollectEndpointSub returns one endpoint DATA body with its flags.
+// sedpEndpointWriterMatch reports whether a writer entity carries endpoint DATA.
+func sedpEndpointWriterMatch(writer SEDPEntityID) bool {
+	isEndpoint, _ := sedpClassifyWriter(writer)
+
+	return isEndpoint
+}
+
+// sedpCollectBuiltinSub returns one DATA body with its flags when the writer matches.
 //
-// It returns a nil body for non-endpoint submessages. Truncation and writer
+// It returns a nil body for other submessages. Truncation and writer
 // errors fail loudly with the submessage offset for the caller.
-func sedpCollectEndpointSub(data []byte, off int) ([]byte, byte, int, error) {
+func sedpCollectBuiltinSub(data []byte, off int, match func(SEDPEntityID) bool) ([]byte, byte, int, error) {
 	id, body, flags, next, err := sedpSplitSubmessage(data, off)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("dds: sedp parse submessage at %d: %w", off, err)
@@ -2699,8 +3349,7 @@ func sedpCollectEndpointSub(data []byte, off int) ([]byte, byte, int, error) {
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("dds: sedp parse data writer: %w", err)
 	}
-	isEndpoint, _ := sedpClassifyWriter(writer)
-	if !isEndpoint {
+	if !match(writer) {
 		return nil, 0, next, nil
 	}
 	return body, flags, next, nil
@@ -2712,6 +3361,28 @@ func sedpCollectEndpointSub(data []byte, off int) ([]byte, byte, int, error) {
 // The submessage walk caps at sedpMaxSubmessages before dispatch; over-cap
 // datagrams drop loudly instead of trusting an unbounded header chain.
 func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
+	bodies, flags, err := sedpFindAllBuiltinDATA(data, sedpEndpointWriterMatch, "endpoint")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sedpTracef("find-data datagram len=%d endpoint-datas=%d first-writer=%02x%02x%02x%02x", len(data), len(bodies), bodies[0][sedpDATAWriterOff], bodies[0][sedpDATAWriterOff+1], bodies[0][sedpDATAWriterOff+2], bodies[0][sedpDATAWriterOff+3])
+	if len(bodies) > 1 {
+		for i, b := range bodies {
+			sedpTracef("find-data batched index=%d/%d %s", i, len(bodies), sedpTraceEndpointSummary(b, flags[i]))
+		}
+	}
+
+	return bodies, flags, nil
+}
+
+// sedpFindAllBuiltinDATA validates the RTPS header and returns every DATA
+// body whose writer matches, with flags in wire order.
+//
+// The submessage walk caps at sedpMaxSubmessages before dispatch; over-cap
+// datagrams drop loudly instead of trusting an unbounded header chain.
+// what names the builtin for the empty error, such as endpoint or topics.
+func sedpFindAllBuiltinDATA(data []byte, match func(SEDPEntityID) bool, what string) ([][]byte, []byte, error) {
 	err := sedpValidateRTPSHeader(data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dds: sedp parse header: %w", err)
@@ -2719,9 +3390,9 @@ func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 
 	off := sedpRTPSHeaderLen
 
-	var endpointBodies [][]byte
+	var bodies [][]byte
 
-	var endpointFlags []byte
+	var flags []byte
 
 	seen := 0
 
@@ -2730,7 +3401,7 @@ func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 		if seen > sedpMaxSubmessages {
 			return nil, nil, fmt.Errorf("dds: sedp parse submessages above %d: %w", sedpMaxSubmessages, ErrSEDPInvalidDATA)
 		}
-		body, flags, next, err := sedpCollectEndpointSub(data, off)
+		body, flag, next, err := sedpCollectBuiltinSub(data, off, match)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2738,22 +3409,15 @@ func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 		if body == nil {
 			continue
 		}
-		endpointBodies = append(endpointBodies, body)
-		endpointFlags = append(endpointFlags, flags)
+		bodies = append(bodies, body)
+		flags = append(flags, flag)
 	}
 
-	if len(endpointBodies) == 0 {
-		return nil, nil, fmt.Errorf("dds: sedp parse finds no endpoint DATA: %w", ErrSEDPInvalidDATA)
+	if len(bodies) == 0 {
+		return nil, nil, fmt.Errorf("dds: sedp parse finds no %s DATA: %w", what, ErrSEDPInvalidDATA)
 	}
 
-	sedpTracef("find-data datagram len=%d endpoint-datas=%d first-writer=%02x%02x%02x%02x", len(data), len(endpointBodies), endpointBodies[0][sedpDATAWriterOff], endpointBodies[0][sedpDATAWriterOff+1], endpointBodies[0][sedpDATAWriterOff+2], endpointBodies[0][sedpDATAWriterOff+3])
-	if len(endpointBodies) > 1 {
-		for i, b := range endpointBodies {
-			sedpTracef("find-data batched index=%d/%d %s", i, len(endpointBodies), sedpTraceEndpointSummary(b, endpointFlags[i]))
-		}
-	}
-
-	return endpointBodies, endpointFlags, nil
+	return bodies, flags, nil
 }
 
 // sedpFindEndpointDATA validates the RTPS header and returns the first
@@ -2832,8 +3496,12 @@ func sedpDATAWriter(body []byte) (SEDPEntityID, error) {
 
 // sedpClassifyWriter reports whether a writer entity is a builtin SEDP
 // endpoint writer and whether it announces readers.
+//
+// The Topics writer is not an endpoint writer: it carries
+// TopicBuiltinTopicData without an endpoint GUID, so endpoint ingest
+// skips it through sedpIsTopicsBuiltin instead of installing it.
 func sedpClassifyWriter(writer SEDPEntityID) (isEndpoint, isReader bool) {
-	if writer == sedpPublicationsWriter || writer == sedpPublicationsWriterCyclone {
+	if writer == sedpPublicationsWriter {
 		return true, false
 	}
 
@@ -2842,6 +3510,15 @@ func sedpClassifyWriter(writer SEDPEntityID) (isEndpoint, isReader bool) {
 	}
 
 	return false, false
+}
+
+// sedpIsTopicsBuiltin reports whether an entity is a SEDP Topics builtin.
+//
+// Both the Topics writer and reader match: neither carries endpoint
+// DATA, so endpoint paths skip them quietly while the Topics parse path
+// below decodes them.
+func sedpIsTopicsBuiltin(writer SEDPEntityID) bool {
+	return writer == sedpTopicsWriter || writer == sedpTopicsReader
 }
 
 // sedpDecodedIdentity holds the wire identity of one endpoint DATA body.
@@ -2954,6 +3631,11 @@ func sedpAssembleEndpoint(identity sedpDecodedIdentity) (SEDPEndpoint, error) {
 		Partitions:           append([]string(nil), identity.fields.partitions...),
 		DurabilityService:    identity.fields.durabilityService,
 		HasDurabilityService: identity.fields.hasDurabilityService,
+		RxOMalformed:         identity.fields.wireQoSMalformed,
+	}
+	if identity.fields.hasWireQoS {
+		parsed := identity.fields.wireQoS
+		ep.RxOWire = &parsed
 	}
 	sedpTracef("assemble accept guid=%s ros=%q dds=%q typeDDS=%q typeIDL=%q hash=%q domain=%d reader=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.TypeIDL, ep.TypeHash, ep.DomainID, ep.IsReader)
 
@@ -2984,6 +3666,12 @@ type sedpEndpointWireFields struct {
 	durabilityService DurabilityServiceQoS
 	// hasDurabilityService reports whether durability-service was present.
 	hasDurabilityService bool
+	// wireQoS carries the parsed RxO wire QoS on success.
+	wireQoS WireQoS
+	// hasWireQoS reports a successful QoS parse.
+	hasWireQoS bool
+	// wireQoSMalformed reports a failed QoS parse, failing closed at match.
+	wireQoSMalformed bool
 }
 
 // sedpCollectParams gathers inline QoS params and the payload bytes.
@@ -2997,7 +3685,9 @@ type sedpEndpointWireFields struct {
 // QoS holds only the opaque bytes after the list. When inline leaves
 // identity incomplete, payload params supply the remainder and the
 // returned QoS stays the full opaque payload for Cyclone compat. Otherwise
-// the payload stays opaque.
+// the payload stays opaque. Identity stays first-wins and the payload
+// decodes once: inline plus payload supply params in one walk, so the
+// Cyclone path carries no second decode.
 func sedpCollectParams(body []byte, flags byte) ([]rtps.Param, []byte, error) {
 	littleEndian := flags&sedpFlagLittleEndian != 0
 
@@ -3251,7 +3941,32 @@ func sedpEndpointFields(params []rtps.Param, littleEndian bool) (sedpEndpointWir
 		return fields, err
 	}
 
+	sedp3FieldsWireQoSsedp3(params, littleEndian, &fields)
+
 	return fields, nil
+}
+
+// sedp3FieldsWireQoSsedp3 parses RxO wire QoS without failing ingest.
+//
+// Success stores the parsed offer for matching, with absent policies
+// filled from DDS spec defaults per ParseWireQoSsedp3WithDefaults.
+// Failure marks the record malformed so the match gate fails closed while
+// discovery stays visible for INCOMPATIBLE status. A payload that carries
+// a parameter-list encapsulation but fails to decode never silently falls
+// back to inline-only params: the single decode in sedpCollectParams
+// already fails loudly for identity, and QoS value failures mark
+// malformed here.
+func sedp3FieldsWireQoSsedp3(params []rtps.Param, littleEndian bool, fields *sedpEndpointWireFields) {
+	parsed, err := ParseWireQoSsedp3WithDefaults(params, littleEndian)
+	if err != nil {
+		sedpTracef("parse qos skip err=%v", err)
+		fields.wireQoSMalformed = true
+
+		return
+	}
+
+	fields.wireQoS = parsed
+	fields.hasWireQoS = true
 }
 
 // sedpFirstParams keeps the first value per parameter id.
@@ -3865,6 +4580,18 @@ func sedpEndpointsQoSBytesEqual(a, b SEDPEndpoint) bool {
 		return false
 	}
 
+	if (a.RxOWire == nil) != (b.RxOWire == nil) {
+		return false
+	}
+
+	if a.RxOWire != nil && *a.RxOWire != *b.RxOWire {
+		return false
+	}
+
+	if a.RxOMalformed != b.RxOMalformed {
+		return false
+	}
+
 	return bytes.Equal(a.QoS, b.QoS)
 }
 
@@ -3954,6 +4681,10 @@ func sedpCloneEndpoint(ep SEDPEndpoint) SEDPEndpoint {
 		offer := *ep.WireOffer
 		ep.WireOffer = &offer
 	}
+	if ep.RxOWire != nil {
+		rxo := *ep.RxOWire
+		ep.RxOWire = &rxo
+	}
 
 	return ep
 }
@@ -4015,3 +4746,14 @@ func sedpSortEndpoints(eps []SEDPEndpoint) {
 // reprocessing. No rejected scaffolding remains: inline-only plus payload
 // duplicate handling stays for Cyclone interop and is covered by fixture
 // tests.
+//
+// TODO(backend-owner): backend.go names sedpWriterEntityB14 (0x02) for
+// publications and documents sedpBuiltinReaderForWriter as publications to
+// 0x000002c7; per DDSI-RTPS 2.5 section 8.5.4.3 third byte 0x02 is the Topics
+// builtin (publications 0x03, subscriptions 0x04), matching
+// sedpTopicsWriter plus sedpPublicationsWriter plus sedpSubscriptionsWriter
+// here and the testbed conformance pins. The pairing itself is mechanical
+// (same third byte, kind 0xC7) and demux routes all three writers to the
+// SEDP path, so wire behavior is unaffected and only the backend names plus
+// docs drift. sedpBuiltinReaderForWriter lives in backend.go and is not
+// owned here.

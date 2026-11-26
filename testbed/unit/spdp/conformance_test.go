@@ -90,9 +90,9 @@ func mustMarshalAlive(t *testing.T, guid dds.GUID, domain uint32, seq uint64, le
 }
 
 // mustMarshalDispose marshals a dispose packet or fails the test.
-func mustMarshalDispose(t *testing.T, guid dds.GUID, domain uint32, seq uint64) []byte {
+func mustMarshalDispose(t *testing.T, guid dds.GUID, seq uint64) []byte {
 	t.Helper()
-	data, err := dds.MarshalDisposePacket(guid, domain, seq)
+	data, err := dds.MarshalDisposePacket(guid, 0, seq)
 	if err != nil {
 		t.Fatalf("marshal dispose: %v", err)
 	}
@@ -230,11 +230,9 @@ func checkPortOne(t *testing.T, domain, participant uint32) {
 	}
 }
 
-// TestPortMulticastVsUnicastWithGain pins B and gain across domains.
-//
-//nolint:gocognit,cyclop // test sequences many assertions, splitting would obscure intent
-func TestPortMulticastVsUnicastWithGain(t *testing.T) {
-	t.Parallel()
+// checkPortConstants pins base plus gain plus offsets.
+func checkPortConstants(t *testing.T) {
+	t.Helper()
 	if rtps.BasePort != basePortLocal {
 		t.Fatalf("BasePort = %d want %d", rtps.BasePort, basePortLocal)
 	}
@@ -256,22 +254,27 @@ func TestPortMulticastVsUnicastWithGain(t *testing.T) {
 	if rtps.UsertrafficUnicastOffset != 11 {
 		t.Fatalf("user unicast offset = %d want 11", rtps.UsertrafficUnicastOffset)
 	}
-	for _, domain := range conformDomains {
-		for _, participant := range conformParticipants {
-			checkPortOne(t, domain, participant)
-		}
-		spdpPort, err := dds.SPDPUnicastPort(domain)
-		if err != nil {
-			t.Fatalf("domain %d SPDP unicast: %v", domain, err)
-		}
-		metaUC, err := rtps.MetatrafficUnicastPort(domain, 0)
-		if err != nil {
-			t.Fatalf("domain %d meta unicast: %v", domain, err)
-		}
-		if int(spdpPort) != metaUC {
-			t.Fatalf("domain %d SPDP port = %d want meta %d", domain, spdpPort, metaUC)
-		}
+}
+
+// checkSPDPMatchesMeta pins SPDP unicast equals meta unicast.
+func checkSPDPMatchesMeta(t *testing.T, domain uint32) {
+	t.Helper()
+	spdpPort, err := dds.SPDPUnicastPort(domain)
+	if err != nil {
+		t.Fatalf("domain %d SPDP unicast: %v", domain, err)
 	}
+	metaUC, err := rtps.MetatrafficUnicastPort(domain, 0)
+	if err != nil {
+		t.Fatalf("domain %d meta unicast: %v", domain, err)
+	}
+	if int(spdpPort) != metaUC {
+		t.Fatalf("domain %d SPDP port = %d want meta %d", domain, spdpPort, metaUC)
+	}
+}
+
+// checkPortsOutOfRange pins errors above the valid domain range.
+func checkPortsOutOfRange(t *testing.T) {
+	t.Helper()
 	for _, domain := range []uint32{102, 200} {
 		_, err := rtps.MetatrafficMulticastPort(domain)
 		if err == nil {
@@ -282,6 +285,19 @@ func TestPortMulticastVsUnicastWithGain(t *testing.T) {
 			t.Fatalf("meta unicast domain %d succeeded want error", domain)
 		}
 	}
+}
+
+// TestPortMulticastVsUnicastWithGain pins B and gain across domains.
+func TestPortMulticastVsUnicastWithGain(t *testing.T) {
+	t.Parallel()
+	checkPortConstants(t)
+	for _, domain := range conformDomains {
+		for _, participant := range conformParticipants {
+			checkPortOne(t, domain, participant)
+		}
+		checkSPDPMatchesMeta(t, domain)
+	}
+	checkPortsOutOfRange(t)
 }
 
 // TestAdvertiseIPv4IsLANNotLoopback checks LAN advertisement.
@@ -343,41 +359,45 @@ func TestWildcardBindIsUnspecified(t *testing.T) {
 	}
 }
 
-// TestHeaderVendorAndEndpoints pins RTPS 2.1 plus vendor plus routing.
-//
-//nolint:gocognit // test sequences many assertions, splitting would obscure intent
+// checkHeaderVendorOneDomain pins header plus vendor plus routing for one domain.
+func checkHeaderVendorOneDomain(t *testing.T, domain uint32) {
+	t.Helper()
+	guid := testGUID(byte(domain + 0x10)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
+	raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
+	hdr, data := decodeSPDPData(t, raw)
+	if hdr.Major != 2 {
+		t.Fatalf("domain %d major = %d want 2", domain, hdr.Major)
+	}
+	if hdr.Minor != 5 {
+		t.Fatalf("domain %d minor = %d want 5", domain, hdr.Minor)
+	}
+	wantVendor := [2]byte{0x01, 0x10}
+	if hdr.Vendor != wantVendor {
+		t.Fatalf("domain %d vendor = %v want 01 10", domain, hdr.Vendor)
+	}
+	if hdr.Vendor != rtps.DefaultVendorID() {
+		t.Fatalf("domain %d vendor mismatch default", domain)
+	}
+	if data.ReaderID != rtps.EntityUnknown {
+		t.Fatalf("domain %d reader = %v want unknown", domain, data.ReaderID)
+	}
+	if data.WriterID != rtps.EntitySPDPWriter {
+		t.Fatalf("domain %d writer = %v want SPDP writer", domain, data.WriterID)
+	}
+	if data.SequenceNumber != 1 {
+		t.Fatalf("domain %d seq = %d want 1", domain, data.SequenceNumber)
+	}
+	prefix := [12]byte(guid.Prefix)
+	if hdr.Prefix != prefix {
+		t.Fatalf("domain %d header prefix mismatch", domain)
+	}
+}
+
+// TestHeaderVendorAndEndpoints pins RTPS 2.5 plus vendor plus routing.
 func TestHeaderVendorAndEndpoints(t *testing.T) {
 	t.Parallel()
 	for _, domain := range conformDomains {
-		guid := testGUID(byte(domain + 0x10)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
-		raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
-		hdr, data := decodeSPDPData(t, raw)
-		if hdr.Major != 2 {
-			t.Fatalf("domain %d major = %d want 2", domain, hdr.Major)
-		}
-		if hdr.Minor != 1 {
-			t.Fatalf("domain %d minor = %d want 1", domain, hdr.Minor)
-		}
-		wantVendor := [2]byte{0x01, 0x10}
-		if hdr.Vendor != wantVendor {
-			t.Fatalf("domain %d vendor = %v want 01 10", domain, hdr.Vendor)
-		}
-		if hdr.Vendor != rtps.DefaultVendorID() {
-			t.Fatalf("domain %d vendor mismatch default", domain)
-		}
-		if data.ReaderID != rtps.EntityUnknown {
-			t.Fatalf("domain %d reader = %v want unknown", domain, data.ReaderID)
-		}
-		if data.WriterID != rtps.EntitySPDPWriter {
-			t.Fatalf("domain %d writer = %v want SPDP writer", domain, data.WriterID)
-		}
-		if data.SequenceNumber != 1 {
-			t.Fatalf("domain %d seq = %d want 1", domain, data.SequenceNumber)
-		}
-		prefix := [12]byte(guid.Prefix)
-		if hdr.Prefix != prefix {
-			t.Fatalf("domain %d header prefix mismatch", domain)
-		}
+		checkHeaderVendorOneDomain(t, domain)
 	}
 }
 
@@ -419,9 +439,58 @@ func TestUserDataPadInLength(t *testing.T) {
 	}
 }
 
+// checkLocator pins one locator against port and address.
+func checkLocator(t *testing.T, domain uint32, raw []byte, label string, wantPort int, wantIP net.IP) {
+	t.Helper()
+	kind, port, ip, err := rtps.DecodeLocator(raw)
+	if err != nil {
+		t.Fatalf("domain %d decode %s: %v", domain, label, err)
+	}
+	if kind != rtps.LocatorKindUDPv4 {
+		t.Fatalf("domain %d %s kind = %d want UDPv4", domain, label, kind)
+	}
+	if int(port) != wantPort {
+		t.Fatalf("domain %d %s port = %d want %d", domain, label, port, wantPort)
+	}
+	if !ip.Equal(wantIP) {
+		t.Fatalf("domain %d %s ip = %s want %s", domain, label, ip.String(), wantIP.String())
+	}
+}
+
+// checkLocatorsOneDomain pins four locators for one domain.
+func checkLocatorsOneDomain(t *testing.T, domain uint32, advertised, group net.IP) {
+	t.Helper()
+	guid := testGUID(byte(domain + 0x20)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
+	raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
+	_, data := decodeSPDPData(t, raw)
+	params := decodePayloadParams(t, data)
+	metaRaw := findParam(t, params, rtps.PIDMetatrafficUnicastLocator)
+	defaultRaw := findParam(t, params, rtps.PIDDefaultUnicastLocatorStandard)
+	metaMCRaw := findParam(t, params, rtps.PIDMetatrafficMulticastLocator)
+	defaultMCRaw := findParam(t, params, rtps.PIDDefaultMulticastLocator)
+	metaPort, err := rtps.MetatrafficUnicastPort(domain, 0)
+	if err != nil {
+		t.Fatalf("domain %d meta port: %v", domain, err)
+	}
+	defaultPort, err := rtps.UsertrafficUnicastPort(domain, 0)
+	if err != nil {
+		t.Fatalf("domain %d default port: %v", domain, err)
+	}
+	metaMCPort, err := rtps.MetatrafficMulticastPort(domain)
+	if err != nil {
+		t.Fatalf("domain %d meta mc port: %v", domain, err)
+	}
+	defaultMCPort, err := rtps.UsertrafficMulticastPort(domain)
+	if err != nil {
+		t.Fatalf("domain %d default mc port: %v", domain, err)
+	}
+	checkLocator(t, domain, metaRaw, "meta unicast", metaPort, advertised)
+	checkLocator(t, domain, defaultRaw, "default unicast", defaultPort, advertised)
+	checkLocator(t, domain, metaMCRaw, "meta multicast", metaMCPort, group)
+	checkLocator(t, domain, defaultMCRaw, "default multicast", defaultMCPort, group)
+}
+
 // TestLocatorsUnicastPlusMulticast checks four locators and group.
-//
-//nolint:gocognit,cyclop // test sequences many assertions, splitting would obscure intent
 func TestLocatorsUnicastPlusMulticast(t *testing.T) {
 	t.Parallel()
 	if rtps.SPDPMulticastGroup != "239.255.0.1" {
@@ -433,157 +502,103 @@ func TestLocatorsUnicastPlusMulticast(t *testing.T) {
 	}
 	advertised := rtps.AdvertiseIPv4()
 	for _, domain := range conformDomains {
-		guid := testGUID(byte(domain + 0x20)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
-		raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
-		_, data := decodeSPDPData(t, raw)
-		params := decodePayloadParams(t, data)
-		metaRaw := findParam(t, params, rtps.PIDMetatrafficUnicastLocator)
-		defaultRaw := findParam(t, params, rtps.PIDDefaultUnicastLocatorStandard)
-		metaMCRaw := findParam(t, params, rtps.PIDMetatrafficMulticastLocator)
-		defaultMCRaw := findParam(t, params, rtps.PIDDefaultMulticastLocator)
-		metaPort, err := rtps.MetatrafficUnicastPort(domain, 0)
-		if err != nil {
-			t.Fatalf("domain %d meta port: %v", domain, err)
-		}
-		defaultPort, err := rtps.UsertrafficUnicastPort(domain, 0)
-		if err != nil {
-			t.Fatalf("domain %d default port: %v", domain, err)
-		}
-		metaMCPort, err := rtps.MetatrafficMulticastPort(domain)
-		if err != nil {
-			t.Fatalf("domain %d meta mc port: %v", domain, err)
-		}
-		defaultMCPort, err := rtps.UsertrafficMulticastPort(domain)
-		if err != nil {
-			t.Fatalf("domain %d default mc port: %v", domain, err)
-		}
-		kind, port, ip, err := rtps.DecodeLocator(metaRaw)
-		if err != nil {
-			t.Fatalf("domain %d decode meta unicast: %v", domain, err)
-		}
-		if kind != rtps.LocatorKindUDPv4 {
-			t.Fatalf("domain %d meta unicast kind = %d want UDPv4", domain, kind)
-		}
-		if int(port) != metaPort {
-			t.Fatalf("domain %d meta unicast port = %d want %d", domain, port, metaPort)
-		}
-		if !ip.Equal(advertised) {
-			t.Fatalf("domain %d meta unicast ip = %s want %s", domain, ip.String(), advertised.String())
-		}
-		kind, port, ip, err = rtps.DecodeLocator(defaultRaw)
-		if err != nil {
-			t.Fatalf("domain %d decode default unicast: %v", domain, err)
-		}
-		if kind != rtps.LocatorKindUDPv4 {
-			t.Fatalf("domain %d default unicast kind = %d want UDPv4", domain, kind)
-		}
-		if int(port) != defaultPort {
-			t.Fatalf("domain %d default unicast port = %d want %d", domain, port, defaultPort)
-		}
-		if !ip.Equal(advertised) {
-			t.Fatalf("domain %d default unicast ip = %s want %s", domain, ip.String(), advertised.String())
-		}
-		kind, port, ip, err = rtps.DecodeLocator(metaMCRaw)
-		if err != nil {
-			t.Fatalf("domain %d decode meta multicast: %v", domain, err)
-		}
-		if kind != rtps.LocatorKindUDPv4 {
-			t.Fatalf("domain %d meta multicast kind = %d want UDPv4", domain, kind)
-		}
-		if int(port) != metaMCPort {
-			t.Fatalf("domain %d meta multicast port = %d want %d", domain, port, metaMCPort)
-		}
-		if !ip.Equal(group) {
-			t.Fatalf("domain %d meta multicast ip = %s want %s", domain, ip.String(), group.String())
-		}
-		kind, port, ip, err = rtps.DecodeLocator(defaultMCRaw)
-		if err != nil {
-			t.Fatalf("domain %d decode default multicast: %v", domain, err)
-		}
-		if kind != rtps.LocatorKindUDPv4 {
-			t.Fatalf("domain %d default multicast kind = %d want UDPv4", domain, kind)
-		}
-		if int(port) != defaultMCPort {
-			t.Fatalf("domain %d default multicast port = %d want %d", domain, port, defaultMCPort)
-		}
-		if !ip.Equal(group) {
-			t.Fatalf("domain %d default multicast ip = %s want %s", domain, ip.String(), group.String())
-		}
+		checkLocatorsOneDomain(t, domain, advertised, group)
 	}
+}
+
+// checkDomainTagLease pins tag plus lease for one domain.
+func checkDomainTagLease(t *testing.T, domain uint32, params []rtps.Param) {
+	t.Helper()
+	domainRaw := findParam(t, params, domainTagPID)
+	if len(domainRaw) != 4 {
+		t.Fatalf("domain %d tag len = %d want 4", domain, len(domainRaw))
+	}
+	gotDomain := binary.LittleEndian.Uint32(domainRaw)
+	if gotDomain != domain {
+		t.Fatalf("domain tag = %d want %d", gotDomain, domain)
+	}
+	leaseRaw := findParam(t, params, leasePID)
+	if len(leaseRaw) != 8 {
+		t.Fatalf("domain %d lease len = %d want 8", domain, len(leaseRaw))
+	}
+	sec := binary.LittleEndian.Uint32(leaseRaw[0:4])
+	nanos := binary.LittleEndian.Uint32(leaseRaw[4:8])
+	if sec != 10 {
+		t.Fatalf("domain %d lease sec = %d want 10", domain, sec)
+	}
+	if nanos != 0 {
+		t.Fatalf("domain %d lease nanos = %d want 0", domain, nanos)
+	}
+}
+
+// checkBuiltinManualQos pins builtin set plus manual plus QoS for one domain.
+func checkBuiltinManualQos(t *testing.T, domain uint32, params []rtps.Param) {
+	t.Helper()
+	builtinRaw := findParam(t, params, builtinEndpointPID)
+	if len(builtinRaw) != 4 {
+		t.Fatalf("domain %d builtin len = %d want 4", domain, len(builtinRaw))
+	}
+	gotSet := binary.LittleEndian.Uint32(builtinRaw)
+	if gotSet != expectedBuiltinSet {
+		t.Fatalf("domain %d builtin = %#x want 0x3F", domain, gotSet)
+	}
+	manualRaw := findParam(t, params, 0x0034)
+	if len(manualRaw) != 4 {
+		t.Fatalf("domain %d manual len = %d want 4", domain, len(manualRaw))
+	}
+	if gotManual := binary.LittleEndian.Uint32(manualRaw); gotManual != 0 {
+		t.Fatalf("domain %d manual = %d want 0", domain, gotManual)
+	}
+	builtinQosRaw := findParam(t, params, 0x0077)
+	if len(builtinQosRaw) != 4 {
+		t.Fatalf("domain %d builtin QoS len = %d want 4", domain, len(builtinQosRaw))
+	}
+	if gotQos := binary.LittleEndian.Uint32(builtinQosRaw); gotQos != 0 {
+		t.Fatalf("domain %d builtin QoS = %d want 0", domain, gotQos)
+	}
+}
+
+// checkParsedDomainAnn pins parsed announcement fields for one domain.
+func checkParsedDomainAnn(t *testing.T, domain uint32, raw []byte) {
+	t.Helper()
+	ann := mustParse(t, raw)
+	if ann.DomainID != domain {
+		t.Fatalf("domain %d parsed domain = %d", domain, ann.DomainID)
+	}
+	if ann.Lease != expectedLease {
+		t.Fatalf("domain %d parsed lease = %v want 10s", domain, ann.Lease)
+	}
+	if ann.ManualLivelinessCount != 0 {
+		t.Fatalf("domain %d manual count = %d want 0", domain, ann.ManualLivelinessCount)
+	}
+	if ann.BuiltinEndpointQos != 0 {
+		t.Fatalf("domain %d builtin QoS = %d want 0", domain, ann.BuiltinEndpointQos)
+	}
+}
+
+// checkDomainTagOneDomain pins tag plus lease plus builtin for one domain.
+func checkDomainTagOneDomain(t *testing.T, domain uint32) {
+	t.Helper()
+	guid := testGUID(byte(domain + 0x40)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
+	raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
+	_, data := decodeSPDPData(t, raw)
+	params := decodePayloadParams(t, data)
+	checkDomainTagLease(t, domain, params)
+	checkBuiltinManualQos(t, domain, params)
+	checkParsedDomainAnn(t, domain, raw)
 }
 
 // TestDomainTagLeaseBuiltin checks tag plus lease plus endpoint set.
-//
-//nolint:gocognit // test sequences many assertions, splitting would obscure intent
 func TestDomainTagLeaseBuiltin(t *testing.T) {
 	t.Parallel()
 	for _, domain := range conformDomains {
-		guid := testGUID(byte(domain + 0x40)) //nolint:gosec // G115: domains 0-101 plus offset fit in byte
-		raw := mustMarshalAlive(t, guid, domain, 1, expectedLease)
-		_, data := decodeSPDPData(t, raw)
-		params := decodePayloadParams(t, data)
-		domainRaw := findParam(t, params, domainTagPID)
-		if len(domainRaw) != 4 {
-			t.Fatalf("domain %d tag len = %d want 4", domain, len(domainRaw))
-		}
-		gotDomain := binary.LittleEndian.Uint32(domainRaw)
-		if gotDomain != domain {
-			t.Fatalf("domain tag = %d want %d", gotDomain, domain)
-		}
-		leaseRaw := findParam(t, params, leasePID)
-		if len(leaseRaw) != 8 {
-			t.Fatalf("domain %d lease len = %d want 8", domain, len(leaseRaw))
-		}
-		sec := binary.LittleEndian.Uint32(leaseRaw[0:4])
-		nanos := binary.LittleEndian.Uint32(leaseRaw[4:8])
-		if sec != 10 {
-			t.Fatalf("domain %d lease sec = %d want 10", domain, sec)
-		}
-		if nanos != 0 {
-			t.Fatalf("domain %d lease nanos = %d want 0", domain, nanos)
-		}
-		builtinRaw := findParam(t, params, builtinEndpointPID)
-		if len(builtinRaw) != 4 {
-			t.Fatalf("domain %d builtin len = %d want 4", domain, len(builtinRaw))
-		}
-		gotSet := binary.LittleEndian.Uint32(builtinRaw)
-		if gotSet != expectedBuiltinSet {
-			t.Fatalf("domain %d builtin = %#x want 0x3F", domain, gotSet)
-		}
-		manualRaw := findParam(t, params, 0x0034)
-		if len(manualRaw) != 4 {
-			t.Fatalf("domain %d manual len = %d want 4", domain, len(manualRaw))
-		}
-		if gotManual := binary.LittleEndian.Uint32(manualRaw); gotManual != 0 {
-			t.Fatalf("domain %d manual = %d want 0", domain, gotManual)
-		}
-		builtinQosRaw := findParam(t, params, 0x0077)
-		if len(builtinQosRaw) != 4 {
-			t.Fatalf("domain %d builtin QoS len = %d want 4", domain, len(builtinQosRaw))
-		}
-		if gotQos := binary.LittleEndian.Uint32(builtinQosRaw); gotQos != 0 {
-			t.Fatalf("domain %d builtin QoS = %d want 0", domain, gotQos)
-		}
-		ann := mustParse(t, raw)
-		if ann.DomainID != domain {
-			t.Fatalf("domain %d parsed domain = %d", domain, ann.DomainID)
-		}
-		if ann.Lease != expectedLease {
-			t.Fatalf("domain %d parsed lease = %v want 10s", domain, ann.Lease)
-		}
-		if ann.ManualLivelinessCount != 0 {
-			t.Fatalf("domain %d manual count = %d want 0", domain, ann.ManualLivelinessCount)
-		}
-		if ann.BuiltinEndpointQos != 0 {
-			t.Fatalf("domain %d builtin QoS = %d want 0", domain, ann.BuiltinEndpointQos)
-		}
+		checkDomainTagOneDomain(t, domain)
 	}
 }
 
-// TestGUIDSeqDisposeRemoves checks identity plus sequence plus removal.
-//
-//nolint:cyclop,gocognit // test sequences many assertions, splitting would obscure intent
-func TestGUIDSeqDisposeRemoves(t *testing.T) {
+// checkGUIDAnnounceSequence pins announce sequencing.
+func checkGUIDAnnounceSequence(t *testing.T) dds.GUID {
+	t.Helper()
 	t.Setenv(transports.DomainEnvVar, "")
 	part, err := dds.NewLocalParticipant(0, expectedLease)
 	if err != nil {
@@ -626,9 +641,13 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if announced2.Sequence != 2 {
 		t.Fatalf("announced seq = %d want 2", announced2.Sequence)
 	}
-	table := dds.NewRemoteTable(nil)
-	now := time.Unix(1000, 0).UTC()
-	alive1 := mustMarshalAlive(t, part.GUID(), 0, 1, expectedLease)
+	return part.GUID()
+}
+
+// checkGUIDAliveMonotonic pins monotonic alive handling.
+func checkGUIDAliveMonotonic(t *testing.T, table *dds.RemoteTable, guid dds.GUID, now time.Time) {
+	t.Helper()
+	alive1 := mustMarshalAlive(t, guid, 0, 1, expectedLease)
 	ann1 := mustParse(t, alive1)
 	if ann1.Sequence != 1 {
 		t.Fatalf("seq = %d want 1", ann1.Sequence)
@@ -636,19 +655,19 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if !ann1.Alive {
 		t.Fatalf("alive parsed as dispose")
 	}
-	err = table.HandlePacket(alive1, now)
+	err := table.HandlePacket(alive1, now)
 	if err != nil {
 		t.Fatalf("handle alive: %v", err)
 	}
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1", table.Len())
 	}
-	alive2 := mustMarshalAlive(t, part.GUID(), 0, 2, expectedLease)
+	alive2 := mustMarshalAlive(t, guid, 0, 2, expectedLease)
 	err = table.HandlePacket(alive2, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("handle second: %v", err)
 	}
-	info, ok := table.Get(prefix)
+	info, ok := table.Get(guid.Prefix)
 	if !ok {
 		t.Fatalf("missing after update")
 	}
@@ -665,7 +684,7 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1 after stale", table.Len())
 	}
-	staleInfo, ok := table.Get(prefix)
+	staleInfo, ok := table.Get(guid.Prefix)
 	if !ok {
 		t.Fatalf("missing after stale")
 	}
@@ -675,7 +694,12 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if table.Generation() != 2 {
 		t.Fatalf("gen = %d want 2 after stale", table.Generation())
 	}
-	bye := mustMarshalDispose(t, part.GUID(), 0, 3)
+}
+
+// checkGUIDDisposeRemoves pins dispose removal and re-add.
+func checkGUIDDisposeRemoves(t *testing.T, table *dds.RemoteTable, guid dds.GUID, now time.Time) {
+	t.Helper()
+	bye := mustMarshalDispose(t, guid, 3)
 	byeAnn := mustParse(t, bye)
 	if byeAnn.Alive {
 		t.Fatalf("dispose parsed as alive")
@@ -683,7 +707,7 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if byeAnn.Sequence != 3 {
 		t.Fatalf("dispose seq = %d want 3", byeAnn.Sequence)
 	}
-	err = table.HandlePacket(bye, now.Add(2*time.Second))
+	err := table.HandlePacket(bye, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatalf("handle dispose: %v", err)
 	}
@@ -700,7 +724,7 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if table.Generation() != 3 {
 		t.Fatalf("gen = %d want 3 after missing dispose", table.Generation())
 	}
-	alive4 := mustMarshalAlive(t, part.GUID(), 0, 4, expectedLease)
+	alive4 := mustMarshalAlive(t, guid, 0, 4, expectedLease)
 	err = table.HandlePacket(alive4, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("handle re-add alive: %v", err)
@@ -708,7 +732,7 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1 after re-add", table.Len())
 	}
-	staleBye := mustMarshalDispose(t, part.GUID(), 0, 2)
+	staleBye := mustMarshalDispose(t, guid, 2)
 	err = table.HandlePacket(staleBye, now.Add(4*time.Second))
 	if !errors.Is(err, dds.ErrStaleSPDP) {
 		t.Fatalf("handle stale dispose = %v, want stale reject", err)
@@ -716,13 +740,22 @@ func TestGUIDSeqDisposeRemoves(t *testing.T) {
 	if table.Len() != 1 {
 		t.Fatalf("len = %d want 1 after stale dispose", table.Len())
 	}
-	kept, ok := table.Get(prefix)
+	kept, ok := table.Get(guid.Prefix)
 	if !ok {
 		t.Fatalf("missing after stale dispose")
 	}
 	if kept.LastSeq != 4 {
 		t.Fatalf("stored seq = %d want 4 after stale dispose", kept.LastSeq)
 	}
+}
+
+// TestGUIDSeqDisposeRemoves checks identity plus sequence plus removal.
+func TestGUIDSeqDisposeRemoves(t *testing.T) {
+	guid := checkGUIDAnnounceSequence(t)
+	table := dds.NewRemoteTable(nil)
+	now := time.Unix(1000, 0).UTC()
+	checkGUIDAliveMonotonic(t, table, guid, now)
+	checkGUIDDisposeRemoves(t, table, guid, now)
 }
 
 // TestMultiPortRoutesStored checks both meta and default ports are kept.

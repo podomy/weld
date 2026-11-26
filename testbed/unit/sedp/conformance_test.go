@@ -45,11 +45,16 @@ const (
 	sedpConformFlagData      = 0x04
 )
 
-// Builtin writer entities on the wire.
+// Builtin writer entities on the wire per DDSI-RTPS 2.5 section 8.5.4.3.
 var (
-	sedpConformPubsWriter        = [4]byte{0x00, 0x00, 0x02, 0xC2}
-	sedpConformPubsWriterCyclone = [4]byte{0x00, 0x00, 0x03, 0xC2}
-	sedpConformSubsWriter        = [4]byte{0x00, 0x00, 0x04, 0xC2}
+	// sedpConformPubsWriter is the SEDP publications writer.
+	sedpConformPubsWriter = [4]byte{0x00, 0x00, 0x03, 0xC2}
+	// sedpConformSubsWriter is the SEDP subscriptions writer.
+	sedpConformSubsWriter = [4]byte{0x00, 0x00, 0x04, 0xC2}
+	// sedpConformTopicsWriter is the SEDP Topics writer.
+	sedpConformTopicsWriter = [4]byte{0x00, 0x00, 0x02, 0xC2}
+	// sedpConformTopicsReader is the SEDP Topics reader.
+	sedpConformTopicsReader = [4]byte{0x00, 0x00, 0x02, 0xC7}
 )
 
 // sedpConformPrefix returns a deterministic 12 byte prefix for tests.
@@ -628,7 +633,7 @@ func TestSEDPConformHeartbeatsAppended(t *testing.T) {
 	firstHBs := sedpConformHeartbeats(t, firstSubs)
 	secondHBs := sedpConformHeartbeats(t, secondSubs)
 	if len(firstHBs) != 1 {
-		t.Fatalf("writer heartbeats = %d, want 1 (Cyclone DATA writer only)", len(firstHBs))
+		t.Fatalf("writer heartbeats = %d, want 1 (endpoint DATA writer only)", len(firstHBs))
 	}
 	if len(secondHBs) != 1 {
 		t.Fatalf("second heartbeats = %d, want 1", len(secondHBs))
@@ -639,10 +644,10 @@ func TestSEDPConformHeartbeatsAppended(t *testing.T) {
 	secondData := sedpConformFindDATA(t, secondSubs)
 	secondHigh, secondLow := sedpConformSeqOf(t, secondData.body)
 	secondSeq := uint64(secondHigh)<<32 | uint64(secondLow)
-	count1 := sedpConformCheckHeartbeat(t, firstHBs[0], sedpConformPubsWriterCyclone, firstSeq)
-	count2 := sedpConformCheckHeartbeat(t, secondHBs[0], sedpConformPubsWriterCyclone, secondSeq)
+	count1 := sedpConformCheckHeartbeat(t, firstHBs[0], sedpConformPubsWriter, firstSeq)
+	count2 := sedpConformCheckHeartbeat(t, secondHBs[0], sedpConformPubsWriter, secondSeq)
 	if count2 <= count1 {
-		t.Fatalf("cyclone count %d not above %d", count2, count1)
+		t.Fatalf("heartbeat count %d not above %d", count2, count1)
 	}
 
 	reader := sedpConformDeclareReader(t, idx, sedpConformTypeHash)
@@ -658,7 +663,7 @@ func TestSEDPConformHeartbeatsAppended(t *testing.T) {
 	sedpConformCheckHeartbeat(t, readerHBs[0], sedpConformSubsWriter, readerSeq)
 }
 
-// TestSEDPConformReliableHistoryProtocolVendor checks reliable QoS, history, version, and vendor.
+// TestSEDPConformReliableHistoryProtocolVendor checks reliable QoS, history, version 2.5, and vendor.
 //
 //nolint:gocognit,cyclop // conformance test asserts reliable QoS, history and vendor in one run
 func TestSEDPConformReliableHistoryProtocolVendor(t *testing.T) {
@@ -669,8 +674,8 @@ func TestSEDPConformReliableHistoryProtocolVendor(t *testing.T) {
 	if raw[4] != 2 {
 		t.Fatalf("RTPS major = %d, want 2", raw[4])
 	}
-	if raw[5] != 1 {
-		t.Fatalf("RTPS minor = %d, want 1 for protocol 2.1", raw[5])
+	if raw[5] != 5 {
+		t.Fatalf("RTPS minor = %d, want 5 for protocol 2.5", raw[5])
 	}
 	if raw[6] != 0x01 || raw[7] != 0x10 {
 		t.Fatalf("RTPS vendor = %02x %02x, want 01 10", raw[6], raw[7])
@@ -713,8 +718,8 @@ func TestSEDPConformReliableHistoryProtocolVendor(t *testing.T) {
 	if len(protocol) < 2 {
 		t.Fatalf("protocol len = %d, want at least 2", len(protocol))
 	}
-	if protocol[0] != 2 || protocol[1] != 1 {
-		t.Fatalf("protocol = %02x %02x, want 02 01 for 2.1", protocol[0], protocol[1])
+	if protocol[0] != 2 || protocol[1] != 5 {
+		t.Fatalf("protocol = %02x %02x, want 02 05 for 2.5", protocol[0], protocol[1])
 	}
 
 	vendor := sedpConformFindParam(t, params, rtps.PIDVendorID)
@@ -811,7 +816,7 @@ func TestSEDPConformEndpointGUIDWire(t *testing.T) {
 	}
 }
 
-// TestSEDPConformBuiltinWriters checks pubs, Cyclone pubs, and subs writer entities.
+// TestSEDPConformBuiltinWriters checks pubs and subs writer entities plus topics builtins.
 func TestSEDPConformBuiltinWriters(t *testing.T) {
 	t.Parallel()
 	idx := sedpConformNewIndex(t, 0x18, sedpConformDomain)
@@ -820,8 +825,8 @@ func TestSEDPConformBuiltinWriters(t *testing.T) {
 	rawWriter := sedpConformMustSerialize(t, writer)
 	dataWriter := sedpConformFindDATA(t, sedpConformSplit(t, rawWriter))
 	gotPubs := sedpConformWriterOf(t, dataWriter.body)
-	if gotPubs != sedpConformPubsWriterCyclone {
-		t.Fatalf("pubs writer = %x, want %x", gotPubs, sedpConformPubsWriterCyclone)
+	if gotPubs != sedpConformPubsWriter {
+		t.Fatalf("pubs writer = %x, want %x", gotPubs, sedpConformPubsWriter)
 	}
 	rawReader := sedpConformMustSerialize(t, reader)
 	dataReader := sedpConformFindDATA(t, sedpConformSplit(t, rawReader))
@@ -830,15 +835,15 @@ func TestSEDPConformBuiltinWriters(t *testing.T) {
 		t.Fatalf("subs writer = %x, want %x", gotSubs, sedpConformSubsWriter)
 	}
 
-	cycloneParams := sedpConformIdentityParams(writer, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
-	cycloneBody := sedpConformBuildBody(t, sedpConformPubsWriterCyclone, 7, cycloneParams)
-	cycloneRaw := sedpConformBuildMessage(writer.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, cycloneBody)
-	cycloneDecoded := sedpConformMustParse(t, cycloneRaw)
-	if cycloneDecoded.IsReader {
-		t.Fatalf("Cyclone pubs writer parsed as reader")
+	pubsParams := sedpConformIdentityParams(writer, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
+	pubsBody := sedpConformBuildBody(t, sedpConformPubsWriter, 7, pubsParams)
+	pubsRaw := sedpConformBuildMessage(writer.ID.Prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, pubsBody)
+	pubsDecoded := sedpConformMustParse(t, pubsRaw)
+	if pubsDecoded.IsReader {
+		t.Fatalf("pubs writer parsed as reader")
 	}
-	if !cycloneDecoded.ID.Equal(writer.ID) {
-		t.Fatalf("Cyclone GUID mismatch")
+	if !pubsDecoded.ID.Equal(writer.ID) {
+		t.Fatalf("pubs GUID mismatch")
 	}
 
 	subsParams := sedpConformIdentityParams(reader, sedpConformEncodeStringPad(sedpConformDDSTopic), sedpConformEncodeStringPad(sedpConformTypeDDS), rtps.PIDEndpointGUIDWire)
@@ -1199,5 +1204,44 @@ func TestSEDPConformPerWriterSeqStreams(t *testing.T) {
 	_, lowReader := sedpConformSeqOf(t, dataReader.body)
 	if lowReader != 1 {
 		t.Fatalf("reader first seq = %d, want 1 on its own stream", lowReader)
+	}
+}
+
+// TestSEDPConformTopicsBuiltin pins the SEDP Topics writer and reader entities.
+//
+// The Topics writer 0x000002c2 carries topic announcements, never endpoint
+// DATA. A topics sample round-trips through parse and advertises the
+// topics writer; endpoint parse rejects Topics DATA from either the
+// writer or the reader.
+func TestSEDPConformTopicsBuiltin(t *testing.T) {
+	t.Parallel()
+	prefix := sedpConformPrefix(0x2B)
+	topic := dds.SEDPTopic{DDSTopic: sedpConformDDSTopic, TypeDDS: sedpConformTypeDDS}
+	raw, err := dds.SerializeSEDPTopicsDATA(prefix, topic)
+	if err != nil {
+		t.Fatalf("serialize topics: %v", err)
+	}
+	data := sedpConformFindDATA(t, sedpConformSplit(t, raw))
+	if got := sedpConformWriterOf(t, data.body); got != sedpConformTopicsWriter {
+		t.Fatalf("topics writer = %x, want %x", got, sedpConformTopicsWriter)
+	}
+	back, err := dds.ParseSEDPTopicsDATA(raw)
+	if err != nil {
+		t.Fatalf("parse topics: %v", err)
+	}
+	if back.DDSTopic != sedpConformDDSTopic || back.TypeDDS != sedpConformTypeDDS {
+		t.Fatalf("topics round trip = %+v", back)
+	}
+	if _, err := dds.ParseSEDPDATA(raw); err == nil {
+		t.Fatalf("endpoint parse of topics DATA succeeded, want reject")
+	}
+	topicParams := []rtps.Param{
+		{ID: rtps.PIDTopicName, Value: sedpConformEncodeStringPad(sedpConformDDSTopic)},
+		{ID: rtps.PIDTypeName, Value: sedpConformEncodeStringPad(sedpConformTypeDDS)},
+	}
+	readerBody := sedpConformBuildBody(t, sedpConformTopicsReader, 1, topicParams)
+	readerRaw := sedpConformBuildMessage(prefix, sedpConformFlagLE|sedpConformFlagInlineQoS|sedpConformFlagData, readerBody)
+	if _, err := dds.ParseSEDPDATA(readerRaw); err == nil {
+		t.Fatalf("endpoint parse of topics reader DATA succeeded, want reject")
 	}
 }

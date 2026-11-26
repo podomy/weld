@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
 )
 
 // DDS Security discovery parameter ids.
@@ -175,11 +176,12 @@ type SecurityInfo struct {
 //
 // INTEGRATION: the SDK must construct this from flags or files, call
 // Validate, and pass it to backend construction. The CLI must add one flag
-// per path plus an enable flag. No call site exists yet; this type only
-// reserves the shape so future wiring has a pinned contract. Governance
-// and permissions documents are never read for access decisions: presence
-// of paths here grants nothing and enforces no topic allow or deny rules,
-// matching the honest-tolerance posture above.
+// per path plus an enable flag. Governance and permissions documents are
+// never read for access decisions while disabled: presence of paths here
+// grants nothing and enforces no topic allow or deny rules, matching the
+// honest-tolerance posture above. When enabled, BuildSuite turns these
+// paths into the Phase 1 decision suite, which denies every remote match
+// and local create because no handshake exists yet.
 type SecurityConfig struct {
 	// Enabled selects secured operation once crypto exists. False means tolerate mode.
 	Enabled bool
@@ -191,14 +193,19 @@ type SecurityConfig struct {
 	PermissionsCAPath string
 	// GovernancePath is the signed governance file.
 	GovernancePath string
+	// PermissionsDocumentPath is the signed permissions file.
+	PermissionsDocumentPath string
 }
 
 // Validate checks path presence for secured operation.
 //
 // Disabled config always passes: tolerate mode needs no material. Enabled
-// config requires every path to be non-empty; file contents are never
-// parsed here because crypto is out of scope. Each missing field joins a
-// distinct error so errors.Is still reports ErrSecurityConfigInvalid.
+// config requires the four historical paths to be non-empty; the
+// permissions document path is enforced separately by SuiteConfig.Validate
+// at BuildSuite time so this contract stays identical to the pinned
+// tolerance matrix. File contents are never parsed here because crypto is
+// out of scope. Each missing field joins a distinct error so errors.Is
+// still reports ErrSecurityConfigInvalid.
 func (c SecurityConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -227,6 +234,32 @@ func (c SecurityConfig) Validate() error {
 	}
 
 	return fmt.Errorf("dds: security config: %w", errors.Join(errs...))
+}
+
+// BuildSuite constructs the Phase 1 decision suite from this config.
+//
+// A disabled config yields a silent allow-all suite, preserving
+// tolerance behavior. An enabled config yields a deny-default suite
+// that refuses every remote match and local create until later phases
+// add the handshake and signature verification. Enabled builds require
+// the permissions document path on top of Validate, failing loudly
+// through the suite constructor when it is empty.
+func (c SecurityConfig) BuildSuite() (*ddssecurity.Suite, error) {
+	cfg := ddssecurity.SuiteConfig{
+		Enabled:                 c.Enabled,
+		IdentityCertificatePath: c.IdentityCertificatePath,
+		IdentityPrivateKeyPath:  c.IdentityPrivateKeyPath,
+		PermissionsCAPath:       c.PermissionsCAPath,
+		GovernancePath:          c.GovernancePath,
+		PermissionsDocumentPath: c.PermissionsDocumentPath,
+	}
+
+	suite, err := ddssecurity.NewSuite(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dds: build security suite: %w", err)
+	}
+
+	return suite, nil
 }
 
 // IsProtectedSubmessageID reports whether id names a crypto-wrapped submessage.
@@ -822,20 +855,19 @@ func DropProtectedSubmessage(r *DataReceiver, id byte) error {
 // secured-transform-unavailable drop and return a loud error. This is the
 // one-line hook for the datapath demux.
 //
-// INTEGRATION state: pure tolerance helpers are done here, including PID
-// presence recorded even when malformed for fail-closed classification and
-// strict trailing-length checks on property lists. Wiring stays out:
-//   - spdp.go announcementFromData: after collectParams, call
-//     ExtractSecurityInfo and carry SecurityInfo on the participant record;
-//     on CheckProtectedDiscovery error, log loudly and keep the unsecured path.
-//   - sedp.go sedpEndpointFields: after byID assembly, call
-//     ExtractSecurityInfo on inline plus payload params and carry
-//     SecurityInfo on SEDPEndpoint.
-//   - backend.go routeBuiltinSub/dispatchRTPS: before DecodeSubmessage,
-//     call HandleProtectedSubmessage and continue when handled is true.
-//   - cli config plumbing: construct SecurityConfig from flags or
-//     files, call Validate, pass into backend construction. No call site
-//     exists yet.
+// INTEGRATION state: tolerance helpers plus datapath wiring are done.
+// spdp.go announcementFromData calls ExtractSecurityInfo and carries
+// SecurityInfo on the participant record, logging loudly and keeping the
+// unsecured path on CheckProtectedDiscovery errors; RemoteTable consults
+// the Phase 1 suite through SetSecuritySuite, refusing alive peers while
+// enabled and staying byte-identical while unset. sedp.go
+// sedpEndpointFields calls ExtractSecurityInfoEndian on inline plus
+// payload params with endianness threaded; SEDPIndex consults the same
+// suite through SetSecuritySuite, refusing remote installs and local
+// declares while enabled. backend.go dispatchRTPS calls
+// HandleProtectedSubmessage before DecodeSubmessage and continues loudly
+// on handled protected bytes. Remaining: no cli config plumbing;
+// SecurityConfig reaches the suite only through BuildSuite.
 func HandleProtectedSubmessage(r *DataReceiver, sub rtps.RawSubmessage) (bool, error) {
 	if !IsProtectedSubmessageID(sub.ID) {
 		return false, nil

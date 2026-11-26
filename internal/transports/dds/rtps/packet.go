@@ -22,6 +22,7 @@ package rtps
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -35,10 +36,9 @@ const (
 	SubmessageHeaderSize = 4
 	// ProtocolMajor is the only accepted RTPS major version.
 	ProtocolMajor = 2
-	// ProtocolMinor is the sent RTPS minor version, 2.1 to match the
-	// CycloneDDS ecosystem floor. Peers may send any 2.x minor; decode
-	// accepts every minor under major 2.
-	ProtocolMinor = 1
+	// ProtocolMinor is the sent RTPS minor version, 2.5 per DDSI-RTPS 2.5.
+	// Peers may send any 2.x minor; decode accepts every minor under major 2.
+	ProtocolMinor = 5
 	// FlagLittleEndian is the submessage flags bit selecting little
 	// endian for the length and content that follow it.
 	FlagLittleEndian = 0x01
@@ -108,7 +108,7 @@ type Header struct {
 	Prefix [12]byte
 }
 
-// DefaultHeader returns a Header for prefix with RTPS 2.1 and the
+// DefaultHeader returns a Header for prefix with RTPS 2.5 and the
 // CycloneDDS vendor id.
 func DefaultHeader(prefix [12]byte) Header {
 	return Header{
@@ -137,13 +137,13 @@ func (h Header) Encode() [HeaderSize]byte {
 func DecodeHeader(buf []byte) (Header, error) {
 	var out Header
 	if len(buf) < HeaderSize {
-		return out, fmt.Errorf("rtps: header need %d have %d", HeaderSize, len(buf))
+		return out, fmt.Errorf("rtps: header need %d have %d (8.3.3)", HeaderSize, len(buf))
 	}
 	if string(buf[0:headerMagicLen]) != Magic {
-		return out, fmt.Errorf("rtps: bad magic %#02x %#02x %#02x %#02x", buf[0], buf[1], buf[2], buf[3])
+		return out, fmt.Errorf("rtps: bad magic %#02x %#02x %#02x %#02x (8.3.3)", buf[0], buf[1], buf[2], buf[3])
 	}
 	if buf[headerMajorOff] != ProtocolMajor {
-		return out, fmt.Errorf("rtps: major version %d, want %d", buf[headerMajorOff], ProtocolMajor)
+		return out, fmt.Errorf("rtps: major version %d, want %d (8.3.3)", buf[headerMajorOff], ProtocolMajor)
 	}
 	out.Major = buf[headerMajorOff]
 	out.Minor = buf[headerMinorOff]
@@ -183,7 +183,7 @@ func (s SubmessageHeader) Encode() [SubmessageHeaderSize]byte {
 func DecodeSubmessageHeader(buf []byte) (SubmessageHeader, error) {
 	var out SubmessageHeader
 	if len(buf) < SubmessageHeaderSize {
-		return out, fmt.Errorf("rtps: submessage header need %d have %d", SubmessageHeaderSize, len(buf))
+		return out, fmt.Errorf("rtps: submessage header need %d have %d (8.3.4)", SubmessageHeaderSize, len(buf))
 	}
 	out.ID = buf[subIDOff]
 	out.Flags = buf[subFlagsOff]
@@ -231,7 +231,7 @@ type RawSubmessage struct {
 // flag order. Bodies above 64K are rejected loudly instead of truncated.
 func WrapSubmessage(id, flags uint8, body []byte) ([]byte, error) {
 	if len(body) > maxSubmessageBody {
-		return nil, fmt.Errorf("rtps: submessage %#02x body %d above %d", id, len(body), maxSubmessageBody)
+		return nil, fmt.Errorf("rtps: submessage %#02x body %d above %d (8.3.4)", id, len(body), maxSubmessageBody)
 	}
 	hdr := SubmessageHeader{ID: id, Flags: flags, Length: uint16(len(body))} //nolint:gosec // G115: length guarded by the maxSubmessageBody check above
 	raw := hdr.Encode()
@@ -256,11 +256,123 @@ func EncodeMessage(h Header, subs []RawSubmessage) ([]byte, error) {
 	return out, nil
 }
 
+// verifyUDPChecksum checks the HeaderExtension checksum on the UDP path
+// per DDSI-RTPS 2.5 8.3.7.3. The checksum covers the full datagram with
+// its own field zeroed; a mismatch drops fail-closed.
+func verifyUDPChecksum(buf []byte, ext HeaderExtension, extOff int, drops *Counter) error {
+	cksLen := checksumKindLen(ext.Checksum)
+	if cksLen <= 0 {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: header extension checksum kind %d unknown (8.3.7.3)", int(ext.Checksum))
+	}
+	cksOff := extOff + SubmessageHeaderSize + extensionChecksumBodyOffset(ext)
+	if cksOff < 0 || cksOff+cksLen > len(buf) {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: header extension checksum overruns %d (8.3.7.3)", len(buf))
+	}
+	probe := make([]byte, len(buf))
+	copy(probe, buf)
+	for i := range cksLen {
+		probe[cksOff+i] = 0
+	}
+	sum, err := TCPComputeChecksum(ext.Checksum, probe)
+	if err != nil {
+		drops.RecordDrop()
+		return err
+	}
+	if !equalTCPChecksum(sum, buf[cksOff:cksOff+cksLen]) {
+		drops.RecordDrop()
+		return errors.New("rtps: header extension checksum mismatch (8.3.7.3)") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	return nil
+}
+
+// checkRtps1HeaderExtension validates every HeaderExtension in the
+// datagram per DDSI-RTPS 2.5 8.3.7.3 on the UDP path. Each present
+// extension must be well-formed; the first must be at index 0 and any
+// later HeaderExtension drops loudly as mispositioned, even when
+// well-formed. Short bodies, malformed parameters, length mismatches,
+// and checksum mismatches drop loudly. A valid first extension is
+// accepted per 2.5 and stays as raw for the dispatcher.
+func checkRtps1HeaderExtension(buf []byte, subs []RawSubmessage, drops *Counter) error {
+	off := HeaderSize
+	for i := range subs {
+		if subs[i].ID != SubmessageHeaderExtension {
+			off += SubmessageHeaderSize + len(subs[i].Body)
+			continue
+		}
+		if err := validateHeaderExtensionAt(buf, subs[i], i, off, drops); err != nil {
+			return err
+		}
+		if i != 0 {
+			drops.RecordDrop()
+			return fmt.Errorf("rtps: header extension not first at %d (8.3.7.3)", i)
+		}
+		off += SubmessageHeaderSize + len(subs[i].Body)
+	}
+	return nil
+}
+
+// validateHeaderExtensionAt validates one header extension body.
+func validateHeaderExtensionAt(buf []byte, sub RawSubmessage, index, off int, drops *Counter) error {
+	var tmp TCPDropCounter
+	ext, err := DecodeHeaderExtension(sub.Body, sub.Flags, &tmp)
+	if err != nil {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: header extension invalid at %d (8.3.7.3): %w", index, err)
+	}
+	if ext.HasLength && uint64(ext.MessageLength) < uint64(HeaderSize+SubmessageHeaderSize+len(sub.Body)) {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: header extension length %d too small (8.3.7.3)", ext.MessageLength)
+	}
+	if ext.HasLength {
+		err = checkUDPMessageLength(ext.MessageLength, len(buf), drops)
+		if err != nil {
+			return err
+		}
+	}
+	if ext.Checksum != TCPChecksumNone {
+		err = verifyUDPChecksum(buf, ext, off, drops)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkUDPMessageLength validates MessageLength against the UDP datagram
+// length per DDSI-RTPS 2.5 8.3.7.3. On UDP the datagram length is
+// determinable as len(buf), so an exact match is required: the
+// MessageLength field names the full RTPS message length from the RTPS
+// header, which on UDP is exactly the datagram length. A short length
+// drops as too small; any mismatch drops, which also rejects a wildly
+// excessive length (for example above datagram plus one max submessage)
+// that would otherwise claim bytes past the datagram.
+func checkUDPMessageLength(messageLength uint32, datagramLen int, drops *Counter) error {
+	if datagramLen < 0 {
+		drops.RecordDrop()
+		return fmt.Errorf("rtps: header extension datagram length %d invalid (8.3.7.3)", datagramLen)
+	}
+	msgLen64 := uint64(messageLength)
+	dgramLen64 := uint64(datagramLen)
+	if msgLen64 != dgramLen64 {
+		drops.RecordDrop()
+		if msgLen64 > dgramLen64+uint64(maxSubmessageBody) {
+			return fmt.Errorf("rtps: header extension length %d wildly exceeds datagram %d (8.3.7.3)", messageLength, datagramLen)
+		}
+		return fmt.Errorf("rtps: header extension length %d differs from datagram %d (8.3.7.3)", messageLength, datagramLen)
+	}
+	return nil
+}
+
 // DecodeMessage parses one datagram into its header and submessages.
 //
 // A datagram is atomic: any truncation drops the whole message with one
 // counter increment and an error. Unknown submessage ids are preserved as
-// raw bodies for the dispatcher; see DecodeSubmessage. Bodies are copied,
+// raw bodies for the dispatcher; see DecodeSubmessage. A HeaderExtension
+// must be first per 8.3.7.3 and is validated loudly; mispositioned, short,
+// or checksum mismatched extensions drop instead of skipping, while a
+// valid first extension is accepted per 2.5. Bodies are copied,
 // so buf may be reused after return. Submessage count is capped at
 // maxSubmessagesPerDatagram so a crafted header chain cannot force
 // unbounded allocation; over-cap datagrams drop loudly.
@@ -269,42 +381,54 @@ func DecodeMessage(buf []byte, drops *Counter) (Header, []RawSubmessage, error) 
 	hdr, err := DecodeHeader(buf)
 	if err != nil {
 		drops.RecordDrop()
-		return zero, nil, fmt.Errorf("rtps: decode message: %w", err)
+		return zero, nil, fmt.Errorf("rtps: decode message: %w (8.3.4.1)", err)
 	}
 	var subs []RawSubmessage
 	off := HeaderSize
 	for off < len(buf) {
 		if len(subs) >= maxSubmessagesPerDatagram {
 			drops.RecordDrop()
-			return zero, nil, fmt.Errorf("rtps: decode message submessages above %d", maxSubmessagesPerDatagram)
+			return zero, nil, fmt.Errorf("rtps: decode message submessages above %d (8.3.4.1)", maxSubmessagesPerDatagram)
 		}
 		sub, next, err := decodeOne(buf, off)
 		if err != nil {
 			drops.RecordDrop()
-			return zero, nil, fmt.Errorf("rtps: decode message: %w", err)
+			return zero, nil, fmt.Errorf("rtps: decode message: %w (8.3.4.1)", err)
 		}
 		subs = append(subs, sub)
 		off = next
+	}
+	err = checkRtps1HeaderExtension(buf, subs, drops)
+	if err != nil {
+		return zero, nil, err
 	}
 	return hdr, subs, nil
 }
 
 // decodeOne parses the submessage at off and returns it with the offset of
 // the next header. The body is copied following the copy once at ingress
-// rule, so later buffer reuse cannot corrupt parsed data.
+// rule, so later buffer reuse cannot corrupt parsed data. A zero
+// octetsToNextHeader extends to the end of the datagram per 9.4.5.1.3;
+// on UDP the datagram length is the message length, so a zero length
+// consumes the datagram tail and must be the last submessage.
 func decodeOne(buf []byte, off int) (RawSubmessage, int, error) {
 	var sub RawSubmessage
 	if len(buf)-off < SubmessageHeaderSize {
-		return sub, 0, fmt.Errorf("rtps: submessage header need %d have %d", SubmessageHeaderSize, len(buf)-off)
+		return sub, 0, fmt.Errorf("rtps: submessage header need %d have %d (8.3.4)", SubmessageHeaderSize, len(buf)-off)
 	}
 	id := buf[off+subIDOff]
 	flags := buf[off+subFlagsOff]
 	length := uint16Value(buf[off+subLenOff:off+subLenOff+subLenSize], LittleEndian(flags))
 	end := off + SubmessageHeaderSize + int(length)
-	if end > len(buf) {
-		return sub, 0, fmt.Errorf("rtps: submessage %#02x length %d overruns %d left", id, length, len(buf)-off)
+	bodyLen := int(length)
+	if length == 0 {
+		end = len(buf)
+		bodyLen = end - off - SubmessageHeaderSize
 	}
-	body := make([]byte, length)
+	if end > len(buf) {
+		return sub, 0, fmt.Errorf("rtps: submessage %#02x length %d overruns %d left (8.3.4)", id, length, len(buf)-off)
+	}
+	body := make([]byte, bodyLen)
 	copy(body, buf[off+SubmessageHeaderSize:end])
 	sub = RawSubmessage{ID: id, Flags: flags, Body: body}
 	return sub, end, nil

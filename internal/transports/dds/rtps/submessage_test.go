@@ -536,13 +536,19 @@ func TestUnknownSubmessageSkipSweep(t *testing.T) {
 	t.Parallel()
 
 	known := map[uint8]bool{
-		rtps.SubmessagePad:       true,
-		rtps.SubmessageAckNack:   true,
-		rtps.SubmessageHeartbeat: true,
-		rtps.SubmessageGap:       true,
-		rtps.SubmessageInfoTS:    true,
-		rtps.SubmessageData:      true,
-		rtps.SubmessageDataFrag:  true,
+		rtps.SubmessagePad:           true,
+		rtps.SubmessageAckNack:       true,
+		rtps.SubmessageHeartbeat:     true,
+		rtps.SubmessageGap:           true,
+		rtps.SubmessageInfoTS:        true,
+		rtps.SubmessageInfoSrc:       true,
+		rtps.SubmessageInfoReplyIP4:  true,
+		rtps.SubmessageInfoDst:       true,
+		rtps.SubmessageInfoReply:     true,
+		rtps.SubmessageData:          true,
+		rtps.SubmessageDataFrag:      true,
+		rtps.SubmessageNackFrag:      true,
+		rtps.SubmessageHeartbeatFrag: true,
 	}
 	for id := range 256 {
 		raw := rtps.RawSubmessage{ID: uint8(id), Flags: 0x01, Body: []byte{0x01, 0x02, 0x03, 0x04}}
@@ -602,6 +608,71 @@ func TestAckNackOversize(t *testing.T) {
 	}
 	if _, err := big.Encode(true); err == nil {
 		t.Fatal("oversize acknack succeeded, want error")
+	}
+}
+
+// TestAckNackRtps1BitsAbove256Invalid pins loud decode reject per 8.3.5.5.
+func TestAckNackRtps1BitsAbove256Invalid(t *testing.T) {
+	t.Parallel()
+
+	body := make([]byte, 0, 24+9*4)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var base [8]byte
+	binary.LittleEndian.PutUint32(base[0:4], 0)
+	binary.LittleEndian.PutUint32(base[4:8], 1)
+	body = append(body, base[:]...)
+	var bits [4]byte
+	binary.LittleEndian.PutUint32(bits[:], 257)
+	body = append(body, bits[:]...)
+	for range 9 {
+		var w [4]byte
+		binary.LittleEndian.PutUint32(w[:], 0xFFFFFFFF)
+		body = append(body, w[:]...)
+	}
+	var count [4]byte
+	binary.LittleEndian.PutUint32(count[:], 1)
+	body = append(body, count[:]...)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeAckNack(body, 0x01, &drops); err == nil {
+		t.Fatal("acknack 257 bits succeeded, want invalid")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// TestNackFragRtps1BitsAbove256Invalid pins loud decode reject per 8.3.5.7.
+func TestNackFragRtps1BitsAbove256Invalid(t *testing.T) {
+	t.Parallel()
+
+	body := make([]byte, 0, 28+9*4)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var sn [8]byte
+	binary.LittleEndian.PutUint32(sn[0:4], 0)
+	binary.LittleEndian.PutUint32(sn[4:8], 9)
+	body = append(body, sn[:]...)
+	var base [4]byte
+	binary.LittleEndian.PutUint32(base[:], 1)
+	body = append(body, base[:]...)
+	var bits [4]byte
+	binary.LittleEndian.PutUint32(bits[:], 257)
+	body = append(body, bits[:]...)
+	for range 9 {
+		var w [4]byte
+		binary.LittleEndian.PutUint32(w[:], 0xFFFFFFFF)
+		body = append(body, w[:]...)
+	}
+	var count [4]byte
+	binary.LittleEndian.PutUint32(count[:], 1)
+	body = append(body, count[:]...)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeNackFrag(body, 0x01, &drops); err == nil {
+		t.Fatal("nackfrag 257 bits succeeded, want invalid")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
 	}
 }
 
@@ -744,7 +815,7 @@ func TestGapBaseAtOrBelowStartRejects(t *testing.T) {
 	}
 }
 
-// TestDataSeqZeroCountsDrop pins the accepted but ignored zero contract.
+// TestDataSeqZeroCountsDrop pins seq 0 invalid per 8.3.8.2, matching DataFrag.
 func TestDataSeqZeroCountsDrop(t *testing.T) {
 	t.Parallel()
 
@@ -755,24 +826,16 @@ func TestDataSeqZeroCountsDrop(t *testing.T) {
 		t.Fatalf("body: %v", err)
 	}
 	var drops rtps.Counter
-	decoded, err := rtps.DecodeData(body, 0x05, &drops)
-	if err != nil {
-		t.Fatalf("decode seq 0: %v, want accept", err)
-	}
-	if decoded.SequenceNumber != 0 {
-		t.Fatalf("seq = %d, want 0", decoded.SequenceNumber)
+	if _, err := rtps.DecodeData(body, 0x05, &drops); err == nil {
+		t.Fatalf("decode seq 0 succeeded, want invalid")
 	}
 	if drops.Count() != 1 {
 		t.Fatalf("drops = %d, want 1", drops.Count())
 	}
 	raw := rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: 0x05, Body: body}
 	var subDrops rtps.Counter
-	sub, err := rtps.DecodeSubmessage(raw, &subDrops)
-	if err != nil {
-		t.Fatalf("dispatcher seq 0: %v, want accept", err)
-	}
-	if sub.Data == nil || sub.Data.SequenceNumber != 0 {
-		t.Fatalf("dispatcher data = %+v, want seq 0", sub.Data)
+	if _, err := rtps.DecodeSubmessage(raw, &subDrops); err == nil {
+		t.Fatalf("dispatcher seq 0 succeeded, want invalid")
 	}
 	if subDrops.Count() != 1 {
 		t.Fatalf("dispatcher drops = %d, want 1", subDrops.Count())
@@ -791,6 +854,25 @@ func validDataFragBody() []byte {
 		0x05, 0x00,
 		0x05, 0x00, 0x00, 0x00,
 		0x00, 0x01, 0x00, 0x00, 0x41,
+	}
+}
+
+// TestDataSeqRtps1UnknownInvalid pins UNKNOWN seq invalid like DataFrag.
+func TestDataSeqRtps1UnknownInvalid(t *testing.T) {
+	t.Parallel()
+
+	unknown := testData()
+	unknown.SequenceNumber = 0xFFFFFFFF00000000
+	body, err := unknown.Body(true)
+	if err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	var drops rtps.Counter
+	if _, err := rtps.DecodeData(body, 0x05, &drops); err == nil {
+		t.Fatalf("decode unknown succeeded, want invalid")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
 	}
 }
 
@@ -896,5 +978,815 @@ func TestDecodeSubmessageKnownTyped(t *testing.T) {
 		if drops.Count() != 0 {
 			t.Fatalf("%s drops = %d, want 0", tc.name, drops.Count())
 		}
+	}
+}
+
+// TestInfoSrcRoundTrip pins minimal INFO_SRC encode plus decode per 8.3.8.10.
+func TestInfoSrcRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	src := rtps.InfoSrc{Major: 2, Minor: 5, Vendor: [2]byte{0x01, 0x10}}
+	body := src.Encode()
+	if len(body) != 5 {
+		t.Fatalf("info_src len = %d, want 5", len(body))
+	}
+	var drops rtps.Counter
+	back, err := rtps.DecodeInfoSrc(body, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if back != src {
+		t.Fatalf("round trip = %+v, want %+v", back, src)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// TestInfoSrcInvalid pins fail-closed validation for malformed bodies.
+func TestInfoSrcInvalid(t *testing.T) {
+	t.Parallel()
+
+	cases := [][]byte{
+		{0x00, 0x02},
+		{0x00, 0x02, 0x05},
+		{0x00, 0x02, 0x05, 0x10},
+		{0x01, 0x02, 0x05, 0x01, 0x10},
+		{0x00, 0x01, 0x05, 0x01, 0x10},
+	}
+	for i, body := range cases {
+		var drops rtps.Counter
+		if _, err := rtps.DecodeInfoSrc(body, 0x01, &drops); err == nil {
+			t.Fatalf("case %d succeeded, want error", i)
+		}
+		if drops.Count() != 1 {
+			t.Fatalf("case %d drops = %d, want 1", i, drops.Count())
+		}
+	}
+}
+
+// TestInfoSrcTrailingIgnored pins forward compatible trailing bytes.
+func TestInfoSrcTrailingIgnored(t *testing.T) {
+	t.Parallel()
+
+	src := rtps.InfoSrc{Major: 2, Minor: 1, Vendor: [2]byte{0x01, 0x01}}
+	body := append(src.Encode(), 0xFF, 0xFF)
+	var drops rtps.Counter
+	back, err := rtps.DecodeInfoSrc(body, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode trailing: %v", err)
+	}
+	if back != src {
+		t.Fatalf("trailing = %+v, want %+v", back, src)
+	}
+}
+
+// TestDecodeSubmessageInfoSrc pins typed dispatch plus error paths.
+func TestDecodeSubmessageInfoSrc(t *testing.T) {
+	t.Parallel()
+
+	src := rtps.InfoSrc{Major: 2, Minor: 5, Vendor: [2]byte{0x01, 0x10}}
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: src.Encode()}
+	var drops rtps.Counter
+	got, err := rtps.DecodeSubmessage(raw, &drops)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if got.InfoSrc == nil || *got.InfoSrc != src {
+		t.Fatalf("info_src = %+v, want %+v", got.InfoSrc, src)
+	}
+	bad := rtps.RawSubmessage{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: []byte{0x01}}
+	var badDrops rtps.Counter
+	if _, err := rtps.DecodeSubmessage(bad, &badDrops); err == nil {
+		t.Fatalf("short info_src succeeded, want error")
+	}
+	if badDrops.Count() != 1 {
+		t.Fatalf("bad drops = %d, want 1", badDrops.Count())
+	}
+}
+
+// TestIsKnownSubmessageID pins known versus unknown classification per 8.3.4.
+func TestIsKnownSubmessageID(t *testing.T) {
+	t.Parallel()
+
+	known := []uint8{
+		rtps.SubmessagePad,
+		rtps.SubmessageAckNack,
+		rtps.SubmessageHeartbeat,
+		rtps.SubmessageGap,
+		rtps.SubmessageInfoTS,
+		rtps.SubmessageInfoSrc,
+		rtps.SubmessageInfoReplyIP4,
+		rtps.SubmessageInfoDst,
+		rtps.SubmessageInfoReply,
+		rtps.SubmessageData,
+		rtps.SubmessageDataFrag,
+		rtps.SubmessageNackFrag,
+		rtps.SubmessageHeartbeatFrag,
+	}
+	for _, id := range known {
+		if !rtps.IsKnownSubmessageID(id) {
+			t.Fatalf("id %#02x not known, want known", id)
+		}
+	}
+	for _, id := range []uint8{0x02, 0xFF} {
+		if rtps.IsKnownSubmessageID(id) {
+			t.Fatalf("id %#02x known, want unknown", id)
+		}
+	}
+}
+
+// putGapSeqLE stores one sequence as high word then low word little endian.
+func putGapSeqLE(dst []byte, v uint64) {
+	binary.LittleEndian.PutUint32(dst[0:4], uint32(v>>32))
+	binary.LittleEndian.PutUint32(dst[4:8], uint32(v)) //nolint:gosec // G115: low word truncation is the RTPS layout
+}
+
+// gapEmptyBody builds an exact empty gap list body without bitmap words.
+func gapEmptyBody(start, base uint64) []byte {
+	body := make([]byte, 0, 28)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var startRaw [8]byte
+	putGapSeqLE(startRaw[:], start)
+	body = append(body, startRaw[:]...)
+	var baseRaw [8]byte
+	putGapSeqLE(baseRaw[:], base)
+	body = append(body, baseRaw[:]...)
+	var bits [4]byte
+	binary.LittleEndian.PutUint32(bits[:], 0)
+	body = append(body, bits[:]...)
+	return body
+}
+
+// TestGapEmptyBaseZeroAccepts pins empty set with base 0 per 8.3.5.5.
+func TestGapEmptyBaseZeroAccepts(t *testing.T) {
+	t.Parallel()
+
+	body := gapEmptyBody(10, 0)
+	var drops rtps.Counter
+	gap, err := rtps.DecodeGap(body, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode empty base 0: %v", err)
+	}
+	if gap.GapListBase != 0 || gap.NumBits != 0 {
+		t.Fatalf("gap = base %d bits %d, want 0 0", gap.GapListBase, gap.NumBits)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// TestGapBaseOverflowRejects pins fail-closed on base plus bits wrap.
+func TestGapBaseOverflowRejects(t *testing.T) {
+	t.Parallel()
+
+	base := ^uint64(0) - 5
+	body := gapBaseBody(1, base, 10)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeGap(body, 0x01, &drops); err == nil {
+		t.Fatalf("gap overflow base %d succeeded, want error", base)
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// ackNackEmptyBody builds an exact empty receipt body.
+func ackNackEmptyBody(base uint64) []byte {
+	body := make([]byte, 0, 24)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var baseRaw [8]byte
+	putGapSeqLE(baseRaw[:], base)
+	body = append(body, baseRaw[:]...)
+	var bits [4]byte
+	binary.LittleEndian.PutUint32(bits[:], 0)
+	body = append(body, bits[:]...)
+	var count [4]byte
+	binary.LittleEndian.PutUint32(count[:], 1)
+	body = append(body, count[:]...)
+	return body
+}
+
+// TestAckNackEmptyBaseZeroAccepts pins empty receipt with base 0.
+func TestAckNackEmptyBaseZeroAccepts(t *testing.T) {
+	t.Parallel()
+
+	var drops rtps.Counter
+	got, err := rtps.DecodeAckNack(ackNackEmptyBody(0), 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode empty base 0: %v", err)
+	}
+	if got.Base != 0 || got.NumBits != 0 {
+		t.Fatalf("acknack = base %d bits %d, want 0 0", got.Base, got.NumBits)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// ackNackOverflowBody builds a receipt with bitmap before count.
+func ackNackOverflowBody(base uint64, numBits uint32) []byte {
+	body := make([]byte, 0, 28)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var baseRaw [8]byte
+	putGapSeqLE(baseRaw[:], base)
+	body = append(body, baseRaw[:]...)
+	var bits [4]byte
+	binary.LittleEndian.PutUint32(bits[:], numBits)
+	body = append(body, bits[:]...)
+	var word [4]byte
+	binary.LittleEndian.PutUint32(word[:], 0xFFFFFFFF)
+	body = append(body, word[:]...)
+	var count [4]byte
+	binary.LittleEndian.PutUint32(count[:], 1)
+	body = append(body, count[:]...)
+	return body
+}
+
+// TestAckNackBaseOverflowRejects pins fail-closed on base plus bits wrap.
+func TestAckNackBaseOverflowRejects(t *testing.T) {
+	t.Parallel()
+
+	base := ^uint64(0) - 3
+	body := ackNackOverflowBody(base, 10)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeAckNack(body, 0x01, &drops); err == nil {
+		t.Fatalf("acknack overflow base %d succeeded, want error", base)
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// TestAckNackTrailingRejects pins exact layout with no trailing garbage.
+func TestAckNackTrailingRejects(t *testing.T) {
+	t.Parallel()
+
+	receipt := rtps.AckNack{
+		ReaderID: rtps.EntityUnknown,
+		WriterID: rtps.EntitySPDPWriter,
+		Base:     1,
+		NumBits:  0,
+		Count:    7,
+	}
+	body, err := receipt.Encode(true)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	body = append(body, 0x00)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeAckNack(body, 0x01, &drops); err == nil {
+		t.Fatalf("trailing byte succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// gapFilteredBody builds a gap list plus 8 byte ChangeCount filteredCount.
+func gapFilteredBody(start, base uint64, numBits uint32, filtered uint64) []byte {
+	body := gapBaseBody(start, base, numBits)
+	var raw [8]byte
+	binary.LittleEndian.PutUint32(raw[0:4], uint32(filtered>>32))
+	binary.LittleEndian.PutUint32(raw[4:8], uint32(filtered)) //nolint:gosec // G115: low word truncation is the RTPS layout
+	body = append(body, raw[:]...)
+	return body
+}
+
+// TestGapFilteredCountWidth pins ChangeCount_t as 8 bytes per 8.3.8.4.
+func TestGapFilteredCountWidth(t *testing.T) {
+	t.Parallel()
+
+	const want uint64 = 0x0102030405060708
+	body := gapFilteredBody(10, 11, 1, want)
+	var drops rtps.Counter
+	gap, err := rtps.DecodeGap(body, 0x01|0x04, &drops)
+	if err != nil {
+		t.Fatalf("decode filtered: %v", err)
+	}
+	if !gap.HasFiltered {
+		t.Fatalf("hasFiltered = false, want true")
+	}
+	if gap.FilteredCount != want {
+		t.Fatalf("filtered = %#x, want %#x", gap.FilteredCount, want)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+	short := body[:len(body)-1]
+	var shortDrops rtps.Counter
+	if _, err := rtps.DecodeGap(short, 0x01|0x04, &shortDrops); err == nil {
+		t.Fatalf("short filtered succeeded, want error")
+	}
+	if shortDrops.Count() != 1 {
+		t.Fatalf("short drops = %d, want 1", shortDrops.Count())
+	}
+}
+
+// TestGapTrailingRejects pins exact length past bitmap and G/F per 8.3.8.4 like AckNack.
+func TestGapTrailingRejects(t *testing.T) {
+	t.Parallel()
+
+	base := gapBaseBody(10, 11, 1)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeGap(append(base, 0x00), 0x01, &drops); err == nil {
+		t.Fatalf("gap trailing after bitmap succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+
+	withGroup := append(gapBaseBody(10, 11, 1), make([]byte, 16)...)
+	// Fill group with valid positive sequences: start 1, end 2.
+	binary.LittleEndian.PutUint32(withGroup[32:36], 0)
+	binary.LittleEndian.PutUint32(withGroup[36:40], 1)
+	binary.LittleEndian.PutUint32(withGroup[40:44], 0)
+	binary.LittleEndian.PutUint32(withGroup[44:48], 2)
+	var gDrops rtps.Counter
+	if _, err := rtps.DecodeGap(append(withGroup, 0xFF), 0x01|0x02, &gDrops); err == nil {
+		t.Fatalf("gap trailing after group succeeded, want error")
+	}
+	if gDrops.Count() != 1 {
+		t.Fatalf("group drops = %d, want 1", gDrops.Count())
+	}
+
+	filtered := gapFilteredBody(10, 11, 1, 7)
+	var fDrops rtps.Counter
+	if _, err := rtps.DecodeGap(append(filtered, 0x00, 0x01), 0x01|0x04, &fDrops); err == nil {
+		t.Fatalf("gap trailing after filtered succeeded, want error")
+	}
+	if fDrops.Count() != 1 {
+		t.Fatalf("filtered drops = %d, want 1", fDrops.Count())
+	}
+}
+
+// TestGapEmptyExtraWordsRejects pins numBits 0 with extra words fail-closed per 8.3.5.5.
+func TestGapEmptyExtraWordsRejects(t *testing.T) {
+	t.Parallel()
+
+	empty := gapEmptyBody(10, 0)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeGap(empty, 0x01, &drops); err != nil {
+		t.Fatalf("empty base 0 with numBits 0: %v", err)
+	}
+	// Extra word without G/F flags must reject as trailing.
+	extra := append(append([]byte(nil), empty...), 0x00, 0x00, 0x00, 0x00)
+	var extraDrops rtps.Counter
+	if _, err := rtps.DecodeGap(extra, 0x01, &extraDrops); err == nil {
+		t.Fatalf("numBits 0 with extra word succeeded, want error")
+	}
+	if extraDrops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", extraDrops.Count())
+	}
+	// Only G/F fields may follow per flags; bare extra words never pass.
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageGap, Flags: 0x01, Body: extra}
+	var subDrops rtps.Counter
+	if _, err := rtps.DecodeSubmessage(raw, &subDrops); err == nil {
+		t.Fatalf("dispatcher extra words succeeded, want error")
+	}
+}
+
+// TestGapFlagValues pins G 0x02 and F 0x04 per DDSI-RTPS 2.5 8.3.8.4 table 24.
+func TestGapFlagValues(t *testing.T) {
+	t.Parallel()
+
+	if rtps.GapFlagGroupInfo != 0x02 {
+		t.Fatalf("GapFlagGroupInfo = %#02x, want 0x02", rtps.GapFlagGroupInfo)
+	}
+	if rtps.GapFlagFilteredCount != 0x04 {
+		t.Fatalf("GapFlagFilteredCount = %#02x, want 0x04", rtps.GapFlagFilteredCount)
+	}
+}
+
+// nackFragBody builds a minimal NACK_FRAG body with one bitmap word.
+func nackFragBody(writerSN uint64, base, numBits uint32) []byte {
+	body := make([]byte, 0, 32)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var sn [8]byte
+	binary.LittleEndian.PutUint32(sn[0:4], uint32(writerSN>>32))
+	binary.LittleEndian.PutUint32(sn[4:8], uint32(writerSN)) //nolint:gosec // G115: low word truncation is the RTPS layout
+	body = append(body, sn[:]...)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], base)
+	body = append(body, b[:]...)
+	var n [4]byte
+	binary.LittleEndian.PutUint32(n[:], numBits)
+	body = append(body, n[:]...)
+	var w [4]byte
+	binary.LittleEndian.PutUint32(w[:], 0xFFFFFFFF)
+	body = append(body, w[:]...)
+	var c [4]byte
+	binary.LittleEndian.PutUint32(c[:], 1)
+	body = append(body, c[:]...)
+	return body
+}
+
+// TestNackFragTrailingRejects pins exact length like AckNack per 8.3.8.12.
+func TestNackFragTrailingRejects(t *testing.T) {
+	t.Parallel()
+
+	body := nackFragBody(9, 1, 1)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeNackFrag(append(body, 0x00), 0x01, &drops); err == nil {
+		t.Fatalf("nackfrag trailing succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+	// Exact body must accept.
+	var goodDrops rtps.Counter
+	got, err := rtps.DecodeNackFrag(body, 0x01, &goodDrops)
+	if err != nil {
+		t.Fatalf("valid nackfrag: %v", err)
+	}
+	if got.Base != 1 || got.NumBits != 1 || got.WriterSN != 9 {
+		t.Fatalf("nackfrag = %+v, want base 1 bits 1 sn 9", got)
+	}
+}
+
+// TestNackFragOverflowRejects pins base plus bits above uint32 per 8.3.8.12 and 8.3.5.7.
+func TestNackFragOverflowRejects(t *testing.T) {
+	t.Parallel()
+
+	// Base at max uint32 with bits 2 exceeds the 32-bit fragment space.
+	body := nackFragBody(5, 0xFFFFFFFF, 2)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeNackFrag(body, 0x01, &drops); err == nil {
+		t.Fatalf("nackfrag base max plus bits succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+	// The uint64 no-wrap guard mirrors AckNack/Gap: near-max base plus bits drops.
+	wide := nackFragBody(5, 0xFFFFFF00, 255)
+	var wideDrops rtps.Counter
+	if _, err := rtps.DecodeNackFrag(wide, 0x01, &wideDrops); err == nil {
+		t.Fatalf("nackfrag wide range succeeded, want error")
+	}
+	if wideDrops.Count() != 1 {
+		t.Fatalf("wide drops = %d, want 1", wideDrops.Count())
+	}
+}
+
+// heartbeatFragBody builds a 24-byte HEARTBEAT_FRAG body per 8.3.8.7.
+func heartbeatFragBody(writerSN uint64, lastFrag uint32) []byte {
+	body := make([]byte, 0, 24)
+	body = append(body, 0x00, 0x00, 0x00, 0x00)
+	body = append(body, 0x00, 0x01, 0x00, 0xC2)
+	var sn [8]byte
+	binary.LittleEndian.PutUint32(sn[0:4], uint32(writerSN>>32))
+	binary.LittleEndian.PutUint32(sn[4:8], uint32(writerSN)) //nolint:gosec // G115: low word truncation is the RTPS layout
+	body = append(body, sn[:]...)
+	var last [4]byte
+	binary.LittleEndian.PutUint32(last[:], lastFrag)
+	body = append(body, last[:]...)
+	var count [4]byte
+	binary.LittleEndian.PutUint32(count[:], 7)
+	body = append(body, count[:]...)
+	return body
+}
+
+// TestHeartbeatFragRoundTrip pins exact 24-byte layout per 8.3.8.7.
+func TestHeartbeatFragRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	body := heartbeatFragBody(3, 5)
+	if len(body) != 24 {
+		t.Fatalf("heartbeatfrag len = %d, want 24", len(body))
+	}
+	var drops rtps.Counter
+	got, err := rtps.DecodeHeartbeatFrag(body, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.WriterSN != 3 || got.LastFragmentNum != 5 || got.Count != 7 {
+		t.Fatalf("heartbeatfrag = %+v, want sn 3 last 5 count 7", got)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageHeartbeatFrag, Flags: 0x01, Body: body}
+	decoded, err := rtps.DecodeSubmessage(raw, &drops)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if decoded.HeartbeatFrag == nil || decoded.HeartbeatFrag.LastFragmentNum != 5 {
+		t.Fatalf("typed = %+v, want last 5", decoded.HeartbeatFrag)
+	}
+}
+
+// TestHeartbeatFragInvalid pins short, non-positive, zero-last, and trailing per 8.3.8.7.
+func TestHeartbeatFragInvalid(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string][]byte{
+		"short":    heartbeatFragBody(3, 5)[:23],
+		"writer 0": heartbeatFragBody(0, 5),
+		"last 0":   heartbeatFragBody(3, 0),
+		"trailing": append(heartbeatFragBody(3, 5), 0x00),
+	}
+	for name, body := range cases {
+		var drops rtps.Counter
+		if _, err := rtps.DecodeHeartbeatFrag(body, 0x01, &drops); err == nil {
+			t.Fatalf("%s succeeded, want error", name)
+		}
+		if drops.Count() != 1 {
+			t.Fatalf("%s drops = %d, want 1", name, drops.Count())
+		}
+	}
+}
+
+// TestHeartbeatBounds pins first 0 and last below first minus one per 8.3.8.6.3.
+func TestHeartbeatBounds(t *testing.T) {
+	t.Parallel()
+
+	beat := rtps.Heartbeat{ReaderID: rtps.EntityUnknown, WriterID: rtps.EntitySPDPWriter, FirstSequence: 1, LastSequence: 5, Count: 9}
+	if _, err := rtps.DecodeHeartbeat(append([]byte(nil), beat.Encode(true)...), beat.Flags(true, false, false), &rtps.Counter{}); err != nil {
+		t.Fatalf("valid heartbeat: %v", err)
+	}
+	firstZero := rtps.Heartbeat{ReaderID: rtps.EntityUnknown, WriterID: rtps.EntitySPDPWriter, FirstSequence: 0, LastSequence: 5, Count: 1}
+	var d0 rtps.Counter
+	if _, err := rtps.DecodeHeartbeat(firstZero.Encode(true), 0x01, &d0); err == nil {
+		t.Fatalf("first 0 succeeded, want error")
+	}
+	below := rtps.Heartbeat{ReaderID: rtps.EntityUnknown, WriterID: rtps.EntitySPDPWriter, FirstSequence: 5, LastSequence: 3, Count: 1}
+	var d1 rtps.Counter
+	if _, err := rtps.DecodeHeartbeat(below.Encode(true), 0x01, &d1); err == nil {
+		t.Fatalf("last below first minus one succeeded, want error")
+	}
+	// Empty range with first equal to last plus one is valid per 8.3.8.6.3.
+	empty := rtps.Heartbeat{ReaderID: rtps.EntityUnknown, WriterID: rtps.EntitySPDPWriter, FirstSequence: 6, LastSequence: 5, Count: 1}
+	var d2 rtps.Counter
+	if _, err := rtps.DecodeHeartbeat(empty.Encode(true), 0x01, &d2); err != nil {
+		t.Fatalf("first last-plus-one: %v", err)
+	}
+	if d0.Count()+d1.Count() != 2 || d2.Count() != 0 {
+		t.Fatalf("drops = %d %d %d", d0.Count(), d1.Count(), d2.Count())
+	}
+}
+
+// TestDataFragNegatives pins zero and UNKNOWN sequences plus geometry per 8.3.8.3.
+func TestDataFragNegatives(t *testing.T) {
+	t.Parallel()
+
+	zero := validDataFragBody()
+	// Zero the sequence low word: bytes 16..20 hold low word LE (01 00 00 00 -> 00 00 00 00).
+	zeroSeq := append([]byte(nil), zero...)
+	zeroSeq[16] = 0x00
+	zeroSeq[17] = 0x00
+	zeroSeq[18] = 0x00
+	zeroSeq[19] = 0x00
+	var d0 rtps.Counter
+	if _, err := rtps.DecodeDataFrag(zeroSeq, 0x01, &d0); err == nil {
+		t.Fatalf("datafrag seq 0 succeeded, want error")
+	}
+	// UNKNOWN sequence is negative signed: high FFFFFFFF plus low 0 per 8.3.5.4.
+	unknown := append([]byte(nil), zero...)
+	unknown[12] = 0xFF
+	unknown[13] = 0xFF
+	unknown[14] = 0xFF
+	unknown[15] = 0xFF
+	unknown[16] = 0x00
+	unknown[17] = 0x00
+	unknown[18] = 0x00
+	unknown[19] = 0x00
+	var d1 rtps.Counter
+	if _, err := rtps.DecodeDataFrag(unknown, 0x01, &d1); err == nil {
+		t.Fatalf("datafrag unknown succeeded, want error")
+	}
+	// Starting number 0 fails per 8.3.8.3.
+	startZero := append([]byte(nil), zero...)
+	startZero[20] = 0x00
+	startZero[21] = 0x00
+	startZero[22] = 0x00
+	startZero[23] = 0x00
+	var d2 rtps.Counter
+	if _, err := rtps.DecodeDataFrag(startZero, 0x01, &d2); err == nil {
+		t.Fatalf("datafrag start 0 succeeded, want error")
+	}
+	if d0.Count()+d1.Count()+d2.Count() != 3 {
+		t.Fatalf("drops = %d %d %d", d0.Count(), d1.Count(), d2.Count())
+	}
+}
+
+// TestDataNeitherFlag pins bare control tolerance and trailing reject per 8.3.8.2.
+func TestDataNeitherFlag(t *testing.T) {
+	t.Parallel()
+
+	fixed := testData()
+	body, err := fixed.Body(true)
+	if err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	bare := body[:20]
+	var drops rtps.Counter
+	got, err := rtps.DecodeData(bare, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("bare control DATA without D nor K: %v", err)
+	}
+	if got.Payload != nil {
+		t.Fatalf("bare payload = % X, want nil", got.Payload)
+	}
+	trailing := append(append([]byte(nil), bare...), 0xAA)
+	var tDrops rtps.Counter
+	if _, err := rtps.DecodeData(trailing, 0x01, &tDrops); err == nil {
+		t.Fatalf("payload without D nor K succeeded, want error")
+	}
+	if drops.Count()+tDrops.Count() != 1 {
+		t.Fatalf("drops = %d %d", drops.Count(), tDrops.Count())
+	}
+}
+
+// TestDecodeParametersOversize pins maxParamsPerList cap via DATA inline QoS per 8.3.5.9.
+func TestDecodeParametersOversize(t *testing.T) {
+	t.Parallel()
+
+	data := testData()
+	for i := range 1025 {
+		data.InlineQoS = append(data.InlineQoS, rtps.Parameter{ID: uint16(0x1000 + i), Value: []byte{0x01}})
+	}
+	body, err := data.Body(true)
+	if err != nil {
+		t.Fatalf("body 1025 params: %v", err)
+	}
+	flags := uint8(0x01 | rtps.DataFlagDataPresent | rtps.DataFlagInlineQoS)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeData(body, flags, &drops); err == nil {
+		t.Fatalf("1025 params succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// TestInfoDstWidths pins 0 or 12 byte widths per 8.3.8.13.
+func TestInfoDstWidths(t *testing.T) {
+	t.Parallel()
+
+	var drops rtps.Counter
+	absent, err := rtps.DecodeInfoDst(nil, 0x01, &drops)
+	if err != nil || absent.HasPrefix {
+		t.Fatalf("empty = %+v %v, want absent", absent, err)
+	}
+	prefix := [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	good, err := rtps.DecodeInfoDst(prefix[:], 0x01, &drops)
+	if err != nil || !good.HasPrefix || good.Prefix != prefix {
+		t.Fatalf("12-byte = %+v %v", good, err)
+	}
+	for _, n := range []int{1, 5, 11, 13} {
+		var badDrops rtps.Counter
+		if _, err := rtps.DecodeInfoDst(make([]byte, n), 0x01, &badDrops); err == nil {
+			t.Fatalf("len %d succeeded, want error", n)
+		}
+		if badDrops.Count() != 1 {
+			t.Fatalf("len %d drops = %d, want 1", n, badDrops.Count())
+		}
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// TestInfoReplyIP4Widths pins 8 and 16 byte widths plus flags per 8.3.8.11.
+func TestInfoReplyIP4Widths(t *testing.T) {
+	t.Parallel()
+
+	uni := []byte{0x01, 0x00, 0x00, 0x00, 0xF9, 0x45, 0x00, 0x00}
+	var drops rtps.Counter
+	got, err := rtps.DecodeInfoReplyIP4(uni, 0x01, &drops)
+	if err != nil || got.HasMulticast {
+		t.Fatalf("unicast = %+v %v", got, err)
+	}
+	multi := append(append([]byte(nil), uni...), 0x02, 0x00, 0x00, 0x00, 0xEF, 0xFF, 0x00, 0x01)
+	got, err = rtps.DecodeInfoReplyIP4(multi, 0x01|0x02, &drops)
+	if err != nil || !got.HasMulticast {
+		t.Fatalf("multicast = %+v %v", got, err)
+	}
+	var badDrops rtps.Counter
+	if _, err := rtps.DecodeInfoReplyIP4(uni, 0x01|0x02, &badDrops); err == nil {
+		t.Fatalf("8 bytes with multicast flag succeeded, want error")
+	}
+	if _, err := rtps.DecodeInfoReplyIP4(multi, 0x01, &badDrops); err == nil {
+		t.Fatalf("16 bytes without multicast flag succeeded, want error")
+	}
+	if _, err := rtps.DecodeInfoReplyIP4(uni, 0x01|0x08, &badDrops); err == nil {
+		t.Fatalf("reserved flags succeeded, want error")
+	}
+}
+
+// TestInfoReplyWidths pins locator multiple plus flags per 8.3.8.11.
+func TestInfoReplyWidths(t *testing.T) {
+	t.Parallel()
+
+	loc := make([]byte, 24)
+	var drops rtps.Counter
+	got, err := rtps.DecodeInfoReply(loc, 0x01, &drops)
+	if err != nil || len(got.Locators) != 1 {
+		t.Fatalf("one locator = %+v %v", got, err)
+	}
+	empty, err := rtps.DecodeInfoReply(nil, 0x01, &drops)
+	if err != nil || len(empty.Locators) != 0 {
+		t.Fatalf("empty = %+v %v", empty, err)
+	}
+	var badDrops rtps.Counter
+	if _, err := rtps.DecodeInfoReply(make([]byte, 25), 0x01, &badDrops); err == nil {
+		t.Fatalf("25 bytes succeeded, want error")
+	}
+	if _, err := rtps.DecodeInfoReply(loc, 0x01|0x08, &badDrops); err == nil {
+		t.Fatalf("reserved flags succeeded, want error")
+	}
+}
+
+// TestClassifyUnicastInfoDst pins absent, match, mismatch, and malformed per 8.3.8.13.
+func TestClassifyUnicastInfoDst(t *testing.T) {
+	t.Parallel()
+
+	local := testPrefix()
+	plain, err := rtps.EncodeMessage(rtps.DefaultHeader(testPrefix()), checksumTestSubs())
+	if err != nil {
+		t.Fatalf("encode plain: %v", err)
+	}
+	if got := rtps.ClassifyUnicastInfoDst(plain, local); got != rtps.InfoDstAbsent {
+		t.Fatalf("plain = %d, want absent", got)
+	}
+	zeroRaw := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: 0x01, Body: nil}
+	zeroMsg, err := rtps.EncodeMessage(rtps.DefaultHeader(testPrefix()), []rtps.RawSubmessage{zeroRaw})
+	if err != nil {
+		t.Fatalf("encode zero: %v", err)
+	}
+	if got := rtps.ClassifyUnicastInfoDst(zeroMsg, local); got != rtps.InfoDstAbsent {
+		t.Fatalf("zero-length = %d, want absent", got)
+	}
+	matchRaw := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: 0x01, Body: append([]byte(nil), local[:]...)}
+	matchMsg, err := rtps.EncodeMessage(rtps.DefaultHeader(testPrefix()), []rtps.RawSubmessage{matchRaw})
+	if err != nil {
+		t.Fatalf("encode match: %v", err)
+	}
+	if got := rtps.ClassifyUnicastInfoDst(matchMsg, local); got != rtps.InfoDstAbsent {
+		t.Fatalf("match = %d, want absent", got)
+	}
+	var other [12]byte
+	other[0] = 0xFF
+	mismatchRaw := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: 0x01, Body: append([]byte(nil), other[:]...)}
+	mismatchMsg, err := rtps.EncodeMessage(rtps.DefaultHeader(testPrefix()), []rtps.RawSubmessage{mismatchRaw})
+	if err != nil {
+		t.Fatalf("encode mismatch: %v", err)
+	}
+	if got := rtps.ClassifyUnicastInfoDst(mismatchMsg, local); got != rtps.InfoDstMismatch {
+		t.Fatalf("mismatch = %d, want mismatch", got)
+	}
+	malformedRaw := rtps.RawSubmessage{ID: rtps.SubmessageInfoDst, Flags: 0x01, Body: []byte{0x01, 0x02, 0x03}}
+	malformedMsg, err := rtps.EncodeMessage(rtps.DefaultHeader(testPrefix()), []rtps.RawSubmessage{malformedRaw})
+	if err != nil {
+		t.Fatalf("encode malformed: %v", err)
+	}
+	if got := rtps.ClassifyUnicastInfoDst(malformedMsg, local); got != rtps.InfoDstMalformed {
+		t.Fatalf("malformed = %d, want malformed", got)
+	}
+	if got := rtps.ClassifyUnicastInfoDst([]byte{0x00, 0x01}, local); got != rtps.InfoDstMalformed {
+		t.Fatalf("undecodable = %d, want malformed", got)
+	}
+}
+
+// TestKnownInvalidCallerDropsRest documents rule 6 per 8.3.4.1.
+func TestKnownInvalidCallerDropsRest(t *testing.T) {
+	t.Parallel()
+
+	// A known but invalid submessage fails loudly; the caller must drop the
+	// rest of the message per DDSI-RTPS 2.5 8.3.4.1 rule 6 instead of
+	// continuing to later submessages.
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageHeartbeat, Flags: 0x01, Body: []byte{0x01}}
+	var drops rtps.Counter
+	if _, err := rtps.DecodeSubmessage(raw, &drops); err == nil {
+		t.Fatalf("known-invalid heartbeat succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// TestInfoSrcVendorFull pins the full 2-byte vendor id per 8.3.8.10.
+func TestInfoSrcVendorFull(t *testing.T) {
+	t.Parallel()
+
+	// Both vendor bytes ride verbatim; a single-byte truncation would lose 0xCD.
+	// TODO: backend_test.go also decodes INFO_SRC and is owned elsewhere; keep its
+	// expectations on [2]byte vendor in sync without editing it here.
+	src := rtps.InfoSrc{Major: 2, Minor: 5, Vendor: [2]byte{0xAB, 0xCD}}
+	body := src.Encode()
+	if len(body) != 5 || body[3] != 0xAB || body[4] != 0xCD {
+		t.Fatalf("info_src bytes = % X, want vendor AB CD", body)
+	}
+	var drops rtps.Counter
+	back, err := rtps.DecodeInfoSrc(body, 0x01, &drops)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if back.Vendor != src.Vendor {
+		t.Fatalf("vendor = % X, want AB CD", back.Vendor)
 	}
 }

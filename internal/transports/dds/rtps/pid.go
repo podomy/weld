@@ -142,7 +142,7 @@ func EncodeParams(params []Param) ([]byte, error) {
 	out := make([]byte, 0, len(params)*8+4)
 	for i := range params {
 		if len(params[i].Value) > maxSubmessageBody {
-			return nil, fmt.Errorf("rtps: param %#04x value %d above %d", params[i].ID, len(params[i].Value), maxSubmessageBody)
+			return nil, fmt.Errorf("rtps: param %#04x value %d above %d (9.4.2.11)", params[i].ID, len(params[i].Value), maxSubmessageBody)
 		}
 		out = appendParamEntry(out, params[i].ID, params[i].Value, littleEndian)
 	}
@@ -163,17 +163,28 @@ func DecodeParams(b []byte) ([]Param, error) {
 		return nil, err
 	}
 	if consumed != len(b) {
-		return nil, fmt.Errorf("rtps: trailing %d bytes after sentinel: %w", len(b)-consumed, ErrInvalidParam)
+		return nil, fmt.Errorf("rtps: trailing %d bytes after sentinel (9.4.2.11): %w", len(b)-consumed, ErrInvalidParam)
 	}
 	return out, nil
 }
 
-// EncodeIPv4Locator renders a 24 byte locator: int32 kind little endian
-// where 1 selects UDPv4, uint32 port little endian, then 16 bytes with
-// 12 zero plus 4 IPv4 bytes in network order. A nil or non IPv4 address
-// encodes as 4 zero bytes; the kind and port are still stored.
+// EncodeIPv4Locator renders a 24 byte locator in little endian order for
+// backward compatibility: int32 kind where 1 selects UDPv4, uint32 port,
+// then 16 bytes with 12 zero plus 4 IPv4 bytes in network order. A nil
+// or non IPv4 address encodes as 4 zero bytes; the kind and port are
+// still stored. Kind and port use the encapsulation endianness per
+// DDSI-RTPS 2.5 9.4.2.11; see EncodeIPv4LocatorEndian for an explicit
+// order.
 func EncodeIPv4Locator(kind int32, port uint32, ip net.IP) []byte {
-	const littleEndian = true
+	return EncodeIPv4LocatorEndian(kind, port, ip, true)
+}
+
+// EncodeIPv4LocatorEndian renders a 24 byte locator in the given order
+// per DDSI-RTPS 2.5 9.4.2.11. Kind and port follow the encapsulation
+// endianness selected by flags; the IPv4 tail stays in network order and
+// is never byte swapped. A nil or non IPv4 address encodes as 4 zero
+// bytes.
+func EncodeIPv4LocatorEndian(kind int32, port uint32, ip net.IP, littleEndian bool) []byte {
 	out := make([]byte, locatorSize)
 	putUint32(out[locatorKindOff:locatorKindOff+wordSize], uint32(kind), littleEndian) //nolint:gosec // G115: intentional two's complement reinterpret for the wire
 	putUint32(out[locatorPortOff:locatorPortOff+wordSize], port, littleEndian)
@@ -185,15 +196,23 @@ func EncodeIPv4Locator(kind int32, port uint32, ip net.IP) []byte {
 	return out
 }
 
-// DecodeIPv4Locator parses the inverse of EncodeIPv4Locator: 24 bytes
-// into kind, port, and IPv4 address. The first 12 address bytes are
-// ignored for tolerance; the last 4 bytes are the IPv4 address in
-// network order. Only the length is validated.
+// DecodeIPv4Locator parses the inverse of EncodeIPv4Locator in little
+// endian order for backward compatibility: 24 bytes into kind, port,
+// and IPv4 address. The first 12 address bytes are ignored for
+// tolerance; the last 4 bytes are the IPv4 address in network order.
+// Only the length is validated. See DecodeIPv4LocatorEndian for an
+// explicit order per 9.4.2.11.
 func DecodeIPv4Locator(b []byte) (int32, uint32, net.IP, error) {
+	return DecodeIPv4LocatorEndian(b, true)
+}
+
+// DecodeIPv4LocatorEndian parses 24 bytes in the given order per
+// DDSI-RTPS 2.5 9.4.2.11. Kind and port follow the encapsulation
+// endianness; the IPv4 tail stays in network order.
+func DecodeIPv4LocatorEndian(b []byte, littleEndian bool) (int32, uint32, net.IP, error) {
 	if len(b) != locatorSize {
-		return 0, 0, nil, fmt.Errorf("rtps: locator need %d have %d: %w", locatorSize, len(b), ErrInvalidParam)
+		return 0, 0, nil, fmt.Errorf("rtps: locator need %d have %d (9.4.2.11): %w", locatorSize, len(b), ErrInvalidParam)
 	}
-	const littleEndian = true
 	kind := int32(uint32Value(b[locatorKindOff:locatorKindOff+wordSize], littleEndian)) //nolint:gosec // G115: intentional two's complement reinterpret from the wire
 	port := uint32Value(b[locatorPortOff:locatorPortOff+wordSize], littleEndian)
 	addr := make(net.IP, ipv4TailSize)
@@ -201,13 +220,24 @@ func DecodeIPv4Locator(b []byte) (int32, uint32, net.IP, error) {
 	return kind, port, addr, nil
 }
 
-// DecodeLocator parses any 24 byte locator into kind, port, and IP.
-// It accepts the EncodeIPv4Locator layout and ignores the first 12
-// address bytes for tolerance with future address families.
+// DecodeLocator parses any 24 byte locator in little endian order for
+// backward compatibility. It accepts the EncodeIPv4Locator layout and
+// ignores the first 12 address bytes for tolerance with future address
+// families. See DecodeLocatorEndian for an explicit order per 9.4.2.11.
 func DecodeLocator(b []byte) (int32, uint32, net.IP, error) {
 	kind, port, ip, err := DecodeIPv4Locator(b)
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("rtps: decode locator: %w", err)
+		return 0, 0, nil, fmt.Errorf("rtps: decode locator (9.4.2.11): %w", err)
+	}
+	return kind, port, ip, nil
+}
+
+// DecodeLocatorEndian parses any 24 byte locator in the given order per
+// DDSI-RTPS 2.5 9.4.2.11.
+func DecodeLocatorEndian(b []byte, littleEndian bool) (int32, uint32, net.IP, error) {
+	kind, port, ip, err := DecodeIPv4LocatorEndian(b, littleEndian)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("rtps: decode locator (9.4.2.11): %w", err)
 	}
 	return kind, port, ip, nil
 }
@@ -216,7 +246,7 @@ func DecodeLocator(b []byte) (int32, uint32, net.IP, error) {
 func copyPIDValue(body []byte, off, length int, id uint16) ([]byte, int, error) {
 	value, next, err := copyParamBytes(body, off, length)
 	if err != nil {
-		return nil, 0, fmt.Errorf("rtps: param %#04x: %w: %w", id, err, ErrInvalidParam)
+		return nil, 0, fmt.Errorf("rtps: param %#04x (9.4.2.11): %w: %w", id, err, ErrInvalidParam)
 	}
 	return value, next, nil
 }
@@ -246,7 +276,7 @@ func DecodeParamsEndian(b []byte, littleEndian bool) ([]Param, int, error) {
 	off := 0
 	for {
 		if len(out) >= maxParamsPerList {
-			return nil, 0, fmt.Errorf("rtps: param count above %d: %w", maxParamsPerList, ErrInvalidParam)
+			return nil, 0, fmt.Errorf("rtps: param count above %d (9.4.2.11): %w", maxParamsPerList, ErrInvalidParam)
 		}
 		done, nextOut, nextOff, err := decodeParamStep(b, off, littleEndian, out)
 		if err != nil {
@@ -267,7 +297,7 @@ func DecodeParamsEndian(b []byte, littleEndian bool) ([]Param, int, error) {
 func decodeParamStep(b []byte, off int, littleEndian bool, out []Param) (bool, []Param, int, error) {
 	id, length, ok := paramHeaderAt(b, off, littleEndian)
 	if !ok {
-		return false, out, 0, fmt.Errorf("rtps: param header need %d have %d: %w", parameterHeaderSize, len(b)-off, ErrInvalidParam)
+		return false, out, 0, fmt.Errorf("rtps: param header need %d have %d (9.4.2.11): %w", parameterHeaderSize, len(b)-off, ErrInvalidParam)
 	}
 	off += parameterHeaderSize
 	if id == PIDSentinel {

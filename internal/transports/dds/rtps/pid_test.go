@@ -729,3 +729,85 @@ func TestDecodeParamsManualAndBuiltinGolden(t *testing.T) {
 		t.Fatalf("type object decode = %+v", back)
 	}
 }
+
+// TestLocatorEndianBE pins kind and port byte order per 9.4.2.11 with IP tail fixed.
+func TestLocatorEndianBE(t *testing.T) {
+	t.Parallel()
+
+	ip := net.ParseIP("192.168.0.162")
+	le := rtps.EncodeIPv4LocatorEndian(rtps.LocatorKindUDPv4, 17913, ip, true)
+	be := rtps.EncodeIPv4LocatorEndian(rtps.LocatorKindUDPv4, 17913, ip, false)
+	checkLocatorEndianBytes(t, le, be)
+	checkLocatorEndianDecode(t, be, ip)
+}
+
+// checkLocatorEndianBytes pins LE versus BE wire bytes with fixed IP tail.
+func checkLocatorEndianBytes(t *testing.T, le, be []byte) {
+	t.Helper()
+
+	if len(le) != 24 || len(be) != 24 {
+		t.Fatalf("lens = %d %d, want 24 24", len(le), len(be))
+	}
+	// Kind 1 LE is 01 00 00 00; BE is 00 00 00 01. Port 17913 (0x45F9) swaps.
+	if !bytes.Equal(le[0:4], []byte{0x01, 0x00, 0x00, 0x00}) {
+		t.Fatalf("LE kind = % X, want 01 00 00 00", le[0:4])
+	}
+	if !bytes.Equal(be[0:4], []byte{0x00, 0x00, 0x00, 0x01}) {
+		t.Fatalf("BE kind = % X, want 00 00 00 01", be[0:4])
+	}
+	if !bytes.Equal(le[4:8], []byte{0xF9, 0x45, 0x00, 0x00}) {
+		t.Fatalf("LE port = % X, want F9 45 00 00", le[4:8])
+	}
+	if !bytes.Equal(be[4:8], []byte{0x00, 0x00, 0x45, 0xF9}) {
+		t.Fatalf("BE port = % X, want 00 00 45 F9", be[4:8])
+	}
+	// IPv4 tail stays in network order in both orders per 9.4.2.11.
+	if !bytes.Equal(le[20:24], be[20:24]) {
+		t.Fatalf("tails differ % X vs % X", le[20:24], be[20:24])
+	}
+}
+
+// checkLocatorEndianDecode pins BE round trip plus order sensitivity.
+func checkLocatorEndianDecode(t *testing.T, be []byte, ip net.IP) {
+	t.Helper()
+
+	kind, port, addr, err := rtps.DecodeIPv4LocatorEndian(be, false)
+	if err != nil {
+		t.Fatalf("decode BE: %v", err)
+	}
+	if kind != rtps.LocatorKindUDPv4 || port != 17913 || !addr.Equal(ip) {
+		t.Fatalf("BE decode = %d %d %v", kind, port, addr)
+	}
+	kind, port, addr, err = rtps.DecodeLocatorEndian(be, false)
+	if err != nil {
+		t.Fatalf("decode locator BE: %v", err)
+	}
+	if kind != rtps.LocatorKindUDPv4 || port != 17913 || !addr.Equal(ip) {
+		t.Fatalf("locator BE = %d %d %v", kind, port, addr)
+	}
+	// BE bytes misread as LE must differ in kind or port, proving order matters.
+	misKind, misPort, _, err := rtps.DecodeIPv4LocatorEndian(be, true)
+	if err != nil {
+		t.Fatalf("misread: %v", err)
+	}
+	if misKind == rtps.LocatorKindUDPv4 && misPort == 17913 {
+		t.Fatalf("LE misread of BE matches, want difference")
+	}
+}
+
+// TestDecodeParamsOversize pins maxParamsPerList cap fail-closed per 9.4.2.11.
+func TestDecodeParamsOversize(t *testing.T) {
+	t.Parallel()
+
+	params := make([]rtps.Param, 0, 1025)
+	for i := range 1025 {
+		params = append(params, rtps.Param{ID: uint16(0x1000 + i), Value: []byte{0x01}})
+	}
+	raw, err := rtps.EncodeParams(params)
+	if err != nil {
+		t.Fatalf("encode 1025: %v", err)
+	}
+	if _, err := rtps.DecodeParams(raw); err == nil {
+		t.Fatalf("1025 params succeeded, want error")
+	}
+}

@@ -9,7 +9,8 @@
 // arguments, and fails loudly with RMW_RET_ERROR, RMW_RET_INVALID_ARGUMENT,
 // RMW_RET_INCORRECT_RMW_IMPLEMENTATION, or RMW_RET_UNSUPPORTED through
 // rmw_reset_error plus RCUTILS_SET_ERROR_MSG instead of crashing.
-// Loans are owned heap buffers, never zero copy shared memory.
+// Loans are single-owner heap buffers: zero copy in process by pointer,
+// copying over the wire by serialization.
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -91,6 +92,33 @@
 #if __has_include("rmw/event_callback_type.h")
 #include "rmw/event_callback_type.h"
 #endif
+#if __has_include("rmw/events_statuses/liveliness_changed.h")
+#include "rmw/events_statuses/liveliness_changed.h"
+#define WELD_HAVE_LIVELINESS_CHANGED 1
+#endif
+#if __has_include("rmw/events_statuses/liveliness_lost.h")
+#include "rmw/events_statuses/liveliness_lost.h"
+#define WELD_HAVE_LIVELINESS_LOST 1
+#endif
+#if __has_include("rmw/events_statuses/message_lost.h")
+#include "rmw/events_statuses/message_lost.h"
+#define WELD_HAVE_MESSAGE_LOST 1
+#endif
+#if __has_include("rmw/events_statuses/offered_deadline_missed.h")
+#include "rmw/events_statuses/offered_deadline_missed.h"
+#define WELD_HAVE_OFFERED_DEADLINE 1
+#endif
+#if __has_include("rmw/events_statuses/requested_deadline_missed.h")
+#include "rmw/events_statuses/requested_deadline_missed.h"
+#define WELD_HAVE_REQUESTED_DEADLINE 1
+#endif
+#if __has_include("rmw/events_statuses/incompatible_qos.h")
+#include "rmw/events_statuses/incompatible_qos.h"
+#define WELD_HAVE_INCOMPAT_QOS 1
+#endif
+#if __has_include("rmw/qos_policy_kind.h")
+#include "rmw/qos_policy_kind.h"
+#endif
 #if __has_include("rmw/time.h")
 #include "rmw/time.h"
 #endif
@@ -123,6 +151,32 @@ extern int weld_ffi_sub_create(
 extern int weld_ffi_sub_destroy(long long handle);
 extern int weld_ffi_sub_take_poll(
   long long handle, char * buf, int buflen, int * out_n);
+
+// In-process loan handoff for zero-copy delivery (see the loan family).
+//
+// loan_addr carries the opaque C message pointer and members_addr carries
+// the opaque C introspection members pointer; the Go bridge never
+// dereferences either and moves only the handle values. Both stay weak so
+// an older Go library without the loan queue falls back to the copying
+// wire path instead of crashing: a NULL address means no loan support.
+extern int weld_ffi_loan_publish(
+  long long handle, unsigned long long loan_addr,
+  unsigned long long members_addr) __attribute__((weak));
+extern int weld_ffi_loan_take_poll(
+  long long handle, unsigned long long * loan_addr_out,
+  unsigned long long * members_addr_out) __attribute__((weak));
+
+// Take attribution side channel from the Go core (weld_ffi_sub_take_info).
+//
+// The poll ABI stays frozen, so the sequence plus writer GID ride beside
+// it: the C take path polls this right after a successful take_poll for
+// the same handle. out_seq receives the per-subscription receive
+// sequence starting at 1; gid_buf receives the 16 byte writer GID
+// without a terminator. It stays weak so an older Go library degrades to
+// unsupported sequences plus a zero GID instead of crashing.
+extern int weld_ffi_sub_take_info(
+  long long handle, unsigned long long * out_seq, char * gid_buf, int gid_len)
+  __attribute__((weak));
 
 // Optional type annotation for graph interop.
 //
@@ -191,6 +245,11 @@ struct weld_pub_data
   char * node_name;
   size_t domain;
   rmw_qos_profile_t qos;
+  // Local incompatible QoS count ever observed at match time against
+  // same-topic subscriptions. Bumped at endpoint creation on both sides
+  // of a mismatched pair via rmw_qos_profile_check_compatible; wire
+  // mismatches add through the FFI incompat totals at take time.
+  size_t incompat_total;
 };
 
 struct weld_sub_data
@@ -200,6 +259,10 @@ struct weld_sub_data
   char * topic;
   size_t domain;
   rmw_qos_profile_t qos;
+  // Local incompatible QoS count ever observed at match time, mirroring
+  // the publisher side. Bumped at creation on both sides of a mismatched
+  // local pair; wire mismatches add through FFI totals at take time.
+  size_t incompat_total;
   rmw_event_callback_t on_new_callback;
   const void * on_new_user_data;
   // Callback dispatch thread started on the first non-NULL on-new
@@ -222,10 +285,14 @@ struct weld_sub_data
   size_t filter_nparams;
   // Wait stash holds one wire sample consumed by rmw_wait so the next
   // rmw_take returns it instead of polling again. Wait and take run on
-  // the same thread in rcl executors, so no lock is needed.
+  // the same thread in rcl executors, so no lock is needed. wait_seq
+  // plus wait_gid park the attribution observed at poll time so the
+  // consuming take fills the same info.
   uint8_t * wait_buf;
   size_t wait_len;
   bool has_wait;
+  unsigned long long wait_seq;
+  uint8_t wait_gid[16];
   // Dynamic type identity resolved at create time from the runtime
   // type description (no static introspection handle). The slash form
   // name plus RIHS hash stay alive for the subscription lifetime and
@@ -447,12 +514,46 @@ static void weld_report_dynamic_sub_type(
 }
 #endif
 
+// Read the take attribution for the last delivered sample.
+//
+// The C take path calls this right after a successful take poll for the
+// same handle. Returns 0 with the sequence plus GID, or -1 with both
+// zeroed when the side channel is missing, fails, or reports no take
+// yet. A zero sequence means unsupported to the fill below.
+static int weld_take_info(
+  long long handle, unsigned long long * seq_out, uint8_t gid_out[16])
+{
+  unsigned long long seq = 0;
+  int rc = 0;
+  if (seq_out == NULL || gid_out == NULL) {
+    return -1;
+  }
+  *seq_out = 0;
+  (void)memset(gid_out, 0, 16);
+  if (weld_ffi_sub_take_info == NULL) {
+    return -1;
+  }
+  rc = weld_ffi_sub_take_info(handle, &seq, (char *)gid_out, 16);
+  if (rc != 0 || seq == 0) {
+    *seq_out = 0;
+    (void)memset(gid_out, 0, 16);
+    return -1;
+  }
+  *seq_out = seq;
+  return 0;
+}
+
 // Poll one payload without blocking.
 //
 // Returns 0 with malloc owned bytes on data, 1 when no data is ready, and
 // -1 with the rmw error set on failure. A short buffer is grown and
 // retried internally because the FFI layer stashes the oversized sample.
-static int weld_poll_payload(long long handle, uint8_t ** out, size_t * out_len)
+// On success seq_out plus gid_out carry the delivered attribution when
+// non-NULL (zeroed when the side channel is missing); they are untouched
+// on empty or failure.
+static int weld_poll_payload(
+  long long handle, uint8_t ** out, size_t * out_len,
+  unsigned long long * seq_out, uint8_t gid_out[16])
 {
   size_t cap = 64 * 1024;
   const size_t cap_max = (size_t)(32 << 20);
@@ -508,7 +609,25 @@ static int weld_poll_payload(long long handle, uint8_t ** out, size_t * out_len)
       free(buf);
       *out = NULL;
       *out_len = 0;
+      if (seq_out != NULL) {
+        uint8_t gid[16];
+        unsigned long long seq = 0;
+        (void)weld_take_info(handle, &seq, gid);
+        *seq_out = seq;
+        if (gid_out != NULL) {
+          (void)memcpy(gid_out, gid, sizeof(gid));
+        }
+      }
       return 0;
+    }
+    if (seq_out != NULL) {
+      uint8_t gid[16];
+      unsigned long long seq = 0;
+      (void)weld_take_info(handle, &seq, gid);
+      *seq_out = seq;
+      if (gid_out != NULL) {
+        (void)memcpy(gid_out, gid, sizeof(gid));
+      }
     }
     *out = buf;
     *out_len = (size_t)n;
@@ -519,9 +638,12 @@ static int weld_poll_payload(long long handle, uint8_t ** out, size_t * out_len)
 // Take a stashed wait sample if present.
 //
 // Wait consumes one sample to prove readiness and parks it here so the
-// next take returns the same bytes instead of polling again. Returns
-// true with malloc owned bytes on hit, false when no stash exists.
-static bool weld_sub_consume_wait(struct weld_sub_data * sd, uint8_t ** out, size_t * out_len)
+// next take returns the same bytes plus the same attribution instead of
+// polling again. Returns true with malloc owned bytes on hit, false
+// when no stash exists.
+static bool weld_sub_consume_wait(
+  struct weld_sub_data * sd, uint8_t ** out, size_t * out_len,
+  unsigned long long * seq_out, uint8_t gid_out[16])
 {
   if (sd == NULL || out == NULL || out_len == NULL) {
     return false;
@@ -531,9 +653,17 @@ static bool weld_sub_consume_wait(struct weld_sub_data * sd, uint8_t ** out, siz
   }
   *out = sd->wait_buf;
   *out_len = sd->wait_len;
+  if (seq_out != NULL) {
+    *seq_out = sd->wait_seq;
+  }
+  if (gid_out != NULL) {
+    (void)memcpy(gid_out, sd->wait_gid, sizeof(sd->wait_gid));
+  }
   sd->wait_buf = NULL;
   sd->wait_len = 0;
   sd->has_wait = false;
+  sd->wait_seq = 0;
+  (void)memset(sd->wait_gid, 0, sizeof(sd->wait_gid));
   return true;
 }
 
@@ -544,28 +674,34 @@ static bool weld_sub_consume_wait(struct weld_sub_data * sd, uint8_t ** out, siz
 // when no stash exists, keeping wait plus take paired. Returns 0 with
 // malloc owned bytes on data (zero bytes allowed as empty sample),
 // 1 when no data is ready, and -1 with the rmw error set on failure.
-static int weld_take_wire(struct weld_sub_data * sd, uint8_t ** out, size_t * out_len)
+// On success seq_out plus gid_out carry the delivered attribution when
+// non-NULL.
+static int weld_take_wire(
+  struct weld_sub_data * sd, uint8_t ** out, size_t * out_len,
+  unsigned long long * seq_out, uint8_t gid_out[16])
 {
   if (sd == NULL || out == NULL || out_len == NULL) {
     return -1;
   }
-  if (weld_sub_consume_wait(sd, out, out_len)) {
+  if (weld_sub_consume_wait(sd, out, out_len, seq_out, gid_out)) {
     return 0;
   }
-  return weld_poll_payload(sd->handle, out, out_len);
+  return weld_poll_payload(sd->handle, out, out_len, seq_out, gid_out);
 }
 
 // Poll one subscription for wait readiness without losing data.
 //
 // A stash hit reports ready immediately. Otherwise one non-blocking
-// poll runs; data is parked in the subscription stash and reports
-// ready, empty reports not ready, and poll errors report not ready so
-// wait keeps polling until the budget expires and take can report the
-// error later.
+// poll runs; data plus its attribution is parked in the subscription
+// stash and reports ready, empty reports not ready, and poll errors
+// report not ready so wait keeps polling until the budget expires and
+// take can report the error later.
 static bool weld_sub_wait_poll(struct weld_sub_data * sd)
 {
   uint8_t * wire = NULL;
   size_t wire_len = 0;
+  unsigned long long seq = 0;
+  uint8_t gid[16];
   int empty = 0;
   if (sd == NULL) {
     return false;
@@ -573,7 +709,8 @@ static bool weld_sub_wait_poll(struct weld_sub_data * sd)
   if (sd->has_wait) {
     return true;
   }
-  empty = weld_poll_payload(sd->handle, &wire, &wire_len);
+  (void)memset(gid, 0, sizeof(gid));
+  empty = weld_poll_payload(sd->handle, &wire, &wire_len, &seq, gid);
   if (empty != 0) {
     return false;
   }
@@ -582,6 +719,8 @@ static bool weld_sub_wait_poll(struct weld_sub_data * sd)
   sd->wait_buf = wire;
   sd->wait_len = wire_len;
   sd->has_wait = true;
+  sd->wait_seq = seq;
+  (void)memcpy(sd->wait_gid, gid, sizeof(sd->wait_gid));
   return true;
 }
 
@@ -799,26 +938,47 @@ static void weld_ep_register(
   int kind, const char * node_name, const char * node_ns,
   size_t domain, const void * data);
 static void weld_ep_unregister(const void * data);
+// Snapshot helpers for match-time incompat counting, defined beside the
+// registry. The scan compares the new endpoint QoS against existing
+// opposite endpoints and bumps both sides on mismatch.
+struct weld_ep_snap;
+static size_t weld_incompat_scan(
+  int new_kind, const rmw_qos_profile_t * new_qos, const char * topic,
+  size_t domain);
+static rmw_ret_t weld_ep_snapshot(
+  const char * name, int kind, size_t domain, bool use_domain,
+  struct weld_ep_snap ** out_items, size_t * out_n);
+static void weld_ep_snapshot_fini(struct weld_ep_snap * items, size_t n);
 
 // Liveliness generation: a process-wide monotonic counter. Repeating a
 // generation with the same alive value is idempotent; any other reuse
 // is stale, so every assert consumes a fresh value.
 static _Atomic unsigned long long g_weld_liveliness_gen = 1;
 
-// Loan family: owned heap buffers handed out as loans, never zero copy.
+// Loan family: single-owner in-process zero copy with a copying wire
+// fallback. True cross-language shared memory would need an shm arena,
+// which is out of scope, so zero copy is kept where the architecture
+// allows it: same-process pub to sub via the bridge without the wire.
 //
-// The transport copies bytes at ingress, so no middleware loan is ever
-// shared. Borrow allocates plus inits a message and records it per
-// publisher, publish encodes plus publishes the buffer then releases the
-// record, take pulls one wire sample (wait stash first via
-// weld_take_wire) plus decodes it into a fresh buffer recorded per
-// subscription, and return releases the buffer. Publishing or returning
-// a foreign or stale pointer fails loudly instead of freeing wild
-// memory. Released buffers are fini plus freed, so strings and sequences
-// inside do not leak. Callers must publish or return every loan before
-// destroying the endpoint; entries for a destroyed endpoint are never
-// reclaimed. Loans are single owner and not thread safe for concurrent
-// use of the same buffer.
+// Borrow allocates plus inits a message and records it per publisher.
+// Publish encodes plus publishes the wire bytes first (fan out to every
+// matched subscription, copying), then enqueues the loaned buffer by
+// pointer for one zero-copy handoff; the first loaned take dequeues the
+// same pointer with no encode, decode, or payload copy. Take prefers the
+// queued handle and falls back to pulling one wire sample (wait stash
+// first via weld_take_wire) plus decoding it into a fresh buffer, which
+// copies. Return releases the buffer. Publishing or returning a foreign
+// or stale pointer fails loudly instead of freeing wild memory. Released
+// buffers are fini plus freed, so strings and sequences inside do not
+// leak. The queued handle is freed exactly once by its taker's return;
+// a second return fails because the record is already unlinked. Callers
+// must publish or return every loan before destroying the endpoint;
+// entries for a destroyed endpoint are never reclaimed. Loans are single
+// owner and not thread safe for concurrent use of the same buffer. Do not
+// mix loaned and regular takes on one subscription for one loaned
+// publish: the loaned take discards its own wire duplicate, but a regular
+// take first leaves the queued handle for a later loaned take to consume
+// as a second delivery.
 
 struct weld_loan_entry
 {
@@ -919,13 +1079,18 @@ static void weld_drop_add(void)
   (void)pthread_mutex_unlock(&g_weld_loan_mutex);
 }
 
-// Fill take info with a local receive stamp for both timestamps.
+// Fill take info with a local receive stamp plus delivered attribution.
 //
-// The FFI layer carries no source timestamp or sequence, so the source
-// stamp reports the local receive time (never 0) while sequences stay
-// unsupported. The publisher GID stays zeroed: takes carry no writer
-// identity, so no endpoint GID can be attributed to the sample.
-static void weld_fill_take_info(rmw_message_info_t * message_info)
+// The source stamp reports the local receive time (never 0) while the
+// sequence is the per-subscription receive count from the Go core with
+// intra-process equal to network because the bridge is a single
+// transport. A zero sequence means the core predates attribution and
+// both sequences stay unsupported. The GID is the publishing writer
+// identity, or zeroed when the take carried none (wire takes, old
+// core, or a NULL gid).
+static void weld_fill_take_info(
+  rmw_message_info_t * message_info, unsigned long long seq,
+  const uint8_t gid[16])
 {
   struct timespec now;
   uint64_t now_ns = 0;
@@ -936,24 +1101,48 @@ static void weld_fill_take_info(rmw_message_info_t * message_info)
   now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
   message_info->source_timestamp = (rmw_time_point_value_t)now_ns;
   message_info->received_timestamp = (rmw_time_point_value_t)now_ns;
-  message_info->publication_sequence_number =
-    RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
-  message_info->reception_sequence_number =
-    RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
+  if (seq == 0 || seq > (unsigned long long)INT64_MAX) {
+    message_info->publication_sequence_number =
+      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
+    message_info->reception_sequence_number =
+      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
+  } else {
+    message_info->publication_sequence_number = (int64_t)seq;
+    message_info->reception_sequence_number = (int64_t)seq;
+  }
   message_info->publisher_gid.implementation_identifier =
     kImplementationIdentifier;
-  (void)memset(
-    message_info->publisher_gid.data, 0,
-    sizeof(message_info->publisher_gid.data));
+  if (gid == NULL) {
+    (void)memset(
+      message_info->publisher_gid.data, 0,
+      sizeof(message_info->publisher_gid.data));
+  } else {
+    size_t copy_len = sizeof(message_info->publisher_gid.data);
+    if (copy_len > 16) {
+      copy_len = 16;
+    }
+    (void)memcpy(message_info->publisher_gid.data, gid, copy_len);
+    if (copy_len < sizeof(message_info->publisher_gid.data)) {
+      (void)memset(
+        message_info->publisher_gid.data + copy_len, 0,
+        sizeof(message_info->publisher_gid.data) - copy_len);
+    }
+  }
   message_info->from_intra_process = false;
 }
 
 // Take plus decode one sample into a fresh owned buffer recorded as a
-// subscription loan. Returns 0 with *message_out owned on data, 1 when
-// no data is ready, and -1 with the rmw error set on failure. Decode
-// failures count as dropped samples for MESSAGE_LOST.
+// subscription loan, with an in-process zero-copy fast path first.
+// Returns 0 with *message_out owned on data, 1 when no data is ready,
+// and -1 with the rmw error set on failure. The fast path dequeues the
+// same buffer pointer enqueued by publish with no encode, decode, or
+// payload copy; the fallback pulls one wire sample (wait stash first via
+// weld_take_wire) plus decodes it into a fresh buffer, which copies.
+// Decode failures count as dropped samples for MESSAGE_LOST. On success
+// seq_out plus gid_out carry the delivered attribution when non-NULL.
 static int weld_take_loaned_wire(
-  const rmw_subscription_t * subscription, void ** message_out)
+  const rmw_subscription_t * subscription, void ** message_out,
+  unsigned long long * seq_out, uint8_t gid_out[16])
 {
   struct weld_sub_data * sd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
@@ -973,6 +1162,45 @@ static int weld_take_loaned_wire(
     RCUTILS_SET_ERROR_MSG("rmw_weld: loaned take no subscription data");
     return -1;
   }
+  if (weld_ffi_loan_take_poll != NULL) {
+    unsigned long long loan_addr = 0;
+    unsigned long long members_addr = 0;
+    int lrc = weld_ffi_loan_take_poll(
+      sd->handle, &loan_addr, &members_addr);
+    if (lrc == 0 && loan_addr != 0 && members_addr != 0) {
+      const rosidl_typesupport_introspection_c__MessageMembers * loan_members =
+        (const rosidl_typesupport_introspection_c__MessageMembers *)
+        (uintptr_t)members_addr;
+      void * loan_buf = (void *)(uintptr_t)loan_addr;
+      uint8_t * dup = NULL;
+      size_t dup_len = 0;
+      if (weld_loan_add(&g_weld_sub_loans, subscription, loan_buf,
+        loan_members) != 0)
+      {
+        loan_members->fini_function(loan_buf);
+        free(loan_buf);
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG("rmw_weld: loaned take no memory");
+        return -1;
+      }
+      if (weld_take_wire(sd, &dup, &dup_len, NULL, NULL) == 0) {
+        free(dup);
+      }
+      if (seq_out != NULL || gid_out != NULL) {
+        uint8_t gid[16];
+        unsigned long long seq = 0;
+        (void)weld_take_info(sd->handle, &seq, gid);
+        if (seq_out != NULL) {
+          *seq_out = seq;
+        }
+        if (gid_out != NULL) {
+          (void)memcpy(gid_out, gid, sizeof(gid));
+        }
+      }
+      *message_out = loan_buf;
+      return 0;
+    }
+  }
   members = weld_resolve_members(sd->type_support);
   if (members == NULL) {
     rmw_reset_error();
@@ -987,7 +1215,7 @@ static int weld_take_loaned_wire(
     RCUTILS_SET_ERROR_MSG("rmw_weld: loaned take type support has no init");
     return -1;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len, seq_out, gid_out);
   if (empty == 1) {
     return 1;
   }
@@ -1030,14 +1258,32 @@ static int weld_take_loaned_wire(
   return 0;
 }
 
-// Event slots keyed by event handle for MESSAGE_LOST state plus
+// Event slots keyed by event handle for per-type baselines plus
 // on-event callbacks. Guarded by g_weld_loan_mutex with the loan lists.
+// Each slot binds one rmw_event_t to its endpoint at init: handle is the
+// FFI pub or sub handle, endpoint points at the live weld_pub_data or
+// weld_sub_data, and is_pub selects the side. Message lost stays global
+// with no endpoint. Baselines mirror the take path so wait peeks without
+// consuming: lost, alive, not-alive, deadline, wire incompat, and local
+// incompat totals last reported. Callback fires on take when new data
+// exists; wait wakes for polling without firing.
 struct weld_event_slot
 {
   const rmw_event_t * handle;
   rmw_event_callback_t callback;
   const void * user_data;
+  rmw_event_type_t event_type;
+  long long endpoint_handle;
+  const void * endpoint;
+  bool is_pub;
   size_t lost_reported;
+  long long alive_reported;
+  long long not_alive_reported;
+  unsigned long long deadline_reported;
+  unsigned long long wire_incompat_reported;
+  size_t local_incompat_reported;
+  long long last_matched;
+  unsigned long long lost_total;
   bool used;
 };
 
@@ -1097,21 +1343,216 @@ static void weld_event_slot_release_locked(const rmw_event_t * handle)
   }
 }
 
-// Report whether a MESSAGE_LOST event has untaken losses without
-// consuming. The caller holds no locks; take_event owns the reported
-// baseline. A full slot table reports not ready so wait keeps polling.
-static bool weld_event_lost_ready(const rmw_event_t * handle)
+// Read the current matched count for a bound endpoint without consuming.
+//
+// Uses the existing matched FFI which sums local same-bridge endpoints
+// with remote SEDP peers. Returns 0 with the count, -1 when the FFI is
+// not linked or the endpoint is gone. Never fails loudly: callers treat
+// unknown as not ready.
+static int weld_event_matched_current(
+  const struct weld_event_slot * slot, long long * out)
+{
+  int n = 0;
+  if (slot == NULL || out == NULL) {
+    return -1;
+  }
+  *out = 0;
+  if (slot->is_pub) {
+    if (weld_ffi_pub_matched_subs == NULL) {
+      return -1;
+    }
+    if (weld_ffi_pub_matched_subs(slot->endpoint_handle, &n) != 0) {
+      return -1;
+    }
+  } else {
+    if (weld_ffi_sub_matched_pubs == NULL) {
+      return -1;
+    }
+    if (weld_ffi_sub_matched_pubs(slot->endpoint_handle, &n) != 0) {
+      return -1;
+    }
+  }
+  if (n < 0) {
+    return -1;
+  }
+  *out = (long long)n;
+  return 0;
+}
+
+// Read the cumulative deadline total for a bound endpoint.
+//
+// Returns 0 with the total, -1 when the FFI is not linked. A zero total
+// means no misses yet, which is a real source (deadline tracked from the
+// stored QoS profile plus take and publish timing in the Go core).
+static int weld_event_deadline_current(
+  const struct weld_event_slot * slot, unsigned long long * out)
+{
+  unsigned long long total = 0;
+  if (slot == NULL || out == NULL) {
+    return -1;
+  }
+  *out = 0;
+  if (slot->is_pub) {
+    if (weld_ffi_pub_offered_deadline_total == NULL) {
+      return -1;
+    }
+    if (weld_ffi_pub_offered_deadline_total(
+        slot->endpoint_handle, &total) != 0)
+    {
+      return -1;
+    }
+  } else {
+    if (weld_ffi_sub_requested_deadline_total == NULL) {
+      return -1;
+    }
+    if (weld_ffi_sub_requested_deadline_total(
+        slot->endpoint_handle, &total) != 0)
+    {
+      return -1;
+    }
+  }
+  *out = total;
+  return 0;
+}
+
+// Read the cumulative wire incompat total for a bound endpoint.
+//
+// Returns 0 with the monotonic ever-seen wire mismatch count, -1 when
+// the FFI is not linked. Local profile mismatches counted at creation
+// add separately from endpoint state.
+static int weld_event_wire_incompat_current(
+  const struct weld_event_slot * slot, unsigned long long * out)
+{
+  unsigned long long total = 0;
+  if (slot == NULL || out == NULL) {
+    return -1;
+  }
+  *out = 0;
+  if (slot->is_pub) {
+    if (weld_ffi_pub_incompatible_total == NULL) {
+      return -1;
+    }
+    if (weld_ffi_pub_incompatible_total(
+        slot->endpoint_handle, &total) != 0)
+    {
+      return -1;
+    }
+  } else {
+    if (weld_ffi_sub_incompatible_total == NULL) {
+      return -1;
+    }
+    if (weld_ffi_sub_incompatible_total(
+        slot->endpoint_handle, &total) != 0)
+    {
+      return -1;
+    }
+  }
+  *out = total;
+  return 0;
+}
+
+// Read the local incompat total stored on the endpoint.
+//
+// Local mismatches are counted at creation via
+// rmw_qos_profile_check_compatible on both sides of a mismatched pair.
+// Returns 0 with the count, -1 when the endpoint is gone.
+static int weld_event_local_incompat_current(
+  const struct weld_event_slot * slot, size_t * out)
+{
+  if (slot == NULL || out == NULL || slot->endpoint == NULL) {
+    return -1;
+  }
+  *out = 0;
+  if (slot->is_pub) {
+    const struct weld_pub_data * pd =
+      (const struct weld_pub_data *)slot->endpoint;
+    *out = pd->incompat_total;
+  } else {
+    const struct weld_sub_data * sd =
+      (const struct weld_sub_data *)slot->endpoint;
+    *out = sd->incompat_total;
+  }
+  return 0;
+}
+
+// Report whether one bound event has untaken status without consuming.
+//
+// Switches on the slot event type and compares the live source against
+// the take-owned baseline. Unknown sources and missing FFI report not
+// ready so wait keeps polling instead of firing spuriously.
+static bool weld_event_bound_ready(const rmw_event_t * handle)
 {
   bool ready = false;
+  long long matched = 0;
+  unsigned long long total = 0;
+  unsigned long long wire = 0;
+  size_t local = 0;
   if (handle == NULL) {
     return false;
   }
   (void)pthread_mutex_lock(&g_weld_loan_mutex);
   {
-    size_t total = g_weld_decode_drops;
     struct weld_event_slot * slot = weld_event_slot_locked(handle);
-    if (slot != NULL) {
-      ready = total > slot->lost_reported;
+    if (slot == NULL || !slot->used) {
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      return false;
+    }
+    switch (slot->event_type) {
+      case RMW_EVENT_MESSAGE_LOST:
+        ready = g_weld_decode_drops > slot->lost_reported;
+        break;
+      case RMW_EVENT_LIVELINESS_CHANGED:
+        if (weld_event_matched_current(slot, &matched) == 0) {
+          ready = matched != slot->alive_reported;
+        }
+        break;
+      case RMW_EVENT_LIVELINESS_LOST:
+        if (weld_event_matched_current(slot, &matched) == 0) {
+          unsigned long long cur = slot->lost_total;
+          if (matched < slot->last_matched) {
+            cur += (unsigned long long)(slot->last_matched - matched);
+          }
+          ready = cur > (unsigned long long)slot->lost_reported;
+        }
+        break;
+      case RMW_EVENT_REQUESTED_DEADLINE_MISSED:
+      case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+        if (!slot->is_pub &&
+          slot->event_type == RMW_EVENT_OFFERED_DEADLINE_MISSED)
+        {
+          break;
+        }
+        if (slot->is_pub &&
+          slot->event_type == RMW_EVENT_REQUESTED_DEADLINE_MISSED)
+        {
+          break;
+        }
+        if (weld_event_deadline_current(slot, &total) == 0) {
+          ready = total > slot->deadline_reported;
+        }
+        break;
+      case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE:
+      case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+        if (!slot->is_pub &&
+          slot->event_type == RMW_EVENT_OFFERED_QOS_INCOMPATIBLE)
+        {
+          break;
+        }
+        if (slot->is_pub &&
+          slot->event_type == RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE)
+        {
+          break;
+        }
+        if (weld_event_wire_incompat_current(slot, &wire) == 0 &&
+          weld_event_local_incompat_current(slot, &local) == 0)
+        {
+          ready = wire + (unsigned long long)local >
+            slot->wire_incompat_reported +
+            (unsigned long long)slot->local_incompat_reported;
+        }
+        break;
+      default:
+        break;
     }
   }
   (void)pthread_mutex_unlock(&g_weld_loan_mutex);
@@ -1579,6 +2020,23 @@ extern int weld_ffi_remote_ep_count(
 extern int weld_ffi_remote_ep_at(
   long long bridge, const char * topic, int role, long long index,
   char * type_buf, int type_len, char * gid_buf, int gid_len)
+  __attribute__((weak));
+
+// Network flow endpoint queries match the
+// internal/rmwbridge/weldffi/netflow.go exports. They stay weak so the
+// flow queries report UNSUPPORTED when the Go core is not linked instead
+// of crashing. local reports the advertised IPv4 plus the bound unicast
+// port, count/at report discovered unicast ports per remote endpoint,
+// and a missing backend (in-memory only) reports -3 with no socket.
+extern int weld_ffi_netflow_local(
+  long long bridge, char * ip_buf, int ip_len, int * port_out)
+  __attribute__((weak));
+extern int weld_ffi_netflow_remote_count(
+  long long bridge, const char * topic, int role, long long * out)
+  __attribute__((weak));
+extern int weld_ffi_netflow_remote_at(
+  long long bridge, const char * topic, int role, long long index,
+  char * ip_buf, int ip_len, int * port_out)
   __attribute__((weak));
 
 // Graph entry buffer sizes for one FFI string copy.
@@ -2676,9 +3134,29 @@ rmw_publisher_t * rmw_create_publisher(
   pd->node_name = node_copy;
   pd->domain = nd->domain;
   pd->qos = *qos_profile;
+  pd->incompat_total = 0;
   // Report the ROS type for graph interop. Best effort: a missing
   // symbol or bad name skips silently and creation still succeeds.
   weld_report_type(handle, type_support);
+  // Report the deadline for offered-miss tracking. Best effort: an older
+  // Go library without the symbol keeps local-only timing with no miss
+  // counts instead of failing creation.
+  if (weld_ffi_pub_set_deadline != NULL) {
+    long long dsec = 0;
+    long long dnsec = 0;
+    if (qos_profile->deadline.sec <= (uint64_t)INT64_MAX) {
+      dsec = (long long)qos_profile->deadline.sec;
+    }
+    if (qos_profile->deadline.nsec <= (uint64_t)INT64_MAX) {
+      dnsec = (long long)qos_profile->deadline.nsec;
+    }
+    (void)weld_ffi_pub_set_deadline(handle, dsec, dnsec);
+  }
+  // Count local incompatibilities at match time against existing
+  // subscriptions on the same topic. Both sides bump so take totals stay
+  // real without a second pass.
+  pd->incompat_total = weld_incompat_scan(
+    WELD_EP_PUB, qos_profile, topic_name, nd->domain);
   pub->implementation_identifier = kImplementationIdentifier;
   pub->data = pd;
   pub->topic_name = topic_copy;
@@ -2921,6 +3399,7 @@ rmw_subscription_t * rmw_create_subscription(
   sd->topic = data_topic;
   sd->domain = nd->domain;
   sd->qos = *qos_profile;
+  sd->incompat_total = 0;
   sd->on_new_callback = NULL;
   sd->on_new_user_data = NULL;
   if (pthread_mutex_init(&sd->dispatch_mutex, NULL) != 0) {
@@ -2942,6 +3421,8 @@ rmw_subscription_t * rmw_create_subscription(
   sd->wait_buf = NULL;
   sd->wait_len = 0;
   sd->has_wait = false;
+  sd->wait_seq = 0;
+  (void)memset(sd->wait_gid, 0, sizeof(sd->wait_gid));
   sd->is_dynamic = is_dynamic;
   sd->dyn_type_name = NULL;
   sd->dyn_type_hash = NULL;
@@ -2988,6 +3469,24 @@ rmw_subscription_t * rmw_create_subscription(
   // the loan family above.
   sub->can_loan_messages = true;
   sub->is_cft_enabled = false;
+  // Report the deadline for requested-miss tracking. Best effort like
+  // the publisher side.
+  if (weld_ffi_sub_set_deadline != NULL) {
+    long long dsec = 0;
+    long long dnsec = 0;
+    if (qos_profile->deadline.sec <= (uint64_t)INT64_MAX) {
+      dsec = (long long)qos_profile->deadline.sec;
+    }
+    if (qos_profile->deadline.nsec <= (uint64_t)INT64_MAX) {
+      dnsec = (long long)qos_profile->deadline.nsec;
+    }
+    (void)weld_ffi_sub_set_deadline(handle, dsec, dnsec);
+  }
+  // Count local incompatibilities at match time against existing
+  // publishers on the same topic. Both sides bump so take totals stay
+  // real without a second pass.
+  sd->incompat_total = weld_incompat_scan(
+    WELD_EP_SUB, qos_profile, topic_name, nd->domain);
   // Record the endpoint for by-node plus info-by-topic queries. Best
   // effort: a missed record only shrinks info snapshots.
   weld_ep_register(
@@ -3083,7 +3582,7 @@ rmw_ret_t rmw_take(
       "rmw_weld: rmw_take type support is not introspection");
     return RMW_RET_ERROR;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len, NULL, NULL);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -3115,13 +3614,15 @@ rmw_ret_t rmw_take_with_info(
   rmw_message_info_t * message_info, rmw_subscription_allocation_t * allocation)
 {
   // Same poll plus decode path as rmw_take, with source info filled from
-  // local metadata through weld_fill_take_info. The FFI layer carries
-  // no source timestamp or sequence, so the source stamp reports the
-  // local receive time while sequences stay unsupported.
+  // local metadata through weld_fill_take_info. The source stamp reports
+  // the local receive time while the sequence plus GID ride the take
+  // info side channel.
   struct weld_sub_data * sd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
   uint8_t * wire = NULL;
   size_t wire_len = 0;
+  unsigned long long seq = 0;
+  uint8_t gid[16];
   char errbuf[256];
   weld_cdr_status_t st;
   int empty = 0;
@@ -3147,7 +3648,8 @@ rmw_ret_t rmw_take_with_info(
       "rmw_weld: rmw_take_with_info type support is not introspection");
     return RMW_RET_ERROR;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  (void)memset(gid, 0, sizeof(gid));
+  empty = weld_take_wire(sd, &wire, &wire_len, &seq, gid);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -3170,7 +3672,7 @@ rmw_ret_t rmw_take_with_info(
     }
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info);
+  weld_fill_take_info(message_info, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }
@@ -3199,7 +3701,7 @@ rmw_ret_t rmw_take_serialized_message(
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_serialized_message no data");
     return RMW_RET_ERROR;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len, NULL, NULL);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -3304,6 +3806,41 @@ extern int weld_ffi_sub_matched_pubs(long long handle, int * out_n)
 extern int weld_ffi_service_remote_available(
   long long bridge, const char * name, int * out_n)
   __attribute__((weak));
+// Event deadline plus incompatibility plus remote QoS wiring matches the
+// internal/rmwbridge/weldffi/events.go exports. Every symbol stays weak:
+// a NULL address means an older Go library is linked and the path falls
+// back to local-only sources (matched counts for liveliness, local QoS
+// mismatches for incompatibility, first-local QoS for remotes) instead
+// of crashing. Deadline setters carry the RMW deadline once at endpoint
+// creation; totals report cumulative missed periods.
+extern int weld_ffi_sub_set_deadline(
+  long long handle, long long sec, long long nsec)
+  __attribute__((weak));
+extern int weld_ffi_pub_set_deadline(
+  long long handle, long long sec, long long nsec)
+  __attribute__((weak));
+extern int weld_ffi_sub_requested_deadline_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_pub_offered_deadline_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_sub_incompatible_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_pub_incompatible_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+// Remote QoS offer for info-by-topic queries. Out params carry
+// reliability, durability, history, depth, deadline sec/nsec,
+// liveliness, and lease sec/nsec with infinite mapped to zero. Unknown
+// or malformed offers report -2 so the caller skips fail-closed.
+extern int weld_ffi_remote_ep_qos(
+  long long bridge, const char * topic, int role, long long index,
+  long long * reliability, long long * durability, long long * history,
+  long long * depth, long long * deadline_sec, long long * deadline_nsec,
+  long long * liveliness, long long * lease_sec, long long * lease_nsec)
+  __attribute__((weak));
 extern int weld_ffi_guard_create(long long * out_handle)
   __attribute__((weak));
 extern int weld_ffi_guard_trigger(long long handle)
@@ -3339,10 +3876,11 @@ enum
 // and pending tracks live ids. Server pending entries are take ids
 // waiting for a response; client pending entries are send ids waiting
 // for a reply. type_support drives CDR encode plus decode through the
-// service introspection request plus response members. Sharing one Go
-// service per name means N servers on one name steal each other's
-// requests (1 server x N clients is the supported shape); give each
-// server its own service name instead.
+// service introspection request plus response members. The Go core keeps
+// one request queue per service name that every server handle pops
+// work-queue style, so N servers on one name share load with
+// first-available-server-wins FIFO fairness and each request is served
+// exactly once, beside 1-server N-clients.
 // pending_is_echo parallels pending: a true slot means the take
 // arrived as an 8 byte sequence echo with no encoded bytes.
 // pending_local parallels pending: a true slot means the take sent
@@ -5208,7 +5746,9 @@ rmw_ret_t rmw_wait(
   // available: the reply peek reports a parked in-memory reply as
   // well as an RTPS wire reply, so local clients fire here too.
   // MESSAGE_LOST events are ready while untaken decode drops exist;
-  // any other event type has no source here and fails loudly with
+  // liveliness events fire on matched-count edges, deadline events on
+  // cumulative miss totals, and incompatible-QoS events on local plus
+  // wire mismatch totals. Unknown event values fail loudly with
   // UNSUPPORTED. NULL slots are empty from a previous wait filter and
   // skip.
   //
@@ -5260,9 +5800,10 @@ rmw_ret_t rmw_wait(
     return weld_fail_invalid("rmw_weld: rmw_wait no sets to wait on");
   }
   {
-    // Reject sourceless events up front: MESSAGE_LOST has the decode
-    // drop counter as its source, every other type reports UNSUPPORTED
-    // per type instead of silently never firing.
+    // Reject sourceless events up front: every known event type below has
+    // a live source (decode drops, matched counts, deadline totals, or
+    // incompat totals). Unknown event values report UNSUPPORTED per type
+    // instead of silently never firing.
     if (events != NULL) {
       for (size_t i = 0; i < events->event_count; i++) {
         const rmw_event_t * ev =
@@ -5275,16 +5816,26 @@ rmw_ret_t rmw_wait(
           RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_wait foreign event");
           return RMW_RET_UNSUPPORTED;
         }
-        if (ev->event_type != RMW_EVENT_MESSAGE_LOST) {
-          char buf[128];
-          (void)snprintf(
-            buf, sizeof(buf),
-            "rmw_weld: rmw_wait event type %d has no source",
-            (int)ev->event_type);
-          buf[sizeof(buf) - 1] = '\0';
-          rmw_reset_error();
-          RCUTILS_SET_ERROR_MSG(buf);
-          return RMW_RET_UNSUPPORTED;
+        switch (ev->event_type) {
+          case RMW_EVENT_MESSAGE_LOST:
+          case RMW_EVENT_LIVELINESS_CHANGED:
+          case RMW_EVENT_LIVELINESS_LOST:
+          case RMW_EVENT_REQUESTED_DEADLINE_MISSED:
+          case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+          case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE:
+          case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+            break;
+          default: {
+            char buf[128];
+            (void)snprintf(
+              buf, sizeof(buf),
+              "rmw_weld: rmw_wait event type %d has no source",
+              (int)ev->event_type);
+            buf[sizeof(buf) - 1] = '\0';
+            rmw_reset_error();
+            RCUTILS_SET_ERROR_MSG(buf);
+            return RMW_RET_UNSUPPORTED;
+          }
         }
       }
     }
@@ -5380,7 +5931,7 @@ rmw_ret_t rmw_wait(
       for (size_t i = 0; i < events->event_count; i++) {
         const rmw_event_t * ev =
           (const rmw_event_t *)events->events[i];
-        if (ev != NULL && weld_event_lost_ready(ev)) {
+        if (ev != NULL && weld_event_bound_ready(ev)) {
           ready++;
         } else {
           events->events[i] = NULL;
@@ -5445,26 +5996,59 @@ rmw_ret_t rmw_wait(
   }
 }
 
+// Forward declarations: event binding snapshots live in the take section
+// below, but init paths above bind before take runs.
+static void weld_event_snapshot_locked(struct weld_event_slot * slot);
+static int weld_event_bind(
+  const rmw_event_t * handle, rmw_event_type_t event_type,
+  long long endpoint_handle, const void * endpoint, bool is_pub);
+static bool weld_event_is_pub_type(rmw_event_type_t event_type);
+static bool weld_event_is_sub_type(rmw_event_type_t event_type);
+
 rmw_ret_t rmw_publisher_event_init(
   rmw_event_t * rmw_event, const rmw_publisher_t * publisher,
   rmw_event_type_t event_type)
 {
+  const struct weld_pub_data * pd = NULL;
   if (rmw_event == NULL || publisher == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_publisher_event_init null arg");
   }
   if (!weld_pub_ok(publisher)) {
     return weld_fail_impl("rmw_weld: rmw_publisher_event_init wrong impl");
   }
-  // Only message lost is tracked; other types stay unsupported with the
-  // event left untouched per RMW error-path rules.
-  if (event_type != RMW_EVENT_MESSAGE_LOST) {
+  // Publisher side types carry live sources; anything else stays
+  // unsupported with the event left untouched per RMW error-path rules.
+  // Unknown future values report unsupported with their numeric type.
+  if (!weld_event_is_pub_type(event_type)) {
+    char buf[128];
+    (void)snprintf(
+      buf, sizeof(buf),
+      "rmw_weld: rmw_publisher_event_init type %d unsupported",
+      (int)event_type);
+    buf[sizeof(buf) - 1] = '\0';
     rmw_reset_error();
-    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_publisher_event_init type unsupported");
+    RCUTILS_SET_ERROR_MSG(buf);
     return RMW_RET_UNSUPPORTED;
+  }
+  pd = (const struct weld_pub_data *)publisher->data;
+  if (pd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_publisher_event_init no data");
+    return RMW_RET_ERROR;
   }
   rmw_event->implementation_identifier = kImplementationIdentifier;
   rmw_event->data = NULL;
   rmw_event->event_type = event_type;
+  if (weld_event_bind(
+      rmw_event, event_type, pd->handle, pd, true) != 0)
+  {
+    rmw_event->implementation_identifier = NULL;
+    rmw_event->data = NULL;
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_publisher_event_init too many events");
+    return RMW_RET_ERROR;
+  }
   return RMW_RET_OK;
 }
 
@@ -5472,6 +6056,7 @@ rmw_ret_t rmw_subscription_event_init(
   rmw_event_t * rmw_event, const rmw_subscription_t * subscription,
   rmw_event_type_t event_type)
 {
+  const struct weld_sub_data * sd = NULL;
   if (rmw_event == NULL || subscription == NULL) {
     return weld_fail_invalid(
       "rmw_weld: rmw_subscription_event_init null arg");
@@ -5480,16 +6065,38 @@ rmw_ret_t rmw_subscription_event_init(
     return weld_fail_impl(
       "rmw_weld: rmw_subscription_event_init wrong impl");
   }
-  // Only message lost is tracked; other types stay unsupported with the
-  // event left untouched per RMW error-path rules.
-  if (event_type != RMW_EVENT_MESSAGE_LOST) {
+  // Subscription side types carry live sources; anything else stays
+  // unsupported with the event left untouched per RMW error-path rules.
+  if (!weld_event_is_sub_type(event_type)) {
+    char buf[128];
+    (void)snprintf(
+      buf, sizeof(buf),
+      "rmw_weld: rmw_subscription_event_init type %d unsupported",
+      (int)event_type);
+    buf[sizeof(buf) - 1] = '\0';
     rmw_reset_error();
-    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_subscription_event_init type unsupported");
+    RCUTILS_SET_ERROR_MSG(buf);
     return RMW_RET_UNSUPPORTED;
+  }
+  sd = (const struct weld_sub_data *)subscription->data;
+  if (sd == NULL) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_subscription_event_init no data");
+    return RMW_RET_ERROR;
   }
   rmw_event->implementation_identifier = kImplementationIdentifier;
   rmw_event->data = NULL;
   rmw_event->event_type = event_type;
+  if (weld_event_bind(
+      rmw_event, event_type, sd->handle, sd, false) != 0)
+  {
+    rmw_event->implementation_identifier = NULL;
+    rmw_event->data = NULL;
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG(
+      "rmw_weld: rmw_subscription_event_init too many events");
+    return RMW_RET_ERROR;
+  }
   return RMW_RET_OK;
 }
 
@@ -6297,8 +6904,8 @@ rmw_ret_t rmw_take_sequence(
     size_t wire_len = 0;
     char errbuf[256];
     weld_cdr_status_t st;
-    struct timespec now;
-    uint64_t now_ns = 0;
+    unsigned long long seq = 0;
+    uint8_t gid[16];
     rmw_message_info_t * info = NULL;
     int empty = 0;
     if (message_sequence->data[i] == NULL) {
@@ -6309,7 +6916,8 @@ rmw_ret_t rmw_take_sequence(
       RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_sequence null message slot");
       return RMW_RET_ERROR;
     }
-    empty = weld_take_wire(sd, &wire, &wire_len);
+    (void)memset(gid, 0, sizeof(gid));
+    empty = weld_take_wire(sd, &wire, &wire_len, &seq, gid);
     if (empty == 1) {
       break;
     }
@@ -6335,19 +6943,8 @@ rmw_ret_t rmw_take_sequence(
       }
       return RMW_RET_ERROR;
     }
-    (void)clock_gettime(CLOCK_REALTIME, &now);
-    now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
     info = &message_info_sequence->data[n];
-    info->source_timestamp = (rmw_time_point_value_t)now_ns;
-    info->received_timestamp = (rmw_time_point_value_t)now_ns;
-    info->publication_sequence_number =
-      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
-    info->reception_sequence_number =
-      RMW_MESSAGE_INFO_SEQUENCE_NUMBER_UNSUPPORTED;
-    info->publisher_gid.implementation_identifier = kImplementationIdentifier;
-    (void)memset(
-      info->publisher_gid.data, 0, sizeof(info->publisher_gid.data));
-    info->from_intra_process = false;
+    weld_fill_take_info(info, seq, gid);
     n++;
   }
   *taken = n;
@@ -6364,6 +6961,8 @@ rmw_ret_t rmw_take_serialized_message_with_info(
   struct weld_sub_data * sd = NULL;
   uint8_t * wire = NULL;
   size_t wire_len = 0;
+  unsigned long long seq = 0;
+  uint8_t gid[16];
   int empty = 0;
   (void)allocation;
   if (subscription == NULL || serialized_message == NULL || taken == NULL ||
@@ -6383,7 +6982,8 @@ rmw_ret_t rmw_take_serialized_message_with_info(
       "rmw_weld: rmw_take_serialized_message_with_info no data");
     return RMW_RET_ERROR;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  (void)memset(gid, 0, sizeof(gid));
+  empty = weld_take_wire(sd, &wire, &wire_len, &seq, gid);
   if (empty == 1) {
     *taken = false;
     return RMW_RET_OK;
@@ -6414,7 +7014,7 @@ rmw_ret_t rmw_take_serialized_message_with_info(
   }
   free(wire);
   serialized_message->buffer_length = wire_len;
-  weld_fill_take_info(message_info);
+  weld_fill_take_info(message_info, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }
@@ -6470,16 +7070,16 @@ rmw_ret_t rmw_get_gid_for_client(const rmw_client_t * client, rmw_gid_t * gid)
 // return real entries for locally created endpoints, plus an empty
 // snapshot with RMW_RET_OK when the node exists but owns nothing here,
 // and RMW_RET_NODE_NAME_NON_EXISTENT otherwise. Info-by-topic queries
-// merge local endpoints (stored actual QoS, IDL type, synthetic GID)
-// with remote SEDP peers (announced type, raw 16 byte GUID, first
-// local QoS or default). The transport copies bytes and never reports
-// a best-known QoS, so callers must not infer absence of peers from
-// size. Loans are owned heap buffers, never zero copy: see the loan
-// family above. MESSAGE_LOST events are backed by the decode drop
-// counter; every other event type reports UNSUPPORTED per type.
-// Content filters attach through the Go backend with the expression
-// plus parameters stored per subscription, and network flow endpoints
-// are not reported.
+// merge local endpoints (stored actual QoS, IDL type, synthetic GID,
+// real node names) with remote SEDP peers (announced type, raw 16 byte
+// GUID, SEDP QoS where visible, empty node names fail-closed). The
+// transport copies bytes and never reports a best-known QoS, so callers
+// must not infer absence of peers from size. Loans are owned heap
+// buffers, never zero copy: see the loan family above. All event types
+// are backed by live sources; unknown event values report UNSUPPORTED
+// per type. Content filters attach through the Go backend with the
+// expression plus parameters stored per subscription, and network flow
+// endpoints are not reported.
 
 // Report whether a node name plus namespace is known locally or via FFI.
 static bool weld_node_known(const char * name, const char * ns)
@@ -6742,6 +7342,100 @@ static rmw_ret_t weld_ep_snapshot(
   *out_items = items;
   *out_n = n;
   return RMW_RET_OK;
+}
+
+// Count local incompatibilities at match time for a new endpoint.
+//
+// Snapshots existing opposite-kind endpoints on the same topic plus
+// domain and runs rmw_qos_profile_check_compatible for each pair. Every
+// mismatched pair bumps both sides: the existing endpoint counter is
+// updated in place under no locks (creation runs single-threaded before
+// the new endpoint registers) and the new count returns for the caller
+// to store. Compatible pairs and check errors never count, so the total
+// stays a real mismatch count instead of a probe failure count.
+static size_t weld_incompat_scan(
+  int new_kind, const rmw_qos_profile_t * new_qos, const char * topic,
+  size_t domain)
+{
+  struct weld_ep_snap * snaps = NULL;
+  size_t n_snaps = 0;
+  size_t mismatched = 0;
+  int opp_kind = WELD_EP_SUB;
+  size_t i = 0;
+  if (new_qos == NULL || topic == NULL) {
+    return 0;
+  }
+  if (new_kind == WELD_EP_PUB) {
+    opp_kind = WELD_EP_SUB;
+  } else if (new_kind == WELD_EP_SUB) {
+    opp_kind = WELD_EP_PUB;
+  } else {
+    return 0;
+  }
+  if (weld_ep_snapshot(topic, opp_kind, domain, true, &snaps, &n_snaps) !=
+    RMW_RET_OK)
+  {
+    return 0;
+  }
+  for (i = 0; i < n_snaps; i++) {
+    rmw_qos_compatibility_type_t compat = RMW_QOS_COMPATIBILITY_OK;
+    rmw_ret_t rc = RMW_RET_OK;
+    if (new_kind == WELD_EP_PUB) {
+      rc = rmw_qos_profile_check_compatible(
+        *new_qos, snaps[i].qos, &compat, NULL, 0);
+    } else {
+      rc = rmw_qos_profile_check_compatible(
+        snaps[i].qos, *new_qos, &compat, NULL, 0);
+    }
+    if (rc != RMW_RET_OK || compat == RMW_QOS_COMPATIBILITY_OK) {
+      continue;
+    }
+    mismatched++;
+  }
+  weld_ep_snapshot_fini(snaps, n_snaps);
+  // Bumping existing endpoints needs live pointers, so rescan the
+  // registry and bump each mismatched endpoint in place. The second scan
+  // repeats the same check; creation is rare so the double walk is fine.
+  if (mismatched > 0) {
+    (void)pthread_mutex_lock(&g_weld_ep_mutex);
+    for (struct weld_ep_entry * e = g_weld_ep_list; e != NULL;
+      e = e->next)
+    {
+      rmw_qos_compatibility_type_t compat = RMW_QOS_COMPATIBILITY_OK;
+      rmw_ret_t rc = RMW_RET_OK;
+      if (e->kind != opp_kind || e->data == NULL) {
+        continue;
+      }
+      if (e->domain != domain) {
+        continue;
+      }
+      if (opp_kind == WELD_EP_PUB) {
+        const struct weld_pub_data * pd =
+          (const struct weld_pub_data *)e->data;
+        if (pd->topic == NULL || strcmp(pd->topic, topic) != 0) {
+          continue;
+        }
+        rc = rmw_qos_profile_check_compatible(
+          pd->qos, *new_qos, &compat, NULL, 0);
+        if (rc == RMW_RET_OK && compat != RMW_QOS_COMPATIBILITY_OK) {
+          ((struct weld_pub_data *)e->data)->incompat_total++;
+        }
+      } else {
+        const struct weld_sub_data * sd =
+          (const struct weld_sub_data *)e->data;
+        if (sd->topic == NULL || strcmp(sd->topic, topic) != 0) {
+          continue;
+        }
+        rc = rmw_qos_profile_check_compatible(
+          *new_qos, sd->qos, &compat, NULL, 0);
+        if (rc == RMW_RET_OK && compat != RMW_QOS_COMPATIBILITY_OK) {
+          ((struct weld_sub_data *)e->data)->incompat_total++;
+        }
+      }
+    }
+    (void)pthread_mutex_unlock(&g_weld_ep_mutex);
+  }
+  return mismatched;
 }
 
 // Fill a names_and_types snapshot from local endpoints owned by one
@@ -7025,15 +7719,107 @@ static void weld_info_gid(uint8_t gid[16], size_t domain, long long handle)
   }
 }
 
+// Fill one remote QoS profile from SEDP params with fallback.
+//
+// Starts from fallback (first local QoS or qos_default) for the policies
+// the wire does not carry, then overrides reliability, durability,
+// history, depth, deadline, liveliness, and lease from the FFI offer.
+// Returns 0 with a real remote offer in out, 1 when the offer is
+// genuinely unknown (caller uses fallback), and -1 when the entry must
+// skip fail-closed (torn read or a policy with no RMW equivalent, such
+// as transient or persistent durability). It never fabricates QoS.
+static int weld_info_remote_qos(
+  long long bridge, const char * name, int remote_role, long long index,
+  const rmw_qos_profile_t * fallback, rmw_qos_profile_t * out)
+{
+  long long reliability = 0;
+  long long durability = 0;
+  long long history = 0;
+  long long depth = 0;
+  long long deadline_sec = 0;
+  long long deadline_nsec = 0;
+  long long liveliness = 0;
+  long long lease_sec = 0;
+  long long lease_nsec = 0;
+  int rc = 0;
+  if (name == NULL || fallback == NULL || out == NULL) {
+    return -1;
+  }
+  *out = *fallback;
+  if (weld_ffi_remote_ep_qos == NULL) {
+    return 1;
+  }
+  rc = weld_ffi_remote_ep_qos(
+    bridge, name, remote_role, index, &reliability, &durability,
+    &history, &depth, &deadline_sec, &deadline_nsec, &liveliness,
+    &lease_sec, &lease_nsec);
+  if (rc != 0) {
+    return rc == -1 ? 1 : -1;
+  }
+  if (reliability == 1) {
+    out->reliability = RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT;
+  } else if (reliability == 2) {
+    out->reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  } else {
+    return -1;
+  }
+  if (durability == 0) {
+    out->durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+  } else if (durability == 1) {
+    out->durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+  } else {
+    return -1;
+  }
+  if (history == 0) {
+    out->history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    if (depth <= 0 || depth > (long long)SIZE_MAX) {
+      return -1;
+    }
+    out->depth = (size_t)depth;
+  } else if (history == 1) {
+    out->history = RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+    out->depth = 0;
+  } else {
+    return -1;
+  }
+  if (deadline_sec < 0 || deadline_nsec < 0) {
+    return -1;
+  }
+  out->deadline.sec = (uint64_t)deadline_sec;
+  out->deadline.nsec = (uint64_t)deadline_nsec;
+  if (liveliness == 0) {
+    out->liveliness = RMW_QOS_POLICY_LIVELINESS_AUTOMATIC;
+  } else if (liveliness == 1) {
+    out->liveliness = RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE;
+  } else if (liveliness == 2) {
+    out->liveliness = RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC;
+  } else {
+    return -1;
+  }
+  if (lease_sec < 0 || lease_nsec < 0) {
+    return -1;
+  }
+  out->liveliness_lease_duration.sec = (uint64_t)lease_sec;
+  out->liveliness_lease_duration.nsec = (uint64_t)lease_nsec;
+  return 0;
+}
+
 // Fill an info array from local registry endpoints plus remote peers.
 //
-// Locals carry their stored actual QoS, type, and synthetic GID.
-// Remotes carry their SEDP GUID, announced type, and the first local
-// QoS on the same name (or qos_default when no local exists), because
-// stored offer bytes do not decode to rmw_qos_profile_t. Remote node
-// names are unavailable from SEDP and report empty with namespace "/".
-// Unknown names still return OK with an empty array per spec. Torn
-// remote entries from discovery churn skip quietly.
+// Locals carry their stored actual QoS, type, and synthetic GID with real
+// node names from the bridge registry. Remotes carry their SEDP GUID,
+// announced type, and QoS decoded from SEDP params through
+// weld_ffi_remote_ep_qos where the bridge can see them; the first local
+// QoS on the same name (or qos_default when no local exists) fills only
+// the policies the wire does not carry and backs entries whose offer is
+// genuinely unknown. Remote node names stay empty with namespace "/"
+// because SEDP carries no ROS node identity (USER_DATA holds only
+// typehash, DDS topic, domain, serviceid, and clientid; SPDP carries
+// only enclave=/ and Weld publishes no ros_discovery_info topic), so no
+// peer node-name map exists; the empty fallback is fail-closed, never a
+// fabricated name. Unknown names still return OK with an empty array per
+// spec. Torn or malformed remote entries skip quietly instead of
+// zero-filling.
 static rmw_ret_t weld_info_fill(
   const rmw_node_t * node, rcutils_allocator_t * allocator,
   const char * name, int local_kind, int remote_role,
@@ -7127,8 +7913,11 @@ static rmw_ret_t weld_info_fill(
     rmw_topic_endpoint_info_t * info = NULL;
     char typebuf[1024];
     uint8_t gid[16];
+    rmw_qos_profile_t rqos;
     const rmw_qos_profile_t * qos = &rmw_qos_profile_default;
+    const rmw_qos_profile_t * use_qos = NULL;
     int frc = 0;
+    int qrc = 0;
     if (n_local > 0) {
       qos = &snaps[0].qos;
     }
@@ -7138,9 +7927,22 @@ static rmw_ret_t weld_info_fill(
     if (frc != 0) {
       continue;
     }
+    // Decode the SEDP offer where the bridge can see it; fall back to
+    // the first local QoS only when genuinely unknown, and skip torn or
+    // inexpressible offers fail-closed instead of zero-filling.
+    qrc = weld_info_remote_qos(
+      bridge, name, remote_role, (long long)i, qos, &rqos);
+    if (qrc < 0) {
+      continue;
+    }
+    if (qrc == 0) {
+      use_qos = &rqos;
+    } else {
+      use_qos = qos;
+    }
     info = &out->info_array[w];
     rc = weld_info_set_one(
-      info, "", "/", typebuf, gid, qos, ep_type, allocator);
+      info, "", "/", typebuf, gid, use_qos, ep_type, allocator);
     if (rc != RMW_RET_OK) {
       goto fail;
     }
@@ -7280,10 +8082,11 @@ const rmw_guard_condition_t * rmw_node_get_graph_guard_condition(
   return guard;
 }
 
-// Loan family: the transport copies bytes at ingress and shares by
-// reference internally, so every loan below is an owned heap buffer and
-// never zero copy shared memory. See the loan infra above for the
-// borrow, publish, take, and return bookkeeping.
+// Loan family: single-owner in-process zero copy with a copying wire
+// fallback. The wire path copies (CDR encode plus channel copy plus CDR
+// decode), which serialization inherently requires; the in-process path
+// shares the loaned buffer by pointer with no copy. See the loan infra
+// above for the borrow, publish, take, and return bookkeeping.
 
 rmw_ret_t rmw_borrow_loaned_message(
   const rmw_publisher_t * publisher,
@@ -7340,6 +8143,10 @@ rmw_ret_t rmw_publish_loaned_message(
   // The loan is unlinked first so a concurrent publish or return of the
   // same buffer fails loudly instead of encoding or freeing twice. On
   // failure the record is restored so the caller still owns the loan.
+  // The wire bytes publish first for every subscriber (copying); the
+  // loaned buffer is then queued by pointer for one zero-copy take, and
+  // freed here when the queue is unavailable so delivery still succeeds
+  // via the wire copy without leaking.
   const struct weld_pub_data * pd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
   uint8_t * wire = NULL;
@@ -7397,6 +8204,14 @@ rmw_ret_t rmw_publish_loaned_message(
     return weld_fail_ffi(
       "rmw_weld: rmw_publish_loaned_message backend failed", rc);
   }
+  if (weld_ffi_loan_publish != NULL) {
+    int lrc = weld_ffi_loan_publish(
+      pd->handle, (unsigned long long)(uintptr_t)ros_message,
+      (unsigned long long)(uintptr_t)members);
+    if (lrc == 0) {
+      return RMW_RET_OK;
+    }
+  }
   members->fini_function(ros_message);
   free(ros_message);
   return RMW_RET_OK;
@@ -7420,7 +8235,7 @@ rmw_ret_t rmw_take_loaned_message(
   }
   *loaned_message = NULL;
   *taken = false;
-  empty = weld_take_loaned_wire(subscription, &buf);
+  empty = weld_take_loaned_wire(subscription, &buf, NULL, NULL);
   if (empty == 1) {
     return RMW_RET_OK;
   }
@@ -7438,6 +8253,8 @@ rmw_ret_t rmw_take_loaned_message_with_info(
   rmw_subscription_allocation_t * allocation)
 {
   void * buf = NULL;
+  unsigned long long seq = 0;
+  uint8_t gid[16];
   int empty = 0;
   (void)allocation;
   if (subscription == NULL || loaned_message == NULL || taken == NULL ||
@@ -7456,14 +8273,15 @@ rmw_ret_t rmw_take_loaned_message_with_info(
   }
   *loaned_message = NULL;
   *taken = false;
-  empty = weld_take_loaned_wire(subscription, &buf);
+  (void)memset(gid, 0, sizeof(gid));
+  empty = weld_take_loaned_wire(subscription, &buf, &seq, gid);
   if (empty == 1) {
     return RMW_RET_OK;
   }
   if (empty != 0) {
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info);
+  weld_fill_take_info(message_info, seq, gid);
   *loaned_message = buf;
   *taken = true;
   return RMW_RET_OK;
@@ -7613,55 +8431,452 @@ rmw_ret_t rmw_client_set_on_new_response_callback(
   return RMW_RET_OK;
 }
 
-// Events: only MESSAGE_LOST is backed, by the decode drop counter in
-// the take paths (see g_weld_decode_drops). Other event types report
-// RMW_RET_UNSUPPORTED loudly per type: liveliness, deadline, and
-// incompatible-QoS have no DDS source wired through the FFI yet.
-// rmw_wait fires on MESSAGE_LOST while untaken losses exist and rejects
-// sourceless events up front.
+// Events: every RMW event type is backed by a live source.
+//
+// MESSAGE_LOST counts decode drops in the take paths (see
+// g_weld_decode_drops). LIVELINESS_CHANGED reports matched-publisher
+// edges for subscriptions and LIVELINESS_LOST reports matched-subscriber
+// drops for publishers, both via the existing matched FFI which sums
+// local same-bridge endpoints with remote SEDP peers. Deadline misses
+// accumulate in the Go core from the stored QoS deadline plus take and
+// publish timing. Incompatible QoS totals sum local profile mismatches
+// counted at endpoint creation with wire mismatches from
+// CheckWireCompatibility in the Go core; the last policy kind is
+// unknown so it reports RMW_QOS_POLICY_INVALID fail-closed. rmw_wait
+// fires on every type while untaken status exists and rejects unknown
+// event values up front. Callbacks stored by rmw_event_set_callback
+// fire on rmw_take_event when new status exists.
+//
+// Remote node names stay empty with namespace "/" because SEDP carries
+// no ROS node identity: USER_DATA holds only typehash, DDS topic,
+// domain, serviceid, and clientid, and SPDP carries only enclave=/.
+// Weld publishes no ros_discovery_info topic, so no peer node-name map
+// exists to consult; the empty fallback is fail-closed, never a
+// fabricated name.
+
+// Clamp an unsigned total into int32_t status range.
+//
+// Totals grow monotonically but status fields are int32_t, so values
+// past INT32_MAX saturate instead of wrapping. Returns the clamped
+// value.
+static int32_t weld_event_clamp32(unsigned long long v)
+{
+  if (v > (unsigned long long)INT32_MAX) {
+    return INT32_MAX;
+  }
+  return (int32_t)v;
+}
+
+// Snapshot the live source into a fresh slot at init without consuming.
+//
+// The slot binding (endpoint handle plus pointer plus side) is already
+// stored; this fills the take-owned baselines so the first take reports
+// only changes since init. Missing FFI leaves zero baselines so take
+// reports not ready until the source appears.
+static void weld_event_snapshot_locked(struct weld_event_slot * slot)
+{
+  long long matched = 0;
+  unsigned long long total = 0;
+  unsigned long long wire = 0;
+  size_t local = 0;
+  if (slot == NULL) {
+    return;
+  }
+  switch (slot->event_type) {
+    case RMW_EVENT_MESSAGE_LOST:
+      slot->lost_reported = g_weld_decode_drops;
+      break;
+    case RMW_EVENT_LIVELINESS_CHANGED:
+      if (weld_event_matched_current(slot, &matched) == 0) {
+        slot->alive_reported = matched;
+        slot->not_alive_reported = 0;
+      }
+      break;
+    case RMW_EVENT_LIVELINESS_LOST:
+      if (weld_event_matched_current(slot, &matched) == 0) {
+        slot->last_matched = matched;
+        slot->lost_total = 0;
+        slot->lost_reported = 0;
+      }
+      break;
+    case RMW_EVENT_REQUESTED_DEADLINE_MISSED:
+    case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+      if (weld_event_deadline_current(slot, &total) == 0) {
+        slot->deadline_reported = total;
+      }
+      break;
+    case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE:
+    case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+      if (weld_event_wire_incompat_current(slot, &wire) == 0) {
+        slot->wire_incompat_reported = wire;
+      }
+      if (weld_event_local_incompat_current(slot, &local) == 0) {
+        slot->local_incompat_reported = local;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+// Bind one event handle to its endpoint at init.
+//
+// Claims the slot, stores the type plus endpoint association, and
+// snapshots baselines. The caller holds no locks. Returns 0 on success
+// and -1 when the slot table is full.
+static int weld_event_bind(
+  const rmw_event_t * handle, rmw_event_type_t event_type,
+  long long endpoint_handle, const void * endpoint, bool is_pub)
+{
+  int ok = -1;
+  (void)pthread_mutex_lock(&g_weld_loan_mutex);
+  {
+    struct weld_event_slot * slot = weld_event_slot_locked(handle);
+    if (slot != NULL) {
+      slot->event_type = event_type;
+      slot->endpoint_handle = endpoint_handle;
+      slot->endpoint = endpoint;
+      slot->is_pub = is_pub;
+      weld_event_snapshot_locked(slot);
+      ok = 0;
+    }
+  }
+  (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+  return ok;
+}
+
+// Report whether a publisher event type belongs on publishers.
+//
+// Returns true for the publisher side types, false otherwise.
+static bool weld_event_is_pub_type(rmw_event_type_t event_type)
+{
+  return event_type == RMW_EVENT_MESSAGE_LOST ||
+    event_type == RMW_EVENT_LIVELINESS_LOST ||
+    event_type == RMW_EVENT_OFFERED_DEADLINE_MISSED ||
+    event_type == RMW_EVENT_OFFERED_QOS_INCOMPATIBLE;
+}
+
+// Report whether a subscription event type belongs on subscriptions.
+//
+// Returns true for the subscription side types, false otherwise.
+static bool weld_event_is_sub_type(rmw_event_type_t event_type)
+{
+  return event_type == RMW_EVENT_MESSAGE_LOST ||
+    event_type == RMW_EVENT_LIVELINESS_CHANGED ||
+    event_type == RMW_EVENT_REQUESTED_DEADLINE_MISSED ||
+    event_type == RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE;
+}
 
 rmw_ret_t rmw_take_event(
   const rmw_event_t * event_handle, void * event_info, bool * taken)
 {
+  rmw_event_callback_t cb = NULL;
+  const void * user_data = NULL;
+  bool fire = false;
   if (event_handle == NULL || event_info == NULL || taken == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_take_event null argument");
   }
   if (event_handle->implementation_identifier != kImplementationIdentifier) {
     return weld_fail_impl("rmw_weld: rmw_take_event wrong implementation");
   }
-  if (event_handle->event_type != RMW_EVENT_MESSAGE_LOST) {
-    *taken = false;
-    rmw_reset_error();
-    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event event type not supported");
-    return RMW_RET_UNSUPPORTED;
-  }
-#ifdef WELD_HAVE_MESSAGE_LOST
-  {
-    rmw_message_lost_status_t * status = (rmw_message_lost_status_t *)event_info;
-    struct weld_event_slot * slot = NULL;
-    size_t total = 0;
-    size_t last = 0;
-    size_t change = 0;
-    (void)pthread_mutex_lock(&g_weld_loan_mutex);
-    total = g_weld_decode_drops;
-    slot = weld_event_slot_locked(event_handle);
-    if (slot != NULL) {
-      last = slot->lost_reported;
-      slot->lost_reported = total;
-    }
-    (void)pthread_mutex_unlock(&g_weld_loan_mutex);
-    change = total - last;
-    status->total_count = total;
-    status->total_count_change = change;
-    *taken = change > 0;
-    return RMW_RET_OK;
-  }
-#else
   *taken = false;
-  rmw_reset_error();
-  RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event message lost unavailable");
-  return RMW_RET_UNSUPPORTED;
+  switch (event_handle->event_type) {
+    case RMW_EVENT_MESSAGE_LOST: {
+#ifdef WELD_HAVE_MESSAGE_LOST
+      rmw_message_lost_status_t * status = (rmw_message_lost_status_t *)event_info;
+      struct weld_event_slot * slot = NULL;
+      size_t total = 0;
+      size_t last = 0;
+      size_t change = 0;
+      (void)pthread_mutex_lock(&g_weld_loan_mutex);
+      total = g_weld_decode_drops;
+      slot = weld_event_slot_locked(event_handle);
+      if (slot != NULL) {
+        last = slot->lost_reported;
+        slot->lost_reported = total;
+        cb = slot->callback;
+        user_data = slot->user_data;
+      }
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      change = total - last;
+      status->total_count = total;
+      status->total_count_change = change;
+      *taken = change > 0;
+      fire = *taken && cb != NULL;
+      if (fire) {
+        cb(user_data, 1);
+      }
+      return RMW_RET_OK;
+#else
+      *taken = false;
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event message lost unavailable");
+      return RMW_RET_UNSUPPORTED;
 #endif
+    }
+    case RMW_EVENT_LIVELINESS_CHANGED: {
+#ifdef WELD_HAVE_LIVELINESS_CHANGED
+      rmw_liveliness_changed_status_t * status =
+        (rmw_liveliness_changed_status_t *)event_info;
+      long long matched = 0;
+      long long last = 0;
+      int rc = -1;
+      (void)pthread_mutex_lock(&g_weld_loan_mutex);
+      {
+        struct weld_event_slot * slot = NULL;
+        for (size_t i = 0; i < (size_t)WELD_EVENT_SLOTS_MAX; i++) {
+          if (g_weld_event_slots[i].used &&
+            g_weld_event_slots[i].handle == event_handle)
+          {
+            slot = &g_weld_event_slots[i];
+            break;
+          }
+        }
+        if (slot != NULL && !slot->is_pub) {
+          rc = weld_event_matched_current(slot, &matched);
+          if (rc == 0) {
+            last = slot->alive_reported;
+            slot->alive_reported = matched;
+            cb = slot->callback;
+            user_data = slot->user_data;
+          }
+        }
+      }
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      if (rc != 0) {
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG(
+          "rmw_weld: rmw_take_event liveliness changed no source");
+        return RMW_RET_UNSUPPORTED;
+      }
+      status->alive_count = weld_event_clamp32(
+        matched < 0 ? 0 : (unsigned long long)matched);
+      status->not_alive_count = 0;
+      status->alive_count_change = weld_event_clamp32(
+        matched >= last ? (unsigned long long)(matched - last) : 0);
+      if (matched < last) {
+        long long drop = last - matched;
+        status->alive_count_change = (int32_t)-weld_event_clamp32(
+          (unsigned long long)drop);
+      }
+      status->not_alive_count_change = 0;
+      *taken = matched != last;
+      fire = *taken && cb != NULL;
+      if (fire) {
+        cb(user_data, 1);
+      }
+      return RMW_RET_OK;
+#else
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG(
+        "rmw_weld: rmw_take_event liveliness changed unavailable");
+      return RMW_RET_UNSUPPORTED;
+#endif
+    }
+    case RMW_EVENT_LIVELINESS_LOST: {
+#ifdef WELD_HAVE_LIVELINESS_LOST
+      rmw_liveliness_lost_status_t * status =
+        (rmw_liveliness_lost_status_t *)event_info;
+      long long matched = 0;
+      unsigned long long last_total = 0;
+      unsigned long long cur = 0;
+      int rc = -1;
+      (void)pthread_mutex_lock(&g_weld_loan_mutex);
+      {
+        struct weld_event_slot * slot = NULL;
+        for (size_t i = 0; i < (size_t)WELD_EVENT_SLOTS_MAX; i++) {
+          if (g_weld_event_slots[i].used &&
+            g_weld_event_slots[i].handle == event_handle)
+          {
+            slot = &g_weld_event_slots[i];
+            break;
+          }
+        }
+        if (slot != NULL && slot->is_pub) {
+          rc = weld_event_matched_current(slot, &matched);
+          if (rc == 0) {
+            if (matched < slot->last_matched) {
+              slot->lost_total +=
+                (unsigned long long)(slot->last_matched - matched);
+            }
+            slot->last_matched = matched;
+            last_total = (unsigned long long)slot->lost_reported;
+            cur = slot->lost_total;
+            slot->lost_reported = (size_t)cur;
+            cb = slot->callback;
+            user_data = slot->user_data;
+          }
+        }
+      }
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      if (rc != 0) {
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG(
+          "rmw_weld: rmw_take_event liveliness lost no source");
+        return RMW_RET_UNSUPPORTED;
+      }
+      status->total_count = weld_event_clamp32(cur);
+      status->total_count_change = weld_event_clamp32(
+        cur >= last_total ? cur - last_total : 0);
+      *taken = cur != last_total;
+      fire = *taken && cb != NULL;
+      if (fire) {
+        cb(user_data, 1);
+      }
+      return RMW_RET_OK;
+#else
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG(
+        "rmw_weld: rmw_take_event liveliness lost unavailable");
+      return RMW_RET_UNSUPPORTED;
+#endif
+    }
+    case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+    case RMW_EVENT_REQUESTED_DEADLINE_MISSED: {
+#if defined(WELD_HAVE_OFFERED_DEADLINE) || defined(WELD_HAVE_REQUESTED_DEADLINE)
+      bool offered = event_handle->event_type ==
+        RMW_EVENT_OFFERED_DEADLINE_MISSED;
+      unsigned long long total = 0;
+      unsigned long long last = 0;
+      int rc = -1;
+      (void)pthread_mutex_lock(&g_weld_loan_mutex);
+      {
+        struct weld_event_slot * slot = NULL;
+        for (size_t i = 0; i < (size_t)WELD_EVENT_SLOTS_MAX; i++) {
+          if (g_weld_event_slots[i].used &&
+            g_weld_event_slots[i].handle == event_handle)
+          {
+            slot = &g_weld_event_slots[i];
+            break;
+          }
+        }
+        if (slot != NULL && slot->is_pub == offered) {
+          rc = weld_event_deadline_current(slot, &total);
+          if (rc == 0) {
+            last = slot->deadline_reported;
+            slot->deadline_reported = total;
+            cb = slot->callback;
+            user_data = slot->user_data;
+          }
+        }
+      }
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      if (rc != 0) {
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event deadline no source");
+        return RMW_RET_UNSUPPORTED;
+      }
+      if (offered) {
+#ifdef WELD_HAVE_OFFERED_DEADLINE
+        rmw_offered_deadline_missed_status_t * status =
+          (rmw_offered_deadline_missed_status_t *)event_info;
+        status->total_count = weld_event_clamp32(total);
+        status->total_count_change = weld_event_clamp32(
+          total >= last ? total - last : 0);
+#else
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG(
+          "rmw_weld: rmw_take_event offered deadline unavailable");
+        return RMW_RET_UNSUPPORTED;
+#endif
+      } else {
+#ifdef WELD_HAVE_REQUESTED_DEADLINE
+        rmw_requested_deadline_missed_status_t * status =
+          (rmw_requested_deadline_missed_status_t *)event_info;
+        status->total_count = weld_event_clamp32(total);
+        status->total_count_change = weld_event_clamp32(
+          total >= last ? total - last : 0);
+#else
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG(
+          "rmw_weld: rmw_take_event requested deadline unavailable");
+        return RMW_RET_UNSUPPORTED;
+#endif
+      }
+      *taken = total != last;
+      fire = *taken && cb != NULL;
+      if (fire) {
+        cb(user_data, 1);
+      }
+      return RMW_RET_OK;
+#else
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event deadline unavailable");
+      return RMW_RET_UNSUPPORTED;
+#endif
+    }
+    case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+    case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE: {
+#ifdef WELD_HAVE_INCOMPAT_QOS
+      bool offered = event_handle->event_type ==
+        RMW_EVENT_OFFERED_QOS_INCOMPATIBLE;
+      rmw_qos_incompatible_event_status_t * status =
+        (rmw_qos_incompatible_event_status_t *)event_info;
+      unsigned long long wire = 0;
+      unsigned long long wire_last = 0;
+      size_t local = 0;
+      size_t local_last = 0;
+      unsigned long long total = 0;
+      unsigned long long last = 0;
+      int rc = -1;
+      (void)pthread_mutex_lock(&g_weld_loan_mutex);
+      {
+        struct weld_event_slot * slot = NULL;
+        for (size_t i = 0; i < (size_t)WELD_EVENT_SLOTS_MAX; i++) {
+          if (g_weld_event_slots[i].used &&
+            g_weld_event_slots[i].handle == event_handle)
+          {
+            slot = &g_weld_event_slots[i];
+            break;
+          }
+        }
+        if (slot != NULL && slot->is_pub == offered) {
+          int wrc = weld_event_wire_incompat_current(slot, &wire);
+          int lrc = weld_event_local_incompat_current(slot, &local);
+          if (wrc == 0 && lrc == 0) {
+            wire_last = slot->wire_incompat_reported;
+            local_last = slot->local_incompat_reported;
+            slot->wire_incompat_reported = wire;
+            slot->local_incompat_reported = local;
+            cb = slot->callback;
+            user_data = slot->user_data;
+            rc = 0;
+          }
+        }
+      }
+      (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+      if (rc != 0) {
+        rmw_reset_error();
+        RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event incompat no source");
+        return RMW_RET_UNSUPPORTED;
+      }
+      total = wire + (unsigned long long)local;
+      last = wire_last + (unsigned long long)local_last;
+      status->total_count = weld_event_clamp32(total);
+      status->total_count_change = weld_event_clamp32(
+        total >= last ? total - last : 0);
+      // The policy that refused last is not tracked through the FFI
+      // totals, so it reports invalid fail-closed while counts stay
+      // real.
+      status->last_policy_kind = RMW_QOS_POLICY_INVALID;
+      *taken = total != last;
+      fire = *taken && cb != NULL;
+      if (fire) {
+        cb(user_data, 1);
+      }
+      return RMW_RET_OK;
+#else
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event incompat unavailable");
+      return RMW_RET_UNSUPPORTED;
+#endif
+    }
+    default: {
+      rmw_reset_error();
+      RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_take_event event type not supported");
+      return RMW_RET_UNSUPPORTED;
+    }
+  }
 }
 
 rmw_ret_t rmw_event_set_callback(
@@ -7688,7 +8903,18 @@ rmw_ret_t rmw_event_set_callback(
 
 bool rmw_event_type_is_supported(rmw_event_type_t rmw_event_type)
 {
-  return rmw_event_type == RMW_EVENT_MESSAGE_LOST;
+  switch (rmw_event_type) {
+    case RMW_EVENT_MESSAGE_LOST:
+    case RMW_EVENT_LIVELINESS_CHANGED:
+    case RMW_EVENT_LIVELINESS_LOST:
+    case RMW_EVENT_REQUESTED_DEADLINE_MISSED:
+    case RMW_EVENT_OFFERED_DEADLINE_MISSED:
+    case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE:
+    case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE:
+      return true;
+    default:
+      return false;
+  }
 }
 
 // Dynamic message take: the wire sample is taken the same way as the
@@ -7897,7 +9123,7 @@ rmw_ret_t rmw_take_dynamic_message(
       "rmw_weld: rmw_take_dynamic_message no dynamic runtime loaded");
     return RMW_RET_UNSUPPORTED;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  empty = weld_take_wire(sd, &wire, &wire_len, NULL, NULL);
   if (empty == 1) {
     return RMW_RET_OK;
   }
@@ -7932,6 +9158,8 @@ rmw_ret_t rmw_take_dynamic_message_with_info(
   rcutils_uint8_array_t buf;
   weld_dyn_deserialize_fn dyn_fn = NULL;
   rcutils_ret_t dyn_rc = RCUTILS_RET_OK;
+  unsigned long long seq = 0;
+  uint8_t gid[16];
   int empty = 0;
   (void)allocation;
   if (subscription == NULL || dynamic_message == NULL || taken == NULL ||
@@ -7959,7 +9187,8 @@ rmw_ret_t rmw_take_dynamic_message_with_info(
       "rmw_weld: rmw_take_dynamic_message_with_info no dynamic runtime");
     return RMW_RET_UNSUPPORTED;
   }
-  empty = weld_take_wire(sd, &wire, &wire_len);
+  (void)memset(gid, 0, sizeof(gid));
+  empty = weld_take_wire(sd, &wire, &wire_len, &seq, gid);
   if (empty == 1) {
     return RMW_RET_OK;
   }
@@ -7979,7 +9208,7 @@ rmw_ret_t rmw_take_dynamic_message_with_info(
       "rmw_weld: rmw_take_dynamic_message_with_info deserialize failed");
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info);
+  weld_fill_take_info(message_info, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }
@@ -8212,12 +9441,147 @@ rmw_ret_t rmw_subscription_get_content_filter(
   return RMW_RET_OK;
 }
 
-// Network flow endpoints are not reported by this transport.
+// Network flow endpoints carry real transport socket data.
+//
+// The local entry is the node's advertised IPv4 (the same source the
+// backend uses for SPDP locators) with the bound unicast port. Remote
+// entries are discovered unicast ports from routes/SED at the loopback
+// destination this transport sends peer DATA to; entries with an
+// unknown port are skipped rather than zero-filled, and torn discovery
+// reads skip quietly. The transport applies no per-flow QoS marking,
+// so flow label and DSCP stay 0.
+
+// Fill one network flow entry with socket data.
+//
+// is_v6 selects the internet protocol for addr. A bad address or a port
+// outside 1..65535 fails with -1 and stores nothing.
+static int weld_netflow_set(
+  rmw_network_flow_endpoint_t * e, bool is_v6, const char * addr, int port)
+{
+  if (e == NULL || addr == NULL || addr[0] == '\0') {
+    return -1;
+  }
+  if (port <= 0 || port > 65535) {
+    return -1;
+  }
+  e->transport_protocol = RMW_TRANSPORT_PROTOCOL_UDP;
+  if (is_v6) {
+    e->internet_protocol = RMW_INTERNET_PROTOCOL_IPV6;
+  } else {
+    e->internet_protocol = RMW_INTERNET_PROTOCOL_IPV4;
+  }
+  e->transport_port = (uint16_t)port;
+  // No per-flow QoS marking in this transport.
+  e->flow_label = 0;
+  e->dscp = 0;
+  (void)snprintf(
+    e->internet_address, sizeof(e->internet_address), "%s",
+    addr);
+  return 0;
+}
+
+// Fill a network flow array: one local socket entry plus best-effort remotes.
+//
+// topic selects the remote endpoints with remote_role (reader peers for
+// a publisher, writer peers for a subscription). The local entry must
+// succeed; remote failures keep the local entry only. Returns RMW_RET_OK
+// with the filled array, UNSUPPORTED when the FFI is not linked, the
+// bridge is missing, or no transport socket exists (in-memory only),
+// and ERROR or BAD_ALLOC otherwise.
+static rmw_ret_t weld_netflow_fill(
+  const char * topic, int remote_role,
+  rcutils_allocator_t * allocator,
+  rmw_network_flow_endpoint_array_t * out)
+{
+  long long bridge = 0;
+  char ip[RMW_INET_ADDRSTRLEN];
+  int port = 0;
+  long long n_remote = 0;
+  size_t w = 0;
+  long long i = 0;
+  int rc = 0;
+  if (topic == NULL) {
+    topic = "";
+  }
+  if (weld_ffi_netflow_local == NULL ||
+    weld_ffi_netflow_remote_count == NULL ||
+    weld_ffi_netflow_remote_at == NULL)
+  {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow FFI not linked");
+    return RMW_RET_UNSUPPORTED;
+  }
+  bridge = weld_graph_bridge();
+  if (bridge == 0) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow bridge not initialized");
+    return RMW_RET_UNSUPPORTED;
+  }
+  (void)memset(ip, 0, sizeof(ip));
+  rc = weld_ffi_netflow_local(
+    bridge, ip, (int)sizeof(ip), &port);
+  if (rc == -3) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow no transport socket");
+    return RMW_RET_UNSUPPORTED;
+  }
+  if (rc != 0) {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow backend failed");
+    return RMW_RET_ERROR;
+  }
+  if (weld_ffi_netflow_remote_count(
+      bridge, topic, remote_role, &n_remote) != 0 ||
+    n_remote < 0)
+  {
+    n_remote = 0;
+  }
+  if (rmw_network_flow_endpoint_array_init(
+      out, (size_t)(1 + n_remote), allocator) != RMW_RET_OK)
+  {
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow init failed");
+    return RMW_RET_BAD_ALLOC;
+  }
+  if (weld_netflow_set(
+      &out->network_flow_endpoint[0],
+      strchr(ip, ':') != NULL, ip, port) != 0)
+  {
+    rmw_ret_t fini_rc = rmw_network_flow_endpoint_array_fini(out);
+    (void)fini_rc;
+    rmw_reset_error();
+    RCUTILS_SET_ERROR_MSG("rmw_weld: netflow backend failed");
+    return RMW_RET_ERROR;
+  }
+  w = 1;
+  for (i = 0; i < n_remote; i++) {
+    char rip[RMW_INET_ADDRSTRLEN];
+    int rport = 0;
+    rmw_network_flow_endpoint_t * e = NULL;
+    (void)memset(rip, 0, sizeof(rip));
+    if (weld_ffi_netflow_remote_at(
+        bridge, topic, remote_role, i, rip, (int)sizeof(rip),
+        &rport) != 0)
+    {
+      continue;
+    }
+    e = &out->network_flow_endpoint[w];
+    if (weld_netflow_set(
+        e, strchr(rip, ':') != NULL, rip, rport) != 0) {
+      continue;
+    }
+    w++;
+  }
+  out->size = w;
+  return RMW_RET_OK;
+}
 
 rmw_ret_t rmw_publisher_get_network_flow_endpoints(
   const rmw_publisher_t * publisher, rcutils_allocator_t * allocator,
   rmw_network_flow_endpoint_array_t * network_flow_endpoint_array)
 {
+  const struct weld_pub_data * pd = NULL;
+  const char * topic = "";
   if (publisher == NULL || allocator == NULL ||
     network_flow_endpoint_array == NULL)
   {
@@ -8228,15 +9592,27 @@ rmw_ret_t rmw_publisher_get_network_flow_endpoints(
     return weld_fail_impl(
       "rmw_weld: rmw_publisher_get_network_flow_endpoints wrong impl");
   }
-  rmw_reset_error();
-  RCUTILS_SET_ERROR_MSG("rmw_weld: network flow endpoints not supported");
-  return RMW_RET_UNSUPPORTED;
+  if (rmw_network_flow_endpoint_array_check_zero(
+      network_flow_endpoint_array) != RMW_RET_OK)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_publisher_get_network_flow_endpoints not zero");
+  }
+  pd = (const struct weld_pub_data *)publisher->data;
+  if (pd != NULL && pd->topic != NULL) {
+    topic = pd->topic;
+  }
+  return weld_netflow_fill(
+    topic, WELD_FILTER_ROLE_READER, allocator,
+    network_flow_endpoint_array);
 }
 
 rmw_ret_t rmw_subscription_get_network_flow_endpoints(
   const rmw_subscription_t * subscription, rcutils_allocator_t * allocator,
   rmw_network_flow_endpoint_array_t * network_flow_endpoint_array)
 {
+  const struct weld_sub_data * sd = NULL;
+  const char * topic = "";
   if (subscription == NULL || allocator == NULL ||
     network_flow_endpoint_array == NULL)
   {
@@ -8247,9 +9623,19 @@ rmw_ret_t rmw_subscription_get_network_flow_endpoints(
     return weld_fail_impl(
       "rmw_weld: rmw_subscription_get_network_flow_endpoints wrong impl");
   }
-  rmw_reset_error();
-  RCUTILS_SET_ERROR_MSG("rmw_weld: network flow endpoints not supported");
-  return RMW_RET_UNSUPPORTED;
+  if (rmw_network_flow_endpoint_array_check_zero(
+      network_flow_endpoint_array) != RMW_RET_OK)
+  {
+    return weld_fail_invalid(
+      "rmw_weld: rmw_subscription_get_network_flow_endpoints not zero");
+  }
+  sd = (const struct weld_sub_data *)subscription->data;
+  if (sd != NULL && sd->topic != NULL) {
+    topic = sd->topic;
+  }
+  return weld_netflow_fill(
+    topic, WELD_FILTER_ROLE_WRITER, allocator,
+    network_flow_endpoint_array);
 }
 
 // Feature query: only dynamic message takes are real. The take

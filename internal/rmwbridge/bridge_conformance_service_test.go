@@ -77,13 +77,23 @@ func checkServiceAvailabilityBefore(t *testing.T, client *rmwbridge.Client) {
 	requireErrorIs(t, err, rmwbridge.ErrServiceNotAvailable, "call without server")
 }
 
-// checkServiceAvailabilityDuplicates pins duplicate create handling.
+// checkServiceAvailabilityDuplicates pins shared queue handles on
+// duplicate create: a second server or client for a name succeeds and
+// shares the same queue instead of reporting ErrServiceExists or
+// ErrClientExists. The shared handles stay live until the destroy step
+// below closes every handle for the name.
 func checkServiceAvailabilityDuplicates(t *testing.T, bridge *rmwbridge.Bridge) {
 	t.Helper()
-	_, err := bridge.CreateService("late_service")
-	requireErrorIs(t, err, rmwbridge.ErrServiceExists, "duplicate service")
-	_, err = bridge.CreateClient("late_service")
-	requireErrorIs(t, err, rmwbridge.ErrClientExists, "duplicate client")
+	extra, err := bridge.CreateService("late_service")
+	requireNoError(t, err, "second service shares queue")
+	if !extra.Exists() {
+		t.Fatalf("extra service exists = false, want true")
+	}
+	extraClient, err := bridge.CreateClient("late_service")
+	requireNoError(t, err, "second client shares service")
+	if !extraClient.Exists() {
+		t.Fatalf("extra client exists = false, want true")
+	}
 }
 
 // checkServiceAvailabilityDestroy pins destroy and second destroy paths.

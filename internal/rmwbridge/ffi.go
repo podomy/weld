@@ -61,6 +61,27 @@ type ffiSvcReplyKey struct {
 	seq int64
 }
 
+// ffiStashedTake holds a dequeued take that did not fit the take buffer.
+//
+// The payload keeps the dequeued bytes while gid plus seq keep the
+// attribution assigned at dequeue, so a larger-buffer retry delivers the
+// same sequence instead of incrementing twice for one sample.
+type ffiStashedTake struct {
+	payload []byte
+	gid     [16]byte
+	seq     uint64
+}
+
+// ffiTakeInfo is the attribution of the most recent delivered take.
+//
+// Seq is the per-subscription receive sequence starting at 1. GID is the
+// publishing writer identity. Intra-process and network sequences are
+// equal because the bridge is a single transport.
+type ffiTakeInfo struct {
+	gid [16]byte
+	seq uint64
+}
+
 // ffiStashedReq holds a dequeued request that did not fit the serve buffer.
 type ffiStashedReq struct {
 	payload []byte
@@ -80,7 +101,8 @@ var (
 	ffiBridgeNodes       = make(map[int64]map[string]*Node)
 	ffiPubs              = make(map[int64]ffiPubEntry)
 	ffiSubs              = make(map[int64]ffiSubEntry)
-	ffiSubPending        = make(map[int64][]byte)
+	ffiSubPending        = make(map[int64]ffiStashedTake)
+	ffiSubLastInfo       = make(map[int64]ffiTakeInfo)
 	ffiServices          = make(map[int64]ffiServiceEntry)
 	ffiGuards            = make(map[int64]*Guard)
 	ffiSvcSeq            = make(map[int64]int64)
@@ -283,6 +305,7 @@ func ffiDetachBridgeLocked(key int64) (*Bridge, []ffiPubEntry, []ffiSubEntry, []
 			subs = append(subs, e)
 			delete(ffiSubs, id)
 			delete(ffiSubPending, id)
+			delete(ffiSubLastInfo, id)
 		}
 	}
 	svcs := make([]ffiServiceEntry, 0)
@@ -318,7 +341,7 @@ func ffiCloseDetachedBridge(b *Bridge, pubs []ffiPubEntry, subs []ffiSubEntry, s
 		firstErr = mergeFirstErr(firstErr, err)
 	}
 	for _, e := range svcs {
-		err := b.DestroyService(e.name)
+		err := e.svc.Close()
 		firstErr = mergeFirstErr(firstErr, err)
 	}
 	err := b.Close()
@@ -596,6 +619,7 @@ func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
 	}
 	delete(ffiSubs, key)
 	delete(ffiSubPending, key)
+	delete(ffiSubLastInfo, key)
 	ffiMu.Unlock()
 	err := e.sub.Close()
 	if err != nil {
@@ -620,8 +644,10 @@ func ffiValidateTakePollArgs(outBuf *C.char, outBufLen C.int, outN *C.int) C.int
 
 // ffiBeginTakePoll resolves the subscription and drains stashed data.
 //
-// When handled is true the caller must return code directly. When false
-// sub holds the subscription for a fresh poll.
+// When handled is true the caller must return code directly. A stashed
+// retry replays the dequeue-time attribution without incrementing the
+// per-subscription sequence. When false sub holds the subscription for
+// a fresh poll.
 func ffiBeginTakePoll(key int64, outBuf *C.char, outBufLen C.int, outN *C.int) (*Subscription, bool, C.int) {
 	ffiMu.Lock()
 	e, ok := ffiSubs[key]
@@ -629,20 +655,23 @@ func ffiBeginTakePoll(key int64, outBuf *C.char, outBufLen C.int, outN *C.int) (
 		ffiMu.Unlock()
 		return nil, true, C.int(ffiErrHandle)
 	}
-	pending, stashed := ffiSubPending[key]
-	if stashed {
-		if len(pending) > int(outBufLen) {
+	stashed, hasStash := ffiSubPending[key]
+	if hasStash {
+		if len(stashed.payload) > int(outBufLen) {
 			ffiMu.Unlock()
 			return nil, true, C.int(ffiErrShort)
 		}
-		code := ffiCopyToC(outBuf, outBufLen, pending)
+		code := ffiCopyToC(outBuf, outBufLen, stashed.payload)
 		if code != C.int(ffiOK) {
 			ffiMu.Unlock()
 			return nil, true, code
 		}
 		delete(ffiSubPending, key)
-		n := len(pending)
+		ffiSubLastInfo[key] = ffiTakeInfo{gid: stashed.gid, seq: stashed.seq}
+		n := len(stashed.payload)
+		sub := e.sub
 		ffiMu.Unlock()
+		sub.ReplayTakeInfo(stashed.gid, stashed.seq)
 		*outN = C.int(n)
 		return nil, true, C.int(ffiOK)
 	}
@@ -669,12 +698,25 @@ func ffiCheckSubUsable(sub *Subscription) C.int {
 }
 
 // ffiStashTakePending stores an oversized payload for retry.
-func ffiStashTakePending(key int64, data []byte) {
-	cp := append([]byte(nil), data...)
+//
+// The gid plus seq keep the dequeue-time attribution so the retry
+// delivers the same sequence instead of incrementing twice.
+func ffiStashTakePending(key int64, sample deliveredSample, seq uint64) {
+	cp := append([]byte(nil), sample.payload...)
 	ffiMu.Lock()
 	_, still := ffiSubs[key]
 	if still {
-		ffiSubPending[key] = cp
+		ffiSubPending[key] = ffiStashedTake{payload: cp, gid: sample.gid, seq: seq}
+	}
+	ffiMu.Unlock()
+}
+
+// ffiRecordTakeInfo stores the attribution of a fresh delivered take.
+func ffiRecordTakeInfo(key int64, gid [16]byte, seq uint64) {
+	ffiMu.Lock()
+	_, still := ffiSubs[key]
+	if still {
+		ffiSubLastInfo[key] = ffiTakeInfo{gid: gid, seq: seq}
 	}
 	ffiMu.Unlock()
 }
@@ -709,10 +751,10 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 	if code := ffiCheckSubUsable(sub); code != C.int(ffiOK) {
 		return code
 	}
-	var data []byte
+	var sample deliveredSample
 	var ready bool
 	select {
-	case data = <-sub.ch:
+	case sample = <-sub.ch:
 		ready = true
 	default:
 		ready = false
@@ -721,15 +763,60 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 		*outN = C.int(0)
 		return C.int(ffiEmpty)
 	}
-	if len(data) > int(outBufLen) {
-		ffiStashTakePending(key, data)
+	seq := sub.noteDeliveredLocked(sample.gid)
+	if len(sample.payload) > int(outBufLen) {
+		ffiStashTakePending(key, sample, seq)
 		return C.int(ffiErrShort)
 	}
-	code = ffiCopyToC(outBuf, outBufLen, data)
+	code = ffiCopyToC(outBuf, outBufLen, sample.payload)
 	if code != C.int(ffiOK) {
 		return code
 	}
-	*outN = C.int(len(data))
+	ffiRecordTakeInfo(key, sample.gid, seq)
+	*outN = C.int(len(sample.payload))
+	return C.int(ffiOK)
+}
+
+// weld_ffi_sub_take_info reports the attribution of the last delivered take.
+//
+// outSeq receives the per-subscription receive sequence starting at 1
+// and gidBuf receives the 16 byte writer GID without a terminator.
+// Intra-process and network sequence numbers are equal because the
+// bridge is a single transport, so the caller reports the same value
+// for both. A handle with no delivered take reports -2. NULL pointers
+// report -1 and an undersized gid buffer reports -4. It never panics.
+func weld_ffi_sub_take_info(handle C.longlong, outSeq *C.ulonglong, gidBuf *C.char, gidLen C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(ffiErrInternal)
+		}
+	}()
+	key := int64(handle)
+	if key <= 0 {
+		return C.int(ffiErrHandle)
+	}
+	if outSeq == nil || gidBuf == nil {
+		return C.int(ffiErrNull)
+	}
+	if int(gidLen) < 16 {
+		return C.int(ffiErrShort)
+	}
+	ffiMu.Lock()
+	info, ok := ffiSubLastInfo[key]
+	if !ok {
+		_, still := ffiSubs[key]
+		ffiMu.Unlock()
+		if !still {
+			return C.int(ffiErrHandle)
+		}
+		return C.int(ffiErrHandle)
+	}
+	ffiMu.Unlock()
+	gid := info.gid
+	*outSeq = C.ulonglong(info.seq)
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(gidBuf)), int(gidLen))
+	copy(dst, gid[:])
 	return C.int(ffiOK)
 }
 
@@ -809,7 +896,7 @@ func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
 		}
 	}
 	ffiMu.Unlock()
-	err := e.svc.bridge.DestroyService(e.name)
+	err := e.svc.Close()
 	if err != nil {
 		return C.int(ffiErrInternal)
 	}
@@ -1353,6 +1440,28 @@ func ffiGoSubTakePoll(handle int64, capacity int) ([]byte, int32, int32) {
 func ffiGoTakePollNullN(handle int64) int32 {
 	rc := weld_ffi_sub_take_poll(C.longlong(handle), nil, C.int(0), nil)
 	return int32(rc)
+}
+
+// ffiGoSubTakeInfo reports the last take attribution for a subscription.
+//
+// It returns the 16 byte writer GID, the per-subscription receive
+// sequence, and the export code. A handle with no delivered take
+// reports the handle code.
+func ffiGoSubTakeInfo(handle int64) ([16]byte, uint64, int32) {
+	var empty [16]byte
+	owned := C.malloc(C.size_t(16))
+	if owned == nil {
+		return empty, 0, int32(ffiErrInternal)
+	}
+	defer C.free(owned)
+	var seq C.ulonglong
+	rc := weld_ffi_sub_take_info(C.longlong(handle), &seq, (*C.char)(owned), C.int(16))
+	if rc != C.int(ffiOK) {
+		return empty, 0, int32(rc)
+	}
+	var gid [16]byte
+	copy(gid[:], C.GoBytes(owned, 16))
+	return gid, uint64(seq), int32(ffiOK)
 }
 
 // ffiGoServiceCreate registers a service through weld_ffi_service_create.

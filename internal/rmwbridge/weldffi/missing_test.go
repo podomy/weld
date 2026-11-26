@@ -4,9 +4,14 @@
 package main
 
 import (
+	"fmt"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/podomy/weld/internal/transports/dds"
+	"github.com/podomy/weld/internal/transports/dds/rtps"
 	"github.com/podomy/weld/internal/types"
 )
 
@@ -303,6 +308,355 @@ func checkRemoteEp(t *testing.T) {
 	requireWeldCode(t, code, -2, "remote_ep_at negative index")
 }
 
+// sharedServedReq is one dequeued request awaiting a response.
+type sharedServedReq struct {
+	handle int64
+	seq    int64
+	req    []byte
+}
+
+// sharedSplitState tracks FFI multiserver progress.
+type sharedSplitState struct {
+	mu     sync.Mutex
+	served int
+	total  int
+}
+
+// sharedSplitFinished reports whether every request was served.
+func (s *sharedSplitState) sharedSplitFinished() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.served >= s.total
+}
+
+// sharedSplitNote records one dequeued request.
+func (s *sharedSplitState) sharedSplitNote() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.served++
+}
+
+// serveSharedSplit drains one FFI service handle until total is served.
+func serveSharedSplit(handle int64, state *sharedSplitState, servedCh chan sharedServedReq, serveErr chan error, done chan struct{}) {
+	defer close(done)
+	for {
+		got, srvSeq, scode := weldGoSvcServeNB(handle, 256)
+		if scode == 1 {
+			if state.sharedSplitFinished() {
+				return
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if scode != 0 {
+			serveErr <- fmt.Errorf("serve_nb code = %d, want 0", scode)
+			return
+		}
+		state.sharedSplitNote()
+		servedCh <- sharedServedReq{handle: handle, seq: srvSeq, req: got}
+	}
+}
+
+// sendSharedBurst enqueues total requests, retrying a full queue.
+//
+// Sends are non-blocking, so a busy queue reports -3 until the servers
+// drain it; the retry preserves send order.
+func sendSharedBurst(t *testing.T, svc int64, guids [][8]byte, total int) {
+	t.Helper()
+	for i := range total {
+		req := []byte{byte(i), byte(i >> 8)}
+		sent := false
+		for attempt := 0; attempt < 1000 && !sent; attempt++ {
+			code := weldGoSvcSendNB(svc, int64(i+1), guids[i], req)
+			if code == 0 {
+				sent = true
+				break
+			}
+			if code != -3 {
+				t.Fatalf("send_nb = %d, want 0", code)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if !sent {
+			t.Fatalf("send_nb %d never accepted: queue stayed full", i)
+		}
+	}
+}
+
+// drainSharedServed responds to every dequeued request and pins exactly-once.
+func drainSharedServed(t *testing.T, svcA, svcB int64, total int, servedCh chan sharedServedReq, doneA, doneB chan struct{}, serveErr chan error) {
+	t.Helper()
+	seen := make(map[string]int)
+	perHandle := make(map[int64]int)
+	for range total {
+		entry := <-servedCh
+		seen[string(entry.req)]++
+		perHandle[entry.handle]++
+		resp := append([]byte("resp:"), entry.req...)
+		requireWeldCode(t, weldGoSvcRespond(entry.handle, entry.seq, resp), 0, "respond")
+	}
+	<-doneA
+	<-doneB
+	close(serveErr)
+	for err := range serveErr {
+		t.Fatalf("server: %v", err)
+	}
+	if len(seen) != total {
+		t.Fatalf("distinct served = %d, want %d", len(seen), total)
+	}
+	for payload, n := range seen {
+		if n != 1 {
+			t.Fatalf("payload %q served %d times, want exactly once", payload, n)
+		}
+	}
+	if perHandle[svcA] == 0 || perHandle[svcB] == 0 {
+		t.Fatalf("server split = %d/%d, want both positive", perHandle[svcA], perHandle[svcB])
+	}
+}
+
+// checkSharedReplies collects every reply and pins the payloads.
+func checkSharedReplies(t *testing.T, svc int64, guids [][8]byte, total int) {
+	t.Helper()
+	for i := range total {
+		req := []byte{byte(i), byte(i >> 8)}
+		want := append([]byte("resp:"), req...)
+		back, _, pcode := weldGoSvcPollReply(svc, int64(i+1), guids[i], 256)
+		requireWeldCode(t, pcode, 0, "poll_reply code")
+		if string(back) != string(want) {
+			t.Fatalf("poll_reply %d = %v, want %v", i, back, want)
+		}
+	}
+}
+
+// checkSharedSurvivor pins the queue staying live after one destroy.
+func checkSharedSurvivor(t *testing.T, svcA, svcB int64) {
+	t.Helper()
+	requireWeldCode(t, weldGoSvcDestroy(svcA), 0, "svc_destroy first")
+	guid := weldTestGuid()
+	requireWeldCode(t, weldGoSvcSendNB(svcB, 100, guid, []byte{9}), 0, "send_nb survivor")
+	got, srvSeq, scode := weldGoSvcServeNB(svcB, 256)
+	requireWeldCode(t, scode, 0, "serve_nb survivor")
+	if string(got) != string([]byte{9}) {
+		t.Fatalf("serve_nb survivor = %v, want [9]", got)
+	}
+	requireWeldCode(t, weldGoSvcRespond(svcB, srvSeq, []byte{7}), 0, "respond survivor")
+	back, _, pcode := weldGoSvcPollReply(svcB, 100, guid, 256)
+	requireWeldCode(t, pcode, 0, "poll_reply survivor")
+	if string(back) != string([]byte{7}) {
+		t.Fatalf("poll_reply survivor = %v, want [7]", back)
+	}
+	requireWeldCode(t, weldGoSvcDestroy(svcB), 0, "svc_destroy second")
+}
+
+// checkServiceSharedQueueMultiServer pins N servers on one service name
+// through the split-leg FFI: two service handles share one request
+// queue, so concurrent servers divide requests work-queue style with
+// each request served exactly once, no loss, and no double serve.
+func checkServiceSharedQueueMultiServer(t *testing.T) {
+	t.Helper()
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	svcA, code := weldGoSvcCreate(bh, "/shared")
+	requireWeldCode(t, code, 0, "svc_create first")
+	svcB, code := weldGoSvcCreate(bh, "/shared")
+	requireWeldCode(t, code, 0, "svc_create second shares queue")
+	const total = 32
+	state := &sharedSplitState{total: total}
+	servedCh := make(chan sharedServedReq, total)
+	serveErr := make(chan error, 2)
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
+	go serveSharedSplit(svcA, state, servedCh, serveErr, doneA)
+	go serveSharedSplit(svcB, state, servedCh, serveErr, doneB)
+	guids := make([][8]byte, total)
+	for i := range guids {
+		guids[i] = weldTestGuid()
+		guids[i][7] = byte(i + 1)
+	}
+	sendSharedBurst(t, svcA, guids, total)
+	drainSharedServed(t, svcA, svcB, total, servedCh, doneA, doneB, serveErr)
+	checkSharedReplies(t, svcA, guids, total)
+	checkSharedSurvivor(t, svcA, svcB)
+}
+
+// checkNetflowLocal pins the local socket entry on a joined bridge.
+//
+// The IP must equal the advertised source the backend uses for SPDP
+// locators and the port must be the nonzero bound unicast port. An
+// in-memory-only bridge reports the internal code: no socket exists.
+func checkNetflowLocal(t *testing.T) {
+	t.Helper()
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	_, _, code := weldGoNetflowLocal(bh)
+	requireWeldCode(t, code, -3, "netflow_local in-memory")
+	_, _, code = weldGoNetflowLocal(1 << 40)
+	requireWeldCode(t, code, -2, "netflow_local unknown bridge")
+	requireWeldCode(t, weldGoJoin(bh, "netflow-local", 76), 0, "join")
+	ip, port, code := weldGoNetflowLocal(bh)
+	requireWeldCode(t, code, 0, "netflow_local code")
+	if parsed := net.ParseIP(ip); parsed == nil {
+		t.Fatalf("netflow_local ip = %q, want a valid IP", ip)
+	}
+	if ip != rtps.AdvertiseIPv4().String() {
+		t.Fatalf("netflow_local ip = %q, want advertised %q", ip, rtps.AdvertiseIPv4().String())
+	}
+	if port <= 0 || port > 65535 {
+		t.Fatalf("netflow_local port = %d, want 1..65535", port)
+	}
+	ipAgain, portAgain, code := weldGoNetflowLocal(bh)
+	requireWeldCode(t, code, 0, "netflow_local repeat code")
+	if ipAgain != ip || portAgain != port {
+		t.Fatalf("netflow_local repeat = %q:%d, want stable %q:%d", ipAgain, portAgain, ip, port)
+	}
+}
+
+// checkNetflowRemoteArgs pins remote validation without a backend.
+func checkNetflowRemoteArgs(t *testing.T) {
+	t.Helper()
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	_, code := weldGoNetflowRemoteCount(bh, "/t", 1)
+	requireWeldCode(t, code, -3, "netflow_remote_count in-memory")
+	_, _, code = weldGoNetflowRemoteAt(bh, "/t", 1, 0)
+	requireWeldCode(t, code, -3, "netflow_remote_at in-memory")
+	_, code = weldGoNetflowRemoteCount(1<<40, "/t", 1)
+	requireWeldCode(t, code, -2, "netflow_remote_count unknown bridge")
+	_, code = weldGoNetflowRemoteCount(bh, "/t", 9)
+	requireWeldCode(t, code, -1, "netflow_remote_count bad role")
+	requireWeldCode(t, weldGoJoin(bh, "netflow-lone", 78), 0, "join")
+	n, code := weldGoNetflowRemoteCount(bh, "/t", 1)
+	requireWeldCode(t, code, 0, "netflow_remote_count lone code")
+	if n != 0 {
+		t.Fatalf("netflow_remote_count lone = %d, want 0", n)
+	}
+	_, _, code = weldGoNetflowRemoteAt(bh, "/t", 1, 0)
+	requireWeldCode(t, code, -2, "netflow_remote_at past end")
+}
+
+// checkNetflowRemoteDiscovery pins discovered peer ports between bridges.
+//
+// Bridge B publishes so its endpoints land in bridge A remotes: A must
+// report B's bound unicast port at loopback for both roles. Entries
+// with unknown ports never surface.
+// joinNetflowPair creates and joins two bridges on one domain.
+func joinNetflowPair(t *testing.T) (int64, int64) {
+	t.Helper()
+	bhA, code := weldGoBridgeNewNoJoin()
+	requireWeldCode(t, code, 0, "bridge_new A")
+	bhB, code := weldGoBridgeNewNoJoin()
+	requireWeldCode(t, code, 0, "bridge_new B")
+	requireWeldCode(t, weldGoJoin(bhA, "netflow-a", 77), 0, "join A")
+	requireWeldCode(t, weldGoJoin(bhB, "netflow-b", 77), 0, "join B")
+	return bhA, bhB
+}
+
+// declareNetflowPair declares a reader on A and a writer on B.
+//
+// Setting the publisher type also declares a reader for the topic, so
+// both roles see the peer.
+func declareNetflowPair(t *testing.T, bhA, bhB int64) (int64, int64) {
+	t.Helper()
+	subA, code := weldGoSubCreate(bhA, "n", "/weld_netflow_probe")
+	requireWeldCode(t, code, 0, "sub_create A")
+	requireWeldCode(t, weldGoSubSetDynamicType(subA, "std_msgs/msg/String", ""), 0, "set_dynamic A")
+	pubB, code := weldGoPubCreate(bhB, "n", "/weld_netflow_probe")
+	requireWeldCode(t, code, 0, "pub_create B")
+	requireWeldCode(t, weldGoPubSetType(pubB, "std_msgs__msg__String", ""), 0, "set_type B")
+	return subA, pubB
+}
+
+// waitNetflowWriterPeer republishes until A sees a writer peer.
+//
+// The writer declares on publish and publishes skip the wire until a
+// remote reader is known, so republish until SEDP converges. It returns
+// B's bound port with the writer peer count.
+func waitNetflowWriterPeer(t *testing.T, bhA, bhB, pubB int64) (int, int64) {
+	t.Helper()
+	_, peerPort, code := weldGoNetflowLocal(bhB)
+	requireWeldCode(t, code, 0, "netflow_local B")
+	if peerPort <= 0 {
+		t.Fatalf("netflow_local B port = %d, want nonzero", peerPort)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var n int64
+	for {
+		requireWeldCode(t, weldGoPubPublish(pubB, []byte{1}), 0, "publish B declares writer")
+		n, code = weldGoNetflowRemoteCount(bhA, "/weld_netflow_probe", 0)
+		requireWeldCode(t, code, 0, "netflow_remote_count code")
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n <= 0 {
+		t.Fatalf("netflow_remote_count writer peers = %d, want at least 1", n)
+	}
+	return peerPort, n
+}
+
+// checkNetflowEntries validates every remote entry and pins B's port.
+func checkNetflowEntries(t *testing.T, bhA int64, role int32, n int64, peerPort int, what string) {
+	t.Helper()
+	found := false
+	for i := range n {
+		ip, port, code := weldGoNetflowRemoteAt(bhA, "/weld_netflow_probe", role, i)
+		requireWeldCode(t, code, 0, "netflow_remote_at "+what+" code")
+		if parsed := net.ParseIP(ip); parsed == nil {
+			t.Fatalf("netflow_remote_at %s ip = %q, want a valid IP", what, ip)
+		}
+		if port <= 0 || port > 65535 {
+			t.Fatalf("netflow_remote_at %s port = %d, want 1..65535", what, port)
+		}
+		// Remote flows address the loopback destination the
+		// transport sends peer DATA to; the port must be the
+		// discovered bound port of bridge B.
+		if ip != weldNetflowLoopback {
+			t.Fatalf("netflow_remote_at %s ip = %q, want loopback %q", what, ip, weldNetflowLoopback)
+		}
+		if port == peerPort {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("netflow %s remotes miss B port %d", what, peerPort)
+	}
+	_, _, code := weldGoNetflowRemoteAt(bhA, "/weld_netflow_probe", role, n)
+	requireWeldCode(t, code, -2, "netflow_remote_at "+what+" past end")
+}
+
+func checkNetflowRemoteDiscovery(t *testing.T) {
+	t.Helper()
+	bhA, bhB := joinNetflowPair(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bhA), 0, "bridge_free A")
+	}()
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bhB), 0, "bridge_free B")
+	}()
+	subA, pubB := declareNetflowPair(t, bhA, bhB)
+	defer func() {
+		requireWeldCode(t, weldGoSubDestroy(subA), 0, "sub_destroy A")
+	}()
+	defer func() {
+		requireWeldCode(t, weldGoPubDestroy(pubB), 0, "pub_destroy B")
+	}()
+	peerPort, n := waitNetflowWriterPeer(t, bhA, bhB, pubB)
+	checkNetflowEntries(t, bhA, 0, n, peerPort, "writer")
+	nReaders, code := weldGoNetflowRemoteCount(bhA, "/weld_netflow_probe", 1)
+	requireWeldCode(t, code, 0, "netflow_remote_count reader role code")
+	if nReaders <= 0 {
+		t.Fatalf("netflow_remote_count reader peers = %d, want at least 1", nReaders)
+	}
+	checkNetflowEntries(t, bhA, 1, nReaders, peerPort, "reader")
+}
+
 // checkLiveliness pins liveliness reporting and generation rules.
 func checkLiveliness(t *testing.T) {
 	t.Helper()
@@ -333,6 +687,10 @@ func TestWeldMissingExports(t *testing.T) {
 	t.Run("split_short", checkServiceSplitShort)
 	t.Run("rtps_args", checkServiceRTPSArgs)
 	t.Run("reply_match", checkServiceReplyMatch)
+	t.Run("shared_queue", checkServiceSharedQueueMultiServer)
+	t.Run("netflow_local", checkNetflowLocal)
+	t.Run("netflow_remote_args", checkNetflowRemoteArgs)
+	t.Run("netflow_remote_discovery", checkNetflowRemoteDiscovery)
 	t.Run("content_filter", checkContentFilter)
 	t.Run("remote_ep", checkRemoteEp)
 	t.Run("liveliness", checkLiveliness)

@@ -193,6 +193,78 @@ func TestFFIServiceCallNB(t *testing.T) {
 	requireFFICodeZero(t, code, "bridge_free")
 }
 
+// serveSharedOnce serves one request expecting ping and replies once.
+func serveSharedOnce(svc *Service, reply string, done chan error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, respond, err := svc.Serve(ctx)
+	if err != nil {
+		done <- err
+		return
+	}
+	if string(req) != "ping" {
+		done <- context.Cause(ctx)
+		return
+	}
+	done <- respond([]byte(reply))
+}
+
+// checkSharedCallRoundTrip calls through one handle while serving on another.
+func checkSharedCallRoundTrip(t *testing.T, callHandle int64, svc *Service, reply string, op string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go serveSharedOnce(svc, reply, done)
+	resp, _, code := ffiGoServiceCallNB(callHandle, []byte("ping"), 256)
+	requireFFICodeZero(t, code, "service_call_nb "+op)
+	if string(resp) != reply {
+		t.Fatalf("service reply = %q, want %q", string(resp), reply)
+	}
+	err := <-done
+	if err != nil {
+		t.Fatalf("%s serve: %v", op, err)
+	}
+}
+
+// TestFFIServiceSharedQueue pins two FFI service handles sharing one queue.
+//
+// A second weld_ffi_service_create for a registered name succeeds with a
+// distinct handle popping the same queue, and destroying one handle
+// leaves the other live until the last destroy closes the queue.
+func TestFFIServiceSharedQueue(t *testing.T) {
+	bh := ffiTestBridge(t)
+	h1, code := ffiGoServiceCreate(bh, "sharedsvc")
+	requireFFICodeZero(t, code, "service_create first")
+	h2, code := ffiGoServiceCreate(bh, "sharedsvc")
+	requireFFICodeZero(t, code, "service_create second shares queue")
+	ffiMu.Lock()
+	e1, ok1 := ffiServices[h1]
+	e2, ok2 := ffiServices[h2]
+	ffiMu.Unlock()
+	if !ok1 || !ok2 {
+		t.Fatalf("shared handles registered = %v/%v, want true/true", ok1, ok2)
+	}
+	if e1.svc == e2.svc {
+		t.Fatalf("second service aliases first, want distinct handles")
+	}
+	if !e1.svc.Exists() || !e2.svc.Exists() {
+		t.Fatalf("shared exists = %v/%v, want true/true", e1.svc.Exists(), e2.svc.Exists())
+	}
+	checkSharedCallRoundTrip(t, h1, e2.svc, "pong", "cross-handle")
+	code = ffiGoServiceDestroy(h1)
+	requireFFICodeZero(t, code, "service_destroy first")
+	if e1.svc.Exists() {
+		t.Fatalf("destroyed service exists = true, want false")
+	}
+	if !e2.svc.Exists() {
+		t.Fatalf("surviving service exists = false, want true")
+	}
+	checkSharedCallRoundTrip(t, h2, e2.svc, "pong2", "survivor")
+	code = ffiGoServiceDestroy(h2)
+	requireFFICodeZero(t, code, "service_destroy second")
+	code = ffiGoBridgeFree(bh)
+	requireFFICodeZero(t, code, "bridge_free")
+}
+
 // TestFFIGuardTriggerReset pins guard create, trigger, and reset.
 func TestFFIGuardTriggerReset(t *testing.T) {
 	gh, code := ffiGoGuardCreate()
@@ -262,5 +334,88 @@ func TestFFIInvalidHandles(t *testing.T) {
 	checkFFIBadPubSub(t, bad)
 	checkFFIBadDestroy(t, bad)
 	code := ffiGoBridgeFree(bh)
+	requireFFICodeZero(t, code, "bridge_free")
+}
+
+// checkFFITakeInfo takes one sample and pins its sequence plus GID.
+func checkFFITakeInfo(t *testing.T, subH int64, want string, wantSeq uint64, wantGID [16]byte) {
+	t.Helper()
+	data, n, code := ffiGoSubTakePoll(subH, 256)
+	requireFFICodeZero(t, code, "take_poll")
+	if string(data) != want || int(n) != len(want) {
+		t.Fatalf("take_poll = %q n = %d, want %q n = %d", string(data), n, want, len(want))
+	}
+	gid, seq, code := ffiGoSubTakeInfo(subH)
+	requireFFICodeZero(t, code, "take_info")
+	if seq != wantSeq {
+		t.Fatalf("sequence = %d, want %d", seq, wantSeq)
+	}
+	if gid != wantGID {
+		t.Fatalf("gid = %x, want %x", gid, wantGID)
+	}
+	if gid == ([16]byte{}) {
+		t.Fatalf("gid is zero, want writer identity")
+	}
+}
+
+// TestFFITakeInfoSequence pins 1,2,3 sequences plus GID across FFI takes.
+//
+// Intra-process and network sequence numbers are equal because the
+// bridge is a single transport, so the side channel reports one value
+// for both. The GID equals the publishing writer identity.
+func TestFFITakeInfoSequence(t *testing.T) {
+	bh := ffiTestBridge(t)
+	pubH, subH := createFFIPubSub(t, bh)
+	ffiMu.Lock()
+	wantGID := ffiPubs[pubH].pub.GID()
+	ffiMu.Unlock()
+	if wantGID == ([16]byte{}) {
+		t.Fatalf("publisher GID is zero")
+	}
+	payloads := []string{"one", "two", "three"}
+	for i, payload := range payloads {
+		code := ffiGoPubPublish(pubH, []byte(payload))
+		requireFFICodeZero(t, code, "publish")
+		checkFFITakeInfo(t, subH, payload, uint64(i+1), wantGID)
+	}
+	destroyFFIPubSub(t, bh, pubH, subH)
+}
+
+// TestFFITakeInfoStashRetry pins that a short-buffer retry keeps its sequence.
+//
+// The oversized take stashes with its dequeue-time attribution, so the
+// retry delivers the same sequence and the next take advances by one.
+func TestFFITakeInfoStashRetry(t *testing.T) {
+	bh := ffiTestBridge(t)
+	pubH, subH := createFFIPubSub(t, bh)
+	ffiMu.Lock()
+	wantGID := ffiPubs[pubH].pub.GID()
+	ffiMu.Unlock()
+	code := ffiGoPubPublish(pubH, []byte("0123456789"))
+	requireFFICodeZero(t, code, "publish 10 bytes")
+	_, _, code = ffiGoSubTakePoll(subH, 2)
+	if code != -4 {
+		t.Fatalf("short take_poll = %d, want -4", code)
+	}
+	checkFFITakeInfo(t, subH, "0123456789", 1, wantGID)
+	code = ffiGoPubPublish(pubH, []byte("next"))
+	requireFFICodeZero(t, code, "publish next")
+	checkFFITakeInfo(t, subH, "next", 2, wantGID)
+	destroyFFIPubSub(t, bh, pubH, subH)
+}
+
+// TestFFITakeInfoNoTake pins the side channel with no delivered take.
+func TestFFITakeInfoNoTake(t *testing.T) {
+	bh := ffiTestBridge(t)
+	_, subH := createFFIPubSub(t, bh)
+	_, _, code := ffiGoSubTakeInfo(subH)
+	if code != -2 {
+		t.Fatalf("take_info without take = %d, want -2", code)
+	}
+	_, _, code = ffiGoSubTakeInfo(int64(123456789))
+	if code != -2 {
+		t.Fatalf("take_info bad handle = %d, want -2", code)
+	}
+	code = ffiGoBridgeFree(bh)
 	requireFFICodeZero(t, code, "bridge_free")
 }

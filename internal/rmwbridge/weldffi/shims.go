@@ -142,6 +142,22 @@ func weldGoSubSetDynamicType(handle int64, name, hash string) int32 {
 	return int32(rc)
 }
 
+// weldGoPubSetType records a publisher type through the export.
+func weldGoPubSetType(handle int64, name, hash string) int32 {
+	tn := C.CString(name)
+	if tn == nil {
+		return int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(tn))
+	th := C.CString(hash)
+	if th == nil {
+		return int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(th))
+	rc := weld_ffi_pub_set_type(C.longlong(handle), tn, th)
+	return int32(rc)
+}
+
 // weldGoSvcSetType records a service type through the export.
 func weldGoSvcSetType(handle int64, name, hash string) int32 {
 	tn := C.CString(name)
@@ -395,4 +411,173 @@ func weldGoReportLiveliness(bridge int64, participant string, domain int32, aliv
 	defer C.free(unsafe.Pointer(cp))
 	rc := weld_ffi_report_liveliness(C.longlong(bridge), cp, C.int(domain), C.int(alive), C.ulonglong(generation))
 	return int32(rc)
+}
+
+// weldGoSubTakePoll takes one message through weld_ffi_sub_take_poll.
+//
+// It returns the payload, the byte count, and the export code. Code 1
+// with nil data means no message was ready.
+func weldGoSubTakePoll(handle int64, capacity int) ([]byte, int32, int32) {
+	if capacity < 0 {
+		capacity = 0
+	}
+	var ptr *C.char
+	var owned unsafe.Pointer
+	if capacity > 0 {
+		owned = C.malloc(C.size_t(capacity))
+		if owned == nil {
+			return nil, 0, int32(weldCodeErrInternal)
+		}
+		defer C.free(owned)
+		ptr = (*C.char)(owned)
+	}
+	var n C.int
+	rc := weld_ffi_sub_take_poll(C.longlong(handle), ptr, C.int(capacity), &n)
+	if rc == C.int(weldCodeEmpty) {
+		return nil, 0, int32(weldCodeEmpty)
+	}
+	if rc != C.int(weldCodeOK) {
+		return nil, 0, int32(rc)
+	}
+	if int(n) == 0 {
+		return []byte{}, 0, int32(weldCodeOK)
+	}
+	out := C.GoBytes(owned, n)
+	return out, int32(n), int32(weldCodeOK)
+}
+
+// weldGoSubTakeInfo reports the last take attribution for a subscription.
+//
+// It returns the 16 byte writer GID, the per-subscription receive
+// sequence, and the export code. A handle with no delivered take
+// reports the handle code.
+func weldGoSubTakeInfo(handle int64) ([16]byte, uint64, int32) {
+	var empty [16]byte
+	owned := C.malloc(C.size_t(16))
+	if owned == nil {
+		return empty, 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(owned)
+	var seq C.ulonglong
+	rc := weld_ffi_sub_take_info(C.longlong(handle), &seq, (*C.char)(owned), C.int(16))
+	if rc != C.int(weldCodeOK) {
+		return empty, 0, int32(rc)
+	}
+	var gid [16]byte
+	copy(gid[:], C.GoBytes(owned, 16))
+	return gid, uint64(seq), int32(weldCodeOK)
+}
+
+// weldGoNetflowLocal reports the local socket address through the export.
+//
+// It returns the advertised IPv4, the bound unicast port, and the export
+// code. An in-memory-only bridge reports the internal code.
+func weldGoNetflowLocal(handle int64) (string, int, int32) {
+	const ipCap = 64
+	owned := C.malloc(C.size_t(ipCap))
+	if owned == nil {
+		return "", 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(owned)
+	var port C.int
+	rc := weld_ffi_netflow_local(C.longlong(handle), (*C.char)(owned), C.int(ipCap), &port)
+	if rc != C.int(weldCodeOK) {
+		return "", 0, int32(rc)
+	}
+	return C.GoString((*C.char)(owned)), int(port), int32(weldCodeOK)
+}
+
+// weldGoNetflowRemoteCount counts remote flow entries through the export.
+//
+// Only peers with at least one known unicast port count. It returns the
+// count and the export code.
+func weldGoNetflowRemoteCount(handle int64, topic string, role int32) (int64, int32) {
+	ct := C.CString(topic)
+	if ct == nil {
+		return 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(ct))
+	var n C.longlong
+	rc := weld_ffi_netflow_remote_count(C.longlong(handle), ct, C.int(role), &n)
+	return int64(n), int32(rc)
+}
+
+// weldGoNetflowRemoteAt copies one remote flow entry through the export.
+//
+// It returns the destination IP, the discovered unicast port, and the
+// export code. Unknown or torn entries report the handle code.
+func weldGoNetflowRemoteAt(handle int64, topic string, role int32, index int64) (string, int, int32) {
+	ct := C.CString(topic)
+	if ct == nil {
+		return "", 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(ct))
+	const ipCap = 64
+	owned := C.malloc(C.size_t(ipCap))
+	if owned == nil {
+		return "", 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(owned)
+	var port C.int
+	rc := weld_ffi_netflow_remote_at(C.longlong(handle), ct, C.int(role), C.longlong(index), (*C.char)(owned), C.int(ipCap), &port)
+	if rc != C.int(weldCodeOK) {
+		return "", 0, int32(rc)
+	}
+	return C.GoString((*C.char)(owned)), int(port), int32(weldCodeOK)
+}
+
+// weldGoSubSetDeadline records one subscription deadline through the export.
+func weldGoSubSetDeadline(handle int64, sec, nsec int64) int32 {
+	rc := weld_ffi_sub_set_deadline(C.longlong(handle), C.longlong(sec), C.longlong(nsec))
+	return int32(rc)
+}
+
+// weldGoPubSetDeadline records one publisher deadline through the export.
+func weldGoPubSetDeadline(handle int64, sec, nsec int64) int32 {
+	rc := weld_ffi_pub_set_deadline(C.longlong(handle), C.longlong(sec), C.longlong(nsec))
+	return int32(rc)
+}
+
+// weldGoSubDeadlineTotal reports cumulative requested misses through the export.
+func weldGoSubDeadlineTotal(handle int64) (uint64, int32) {
+	var total C.ulonglong
+	rc := weld_ffi_sub_requested_deadline_total(C.longlong(handle), &total)
+	return uint64(total), int32(rc)
+}
+
+// weldGoPubDeadlineTotal reports cumulative offered misses through the export.
+func weldGoPubDeadlineTotal(handle int64) (uint64, int32) {
+	var total C.ulonglong
+	rc := weld_ffi_pub_offered_deadline_total(C.longlong(handle), &total)
+	return uint64(total), int32(rc)
+}
+
+// weldGoSubIncompatTotal reports cumulative requested incompatibilities.
+func weldGoSubIncompatTotal(handle int64) (uint64, int32) {
+	var total C.ulonglong
+	rc := weld_ffi_sub_incompatible_total(C.longlong(handle), &total)
+	return uint64(total), int32(rc)
+}
+
+// weldGoPubIncompatTotal reports cumulative offered incompatibilities.
+func weldGoPubIncompatTotal(handle int64) (uint64, int32) {
+	var total C.ulonglong
+	rc := weld_ffi_pub_incompatible_total(C.longlong(handle), &total)
+	return uint64(total), int32(rc)
+}
+
+// weldGoRemoteEpQoS copies one remote endpoint QoS offer through the export.
+//
+// It returns reliability, durability, history, depth, deadline sec/nsec,
+// liveliness, lease sec/nsec, and the export code. Unknown or malformed
+// offers report the handle code so callers skip fail-closed.
+func weldGoRemoteEpQoS(bridge int64, topic string, role int32, index int64) (int64, int64, int64, int64, int64, int64, int64, int64, int64, int32) {
+	ct := C.CString(topic)
+	if ct == nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(ct))
+	var reliability, durability, history, depth, deadlineSec, deadlineNs, liveliness, leaseSec, leaseNs C.longlong
+	rc := weld_ffi_remote_ep_qos(C.longlong(bridge), ct, C.int(role), C.longlong(index), &reliability, &durability, &history, &depth, &deadlineSec, &deadlineNs, &liveliness, &leaseSec, &leaseNs)
+	return int64(reliability), int64(durability), int64(history), int64(depth), int64(deadlineSec), int64(deadlineNs), int64(liveliness), int64(leaseSec), int64(leaseNs), int32(rc)
 }

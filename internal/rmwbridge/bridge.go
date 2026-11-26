@@ -42,9 +42,17 @@ var ErrNodeExists = errors.New("rmwbridge: node exists")
 var ErrNodeNotFound = errors.New("rmwbridge: node not found")
 
 // ErrServiceExists reports duplicate service creation.
+//
+// Creation no longer fails: every CreateService for a registered name
+// returns a new handle sharing the same request queue. The sentinel stays
+// for API compatibility.
 var ErrServiceExists = errors.New("rmwbridge: service exists")
 
 // ErrClientExists reports duplicate client creation.
+//
+// Creation no longer fails: every CreateClient for a name returns a new
+// handle calling the shared queue. The sentinel stays for API
+// compatibility.
 var ErrClientExists = errors.New("rmwbridge: client exists")
 
 // ErrClientNotFound reports use or destroy of an unknown client.
@@ -222,6 +230,38 @@ type Publisher struct {
 	gid      [16]byte
 }
 
+// deliveredSample is one queued delivery with its writer identity.
+//
+// Payload is the copied sample bytes. GID is the publishing writer
+// identity captured at publish time, mirroring dds.WriterGUID width.
+type deliveredSample struct {
+	payload []byte
+	gid     [16]byte
+}
+
+// loanSlot is one queued in-process loan carrying opaque C handles.
+//
+// Ptr is the opaque C message pointer valid only in the publishing
+// process. Members is the opaque C introspection members pointer for
+// fini plus free on return. The bridge never dereferences either and
+// never copies payload bytes; only the 16 bytes of handles move, so the
+// in-process path is zero-copy. GID is the publishing writer identity
+// captured at publish time for the take-info side channel.
+type loanSlot struct {
+	ptr     uint64
+	members uint64
+	gid     [16]byte
+}
+
+// loanQueueDepth bounds each per-topic in-process loan queue.
+//
+// A bounded queue keeps a misuse leak bounded: loaned publishes consumed
+// only via regular takes leave their handles queued, so an unbounded
+// queue would grow without limit. When full, PublishLoan reports false
+// and the C caller frees the buffer and keeps the wire copy, so delivery
+// still succeeds via the copying path.
+const loanQueueDepth = 16
+
 // Subscription is a topic reader bound to a node with passthrough QoS.
 //
 // DomainID is inherited from the node at creation. Delivery only happens
@@ -237,9 +277,16 @@ type Subscription struct {
 	DomainID uint32
 	node     *Node
 	bridge   *Bridge
-	ch       chan []byte
+	ch       chan deliveredSample
 	mu       sync.Mutex
 	closed   bool
+	// recvSeq is the per-subscription receive sequence. It starts at 0
+	// and increments on every delivered take, so the first take reports
+	// 1, the second 2, and so on. Intra-process and network sequence
+	// numbers are equal here because the bridge is a single transport.
+	recvSeq uint64
+	// lastGID is the writer identity of the most recent delivered take.
+	lastGID [16]byte
 }
 
 // ServiceRequest is one pending call from client to server.
@@ -324,18 +371,42 @@ type topicKey struct {
 // It mirrors the transports.Backend contract with JoinDiscovery,
 // PublishBytes, TakeBytes, ReportLiveliness, and Close, and adds RMW
 // registries for nodes, topic pub/sub, services, guards, and wait sets.
+// Services on one name share a single request queue: every CreateService
+// for a registered name returns a new handle popping the same queue, so
+// N servers share load work-queue style with first-available-server-wins
+// FIFO fairness and each request served exactly once. Clients behave the
+// same way: every CreateClient for a name returns a new handle calling
+// the shared queue, so 1-server N-clients keeps working beside N servers.
 // The zero value is not usable; construct with NewBridge.
 type Bridge struct {
-	mu              sync.Mutex
-	closed          bool
-	joined          bool
-	participant     string
-	domainID        uint32
-	nodes           map[nodeKey]*Node
-	pubs            map[topicKey]map[*Publisher]struct{}
-	subs            map[topicKey]map[*Subscription]struct{}
-	services        map[string]*Service
-	clients         map[string]*Client
+	mu          sync.Mutex
+	closed      bool
+	joined      bool
+	participant string
+	domainID    uint32
+	nodes       map[nodeKey]*Node
+	pubs        map[topicKey]map[*Publisher]struct{}
+	subs        map[topicKey]map[*Subscription]struct{}
+	services    map[string]*Service
+	clients     map[string]*Client
+	// serviceExtras holds non-primary server handles sharing the primary
+	// queue for a name. The primary lives in services; extras pop the
+	// same requests channel, so every handle is a work-queue consumer.
+	serviceExtras map[string]map[*Service]struct{}
+	// clientExtras holds non-primary client handles for a name. The
+	// primary lives in clients; extras call the same shared queue.
+	clientExtras map[string]map[*Client]struct{}
+	// loans holds one FIFO of opaque in-process loan handles per topic.
+	// The queue carries only handle values, never payload bytes, so the
+	// in-process loaned path moves no payload bytes. The wire path still
+	// copies: CDR encode plus channel copy plus CDR decode each allocate.
+	loans map[topicKey][]loanSlot
+	// loanTransfers counts zero-copy handoffs consumed by TakeLoan.
+	loanTransfers uint64
+	// loanCopies counts payload byte copies on the loan path, always zero
+	// by construction. A nonzero value would prove a copy slipped into
+	// the zero-copy path, so tests assert it stays zero.
+	loanCopies      uint64
 	inbox           chan IncomingMessage
 	generations     map[string]uint64
 	generationAlive map[string]bool
@@ -352,6 +423,9 @@ func NewBridge() *Bridge {
 		subs:            make(map[topicKey]map[*Subscription]struct{}),
 		services:        make(map[string]*Service),
 		clients:         make(map[string]*Client),
+		serviceExtras:   make(map[string]map[*Service]struct{}),
+		clientExtras:    make(map[string]map[*Client]struct{}),
+		loans:           make(map[topicKey][]loanSlot),
 		inbox:           make(chan IncomingMessage, inboxCapacity),
 		generations:     make(map[string]uint64),
 		generationAlive: make(map[string]bool),
@@ -779,7 +853,7 @@ func (b *Bridge) CreateSubscription(node *Node, topic string, qos QoS) (*Subscri
 		DomainID: node.DomainID,
 		node:     node,
 		bridge:   b,
-		ch:       make(chan []byte, subscriptionCapacity),
+		ch:       make(chan deliveredSample, subscriptionCapacity),
 	}
 	key := topicKey{domain: node.DomainID, topic: topic}
 	set, ok := b.subs[key]
@@ -821,7 +895,11 @@ func (s *Subscription) CountMatchedPublishers() int {
 // Publish delivers a payload copy to every subscription on the topic in
 // the same domain.
 //
-// Domain isolation: only subscriptions with DomainID equal to the
+// Copy path: the payload bytes are copied once here and once per Take,
+// plus CDR encode plus decode each allocate, because serialization plus
+// Go channel ownership inherently copy. The loaned path PublishLoan is
+// zero-copy instead: only opaque handle values move with no payload byte
+// copy. Domain isolation: only subscriptions with DomainID equal to the
 // publisher domain on the same topic receive the sample, mirroring
 // dds decodePlainCDR plus TakeFrom domain filtering. Payload ownership is
 // copy once per transports copy once: the bridge copies once and each
@@ -842,6 +920,7 @@ func (p *Publisher) Publish(ctx context.Context, payload []byte) error {
 	bridge := p.bridge
 	p.mu.Lock()
 	pubClosed := p.closed
+	gid := p.gid
 	p.mu.Unlock()
 	if pubClosed {
 		return fmt.Errorf("rmwbridge: publisher publish: %w", ErrPublisherClosed)
@@ -861,6 +940,7 @@ func (p *Publisher) Publish(ctx context.Context, payload []byte) error {
 	}
 	bridge.mu.Unlock()
 	data := append([]byte(nil), payload...)
+	sample := deliveredSample{payload: data, gid: gid}
 	for _, sub := range targets {
 		sub.mu.Lock()
 		closed := sub.closed
@@ -875,7 +955,7 @@ func (p *Publisher) Publish(ctx context.Context, payload []byte) error {
 				return fmt.Errorf("rmwbridge: publisher publish: %w", err)
 			}
 			return fmt.Errorf("rmwbridge: publisher publish: %w", context.Canceled)
-		case sub.ch <- data:
+		case sub.ch <- sample:
 		}
 	}
 	return nil
@@ -885,31 +965,229 @@ func (p *Publisher) Publish(ctx context.Context, payload []byte) error {
 //
 // It blocks until a message arrives or ctx ends. The returned slice is
 // newly owned by the caller per copy once, mirroring dds TakeFrom
-// ownership. It backs rmw_take.
+// ownership. Every delivered take, including this one, increments the
+// per-subscription receive sequence. It backs rmw_take.
 func (s *Subscription) Take(ctx context.Context) ([]byte, error) {
+	payload, _, _, err := s.TakeWithInfo(ctx)
+	return payload, err
+}
+
+// TakeWithInfo receives one payload with writer identity and sequence.
+//
+// Copy path: the returned payload is newly owned by the caller per copy
+// once, because channel delivery plus ownership inherently copy; CDR
+// decode on the C side allocates a fresh message for the same reason.
+// The loaned path TakeLoan is zero-copy instead: it returns the same
+// opaque handle enqueued by PublishLoan with no payload byte copy. It
+// blocks until a message arrives or ctx ends. The GID is the publishing
+// writer identity captured at publish time. The sequence is the
+// per-subscription receive counter starting at 1 and incrementing on
+// every delivered take, including Takes that discard the attribution.
+// Intra-process and network sequence numbers are equal here because the
+// bridge is a single transport: callers report the same value for both.
+// It backs the rmw_take_with_info attribution path.
+func (s *Subscription) TakeWithInfo(ctx context.Context) ([]byte, [16]byte, uint64, error) {
+	var empty [16]byte
 	s.bridge.mu.Lock()
 	bridgeClosed := s.bridge.closed
 	s.bridge.mu.Unlock()
 	if bridgeClosed {
-		return nil, fmt.Errorf("rmwbridge: subscription take: %w", ErrBridgeClosed)
+		return nil, empty, 0, fmt.Errorf("rmwbridge: subscription take: %w", ErrBridgeClosed)
 	}
 	s.mu.Lock()
 	subClosed := s.closed
 	s.mu.Unlock()
 	if subClosed {
-		return nil, fmt.Errorf("rmwbridge: subscription take: %w", ErrSubscriptionClosed)
+		return nil, empty, 0, fmt.Errorf("rmwbridge: subscription take: %w", ErrSubscriptionClosed)
 	}
 	select {
 	case <-ctx.Done():
 		err := ctx.Err()
 		if err != nil {
-			return nil, fmt.Errorf("rmwbridge: subscription take: %w", err)
+			return nil, empty, 0, fmt.Errorf("rmwbridge: subscription take: %w", err)
 		}
-		return nil, fmt.Errorf("rmwbridge: subscription take: %w", context.Canceled)
-	case data := <-s.ch:
-		out := append([]byte(nil), data...)
-		return out, nil
+		return nil, empty, 0, fmt.Errorf("rmwbridge: subscription take: %w", context.Canceled)
+	case sample := <-s.ch:
+		out := append([]byte(nil), sample.payload...)
+		seq := s.noteDeliveredLocked(sample.gid)
+		return out, sample.gid, seq, nil
 	}
+}
+
+// noteDeliveredLocked records one delivery and returns its sequence.
+//
+// The caller must not hold s.mu. The GID is the writer identity of the
+// delivered sample. The sequence increments on every call, so stashed
+// retries must not call it twice for one sample.
+func (s *Subscription) noteDeliveredLocked(gid [16]byte) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recvSeq++
+	s.lastGID = gid
+	return s.recvSeq
+}
+
+// ReplayTakeInfo records a stashed retry delivery without incrementing.
+//
+// A short-buffer retry dequeued once already: its sequence was assigned
+// at dequeue, so redelivery replays the same gid plus seq. When seq
+// advances past the counter (no interleaving in practice) the counter
+// follows it to keep the stream contiguous. It never blocks.
+func (s *Subscription) ReplayTakeInfo(gid [16]byte, seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq > s.recvSeq {
+		s.recvSeq = seq
+	}
+	s.lastGID = gid
+}
+
+// NoteExternalDelivery records one wire delivery from outside the queue.
+//
+// Wire takes bypass the subscription channel, so this assigns them the
+// next per-subscription receive sequence and records the writer identity
+// for the take-info side channel. A zero GID means the wire leg carried
+// no writer identity. It returns the assigned sequence.
+func (s *Subscription) NoteExternalDelivery(gid [16]byte) uint64 {
+	return s.noteDeliveredLocked(gid)
+}
+
+// LastTakeInfo returns the attribution of the most recent delivered take.
+//
+// It reports the writer identity and the per-subscription receive
+// sequence of the last delivery. A zero sequence means no take has
+// delivered yet. It never blocks.
+func (s *Subscription) LastTakeInfo() ([16]byte, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastGID, s.recvSeq
+}
+
+// PublishLoan enqueues one in-process loan handle without copying.
+//
+// Ptr is the opaque C message pointer and members is the opaque C
+// introspection members pointer, both valid only in the publishing
+// process. The bridge never dereferences either and never copies payload
+// bytes; only the handle values move, so this path is zero-copy. The
+// wire path still copies: CDR encode allocates wire bytes, Publish copies
+// into each subscription channel, and Take copies out plus CDR decode
+// allocates a fresh message. Domain isolation matches Publish: only
+// subscriptions in the publisher domain on the same topic may later
+// dequeue the handle.
+//
+// Single-owner transfer: the first TakeLoan dequeues the handle and owns
+// it until C return frees it exactly once via the C loan tracking. Other
+// matched subscriptions still receive the wire copy published alongside,
+// so every subscriber gets exactly one delivery with at most one
+// zero-copy handoff per publish. When no subscription matches or the
+// per-topic queue is full it reports false with nil error and queues
+// nothing; the caller keeps the wire copy path and frees the buffer, so
+// delivery still succeeds via copying without leaking. It reports
+// ErrPublisherClosed after Close and ErrBridgeClosed after Bridge Close.
+// It never blocks.
+func (p *Publisher) PublishLoan(ptr uint64, members uint64) (bool, error) {
+	if ptr == 0 || members == 0 {
+		return false, errors.New("rmwbridge: publish loan: zero handle") //nolint:wrapcheck // new error, nothing to wrap
+	}
+	bridge := p.bridge
+	p.mu.Lock()
+	pubClosed := p.closed
+	gid := p.gid
+	p.mu.Unlock()
+	if pubClosed {
+		return false, fmt.Errorf("rmwbridge: publisher publish loan: %w", ErrPublisherClosed)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.closed {
+		return false, fmt.Errorf("rmwbridge: publisher publish loan: %w", ErrBridgeClosed)
+	}
+	key := topicKey{domain: p.DomainID, topic: p.Topic}
+	matched := 0
+	for sub := range bridge.subs[key] {
+		sub.mu.Lock()
+		closedSub := sub.closed
+		subDomain := sub.DomainID
+		sub.mu.Unlock()
+		if !closedSub && subDomain == p.DomainID {
+			matched++
+		}
+	}
+	if matched == 0 {
+		return false, nil
+	}
+	queued := bridge.loans[key]
+	if len(queued) >= loanQueueDepth {
+		return false, nil
+	}
+	bridge.loans[key] = append(queued, loanSlot{ptr: ptr, members: members, gid: gid})
+	return true, nil
+}
+
+// TakeLoan dequeues one in-process loan handle without copying.
+//
+// It returns the same ptr plus members values passed to PublishLoan with
+// no payload byte copy, so this path is zero-copy where the wire path
+// copies (channel copy plus CDR decode into a fresh buffer). The returned
+// GID is the publishing writer identity and seq is the per-subscription
+// receive sequence starting at 1, recorded like TakeWithInfo for the
+// take-info side channel. Ok is false when no loan is queued; the caller
+// falls back to the copying wire take. Single-owner transfer: the dequeued
+// handle is owned by the caller until C return frees it exactly once.
+// It reports ErrSubscriptionClosed after Close and ErrBridgeClosed after
+// Bridge Close. It never blocks.
+func (s *Subscription) TakeLoan() (ptr uint64, members uint64, gid [16]byte, seq uint64, ok bool, err error) {
+	var empty [16]byte
+	bridge := s.bridge
+	bridge.mu.Lock()
+	if bridge.closed {
+		bridge.mu.Unlock()
+		return 0, 0, empty, 0, false, fmt.Errorf("rmwbridge: subscription take loan: %w", ErrBridgeClosed)
+	}
+	s.mu.Lock()
+	subClosed := s.closed
+	s.mu.Unlock()
+	if subClosed {
+		bridge.mu.Unlock()
+		return 0, 0, empty, 0, false, fmt.Errorf("rmwbridge: subscription take loan: %w", ErrSubscriptionClosed)
+	}
+	key := topicKey{domain: s.DomainID, topic: s.Topic}
+	queued := bridge.loans[key]
+	if len(queued) == 0 {
+		bridge.mu.Unlock()
+		return 0, 0, empty, 0, false, nil
+	}
+	slot := queued[0]
+	rest := queued[1:]
+	if len(rest) == 0 {
+		delete(bridge.loans, key)
+	} else {
+		bridge.loans[key] = rest
+	}
+	bridge.loanTransfers++
+	bridge.mu.Unlock()
+	seq = s.noteDeliveredLocked(slot.gid)
+	return slot.ptr, slot.members, slot.gid, seq, true, nil
+}
+
+// LoanTransfers returns the count of zero-copy loan handoffs consumed.
+//
+// Each TakeLoan that dequeues a handle increments it. It never blocks.
+func (b *Bridge) LoanTransfers() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.loanTransfers
+}
+
+// LoanCopies returns the count of payload byte copies on the loan path.
+//
+// It stays zero by construction: PublishLoan plus TakeLoan move only
+// handle values and never copy payload bytes. A nonzero value would prove
+// a copy slipped into the zero-copy path. It never blocks.
+func (b *Bridge) LoanCopies() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.loanCopies
 }
 
 // Close unregisters the subscription and marks it closed.
@@ -950,7 +1228,12 @@ func resolveServiceQoS(qos []QoS) (QoS, QoS, error) {
 // CreateService registers a service by name with request plus reply channels.
 //
 // Optional QoS inputs fan out per resolveServiceQoS: zero means both sides
-// default, one fans out to both, two set request then reply.
+// default, one fans out to both, two set request then reply. Every call
+// for a registered name returns a new handle sharing the same request
+// queue: N servers on one name pop the same channel work-queue style, so
+// first-available-server-wins with FIFO fairness and each request is
+// served exactly once. Later handles inherit the queue profiles stored
+// at first create.
 func (b *Bridge) CreateService(name string, qos ...QoS) (*Service, error) {
 	if name == "" {
 		return nil, errors.New("rmwbridge: create service: empty name") //nolint:wrapcheck // new error, nothing to wrap
@@ -964,9 +1247,21 @@ func (b *Bridge) CreateService(name string, qos ...QoS) (*Service, error) {
 	if b.closed {
 		return nil, fmt.Errorf("rmwbridge: create service: %w", ErrBridgeClosed)
 	}
-	_, exists := b.services[name]
-	if exists {
-		return nil, fmt.Errorf("rmwbridge: create service %q: %w", name, ErrServiceExists)
+	if primary, exists := b.services[name]; exists {
+		extra := &Service{
+			Name:       name,
+			bridge:     b,
+			requests:   primary.requests,
+			requestQoS: primary.requestQoS,
+			replyQoS:   primary.replyQoS,
+		}
+		set, ok := b.serviceExtras[name]
+		if !ok {
+			set = make(map[*Service]struct{})
+			b.serviceExtras[name] = set
+		}
+		set[extra] = struct{}{}
+		return extra, nil
 	}
 	svc := &Service{
 		Name:       name,
@@ -979,7 +1274,63 @@ func (b *Bridge) CreateService(name string, qos ...QoS) (*Service, error) {
 	return svc, nil
 }
 
+// liveServiceLocked reports whether s is a registered handle for name.
+//
+// The primary lives in services and extras live in serviceExtras. The
+// caller must hold b.mu.
+func (b *Bridge) liveServiceLocked(name string, s *Service) bool {
+	if primary, ok := b.services[name]; ok && primary == s {
+		return true
+	}
+	set, ok := b.serviceExtras[name]
+	if !ok {
+		return false
+	}
+	_, ok = set[s]
+	return ok
+}
+
+// closeServiceLocked marks one service handle closed and unregisters it.
+//
+// A closed primary promotes one extra to primary so the shared queue
+// stays registered while servers remain; the last handle closes the
+// queue and deletes the registration. It is idempotent. The caller
+// must hold b.mu.
+func (b *Bridge) closeServiceLocked(s *Service) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	s.mu.Unlock()
+	if primary, ok := b.services[s.Name]; ok && primary == s {
+		if set, has := b.serviceExtras[s.Name]; has {
+			for extra := range set {
+				delete(set, extra)
+				if len(set) == 0 {
+					delete(b.serviceExtras, s.Name)
+				}
+				b.services[s.Name] = extra
+				return
+			}
+		}
+		delete(b.services, s.Name)
+		return
+	}
+	if set, has := b.serviceExtras[s.Name]; has {
+		delete(set, s)
+		if len(set) == 0 {
+			delete(b.serviceExtras, s.Name)
+		}
+	}
+}
+
 // destroyServiceOrClient removes a service or client registration.
+//
+// Destroying a service closes every handle sharing its queue: the queue
+// is gone only when no server remains, so one DestroyService call ends
+// service for the name. The same holds for clients.
 func (b *Bridge) destroyServiceOrClient(name, kind string) error {
 	if name == "" {
 		return errors.New("rmwbridge: destroy " + kind + ": empty name") //nolint:wrapcheck // new error, nothing to wrap
@@ -990,23 +1341,39 @@ func (b *Bridge) destroyServiceOrClient(name, kind string) error {
 		return fmt.Errorf("rmwbridge: destroy %s: %w", kind, ErrBridgeClosed)
 	}
 	if kind == "service" {
-		svc, exists := b.services[name]
+		primary, exists := b.services[name]
 		if !exists {
 			return fmt.Errorf("rmwbridge: destroy service %q: %w", name, ErrServiceNotFound)
 		}
-		svc.mu.Lock()
-		svc.closed = true
-		svc.mu.Unlock()
+		primary.mu.Lock()
+		primary.closed = true
+		primary.mu.Unlock()
+		if set, has := b.serviceExtras[name]; has {
+			for extra := range set {
+				extra.mu.Lock()
+				extra.closed = true
+				extra.mu.Unlock()
+			}
+			delete(b.serviceExtras, name)
+		}
 		delete(b.services, name)
 		return nil
 	}
-	client, exists := b.clients[name]
+	primary, exists := b.clients[name]
 	if !exists {
 		return fmt.Errorf("rmwbridge: destroy client %q: %w", name, ErrClientNotFound)
 	}
-	client.mu.Lock()
-	client.closed = true
-	client.mu.Unlock()
+	primary.mu.Lock()
+	primary.closed = true
+	primary.mu.Unlock()
+	if set, has := b.clientExtras[name]; has {
+		for extra := range set {
+			extra.mu.Lock()
+			extra.closed = true
+			extra.mu.Unlock()
+		}
+		delete(b.clientExtras, name)
+	}
 	delete(b.clients, name)
 	return nil
 }
@@ -1021,8 +1388,8 @@ func (b *Bridge) DestroyService(name string) error {
 
 // Exists reports whether the service is still registered and usable.
 //
-// It returns false after DestroyService, after Bridge Close, or when the
-// handle was already marked closed. It never blocks.
+// It returns false after DestroyService, after Bridge Close, after the
+// handle was closed, or when the handle is unknown. It never blocks.
 func (s *Service) Exists() bool {
 	s.bridge.mu.Lock()
 	defer s.bridge.mu.Unlock()
@@ -1035,8 +1402,20 @@ func (s *Service) Exists() bool {
 	if closed {
 		return false
 	}
-	stored, ok := s.bridge.services[s.Name]
-	return ok && stored == s
+	return s.bridge.liveServiceLocked(s.Name, s)
+}
+
+// Close unregisters one service handle without disturbing the queue.
+//
+// Other handles sharing the name keep serving: a closed primary
+// promotes one extra so the queue stays registered, and the queue is
+// deleted only when the last handle closes. It is idempotent and never
+// closes the request channel, so concurrent callers never panic.
+func (s *Service) Close() error {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	s.bridge.closeServiceLocked(s)
+	return nil
 }
 
 // RequestActualQoS returns the stored request side profile.
@@ -1067,7 +1446,9 @@ func (s *Service) ResponsePublisherActualQoS() QoS {
 //
 // The server need not exist yet. Optional QoS inputs fan out per
 // resolveServiceQoS: zero means both sides default, one fans out to both,
-// two set request then reply. Duplicate names report ErrClientExists.
+// two set request then reply. Every call for a name returns a new handle
+// calling the shared queue, so N clients share one service beside N
+// servers. Later handles inherit the profiles stored at first create.
 func (b *Bridge) CreateClient(name string, qos ...QoS) (*Client, error) {
 	if name == "" {
 		return nil, errors.New("rmwbridge: create client: empty name") //nolint:wrapcheck // new error, nothing to wrap
@@ -1081,9 +1462,20 @@ func (b *Bridge) CreateClient(name string, qos ...QoS) (*Client, error) {
 	if b.closed {
 		return nil, fmt.Errorf("rmwbridge: create client: %w", ErrBridgeClosed)
 	}
-	_, exists := b.clients[name]
-	if exists {
-		return nil, fmt.Errorf("rmwbridge: create client %q: %w", name, ErrClientExists)
+	if primary, exists := b.clients[name]; exists {
+		extra := &Client{
+			Name:       name,
+			bridge:     b,
+			requestQoS: primary.requestQoS,
+			replyQoS:   primary.replyQoS,
+		}
+		set, ok := b.clientExtras[name]
+		if !ok {
+			set = make(map[*Client]struct{})
+			b.clientExtras[name] = set
+		}
+		set[extra] = struct{}{}
+		return extra, nil
 	}
 	client := &Client{
 		Name:       name,

@@ -84,6 +84,28 @@ type weldStashedReq struct {
 	respond func([]byte) error
 }
 
+// weldStashedTake holds a take that did not fit the caller buffer.
+//
+// The payload keeps the dequeued bytes while gid plus seq keep the
+// dequeue-time attribution, so a larger-buffer retry delivers the same
+// sequence instead of incrementing twice for one sample.
+type weldStashedTake struct {
+	payload []byte
+	gid     [16]byte
+	seq     uint64
+}
+
+// weldTakeInfo is the attribution of the most recent delivered take.
+//
+// Seq is the per-subscription receive sequence starting at 1. GID is
+// the publishing writer identity, zero when the wire leg carried none.
+// Intra-process and network sequences are equal because the bridge is
+// a single transport.
+type weldTakeInfo struct {
+	gid [16]byte
+	seq uint64
+}
+
 // Weld FFI handle registry.
 //
 // Handles are int64 keys handed to C as opaque values. Every map here is
@@ -96,7 +118,8 @@ var (
 	weldBridgeNodes       = make(map[int64]map[string]*rmwbridge.Node)
 	weldPubs              = make(map[int64]weldPubEntry)
 	weldSubs              = make(map[int64]weldSubEntry)
-	weldSubPending        = make(map[int64][]byte)
+	weldSubPending        = make(map[int64]weldStashedTake)
+	weldSubLastInfo       = make(map[int64]weldTakeInfo)
 	weldServices          = make(map[int64]weldSvcEntry)
 	weldGuards            = make(map[int64]*rmwbridge.Guard)
 	weldSvcSeq            = make(map[int64]int64)
@@ -215,20 +238,23 @@ func weldEnsureNodeLocked(bridgeID int64, b *rmwbridge.Bridge, name string) (*rm
 
 // weldTakeOnce takes one payload with a bounded wait.
 //
-// It uses the public Subscription Take with a short timeout so the poll
-// path never blocks long. A timeout maps to empty with no data.
-func weldTakeOnce(sub *rmwbridge.Subscription) ([]byte, bool, error) {
+// It uses the public Subscription TakeWithInfo with a short timeout so
+// the poll path never blocks long. A timeout maps to empty with no data.
+// The returned gid plus seq carry the dequeue-time attribution for the
+// take-info side channel.
+func weldTakeOnce(sub *rmwbridge.Subscription) ([]byte, [16]byte, uint64, bool, error) {
+	var empty [16]byte
 	ctx, cancel := context.WithTimeout(context.Background(), weldPollBound)
 	defer cancel()
-	data, err := sub.Take(ctx)
+	data, gid, seq, err := sub.TakeWithInfo(ctx)
 	if err != nil {
 		cerr := ctx.Err()
 		if cerr != nil {
-			return nil, false, nil
+			return nil, empty, 0, false, nil
 		}
-		return nil, false, fmt.Errorf("weld: take: %w", err)
+		return nil, empty, 0, false, fmt.Errorf("weld: take: %w", err)
 	}
-	return data, true, nil
+	return data, gid, seq, true, nil
 }
 
 // weldServeOnce waits for one request with a bounded wait.
@@ -290,6 +316,7 @@ func weldCollectBridgeLocked(key int64) ([]weldPubEntry, []weldSubEntry, []weldS
 			subs = append(subs, e)
 			delete(weldSubs, id)
 			delete(weldSubPending, id)
+			delete(weldSubLastInfo, id)
 		}
 	}
 	svcs := make([]weldSvcEntry, 0)
@@ -334,7 +361,7 @@ func weldCloseCollected(b *rmwbridge.Bridge, pubs []weldPubEntry, subs []weldSub
 		}
 	}
 	for _, e := range svcs {
-		err := b.DestroyService(e.name)
+		err := e.svc.Close()
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -346,30 +373,54 @@ func weldCloseCollected(b *rmwbridge.Bridge, pubs []weldPubEntry, subs []weldSub
 	return firstErr
 }
 
-// weldLoadSubLocked returns the sub entry plus stashed payload state.
+// weldLoadSubLocked returns the sub entry plus stashed take state.
 //
 // It reports false for an unknown handle. The caller must hold weldMu.
-func weldLoadSubLocked(key int64) (weldSubEntry, []byte, bool, bool) {
+func weldLoadSubLocked(key int64) (weldSubEntry, weldStashedTake, bool, bool) {
 	e, ok := weldSubs[key]
 	if !ok {
-		return weldSubEntry{}, nil, false, false
+		return weldSubEntry{}, weldStashedTake{}, false, false
 	}
 	pending, stashed := weldSubPending[key]
 	return e, pending, stashed, true
 }
 
-// weldStashSubPayload parks an oversized payload for later delivery.
+// weldStashSubPayload parks an oversized take for later delivery.
 //
-// Only live subscriptions keep the stash; a bridge freed mid-take drops
-// it. It never panics.
-func weldStashSubPayload(key int64, data []byte) {
+// The gid plus seq keep the dequeue-time attribution so the retry
+// delivers the same sequence. Only live subscriptions keep the stash; a
+// bridge freed mid-take drops it. It never panics.
+func weldStashSubPayload(key int64, data []byte, gid [16]byte, seq uint64) {
 	cp := append([]byte(nil), data...)
 	weldMu.Lock()
 	_, still := weldSubs[key]
 	if still {
-		weldSubPending[key] = cp
+		weldSubPending[key] = weldStashedTake{payload: cp, gid: gid, seq: seq}
 	}
 	weldMu.Unlock()
+}
+
+// weldRecordSubTakeInfo stores the attribution of a delivered take.
+//
+// Only live subscriptions keep the record; a bridge freed mid-take
+// drops it. It never panics.
+func weldRecordSubTakeInfo(key int64, gid [16]byte, seq uint64) {
+	weldMu.Lock()
+	_, still := weldSubs[key]
+	if still {
+		weldSubLastInfo[key] = weldTakeInfo{gid: gid, seq: seq}
+	}
+	weldMu.Unlock()
+}
+
+// weldReplaySubTakeInfo records a stashed retry without incrementing.
+//
+// The retry dequeued once already, so the bridge counter replays the
+// same gid plus seq while the FFI record updates to the redelivery. It
+// never panics.
+func weldReplaySubTakeInfo(sub *rmwbridge.Subscription, key int64, stashed weldStashedTake) {
+	sub.ReplayTakeInfo(stashed.gid, stashed.seq)
+	weldRecordSubTakeInfo(key, stashed.gid, stashed.seq)
 }
 
 // weldCheckServiceCallArgs validates call_nb pointer plus length args.
@@ -669,6 +720,8 @@ func weld_ffi_pub_destroy(handle C.longlong) (rc C.int) {
 	}
 	delete(weldPubs, key)
 	delete(weldPubTypes, key)
+	delete(weldPubDeadlines, key)
+	delete(weldIncompatSeen, key)
 	weldMu.Unlock()
 	err := e.pub.Close()
 	if err != nil {
@@ -710,6 +763,7 @@ func weld_ffi_pub_publish(handle C.longlong, data *C.char, dataLen C.int) (rc C.
 		return C.int(weldCodeErrInternal)
 	}
 	weldPublishRTPS(key, payload)
+	weldNotePubPublish(key)
 	return C.int(weldCodeOK)
 }
 
@@ -789,7 +843,10 @@ func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
 	}
 	delete(weldSubs, key)
 	delete(weldSubPending, key)
+	delete(weldSubLastInfo, key)
 	delete(weldSubTypes, key)
+	delete(weldSubDeadlines, key)
+	delete(weldIncompatSeen, key)
 	weldDropSubExtrasLocked(key)
 	weldMu.Unlock()
 	err := e.sub.Close()
@@ -802,27 +859,42 @@ func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
 // weldTakeLiveSub takes one live sample and copies it out.
 //
 // It merges the in-memory take with the RTPS wire take, stashes oversized
-// payloads for a later retry, and writes the byte count. It never panics.
+// payloads with their dequeue-time attribution for a later retry, and
+// writes the byte count. The take-info side channel records the gid plus
+// sequence of the delivered take: in-memory takes carry the publishing
+// writer identity while wire takes carry zero because the backend take
+// drops the writer GUID. It never panics.
 func weldTakeLiveSub(key int64, sub *rmwbridge.Subscription, bkey int64, topic string, outBuf *C.char, outBufLen C.int, outN *C.int) C.int {
-	data, ready, err := weldTakeOnce(sub)
+	data, gid, seq, ready, err := weldTakeOnce(sub)
 	if err != nil {
 		return C.int(weldCodeErrInternal)
 	}
 	if !ready {
-		data, ready = weldTakeRTPS(bkey, topic)
+		wire, ok := weldTakeRTPS(bkey, topic)
+		if !ok {
+			*outN = C.int(0)
+			return C.int(weldCodeEmpty)
+		}
+		var zero [16]byte
+		seq = sub.NoteExternalDelivery(zero)
+		gid = zero
+		data = wire
+		ready = true
 	}
 	if !ready {
 		*outN = C.int(0)
 		return C.int(weldCodeEmpty)
 	}
 	if len(data) > int(outBufLen) {
-		weldStashSubPayload(key, data)
+		weldStashSubPayload(key, data, gid, seq)
 		return C.int(weldCodeErrShort)
 	}
 	code := weldCopyToC(outBuf, outBufLen, data)
 	if code != C.int(weldCodeOK) {
 		return code
 	}
+	weldRecordSubTakeInfo(key, gid, seq)
+	weldNoteSubDelivery(key)
 	*outN = C.int(len(data))
 	return C.int(weldCodeOK)
 }
@@ -865,18 +937,20 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 		return C.int(weldCodeErrHandle)
 	}
 	if stashed {
-		if len(pending) > int(outBufLen) {
+		if len(pending.payload) > int(outBufLen) {
 			weldMu.Unlock()
 			return C.int(weldCodeErrShort)
 		}
-		code := weldCopyToC(outBuf, outBufLen, pending)
+		code := weldCopyToC(outBuf, outBufLen, pending.payload)
 		if code != C.int(weldCodeOK) {
 			weldMu.Unlock()
 			return code
 		}
 		delete(weldSubPending, key)
-		n := len(pending)
+		n := len(pending.payload)
+		sub := e.sub
 		weldMu.Unlock()
+		weldReplaySubTakeInfo(sub, key, pending)
 		*outN = C.int(n)
 		return C.int(weldCodeOK)
 	}
@@ -885,6 +959,54 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 	topic := sub.Topic
 	weldMu.Unlock()
 	return weldTakeLiveSub(key, sub, bkey, topic, outBuf, outBufLen, outN)
+}
+
+// weld_ffi_sub_take_info reports the attribution of the last delivered take.
+//
+// outSeq receives the per-subscription receive sequence starting at 1
+// and gidBuf receives the 16 byte writer GID without a terminator.
+// Intra-process and network sequence numbers are equal because the
+// bridge is a single transport, so the caller reports the same value
+// for both. In-memory takes carry the publishing writer identity while
+// wire takes carry zero because the backend take drops the writer GUID.
+// A handle with no delivered take, or an unknown handle, reports -2.
+// NULL pointers report -1 and an undersized gid buffer reports -4. It
+// never panics.
+//
+//export weld_ffi_sub_take_info
+func weld_ffi_sub_take_info(handle C.longlong, outSeq *C.ulonglong, gidBuf *C.char, gidLen C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(weldCodeErrInternal)
+		}
+	}()
+	key := int64(handle)
+	if key <= 0 {
+		return C.int(weldCodeErrHandle)
+	}
+	if outSeq == nil || gidBuf == nil {
+		return C.int(weldCodeErrNull)
+	}
+	if int(gidLen) < 16 {
+		return C.int(weldCodeErrShort)
+	}
+	weldMu.Lock()
+	info, ok := weldSubLastInfo[key]
+	if !ok {
+		_, still := weldSubs[key]
+		weldMu.Unlock()
+		if !still {
+			return C.int(weldCodeErrHandle)
+		}
+		return C.int(weldCodeErrHandle)
+	}
+	weldMu.Unlock()
+	gid := info.gid
+	*outSeq = C.ulonglong(info.seq)
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(gidBuf)), int(gidLen))
+	copy(dst, gid[:])
+	return C.int(weldCodeOK)
 }
 
 // weld_ffi_service_create registers a service and writes its handle.
@@ -959,7 +1081,6 @@ func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
 		return C.int(weldCodeErrHandle)
 	}
 	bkey := e.bridgeID
-	sname := e.name
 	delete(weldServices, key)
 	delete(weldSvcStash, key)
 	delete(weldSvcSeq, key)
@@ -969,12 +1090,13 @@ func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
 			delete(weldSvcReplies, rkey)
 		}
 	}
-	b, bok := weldBridges[bkey]
+	svc := e.svc
+	_, bok := weldBridges[bkey]
 	weldMu.Unlock()
 	if !bok {
 		return C.int(weldCodeErrHandle)
 	}
-	err := b.DestroyService(sname)
+	err := svc.Close()
 	if err != nil {
 		return C.int(weldCodeErrInternal)
 	}

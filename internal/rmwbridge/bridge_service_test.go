@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,8 +122,16 @@ func TestServiceAvailability(t *testing.T) {
 	svc, err := bridge.CreateService("late_service")
 	requireNoError(t, err, "create service")
 	checkSvcAvailabilityAfter(t, client, svc)
-	_, err = bridge.CreateClient("late_service")
-	requireError(t, err, "duplicate create client")
+	extra, err := bridge.CreateService("late_service")
+	requireNoError(t, err, "second service shares queue")
+	if !extra.Exists() {
+		t.Fatalf("extra service exists = false, want true")
+	}
+	extraClient, err := bridge.CreateClient("late_service")
+	requireNoError(t, err, "second client shares service")
+	if !extraClient.Exists() {
+		t.Fatalf("extra client exists = false, want true")
+	}
 	checkSvcAvailabilityDestroy(t, bridge, svc, client)
 }
 
@@ -177,6 +186,222 @@ func checkDualQoSClient(t *testing.T, client *rmwbridge.Client) {
 	requireQoSDepth(t, client.ReplyActualQoS().Depth, "3", "client reply")
 	requireQoSDepth(t, client.RequestPublisherActualQoS().Depth, "3", "client request publisher")
 	requireQoSDepth(t, client.ResponseSubscriptionActualQoS().Depth, "3", "client response subscription")
+}
+
+// sharedQueueProbe tracks one multiserver service test run.
+//
+// Servers record every delivery here so the test pins exactly-once
+// service across concurrent servers and clients.
+type sharedQueueProbe struct {
+	mu          sync.Mutex
+	served      map[string]int
+	perServer   map[*rmwbridge.Service]int
+	done        int
+	total       int
+	clientsOpen bool
+	serverErr   chan error
+	clientErr   chan error
+	serversDone sync.WaitGroup
+}
+
+// newSharedQueueProbe returns a probe expecting total requests.
+func newSharedQueueProbe(total int) *sharedQueueProbe {
+	return &sharedQueueProbe{
+		served:      make(map[string]int),
+		perServer:   make(map[*rmwbridge.Service]int),
+		total:       total,
+		clientsOpen: true,
+		serverErr:   make(chan error, 2),
+		clientErr:   make(chan error, 64),
+	}
+}
+
+// probeFinished reports whether every request was served.
+func (p *sharedQueueProbe) probeFinished() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done >= p.total
+}
+
+// probeNoteServed records one delivery by a server.
+func (p *sharedQueueProbe) probeNoteServed(svc *rmwbridge.Service, req []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.served[string(req)]++
+	p.perServer[svc]++
+	p.done++
+}
+
+// probeKeepPolling reports whether a timed-out server retries.
+//
+// An idle timeout while clients are still sending is normal; only a
+// quiet queue after the last client finished means a request was lost.
+func (p *sharedQueueProbe) probeKeepPolling() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done < p.total && p.clientsOpen
+}
+
+// serveLoop serves until every request is done.
+func (p *sharedQueueProbe) serveLoop(svc *rmwbridge.Service) {
+	defer p.serversDone.Done()
+	for {
+		if p.probeFinished() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		req, respond, err := svc.Serve(ctx)
+		cancel()
+		if err != nil {
+			if p.probeFinished() {
+				return
+			}
+			if p.probeKeepPolling() {
+				continue
+			}
+			p.serverErr <- fmt.Errorf("serve: %w", err)
+			return
+		}
+		p.probeNoteServed(svc, req)
+		err = respond([]byte("resp:" + string(req)))
+		if err != nil {
+			p.serverErr <- fmt.Errorf("respond: %w", err)
+			return
+		}
+	}
+}
+
+// startServers runs one serve loop per server.
+func (p *sharedQueueProbe) startServers(servers ...*rmwbridge.Service) {
+	p.serversDone.Add(len(servers))
+	for _, svc := range servers {
+		go p.serveLoop(svc)
+	}
+}
+
+// runOneClient sends perClient sequential calls on one client.
+func (p *sharedQueueProbe) runOneClient(ci int, client *rmwbridge.Client, perClient int, done chan struct{}) {
+	defer close(done)
+	for i := range perClient {
+		payload := fmt.Sprintf("req-%d-%d", ci, i)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := client.Call(ctx, []byte(payload))
+		cancel()
+		if err != nil {
+			p.clientErr <- fmt.Errorf("call %s: %w", payload, err)
+			return
+		}
+		if string(resp) != "resp:"+payload {
+			p.clientErr <- fmt.Errorf("reply %s = %q, want resp:%s", payload, string(resp), payload)
+			return
+		}
+	}
+}
+
+// runClients sends perClient calls on every client concurrently.
+func (p *sharedQueueProbe) runClients(t *testing.T, clients []*rmwbridge.Client, perClient int) {
+	t.Helper()
+	dones := make([]chan struct{}, 0, len(clients))
+	for ci, client := range clients {
+		done := make(chan struct{})
+		dones = append(dones, done)
+		go p.runOneClient(ci, client, perClient, done)
+	}
+	for _, done := range dones {
+		<-done
+	}
+	p.mu.Lock()
+	p.clientsOpen = false
+	p.mu.Unlock()
+	p.serversDone.Wait()
+}
+
+// checkServed drains errors and pins exactly-once service plus sharing.
+func (p *sharedQueueProbe) checkServed(t *testing.T, svc1, svc2 *rmwbridge.Service) {
+	t.Helper()
+	close(p.serverErr)
+	close(p.clientErr)
+	for err := range p.serverErr {
+		t.Fatalf("server: %v", err)
+	}
+	for err := range p.clientErr {
+		t.Fatalf("client: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done != p.total {
+		t.Fatalf("served = %d, want %d: requests lost", p.done, p.total)
+	}
+	if len(p.served) != p.total {
+		t.Fatalf("distinct payloads = %d, want %d: loss or duplication", len(p.served), p.total)
+	}
+	for payload, n := range p.served {
+		if n != 1 {
+			t.Fatalf("payload %q served %d times, want exactly once", payload, n)
+		}
+	}
+	if p.perServer[svc1] == 0 || p.perServer[svc2] == 0 {
+		t.Fatalf("server split = %d/%d, want both positive: load not shared", p.perServer[svc1], p.perServer[svc2])
+	}
+}
+
+// TestServiceSharedQueueMultiServer pins N servers on one service name.
+//
+// Two server handles share one FIFO request queue work-queue style:
+// every request from N concurrent clients is served exactly once with
+// no loss and no double serve, and both servers share the load.
+// First-available-server-wins with FIFO fairness holds by channel
+// construction: Serve pops one queued request atomically, so concurrent
+// servers divide the queue instead of stealing repeats from each other.
+func TestServiceSharedQueueMultiServer(t *testing.T) {
+	t.Parallel()
+	bridge := rmwbridge.NewBridge()
+	defer func() {
+		closeBridgeChecked(t, bridge)
+	}()
+	svc1, err := bridge.CreateService("shared_work")
+	requireNoError(t, err, "create first server")
+	svc2, err := bridge.CreateService("shared_work")
+	requireNoError(t, err, "create second server shares queue")
+	if svc1 == svc2 {
+		t.Fatalf("second server aliases first, want distinct handles")
+	}
+	if !svc1.Exists() || !svc2.Exists() {
+		t.Fatalf("server exists = %v/%v, want true/true", svc1.Exists(), svc2.Exists())
+	}
+	if got := svc1.RequestActualQoS().Depth; got != "10" {
+		t.Fatalf("extra server request depth = %q, want inherited 10", got)
+	}
+
+	const nClients = 4
+	const perClient = 16
+	const total = nClients * perClient
+	clients := make([]*rmwbridge.Client, 0, nClients)
+	for range nClients {
+		client, err := bridge.CreateClient("shared_work")
+		requireNoError(t, err, "create client shares service")
+		clients = append(clients, client)
+	}
+
+	probe := newSharedQueueProbe(total)
+	probe.startServers(svc1, svc2)
+	probe.runClients(t, clients, perClient)
+	probe.checkServed(t, svc1, svc2)
+
+	// Closing one handle leaves the queue live for the other server.
+	requireNoError(t, svc1.Close(), "close first server")
+	if svc1.Exists() {
+		t.Fatalf("closed server exists = true, want false")
+	}
+	if !svc2.Exists() {
+		t.Fatalf("remaining server exists = false, want true")
+	}
+	// DestroyService closes every handle sharing the name at once.
+	requireNoError(t, bridge.DestroyService("shared_work"), "destroy shared service")
+	if svc2.Exists() {
+		t.Fatalf("server exists after destroy = true, want false")
+	}
+	requireErrorIs(t, bridge.DestroyService("shared_work"), rmwbridge.ErrServiceNotFound, "second destroy service")
 }
 
 // TestServiceDualQoS covers fanout of one input and storage of two inputs.

@@ -422,6 +422,7 @@ func weldDropBridgeExtrasLocked(bridgeID int64) {
 	for _, rkey := range weldSplitKeysForBridgeLocked(bridgeID) {
 		weldForgetSplitKey(rkey)
 	}
+	weldDropEventExtrasLocked(bridgeID)
 }
 
 // weldReadFilterParams splits a NUL joined params blob into nparams strings.

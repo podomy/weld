@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 package types
 
-// Envelope handling for XCDR1 samples.
+// Envelope handling for XCDR1 and XCDR2 samples.
 //
-// The base envelope is a 4 byte header followed by payload rebased 4
-// bytes forward. Header bytes are 0x00, endian flag (0x01 LE, 0x00 BE),
-// 0x00, 0x00. Services add an 8 byte GUID plus an 8 byte sequence in
-// negotiated endianness after the header. Serialized data is padded to
-// 4 bytes with a zeroed tail. Header plus length are validated before
-// parsing. Truncated, empty, and extra field input drops with a metric
-// counter and never panics.
+// The base envelope is a 4 byte Table 57 header followed by payload
+// rebased 4 bytes forward. Final V1 headers are 0x00, endian flag (0x01
+// LE, 0x00 BE), 0x00, 0x00; appendable/mutable V2 headers use the
+// delimited IDs via EncodeHeaderForExt. Services add an 8 byte GUID plus
+// an 8 byte sequence in negotiated endianness after the header.
+// Serialized data is padded to 4 bytes with a zeroed tail. Header plus
+// length are validated before parsing. Truncated, empty, and extra field
+// input drops with a metric counter and never panics.
 
 import (
 	"encoding/binary"
@@ -66,36 +67,52 @@ func (m *Metrics) Count() uint64 {
 	return m.Drops
 }
 
-// EncodeHeader builds the 4 byte XCDR1 header for an endianness.
+// EncodeHeader builds the 4 byte XCDR header for final V1.
+//
+// It delegates to EncodeEncapsulationxt6b with final kind so header
+// encoding lives in one place. Final V1 yields 00 01 or 00 00 which
+// matches the legacy ROS wire. Option bytes start zero. Use
+// EncodeHeaderForExt for appendable/mutable V2 IDs; this wrapper stays
+// byte identical for existing final paths.
 func EncodeHeader(littleEndian bool) [4]byte {
-	var h [4]byte
-	h[0] = 0x00
-	if littleEndian {
-		h[1] = 0x01
-	} else {
-		h[1] = 0x00
-	}
-	h[2] = 0x00
-	h[3] = 0x00
-	return h
+	return EncodeEncapsulationxt6b(ExtFinal, littleEndian)
+}
+
+// EncodeHeaderForExt builds the 4 byte header for one extensibility kind.
+//
+// Final yields V1 IDs; appendable and mutable yield V2 delimited IDs per
+// Table 32. Parsing via ParseEncapsulationxt6b already accepts all
+// Table 57 IDs. Option bytes start zero. For explicit V1 appendable
+// (PLAIN_CDR) and V1 mutable (PL_CDR) emits use
+// EncodeHeaderForExtWithVersion.
+func EncodeHeaderForExt(ext Extensibility, littleEndian bool) [4]byte {
+	return EncodeEncapsulationxt6b(ext, littleEndian)
+}
+
+// EncodeHeaderForExtWithVersion builds the header for a kind plus version.
+//
+// V1 appendable yields PLAIN_CDR (0x0000/0x0001) and V1 mutable yields
+// PL_CDR (0x0002/0x0003); V2 yields CDR2/D_CDR2/PL_CDR2 per Table 32.
+func EncodeHeaderForExtWithVersion(ext Extensibility, ver EncodingVersion, littleEndian bool) [4]byte {
+	return EncodeEncapsulationxt6bWithVersion(ext, ver, littleEndian)
 }
 
 // ParseHeader validates 4 header bytes and returns the endian flag.
 //
-// It rejects a nonzero first byte and a second byte above 1. The third
-// and fourth bytes are reserved and ignored, so nonzero reserved bytes
-// are accepted for forward compatibility.
+// It delegates to ParseEncapsulationxt6b so all Table 57 XCDR IDs are
+// accepted, not only 00 00 and 00 01. The legacy ROS IDs remain valid.
+// Reserved option bytes are ignored. XML and unknown IDs are rejected.
 func ParseHeader(data []byte) (bool, error) {
 	if len(data) < HeaderSize {
 		return false, fmt.Errorf("envelope: buffer too short for header: %d bytes", len(data))
 	}
-	if data[0] != 0x00 {
-		return false, fmt.Errorf("envelope: bad header first byte 0x%02x", data[0])
+	var hdr [4]byte
+	copy(hdr[:], data[:HeaderSize])
+	parsed, err := ParseEncapsulationxt6b(hdr)
+	if err != nil {
+		return false, err
 	}
-	if data[1] > 0x01 {
-		return false, fmt.Errorf("envelope: bad header endian flag 0x%02x", data[1])
-	}
-	return data[1] == 0x01, nil
+	return parsed.LittleEndian, nil
 }
 
 // padTo4 returns the zero pad needed to reach a 4 byte boundary.
@@ -144,9 +161,41 @@ func decodeServiceSequence(b []byte, littleEndian bool) uint64 {
 //
 // An empty or nil payload encodes as one dummy zero byte. Output size
 // includes the header and is always a multiple of 4. The dummy rule is
-// needsDummyByte so Encoder.Bytes agrees on empty input.
+// needsDummyByte so Encoder.Bytes agrees on empty input. This is the
+// final V1 path and stays byte identical; use MarshalMessageWithExt for
+// appendable/mutable V2 IDs.
 func MarshalMessage(payload []byte, littleEndian bool) []byte {
-	h := EncodeHeader(littleEndian)
+	return MarshalMessageWithExt(payload, ExtFinal, littleEndian)
+}
+
+// MarshalMessageWithExt wraps a payload with the header for one kind.
+//
+// Final emits V1 IDs; appendable and mutable emit V2 delimited IDs per
+// Table 32. Empty handling and pad match MarshalMessage so final wires
+// are identical. For explicit V1 appendable/mutable emits use
+// MarshalMessageWithExtVersioned.
+func MarshalMessageWithExt(payload []byte, ext Extensibility, littleEndian bool) []byte {
+	h := EncodeHeaderForExt(ext, littleEndian)
+	body := payload
+	if needsDummyByte(len(body)) {
+		body = []byte{0x00}
+	}
+	out := make([]byte, 0, HeaderSize+len(body)+4)
+	out = append(out, h[:]...)
+	out = append(out, body...)
+	pad := padTo4(len(out))
+	for range pad {
+		out = append(out, 0x00)
+	}
+	return out
+}
+
+// MarshalMessageWithExtVersioned wraps a payload with an explicit version.
+//
+// V1 appendable emits PLAIN_CDR and V1 mutable emits PL_CDR per Table 57;
+// V2 emits the delimited IDs per Table 32.
+func MarshalMessageWithExtVersioned(payload []byte, ext Extensibility, ver EncodingVersion, littleEndian bool) []byte {
+	h := EncodeHeaderForExtWithVersion(ext, ver, littleEndian)
 	body := payload
 	if needsDummyByte(len(body)) {
 		body = []byte{0x00}
@@ -192,12 +241,42 @@ func UnmarshalMessage(data []byte, m *Metrics) ([]byte, bool, error) {
 // User payload is therefore rebased at offset 20. This matches
 // Encoder.WriteServiceHeader and Decoder.ReadServiceHeader and is pinned
 // by golden byte tests plus live ROS captures. Empty payload stays empty:
-// ROS sends no dummy byte for empty service structs.
+// ROS sends no dummy byte for empty service structs. This is the final
+// V1 path; use MarshalServiceMessageWithExt for V2 kinds.
 //
 // The GUID is the opaque 8 byte rmw request id echoed verbatim in the
 // reply. It is copied verbatim and never byte swapped.
 func MarshalServiceMessage(payload []byte, guid [8]byte, seq uint64, littleEndian bool) []byte {
-	h := EncodeHeader(littleEndian)
+	return MarshalServiceMessageWithExt(payload, guid, seq, ExtFinal, littleEndian)
+}
+
+// MarshalServiceMessageWithExt wraps a service payload for one kind.
+//
+// Final emits V1 IDs; appendable and mutable emit V2 IDs per Table 32.
+// Layout and empty handling match MarshalServiceMessage so final wires
+// are identical. For explicit V1 appendable/mutable emits use
+// MarshalServiceMessageWithExtVersioned.
+func MarshalServiceMessageWithExt(payload []byte, guid [8]byte, seq uint64, ext Extensibility, littleEndian bool) []byte {
+	h := EncodeHeaderForExt(ext, littleEndian)
+	body := payload
+	out := make([]byte, 0, ServiceEnvelopeSize+len(body)+4)
+	out = append(out, h[:]...)
+	out = append(out, guid[:]...)
+	tmp := encodeServiceSequence(seq, littleEndian)
+	out = append(out, tmp[:]...)
+	out = append(out, body...)
+	pad := padTo4(len(out))
+	for range pad {
+		out = append(out, 0x00)
+	}
+	return out
+}
+
+// MarshalServiceMessageWithExtVersioned wraps a service payload with version.
+//
+// V1 appendable emits PLAIN_CDR and V1 mutable emits PL_CDR per Table 57.
+func MarshalServiceMessageWithExtVersioned(payload []byte, guid [8]byte, seq uint64, ext Extensibility, ver EncodingVersion, littleEndian bool) []byte {
+	h := EncodeHeaderForExtWithVersion(ext, ver, littleEndian)
 	body := payload
 	out := make([]byte, 0, ServiceEnvelopeSize+len(body)+4)
 	out = append(out, h[:]...)
@@ -243,4 +322,217 @@ func UnmarshalServiceMessage(data []byte, m *Metrics) ([]byte, [8]byte, uint64, 
 	copy(guid[:], data[HeaderSize:HeaderSize+ServiceGUIDSize])
 	seq := decodeServiceSequence(data[HeaderSize+ServiceGUIDSize:ServiceEnvelopeSize], le)
 	return data[ServiceEnvelopeSize:], guid, seq, le, nil
+}
+
+// RepresentationIDxt6b names Table 57 encapsulation IDs.
+type RepresentationIDxt6b uint16
+
+// Table 57 representation IDs.
+const (
+	// Repxt6bCDRBE is XCDR final or appendable big endian V1.
+	Repxt6bCDRBE RepresentationIDxt6b = 0x0000
+	// Repxt6bCDRLE is XCDR final or appendable little endian V1.
+	Repxt6bCDRLE RepresentationIDxt6b = 0x0001
+	// Repxt6bPLCDRBE is XCDR mutable big endian V1.
+	Repxt6bPLCDRBE RepresentationIDxt6b = 0x0002
+	// Repxt6bPLCDRLE is XCDR mutable little endian V1.
+	Repxt6bPLCDRLE RepresentationIDxt6b = 0x0003
+	// Repxt6bCDR2BE is XCDR final big endian V2.
+	Repxt6bCDR2BE RepresentationIDxt6b = 0x0006
+	// Repxt6bCDR2LE is XCDR final little endian V2.
+	Repxt6bCDR2LE RepresentationIDxt6b = 0x0007
+	// Repxt6bDCDR2BE is XCDR appendable big endian V2.
+	Repxt6bDCDR2BE RepresentationIDxt6b = 0x0008
+	// Repxt6bDCDR2LE is XCDR appendable little endian V2.
+	Repxt6bDCDR2LE RepresentationIDxt6b = 0x0009
+	// Repxt6bPLCDR2BE is XCDR mutable big endian V2.
+	Repxt6bPLCDR2BE RepresentationIDxt6b = 0x000A
+	// Repxt6bPLCDR2LE is XCDR mutable little endian V2.
+	Repxt6bPLCDR2LE RepresentationIDxt6b = 0x000B
+)
+
+// String returns the symbolic name of the representation ID.
+func (r RepresentationIDxt6b) String() string {
+	switch r {
+	case Repxt6bCDRBE:
+		return "CDR_BE"
+	case Repxt6bCDRLE:
+		return "CDR_LE"
+	case Repxt6bPLCDRBE:
+		return "PL_CDR_BE"
+	case Repxt6bPLCDRLE:
+		return "PL_CDR_LE"
+	case Repxt6bCDR2BE:
+		return "CDR2_BE"
+	case Repxt6bCDR2LE:
+		return "CDR2_LE"
+	case Repxt6bDCDR2BE:
+		return "D_CDR2_BE"
+	case Repxt6bDCDR2LE:
+		return "D_CDR2_LE"
+	case Repxt6bPLCDR2BE:
+		return "PL_CDR2_BE"
+	case Repxt6bPLCDR2LE:
+		return "PL_CDR2_LE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// ParsedEncapsulationxt6b is one decoded 4 byte header.
+type ParsedEncapsulationxt6b struct {
+	// Representation is the Table 57 ID from the first two bytes.
+	Representation RepresentationIDxt6b
+	// Extensibility is the kind implied by the representation.
+	Extensibility Extensibility
+	// Version is the XCDR version implied by the representation.
+	Version EncodingVersion
+	// LittleEndian is the negotiated byte order.
+	LittleEndian bool
+}
+
+// representationxt6bLayout is the decoded meaning of one ID.
+type representationxt6bLayout struct {
+	ext Extensibility
+	ver EncodingVersion
+	le  bool
+}
+
+// lookupxt6bRepresentation maps a Table 57 ID to kind plus version.
+func lookupxt6bRepresentation(id RepresentationIDxt6b) (representationxt6bLayout, bool) {
+	switch id {
+	case Repxt6bCDRBE:
+		return representationxt6bLayout{ExtFinal, XCDRVersion1, false}, true
+	case Repxt6bCDRLE:
+		return representationxt6bLayout{ExtFinal, XCDRVersion1, true}, true
+	case Repxt6bPLCDRBE:
+		return representationxt6bLayout{ExtMutable, XCDRVersion1, false}, true
+	case Repxt6bPLCDRLE:
+		return representationxt6bLayout{ExtMutable, XCDRVersion1, true}, true
+	case Repxt6bCDR2BE:
+		return representationxt6bLayout{ExtFinal, XCDRVersion2, false}, true
+	case Repxt6bCDR2LE:
+		return representationxt6bLayout{ExtFinal, XCDRVersion2, true}, true
+	case Repxt6bDCDR2BE:
+		return representationxt6bLayout{ExtAppendable, XCDRVersion2, false}, true
+	case Repxt6bDCDR2LE:
+		return representationxt6bLayout{ExtAppendable, XCDRVersion2, true}, true
+	case Repxt6bPLCDR2BE:
+		return representationxt6bLayout{ExtMutable, XCDRVersion2, false}, true
+	case Repxt6bPLCDR2LE:
+		return representationxt6bLayout{ExtMutable, XCDRVersion2, true}, true
+	default:
+		return representationxt6bLayout{}, false
+	}
+}
+
+// ParseEncapsulationxt6b decodes a 4 byte header into kind plus version.
+//
+// All Table 57 XCDR IDs are accepted. XML and unknown IDs are rejected.
+// Reserved option bytes are ignored for forward compatibility.
+func ParseEncapsulationxt6b(header [4]byte) (ParsedEncapsulationxt6b, error) {
+	var out ParsedEncapsulationxt6b
+	if header[0] != 0x00 {
+		return out, fmt.Errorf("envelope: bad encapsulation first byte 0x%02x: %w", header[0], ErrInvalid)
+	}
+	id := RepresentationIDxt6b(uint16(header[0])<<8 | uint16(header[1]))
+	out.Representation = id
+	layout, ok := lookupxt6bRepresentation(id)
+	if !ok {
+		return out, fmt.Errorf("envelope: unknown representation id 0x%04x: %w", uint16(id), ErrInvalid)
+	}
+	out.Extensibility = layout.ext
+	out.Version = layout.ver
+	out.LittleEndian = layout.le
+	return out, nil
+}
+
+// RepresentationForxt6b selects the emitted ID for a kind plus version.
+//
+// Final and appendable use plain CDR under V1 and the delimited form
+// under V2. Mutable uses the parameter list form under both versions.
+// Unknown kinds and versions are rejected.
+func RepresentationForxt6b(ext Extensibility, ver EncodingVersion, littleEndian bool) (RepresentationIDxt6b, error) {
+	err := ver.Validate()
+	if err != nil {
+		return 0, err
+	}
+	if ver == XCDRVersion2 {
+		return representationxt6bV2(ext, littleEndian)
+	}
+	return representationxt6bV1(ext, littleEndian)
+}
+
+// representationxt6bV1 selects the V1 ID for a kind.
+func representationxt6bV1(ext Extensibility, littleEndian bool) (RepresentationIDxt6b, error) {
+	switch ext {
+	case ExtFinal, ExtAppendable:
+		if littleEndian {
+			return Repxt6bCDRLE, nil
+		}
+		return Repxt6bCDRBE, nil
+	case ExtMutable:
+		if littleEndian {
+			return Repxt6bPLCDRLE, nil
+		}
+		return Repxt6bPLCDRBE, nil
+	default:
+		return 0, fmt.Errorf("envelope: unknown extensibility %d", int(ext))
+	}
+}
+
+// representationxt6bV2 selects the V2 ID for a kind.
+func representationxt6bV2(ext Extensibility, littleEndian bool) (RepresentationIDxt6b, error) {
+	switch ext {
+	case ExtFinal:
+		if littleEndian {
+			return Repxt6bCDR2LE, nil
+		}
+		return Repxt6bCDR2BE, nil
+	case ExtAppendable:
+		if littleEndian {
+			return Repxt6bDCDR2LE, nil
+		}
+		return Repxt6bDCDR2BE, nil
+	case ExtMutable:
+		if littleEndian {
+			return Repxt6bPLCDR2LE, nil
+		}
+		return Repxt6bPLCDR2BE, nil
+	default:
+		return 0, fmt.Errorf("envelope: unknown extensibility %d", int(ext))
+	}
+}
+
+// EncodeEncapsulationxt6b builds the 4 byte header for an emitted sample.
+//
+// Final kinds keep the V1 IDs so existing DDS paths stay byte identical.
+// Appendable and mutable kinds emit the V2 delimited IDs per Table 32.
+// Option bytes start zero. For explicit V1 appendable (PLAIN_CDR) and V1
+// mutable (PL_CDR) emits use EncodeEncapsulationxt6bWithVersion.
+func EncodeEncapsulationxt6b(ext Extensibility, littleEndian bool) [4]byte {
+	ver := XCDRVersion1
+	if ext != ExtFinal {
+		ver = XCDRVersion2
+	}
+	return EncodeEncapsulationxt6bWithVersion(ext, ver, littleEndian)
+}
+
+// EncodeEncapsulationxt6bWithVersion builds the header for an explicit version.
+//
+// V1 appendable emits PLAIN_CDR (0x0000/0x0001) and V1 mutable emits PL_CDR
+// (0x0002/0x0003) per Table 57; V2 emits CDR2/D_CDR2/PL_CDR2 per Table 32.
+// Unknown kinds fall back to plain CDR in the requested endian.
+func EncodeEncapsulationxt6bWithVersion(ext Extensibility, ver EncodingVersion, littleEndian bool) [4]byte {
+	id, err := RepresentationForxt6b(ext, ver, littleEndian)
+	if err != nil {
+		id = Repxt6bCDRLE
+		if !littleEndian {
+			id = Repxt6bCDRBE
+		}
+	}
+	var h [4]byte
+	h[0] = byte(uint16(id) >> 8)
+	h[1] = byte(uint16(id) & 0xFF)
+	return h
 }

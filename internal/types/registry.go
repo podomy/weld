@@ -17,20 +17,35 @@ type fullKey struct {
 	hash TypeHash
 }
 
+// equivalencext6aKey identifies one stored description by name plus EQ14.
+type equivalencext6aKey struct {
+	name string
+	eq   Equivalencext6aHash
+}
+
 // Registry stores individuals plus sources plus full descriptions by name and hash.
 type Registry struct {
 	mu             sync.RWMutex
 	types          map[string]IndividualTypeDescription
 	sources        map[string]TypeSource
 	fullByNameHash map[fullKey]TypeDescription
+	// equivalencext6a indexes the same descriptions by EQ14 hash.
+	// This is the model-only JSON MD5 index; discovery uses wireByHash.
+	equivalencext6a map[equivalencext6aKey]TypeDescription
+	// wireByHash indexes individuals by wire EquivalenceHash (CDR MD5)
+	// for exact discovery lookup. Both LE and BE hashes plus minimal
+	// and complete variants point to the same individual.
+	wireByHash map[[14]byte]IndividualTypeDescription
 }
 
 // NewRegistry returns an empty registry with no shared global state.
 func NewRegistry() *Registry {
 	return &Registry{
-		types:          make(map[string]IndividualTypeDescription),
-		sources:        make(map[string]TypeSource),
-		fullByNameHash: make(map[fullKey]TypeDescription),
+		types:           make(map[string]IndividualTypeDescription),
+		sources:         make(map[string]TypeSource),
+		fullByNameHash:  make(map[fullKey]TypeDescription),
+		equivalencext6a: make(map[equivalencext6aKey]TypeDescription),
+		wireByHash:      make(map[[14]byte]IndividualTypeDescription),
 	}
 }
 
@@ -52,6 +67,7 @@ func (r *Registry) RegisterType(desc IndividualTypeDescription) error {
 		return nil
 	}
 	r.types[desc.TypeName] = cloneIndividual(desc)
+	indexWireIndividualLocked(r, desc)
 	if _, ok := r.sources[desc.TypeName]; !ok {
 		r.sources[desc.TypeName] = TypeSource{
 			TypeName: desc.TypeName,
@@ -292,7 +308,9 @@ func visitReachableFields(cur IndividualTypeDescription, present, reachable map[
 // storeFull stores one normalized description plus sources with conflict checks.
 //
 // Conflicting redefinitions with different fields are rejected. The caller
-// must hold no lock; this helper locks internally.
+// must hold no lock; this helper locks internally. The model EQ14 index
+// (JSON MD5) is kept for model-only use; the wire index (CDR MD5) is built
+// for discovery via indexWireIndividualLocked.
 func (r *Registry) storeFull(sorted TypeDescription, h TypeHash, sources []TypeSource) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -307,12 +325,18 @@ func (r *Registry) storeFull(sorted TypeDescription, h TypeHash, sources []TypeS
 	}
 	for i := range all {
 		r.types[all[i].TypeName] = cloneIndividual(all[i])
+		indexWireIndividualLocked(r, all[i])
 	}
 	for i := range sources {
 		r.sources[sources[i].TypeName] = sources[i]
 	}
 	key := fullKey{name: sorted.Description.TypeName, hash: h}
 	r.fullByNameHash[key] = sorted
+	eq, err := ComputeEquivalencext6aHash(sorted)
+	if err != nil {
+		return fmt.Errorf("types: store full %q equivalence: %w", sorted.Description.TypeName, err)
+	}
+	r.equivalencext6a[equivalencext6aKey{name: sorted.Description.TypeName, eq: eq}] = sorted
 	return nil
 }
 
@@ -333,6 +357,76 @@ func (r *Registry) RegisterFull(desc TypeDescription, sources []TypeSource) (Typ
 	return h, nil
 }
 
+// individualToMinimalTypeObject converts one stored individual to a minimal body.
+func individualToMinimalTypeObject(ind IndividualTypeDescription) MinimalTypeObject {
+	out := MinimalTypeObject{TypeName: ind.TypeName}
+	for i := range ind.Fields {
+		var h [4]byte
+		copy(h[:], ind.Fields[i].Name)
+		out.Members = append(out.Members, MinimalMember{MemberID: ind.Fields[i].MemberID, Kind: uint8(ind.Fields[i].Type.TypeID), NameHash: h})
+	}
+	return out
+}
+
+// individualToCompleteTypeObject converts one stored individual to a complete body.
+func individualToCompleteTypeObject(ind IndividualTypeDescription) CompleteTypeObject {
+	out := CompleteTypeObject{TypeName: ind.TypeName}
+	for i := range ind.Fields {
+		out.Members = append(out.Members, CompleteMember{MemberID: ind.Fields[i].MemberID, Kind: uint8(ind.Fields[i].Type.TypeID), Name: ind.Fields[i].Name, Optional: ind.Fields[i].Optional})
+	}
+	return out
+}
+
+// wireHashForIndividual returns the wire EquivalenceHash for one individual.
+//
+// The hash is MD5 over the TypeObjectSeq CDR containing the single
+// DHEADER-framed TypeObject per 7.3.3.10. Minimal selects the minimal arm,
+// complete the complete arm. LittleEndian selects the seq byte order.
+func wireHashForIndividual(ind IndividualTypeDescription, minimal bool, littleEndian bool) (EquivalenceHash, error) {
+	var raw []byte
+	var err error
+	if minimal {
+		raw, err = MarshalTypeObject(TypeObject{Minimal: func() *MinimalTypeObject { m := individualToMinimalTypeObject(ind); return &m }()}, littleEndian)
+	} else {
+		raw, err = MarshalTypeObject(TypeObject{Complete: func() *CompleteTypeObject { c := individualToCompleteTypeObject(ind); return &c }()}, littleEndian)
+	}
+	if err != nil {
+		return EquivalenceHash{}, err
+	}
+	return ComputeWireEquivalenceHash([][]byte{raw}, littleEndian)
+}
+
+// indexWireIndividualLocked stores minimal and complete wire hashes for both endians.
+//
+// The caller must hold the write lock. Colliding hashes from different type
+// names are kept first-wins to preserve exact lookup determinism.
+func indexWireIndividualLocked(r *Registry, ind IndividualTypeDescription) {
+	clone := cloneIndividual(ind)
+	for _, minimal := range []bool{true, false} {
+		for _, le := range []bool{true, false} {
+			h, err := wireHashForIndividual(ind, minimal, le)
+			if err != nil {
+				continue
+			}
+			if _, ok := r.wireByHash[h.Digest]; !ok {
+				r.wireByHash[h.Digest] = clone
+			}
+		}
+	}
+}
+
+// cloneFullxt6a returns a deep copy of one stored description.
+func cloneFullxt6a(d TypeDescription) TypeDescription {
+	out := TypeDescription{
+		Description: cloneIndividual(d.Description),
+		Referenced:  make([]IndividualTypeDescription, len(d.Referenced)),
+	}
+	for i := range d.Referenced {
+		out.Referenced[i] = cloneIndividual(d.Referenced[i])
+	}
+	return out
+}
+
 // LookupFull returns one stored description by type name plus hash.
 // The lookup is version-sensitive like Equal: version and digest must match.
 func (r *Registry) LookupFull(name string, hash TypeHash) (TypeDescription, bool) {
@@ -343,14 +437,35 @@ func (r *Registry) LookupFull(name string, hash TypeHash) (TypeDescription, bool
 	if !ok {
 		return TypeDescription{}, false
 	}
-	out := TypeDescription{
-		Description: cloneIndividual(d.Description),
-		Referenced:  make([]IndividualTypeDescription, len(d.Referenced)),
+	return cloneFullxt6a(d), true
+}
+
+// LookupFullByEquivalencext6a returns one stored description by name plus EQ14.
+//
+// The RIHS01 index in LookupFull is unchanged and byte-identical; this
+// is a second index for equivalence based discovery.
+func (r *Registry) LookupFullByEquivalencext6a(name string, eq Equivalencext6aHash) (TypeDescription, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := equivalencext6aKey{name: name, eq: eq}
+	d, ok := r.equivalencext6a[key]
+	if !ok {
+		return TypeDescription{}, false
 	}
-	for i := range d.Referenced {
-		out.Referenced[i] = cloneIndividual(d.Referenced[i])
+	return cloneFullxt6a(d), true
+}
+
+// ComputeEquivalencext6a returns the EQ14 hash of the closure for root.
+func (r *Registry) ComputeEquivalencext6a(root string) (Equivalencext6aHash, error) {
+	full, err := r.TransitiveClosure(root)
+	if err != nil {
+		return Equivalencext6aHash{}, fmt.Errorf("types: compute equivalence %q: %w", root, err)
 	}
-	return out, true
+	eq, err := ComputeEquivalencext6aHash(full)
+	if err != nil {
+		return Equivalencext6aHash{}, fmt.Errorf("types: compute equivalence %q: %w", root, err)
+	}
+	return eq, nil
 }
 
 // LookupWithHash verifies the closure hash for name against hash.
@@ -377,4 +492,314 @@ func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.types)
+}
+
+// TypeLookupServer answers getTypeDependencies and getTypes over CDR.
+//
+// The server wraps a Registry and speaks the DDS TypeLookup wire: the
+// caller passes CDR request bytes (as they would arrive on the built-in
+// TypeLookup endpoints) and receives CDR reply bytes. This keeps the
+// transport out of this package while pinning the exact wire framing
+// with round-trip tests.
+type TypeLookupServer struct {
+	reg *Registry
+}
+
+// NewTypeLookupServer binds a server to a registry.
+func NewTypeLookupServer(reg *Registry) *TypeLookupServer {
+	return &TypeLookupServer{reg: reg}
+}
+
+// MarshalDependenciesRequest encodes hashes as sequence plus 33 byte entries.
+//
+// Each entry is version byte plus 32 digest bytes with no per-entry pad.
+// The sequence length uses 4 byte alignment; entries follow contiguously.
+func MarshalDependenciesRequest(hashes []TypeHash, littleEndian bool) ([]byte, error) {
+	enc := NewEncoder(littleEndian)
+	err := enc.WriteSequenceLength(len(hashes))
+	if err != nil {
+		return nil, err
+	}
+	for i := range hashes {
+		vb := hashes[i].VersionedBytes()
+		enc.buf = append(enc.buf, vb[:]...)
+	}
+	return enc.Bytes(), nil
+}
+
+// ParseDependenciesRequest decodes a dependencies request.
+func ParseDependenciesRequest(wire []byte) ([]TypeHash, error) {
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		return nil, err
+	}
+	n, err := dec.ReadSequenceLength()
+	if err != nil {
+		return nil, err
+	}
+	err = dec.CheckSequenceAllocation(n, 33)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TypeHash, 0, n)
+	for range n {
+		err = dec.need(33)
+		if err != nil {
+			return nil, err
+		}
+		var h TypeHash
+		h.Version = dec.data[dec.off]
+		copy(h.Digest[:], dec.data[dec.off+1:dec.off+33])
+		dec.off += 33
+		out = append(out, h)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarshalDependenciesReply encodes identifiers as octet sequences.
+func MarshalDependenciesReply(ids []TypeIdentifier, littleEndian bool) ([]byte, error) {
+	enc := NewEncoder(littleEndian)
+	err := enc.WriteSequenceLength(len(ids))
+	if err != nil {
+		return nil, err
+	}
+	for i := range ids {
+		raw, err := MarshalTypeIdentifier(ids[i], littleEndian)
+		if err != nil {
+			return nil, err
+		}
+		err = enc.WriteOctetSequence(raw)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return enc.Bytes(), nil
+}
+
+// ParseDependenciesReply decodes a dependencies reply.
+func ParseDependenciesReply(wire []byte) ([]TypeIdentifier, error) {
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		return nil, err
+	}
+	n, err := dec.ReadSequenceLength()
+	if err != nil {
+		return nil, err
+	}
+	err = dec.CheckSequenceAllocation(n, 4)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TypeIdentifier, 0, n)
+	for range n {
+		raw, err := dec.ReadOctetSequence()
+		if err != nil {
+			return nil, err
+		}
+		id, err := UnmarshalTypeIdentifier(raw, dec.LittleEndian())
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	err = dec.Finish()
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarshalTypesRequest encodes identifiers as octet sequences.
+func MarshalTypesRequest(ids []TypeIdentifier, littleEndian bool) ([]byte, error) {
+	return MarshalDependenciesReply(ids, littleEndian)
+}
+
+// ParseTypesRequest decodes a getTypes request.
+func ParseTypesRequest(wire []byte) ([]TypeIdentifier, error) {
+	return ParseDependenciesReply(wire)
+}
+
+// MarshalTypesReply encodes type objects as octet sequences.
+//
+// Each object already carries its DHEADER per 7.3.3.5; the sequence
+// adds only the element count plus 4 byte alignment pad between objects.
+// Minimal and complete objects share one sequence in discriminator order
+// as they appear on the wire. Framing is shared with
+// MarshalTypeObjectSeqCDR via appendTypeObjectsSeq.
+func MarshalTypesReply(objects [][]byte, littleEndian bool) ([]byte, error) {
+	return MarshalTypeObjectSeqCDR(objects, littleEndian)
+}
+
+// ParseTypesReply decodes a getTypes reply into raw objects.
+func ParseTypesReply(wire []byte) ([][]byte, error) {
+	return ParseTypeObjectSeqCDR(wire)
+}
+
+// HandleDependencies answers one getTypeDependencies request wire.
+//
+// Each requested RIHS01 hash maps to a strongly connected hash
+// identifier carrying the wire 14 byte equivalence digest (CDR MD5 per
+// 7.3.3.10) when the registry holds the description; unknown hashes fail.
+// The encapsulation header must parse; a bad header fails instead of
+// defaulting to little-endian.
+func (s *TypeLookupServer) HandleDependencies(wire []byte) ([]byte, error) {
+	if s.reg == nil {
+		return nil, fmt.Errorf("types: lookup server misses registry: %w", ErrInvalid)
+	}
+	if len(wire) < HeaderSize {
+		return nil, fmt.Errorf("types: lookup dependencies wire too short %d: %w", len(wire), ErrTruncated)
+	}
+	var hdr [4]byte
+	copy(hdr[:], wire[:HeaderSize])
+	parsed, err := ParseEncapsulationxt6b(hdr)
+	if err != nil {
+		return nil, err
+	}
+	le := parsed.LittleEndian
+	hashes, err := ParseDependenciesRequest(wire)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]TypeIdentifier, 0, len(hashes))
+	for i := range hashes {
+		id, err := s.dependencyFor(hashes[i], le)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return MarshalDependenciesReply(ids, le)
+}
+
+// dependencyFor maps one RIHS01 hash to a strongly connected identifier.
+//
+// The returned hash is the wire EquivalenceHash (TypeObjectSeq CDR MD5)
+// for the root individual, not the model JSON MD5. The RIHS01 index stays
+// for ROS interop; the SCC digest is the wire form per 7.3.3.10.
+func (s *TypeLookupServer) dependencyFor(hash TypeHash, le bool) (TypeIdentifier, error) {
+	s.reg.mu.RLock()
+	defer s.reg.mu.RUnlock()
+	for key, full := range s.reg.fullByNameHash {
+		if key.hash.Equal(hash) {
+			wire, err := wireHashForIndividual(full.Description, true, le)
+			if err != nil {
+				return TypeIdentifier{}, err
+			}
+			return TypeIdentifier{Kind: TIStrongComp, Hash: wire.Digest}, nil
+		}
+	}
+	return TypeIdentifier{}, fmt.Errorf("types: lookup unknown hash %s: %w", hash.String(), ErrInvalid)
+}
+
+// HandleTypes answers one getTypes request wire.
+//
+// The reply carries one DHEADER framed TypeObject per known hash
+// identifier in request order. Unknown kinds and unknown hashes fail.
+// The encapsulation header must parse; a bad header fails instead of
+// defaulting to little-endian.
+func (s *TypeLookupServer) HandleTypes(wire []byte) ([]byte, error) {
+	if s.reg == nil {
+		return nil, fmt.Errorf("types: lookup server misses registry: %w", ErrInvalid)
+	}
+	if len(wire) < HeaderSize {
+		return nil, fmt.Errorf("types: lookup types wire too short %d: %w", len(wire), ErrTruncated)
+	}
+	var hdr [4]byte
+	copy(hdr[:], wire[:HeaderSize])
+	parsed, err := ParseEncapsulationxt6b(hdr)
+	if err != nil {
+		return nil, err
+	}
+	le := parsed.LittleEndian
+	ids, err := ParseTypesRequest(wire)
+	if err != nil {
+		return nil, err
+	}
+	objects := make([][]byte, 0, len(ids))
+	for i := range ids {
+		obj, err := s.objectFor(ids[i], le)
+		if err != nil {
+			return nil, err
+		}
+		objects = append(objects, obj)
+	}
+	return MarshalTypesReply(objects, le)
+}
+
+// objectFor builds one TypeObject body for a requested identifier.
+//
+// The requested 14 byte hash must exactly match a stored wire hash (both
+// LE and BE hashes are indexed); the lexicographically-first fallback is
+// removed. Unknown hashes and unknown kinds fail. EKMinimal returns the
+// minimal arm, EKComplete the complete arm, and TIStrongComp the minimal
+// arm for the matched individual.
+func (s *TypeLookupServer) objectFor(id TypeIdentifier, le bool) ([]byte, error) {
+	s.reg.mu.RLock()
+	defer s.reg.mu.RUnlock()
+	if len(s.reg.wireByHash) == 0 && len(s.reg.fullByNameHash) == 0 {
+		return nil, fmt.Errorf("types: lookup registry empty: %w", ErrInvalid)
+	}
+	ind, ok := s.reg.wireByHash[id.Hash]
+	if !ok {
+		return nil, fmt.Errorf("types: lookup unknown equivalence hash %x: %w", id.Hash, ErrInvalid)
+	}
+	switch id.Kind {
+	case EKMinimal, TIStrongComp:
+		minimal := individualToMinimalTypeObject(ind)
+		return MarshalTypeObject(TypeObject{Minimal: &minimal}, le)
+	case EKComplete:
+		complete := individualToCompleteTypeObject(ind)
+		return MarshalTypeObject(TypeObject{Complete: &complete}, le)
+	default:
+		return nil, fmt.Errorf("types: lookup kind %#02x unsupported: %w", id.Kind, ErrInvalid)
+	}
+}
+
+// TypeLookupClient exchanges CDR request and reply bytes with a server.
+//
+// Transport simulates the DDS built-in endpoints: it receives request
+// bytes and returns reply bytes. Round-trip tests pin the exact wire.
+type TypeLookupClient struct {
+	transport func(request []byte) ([]byte, error)
+}
+
+// NewTypeLookupClient binds a client to a transport function.
+func NewTypeLookupClient(transport func(request []byte) ([]byte, error)) *TypeLookupClient {
+	return &TypeLookupClient{transport: transport}
+}
+
+// GetTypeDependencies requests identifiers for hashes over the transport.
+func (c *TypeLookupClient) GetTypeDependencies(hashes []TypeHash, littleEndian bool) ([]TypeIdentifier, error) {
+	if c.transport == nil {
+		return nil, fmt.Errorf("types: lookup client misses transport: %w", ErrInvalid)
+	}
+	wire, err := MarshalDependenciesRequest(hashes, littleEndian)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := c.transport(wire)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDependenciesReply(reply)
+}
+
+// GetTypes requests type objects for identifiers over the transport.
+func (c *TypeLookupClient) GetTypes(ids []TypeIdentifier, littleEndian bool) ([][]byte, error) {
+	if c.transport == nil {
+		return nil, fmt.Errorf("types: lookup client misses transport: %w", ErrInvalid)
+	}
+	wire, err := MarshalTypesRequest(ids, littleEndian)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := c.transport(wire)
+	if err != nil {
+		return nil, err
+	}
+	return ParseTypesReply(reply)
 }

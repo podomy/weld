@@ -301,12 +301,16 @@ func (b StringBound) Merge(field DescriptionField) StringBound {
 }
 
 // CheckStringLength enforces all bound sources at serialize time.
-// Bounds count runes like the CDR wire bounds, not bytes, so multi-byte
-// UTF-8 never over-rejects.
+// Bounds count octets (len(s) bytes) excluding NUL to match the CDR wire
+// check in cdr.go readStringWithBound. DDS-XTypes 7.2.3.1.2 states the
+// bound in characters, but the wire carries UTF-8 octets; counting octets
+// is fail-closed (a multibyte string uses more octets than runes) and keeps
+// serialize-time and wire-time checks identical. See TestBoundsRuneCounts
+// for the multibyte pin.
 func CheckStringLength(s string, bound StringBound) error {
 	upper, ok := bound.EffectiveUpperBound()
 	if ok {
-		n := countRunes(s)
+		n := len(s)
 		if uint(n) > upper {
 			return fmt.Errorf("types: string len %d above bound %d", n, upper)
 		}
@@ -392,8 +396,128 @@ type DescriptionField struct {
 	StringCapacity uint
 }
 
+// Enumxt6aLiteral is one named value of an enumerated type.
+type Enumxt6aLiteral struct {
+	Name  string
+	Value int32
+}
+
+// Enumxt6aType is one enumerated type with its bit bound and literals.
+type Enumxt6aType struct {
+	BitBound uint32
+	Literals []Enumxt6aLiteral
+}
+
+// Validate checks bound range plus literal names plus value uniqueness.
+func (e Enumxt6aType) Validate() error {
+	if e.BitBound < 1 || e.BitBound > 32 {
+		return fmt.Errorf("types: enum bit bound %d out of range 1-32", e.BitBound)
+	}
+	seenNames := make(map[string]bool, len(e.Literals))
+	seenValues := make(map[int32]bool, len(e.Literals))
+	for i := range e.Literals {
+		if e.Literals[i].Name == "" {
+			return fmt.Errorf("types: enum literal %d has empty name", i)
+		}
+		if seenNames[e.Literals[i].Name] {
+			return fmt.Errorf("types: enum duplicate literal %q", e.Literals[i].Name)
+		}
+		seenNames[e.Literals[i].Name] = true
+		if seenValues[e.Literals[i].Value] {
+			return fmt.Errorf("types: enum duplicate value %d", e.Literals[i].Value)
+		}
+		seenValues[e.Literals[i].Value] = true
+	}
+	return nil
+}
+
+// Width returns the CDR width in bytes selected by the bit bound.
+func (e Enumxt6aType) Width() (int, error) {
+	return Enumxt6aWidth(e.BitBound)
+}
+
+// Enumxt6aWidth maps an enum bit bound to its CDR width per Table 30.
+//
+// Bounds 1-8 select 1 byte, 9-16 select 2 bytes, and 17-32 select 4
+// bytes. Out of range bounds fail.
+func Enumxt6aWidth(bound uint32) (int, error) {
+	switch {
+	case bound >= 1 && bound <= 8:
+		return 1, nil
+	case bound >= 9 && bound <= 16:
+		return 2, nil
+	case bound >= 17 && bound <= 32:
+		return 4, nil
+	default:
+		return 0, fmt.Errorf("types: enum bit bound %d out of range 1-32", bound)
+	}
+}
+
+// Bitmaskxt6aFlag is one named position of a bitmask type.
+type Bitmaskxt6aFlag struct {
+	Name     string
+	Position uint16
+}
+
+// Bitmaskxt6aType is one bitmask type with its bound and flags.
+type Bitmaskxt6aType struct {
+	BitBound uint32
+	Flags    []Bitmaskxt6aFlag
+}
+
+// Validate checks bound range plus flag names plus position uniqueness.
+func (b Bitmaskxt6aType) Validate() error {
+	if b.BitBound < 1 || b.BitBound > 64 {
+		return fmt.Errorf("types: bitmask bit bound %d out of range 1-64", b.BitBound)
+	}
+	seenNames := make(map[string]bool, len(b.Flags))
+	seenPos := make(map[uint16]bool, len(b.Flags))
+	for i := range b.Flags {
+		if b.Flags[i].Name == "" {
+			return fmt.Errorf("types: bitmask flag %d has empty name", i)
+		}
+		if seenNames[b.Flags[i].Name] {
+			return fmt.Errorf("types: bitmask duplicate flag %q", b.Flags[i].Name)
+		}
+		seenNames[b.Flags[i].Name] = true
+		if uint32(b.Flags[i].Position) >= b.BitBound {
+			return fmt.Errorf("types: bitmask flag %q position %d outside bound %d", b.Flags[i].Name, b.Flags[i].Position, b.BitBound)
+		}
+		if seenPos[b.Flags[i].Position] {
+			return fmt.Errorf("types: bitmask duplicate position %d", b.Flags[i].Position)
+		}
+		seenPos[b.Flags[i].Position] = true
+	}
+	return nil
+}
+
+// Width returns the CDR width in bytes selected by the bit bound.
+func (b Bitmaskxt6aType) Width() (int, error) {
+	return Bitmaskxt6aWidth(b.BitBound)
+}
+
+// Bitmaskxt6aWidth maps a bitmask bound to its CDR width per Table 31.
+//
+// Bounds 1-8 select 1 byte, 9-16 select 2 bytes, 17-32 select 4 bytes,
+// and 33-64 select 8 bytes. Out of range bounds fail. Wire framing is
+// in cdr.go WriteBitmask plus ReadBitmask keyed by this width.
+func Bitmaskxt6aWidth(bound uint32) (int, error) {
+	switch {
+	case bound >= 1 && bound <= 8:
+		return 1, nil
+	case bound >= 9 && bound <= 16:
+		return 2, nil
+	case bound >= 17 && bound <= 32:
+		return 4, nil
+	case bound >= 33 && bound <= 64:
+		return 8, nil
+	default:
+		return 0, fmt.Errorf("types: bitmask bit bound %d out of range 1-64", bound)
+	}
+}
+
 // CheckAgainstDescription enforces description capacities at serialize time.
-// StrLen counts runes like the CDR wire bounds, not bytes.
+// StrLen counts octets (bytes, not runes) to match the CDR wire.
 func CheckAgainstDescription(field DescriptionField, strLen, seqLen uint, isString bool) error {
 	if isString {
 		if field.StringCapacity != 0 && strLen > field.StringCapacity {

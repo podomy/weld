@@ -419,14 +419,14 @@ func checkBoundedRoundTrip(t *testing.T, isWString bool) {
 	var truncated bool
 	var err error
 	if isWString {
-		truncated, err = enc.WriteBoundedWString("abcdef", 3)
+		truncated, err = enc.WriteBoundedWStringTruncate("abcdef", 3)
 		if err != nil {
-			t.Fatalf("WriteBoundedWString failed: %v", err)
+			t.Fatalf("WriteBoundedWStringTruncate failed: %v", err)
 		}
 	} else {
-		truncated, err = enc.WriteBoundedString("abcdef", 3)
+		truncated, err = enc.WriteBoundedStringTruncate("abcdef", 3)
 		if err != nil {
-			t.Fatalf("WriteBoundedString failed: %v", err)
+			t.Fatalf("WriteBoundedStringTruncate failed: %v", err)
 		}
 	}
 	if truncated != true {
@@ -435,6 +435,26 @@ func checkBoundedRoundTrip(t *testing.T, isWString bool) {
 	wire := enc.Bytes()
 	checkBoundedExact(t, wire, isWString)
 	checkBoundedOverlong(t, wire, isWString)
+	checkBoundedStrictFail(t, isWString)
+}
+
+// checkBoundedStrictFail verifies strict bounded writes fail without mutating.
+func checkBoundedStrictFail(t *testing.T, isWString bool) {
+	t.Helper()
+	enc := NewEncoder(true)
+	before := enc.Len()
+	var err error
+	if isWString {
+		_, err = enc.WriteBoundedWString("abcdef", 3)
+	} else {
+		_, err = enc.WriteBoundedString("abcdef", 3)
+	}
+	if err == nil {
+		t.Fatalf("strict bounded overlong must fail")
+	}
+	if enc.Len() != before {
+		t.Fatalf("strict reject mutated buffer")
+	}
 }
 
 // checkBoundedExactWString verifies exact wstring read.
@@ -1106,13 +1126,13 @@ func TestCdrWStringMissingNUL(t *testing.T) {
 	}
 }
 
-// TestCdrBoundedStringNonASCII checks truncation never splits UTF-8.
-func TestCdrBoundedStringNonASCII(t *testing.T) {
-	s := "a\u2705b"
+// checkNonASCIIStringTruncate verifies string truncation.
+func checkNonASCIIStringTruncate(t *testing.T, s string) {
+	t.Helper()
 	enc := NewEncoder(true)
-	truncated, err := enc.WriteBoundedString(s, 2)
+	truncated, err := enc.WriteBoundedStringTruncate(s, 2)
 	if err != nil {
-		t.Fatalf("WriteBoundedString failed: %v", err)
+		t.Fatalf("WriteBoundedStringTruncate failed: %v", err)
 	}
 	if truncated != true {
 		t.Fatalf("expected truncated true for non-ASCII bound")
@@ -1126,13 +1146,18 @@ func TestCdrBoundedStringNonASCII(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadString failed: %v", err)
 	}
-	if got != "a\u2705" {
-		t.Fatalf("non-ASCII truncation mismatch %q want %q", got, "a\u2705")
+	if got != "a" {
+		t.Fatalf("non-ASCII truncation mismatch %q want %q", got, "a")
 	}
+}
+
+// checkNonASCIIWStringTruncate verifies wstring truncation.
+func checkNonASCIIWStringTruncate(t *testing.T, s string) {
+	t.Helper()
 	enc2 := NewEncoder(true)
-	truncated, err = enc2.WriteBoundedWString(s, 2)
+	truncated, err := enc2.WriteBoundedWStringTruncate(s, 2)
 	if err != nil {
-		t.Fatalf("WriteBoundedWString failed: %v", err)
+		t.Fatalf("WriteBoundedWStringTruncate failed: %v", err)
 	}
 	if truncated != true {
 		t.Fatalf("expected wstring truncated true")
@@ -1149,6 +1174,28 @@ func TestCdrBoundedStringNonASCII(t *testing.T) {
 	if got2 != "a\u2705" {
 		t.Fatalf("wstring non-ASCII mismatch %q", got2)
 	}
+}
+
+// checkNonASCIIStrictFail verifies strict reject without mutation.
+func checkNonASCIIStrictFail(t *testing.T, s string) {
+	t.Helper()
+	enc3 := NewEncoder(true)
+	before := enc3.Len()
+	_, err := enc3.WriteBoundedString(s, 2)
+	if err == nil {
+		t.Fatalf("strict bounded string over bound must fail")
+	}
+	if enc3.Len() != before {
+		t.Fatalf("strict reject mutated buffer")
+	}
+}
+
+// TestCdrBoundedStringNonASCII checks truncation never splits UTF-8.
+func TestCdrBoundedStringNonASCII(t *testing.T) {
+	s := "a\u2705b"
+	t.Run("string", func(t *testing.T) { checkNonASCIIStringTruncate(t, s) })
+	t.Run("wstring", func(t *testing.T) { checkNonASCIIWStringTruncate(t, s) })
+	t.Run("strict", func(t *testing.T) { checkNonASCIIStrictFail(t, s) })
 }
 
 // checkNegativeWriteBounds verifies negative write bounds do not mutate.
@@ -1860,16 +1907,16 @@ func TestCdrEncoderCapsChecked(t *testing.T) {
 	t.Run("overflow", checkEncoderOverflowWString)
 }
 
-// checkAstralSingle verifies single astral fits bound 1.
+// checkAstralSingle verifies single astral truncates under unit bound 1.
 func checkAstralSingle(t *testing.T, le bool, astral string) {
 	t.Helper()
 	enc := NewEncoder(le)
-	truncated, err := enc.WriteBoundedWString(astral, 1)
+	truncated, err := enc.WriteBoundedWStringTruncate(astral, 1)
 	if err != nil {
-		t.Fatalf("le=%v WriteBoundedWString failed: %v", le, err)
+		t.Fatalf("le=%v WriteBoundedWStringTruncate failed: %v", le, err)
 	}
-	if truncated {
-		t.Fatalf("le=%v astral bound 1 should not truncate", le)
+	if !truncated {
+		t.Fatalf("le=%v astral bound 1 should truncate to empty", le)
 	}
 	wire := enc.Bytes()
 	dec, err := NewDecoder(wire)
@@ -1880,18 +1927,27 @@ func checkAstralSingle(t *testing.T, le bool, astral string) {
 	if err != nil {
 		t.Fatalf("le=%v ReadBoundedWString failed: %v", le, err)
 	}
-	if got != astral {
-		t.Fatalf("le=%v astral mismatch %q", le, got)
+	if got != "" {
+		t.Fatalf("le=%v astral mismatch %q want empty", le, got)
+	}
+	encStrict := NewEncoder(le)
+	before := encStrict.Len()
+	_, err = encStrict.WriteBoundedWString(astral, 1)
+	if err == nil {
+		t.Fatalf("le=%v strict astral bound must fail", le)
+	}
+	if encStrict.Len() != before {
+		t.Fatalf("le=%v strict reject mutated buffer", le)
 	}
 }
 
-// checkAstralDouble verifies double astral truncates to one.
+// checkAstralDouble verifies double astral truncates to empty under unit bound 1.
 func checkAstralDouble(t *testing.T, le bool, astral string) {
 	t.Helper()
 	enc2 := NewEncoder(le)
-	truncated, err := enc2.WriteBoundedWString(astral+astral, 1)
+	truncated, err := enc2.WriteBoundedWStringTruncate(astral+astral, 1)
 	if err != nil {
-		t.Fatalf("le=%v WriteBoundedWString double failed: %v", le, err)
+		t.Fatalf("le=%v WriteBoundedWStringTruncate double failed: %v", le, err)
 	}
 	if !truncated {
 		t.Fatalf("le=%v expected truncate for two astral with bound 1", le)
@@ -1905,8 +1961,8 @@ func checkAstralDouble(t *testing.T, le bool, astral string) {
 	if err != nil {
 		t.Fatalf("le=%v ReadWString failed: %v", le, err)
 	}
-	if got2 != astral {
-		t.Fatalf("le=%v truncated astral mismatch %q", le, got2)
+	if got2 != "" {
+		t.Fatalf("le=%v truncated astral mismatch %q want empty", le, got2)
 	}
 }
 

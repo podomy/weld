@@ -73,13 +73,13 @@ func TestCdrEnvelopeRoundTripBE(t *testing.T) {
 	}
 }
 
-// TestCdrEnvelopeBadHeaderRejected checks nonzero and endian violations.
+// TestCdrEnvelopeBadHeaderRejected checks nonzero and unknown violations.
 func TestCdrEnvelopeBadHeaderRejected(t *testing.T) {
 	cases := [][]byte{
 		{0x01, 0x01, 0x00, 0x00},
-		{0x00, 0x02, 0x00, 0x00},
 		{0x00, 0xFF, 0x00, 0x00},
 		{0xCD, 0x00, 0x00, 0x00},
+		{0x00, 0x04, 0x00, 0x00},
 	}
 	for i, c := range cases {
 		var m Metrics

@@ -1428,3 +1428,659 @@ func storeDirectSlice(base any, field string, next reflect.Value) error {
 	f.Set(next)
 	return nil
 }
+
+// Kindxt6a names the XTypes kind of a TypeRefxt6a for assignability.
+type Kindxt6a int
+
+// Type reference kinds covered by the assignability tables.
+const (
+	Kindxt6aPrimitive Kindxt6a = iota
+	Kindxt6aString8
+	Kindxt6aString16
+	Kindxt6aArray
+	Kindxt6aSequence
+	Kindxt6aMap
+	Kindxt6aEnum
+	Kindxt6aBitmask
+	Kindxt6aStruct
+	Kindxt6aUnion
+)
+
+// TypeRefxt6a is one model type for assignability evaluation.
+type TypeRefxt6a struct {
+	Kind    Kindxt6a
+	Base    FieldTypeID
+	Bound   uint32
+	Elem    *TypeRefxt6a
+	Key     *TypeRefxt6a
+	Enum    *Enumxt6aType
+	Bitmask *Bitmaskxt6aType
+	Struct  *Structxt6aShape
+	Union   *Unionxt6aShape
+	// Ext carries the aggregated type extensibility for enum, bitmask,
+	// struct, and union kinds. Zero value ExtFinal matches existing
+	// callers that omit the field.
+	Ext Extensibility
+}
+
+// Structxt6aMember is one struct member for assignability checks.
+type Structxt6aMember struct {
+	Name           string
+	MemberID       uint32
+	Type           FieldTypeID
+	Optional       bool
+	MustUnderstand bool
+	IsKey          bool
+	Units          string
+	// Bound carries the string or sequence bound for members inside
+	// structs; 0 means unbounded. See IsStructxt6aAssignable for the
+	// bound compatibility rule.
+	Bound uint32
+	// Elem carries nested type detail for sequences, arrays, maps, and
+	// nested messages; nil means no further detail (primitive check only).
+	Elem *TypeRefxt6a
+}
+
+// Structxt6aShape is one struct type for assignability checks.
+type Structxt6aShape struct {
+	Ext     Extensibility
+	Members []Structxt6aMember
+}
+
+// IsPrimitivext6aAssignable reports same kind assignability per Table 14.
+func IsPrimitivext6aAssignable(t1, t2 FieldTypeID) bool {
+	if t1 == FieldTypeNotSet || t2 == FieldTypeNotSet {
+		return false
+	}
+	return t1 == t2
+}
+
+// IsUintFromBitmaskxt6aAssignable checks UINT from BITMASK per Table 14.
+func IsUintFromBitmaskxt6aAssignable(t1 FieldTypeID, bound uint32) bool {
+	switch t1 {
+	case FieldTypeUInt8:
+		return bound >= 1 && bound <= 8
+	case FieldTypeUInt16:
+		return bound >= 9 && bound <= 16
+	case FieldTypeUInt32:
+		return bound >= 17 && bound <= 32
+	case FieldTypeUInt64:
+		return bound >= 33 && bound <= 64
+	case FieldTypeNotSet, FieldTypeNestedType, FieldTypeInt8, FieldTypeInt16,
+		FieldTypeInt32, FieldTypeInt64, FieldTypeFloat, FieldTypeDouble,
+		FieldTypeLongDouble, FieldTypeChar, FieldTypeWChar, FieldTypeBoolean,
+		FieldTypeByte, FieldTypeString, FieldTypeWString, FieldTypeFixedString,
+		FieldTypeFixedWString, FieldTypeBoundedString, FieldTypeBoundedWString,
+		FieldTypeArrayOffset, FieldTypeBoundedSequenceOffset,
+		FieldTypeUnboundedSequenceOffset:
+		return false
+	default:
+		return false
+	}
+}
+
+// IsBitmaskFromUintxt6aAssignable checks BITMASK from UINT per Table 17.
+func IsBitmaskFromUintxt6aAssignable(bound uint32, t2 FieldTypeID) bool {
+	return IsUintFromBitmaskxt6aAssignable(t2, bound)
+}
+
+// IsStringxt6aAssignable checks string family plus bound compatibility.
+//
+// Families never mix: STRING8 derives only from STRING8. A bounded T1
+// rejects an unbounded T2 unless bounds are ignored. Two bounded
+// strings need T1 bound at or above T2 bound unless ignored.
+func IsStringxt6aAssignable(t1Kind, t2Kind Kindxt6a, t1Bound, t2Bound uint32, ignoreBounds bool) bool {
+	if t1Kind != t2Kind {
+		return false
+	}
+	if t1Kind != Kindxt6aString8 && t1Kind != Kindxt6aString16 {
+		return false
+	}
+	if ignoreBounds {
+		return true
+	}
+	if t1Bound == 0 {
+		return true
+	}
+	if t2Bound == 0 {
+		return false
+	}
+	return t1Bound >= t2Bound
+}
+
+// IsArrayxt6aAssignable checks equal bounds plus element assignability.
+func IsArrayxt6aAssignable(t1Bound, t2Bound uint32, elemAssignable bool) bool {
+	return t1Bound == t2Bound && elemAssignable
+}
+
+// IsSequencext6aAssignable checks sequence bound compatibility.
+//
+// An unbounded T1 accepts any T2. A bounded T1 accepts T2 bounds at or
+// below its own unless bounds are ignored.
+func IsSequencext6aAssignable(t1Bound, t2Bound uint32, elemAssignable, ignoreBounds bool) bool {
+	if !elemAssignable {
+		return false
+	}
+	if ignoreBounds {
+		return true
+	}
+	if t1Bound == 0 {
+		return true
+	}
+	if t2Bound == 0 {
+		return false
+	}
+	return t1Bound >= t2Bound
+}
+
+// IsMapxt6aAssignable checks map bound compatibility for one entry kind.
+//
+// Keys need strong assignability and values need assignability; the
+// caller evaluates both and passes the verdicts in.
+func IsMapxt6aAssignable(t1Bound, t2Bound uint32, keyAssignable, elemAssignable, ignoreBounds bool) bool {
+	if !keyAssignable || !elemAssignable {
+		return false
+	}
+	if ignoreBounds {
+		return true
+	}
+	if t1Bound == 0 {
+		return true
+	}
+	if t2Bound == 0 {
+		return false
+	}
+	return t1Bound >= t2Bound
+}
+
+// enumxt6aBoundSet maps a bit bound to its equivalence set index.
+func enumxt6aBoundSet(bound uint32) int {
+	switch {
+	case bound >= 1 && bound <= 8:
+		return 0
+	case bound >= 9 && bound <= 16:
+		return 1
+	case bound >= 17 && bound <= 32:
+		return 2
+	default:
+		return -1
+	}
+}
+
+// IsEnumxt6aAssignable checks enumerated assignability per Table 18.
+//
+// Extensibility must match and both bit bounds must sit in the same
+// equivalence set. Literal names and values must agree both ways unless
+// literal names are ignored. Final types additionally need identical
+// literal sets.
+func IsEnumxt6aAssignable(t1, t2 Enumxt6aType, t1Ext, t2Ext Extensibility, ignoreLiteralNames bool) error {
+	if t1Ext != t2Ext {
+		return fmt.Errorf("types: enum extensibility %s vs %s: %w", t1Ext.String(), t2Ext.String(), ErrInvalid)
+	}
+	if err := t1.Validate(); err != nil {
+		return fmt.Errorf("types: enum T1: %w", err)
+	}
+	if err := t2.Validate(); err != nil {
+		return fmt.Errorf("types: enum T2: %w", err)
+	}
+	if enumxt6aBoundSet(t1.BitBound) != enumxt6aBoundSet(t2.BitBound) {
+		return fmt.Errorf("types: enum bit bounds %d vs %d differ in set: %w", t1.BitBound, t2.BitBound, ErrInvalid)
+	}
+	err := checkxt6aEnumNames(t1, t2, ignoreLiteralNames)
+	if err != nil {
+		return err
+	}
+	err = checkxt6aEnumValues(t1, t2, ignoreLiteralNames)
+	if err != nil {
+		return err
+	}
+	if t1Ext == ExtFinal && len(t1.Literals) != len(t2.Literals) {
+		return fmt.Errorf("types: final enum literal count %d vs %d: %w", len(t1.Literals), len(t2.Literals), ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aEnumNames requires shared literal names to keep values.
+func checkxt6aEnumNames(t1, t2 Enumxt6aType, ignoreLiteralNames bool) error {
+	if ignoreLiteralNames {
+		return nil
+	}
+	byName2 := make(map[string]int32, len(t2.Literals))
+	for i := range t2.Literals {
+		byName2[t2.Literals[i].Name] = t2.Literals[i].Value
+	}
+	for i := range t1.Literals {
+		v2, ok := byName2[t1.Literals[i].Name]
+		if !ok {
+			continue
+		}
+		if v2 != t1.Literals[i].Value {
+			return fmt.Errorf("types: enum literal %q values %d vs %d: %w", t1.Literals[i].Name, t1.Literals[i].Value, v2, ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// checkxt6aEnumValues requires shared values to keep literal names.
+func checkxt6aEnumValues(t1, t2 Enumxt6aType, ignoreLiteralNames bool) error {
+	byValue1 := make(map[int32]string, len(t1.Literals))
+	for i := range t1.Literals {
+		byValue1[t1.Literals[i].Value] = t1.Literals[i].Name
+	}
+	for i := range t2.Literals {
+		name1, ok := byValue1[t2.Literals[i].Value]
+		if !ok {
+			continue
+		}
+		if !ignoreLiteralNames && name1 != t2.Literals[i].Name {
+			return fmt.Errorf("types: enum value %d names %q vs %q: %w", t2.Literals[i].Value, name1, t2.Literals[i].Name, ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// IsBitmaskxt6aAssignable checks bitmask assignability per Table 18.
+//
+// Extensibility must match like enums per 7.2.5.5: final types need
+// identical bounds and kinds, other kinds follow the same bound rule.
+// The Ext fields are threaded from TypeRefxt6a so mismatched
+// extensibility fails instead of silently assigning.
+func IsBitmaskxt6aAssignable(t1, t2 Bitmaskxt6aType, t1Ext, t2Ext Extensibility) error {
+	if t1Ext != t2Ext {
+		return fmt.Errorf("types: bitmask extensibility %s vs %s: %w", t1Ext.String(), t2Ext.String(), ErrInvalid)
+	}
+	if err := t1.Validate(); err != nil {
+		return fmt.Errorf("types: bitmask T1: %w", err)
+	}
+	if err := t2.Validate(); err != nil {
+		return fmt.Errorf("types: bitmask T2: %w", err)
+	}
+	if t1.BitBound != t2.BitBound {
+		return fmt.Errorf("types: bitmask bounds %d vs %d: %w", t1.BitBound, t2.BitBound, ErrInvalid)
+	}
+	return nil
+}
+
+// AreUnitsxt6aCompatible checks unit compatibility per 7.2.2.9.
+//
+// Equal empty means compatible. The wildcard __ANY__ matches anything.
+// One sided units follow the policy: ignored with IgnoreUnits or with
+// IgnoreUnspecifiedUnits, otherwise incompatible.
+func AreUnitsxt6aCompatible(a, b string, policy TypeConsistencyxt6aPolicy) bool {
+	if policy.IgnoreUnits {
+		return true
+	}
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return policy.IgnoreUnspecifiedUnits
+	}
+	setA := unitsxt6aSet(a)
+	if setA["__ANY__"] {
+		return true
+	}
+	setB := unitsxt6aSet(b)
+	if setB["__ANY__"] {
+		return true
+	}
+	for name := range setA {
+		if setB[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// unitsxt6aSet splits a validated unit string into trimmed names.
+func unitsxt6aSet(s string) map[string]bool {
+	out := map[string]bool{}
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == ';' {
+			if name := trimxt6aSpaces(s[start:i]); name != "" {
+				out[name] = true
+			}
+			start = i + 1
+		}
+	}
+	return out
+}
+
+// Rangext6aLimit carries one optional inclusive range limit.
+type Rangext6aLimit struct {
+	HasMin bool
+	Min    int64
+	HasMax bool
+	Max    int64
+}
+
+// AreRangesxt6aCompatible checks non-empty range intersection per 7.2.2.10.
+func AreRangesxt6aCompatible(a, b Rangext6aLimit, ignoreRanges bool) bool {
+	if ignoreRanges {
+		return true
+	}
+	lo := int64(-1 << 62)
+	hi := int64(1<<62 - 1)
+	loA, hiA := rangext6aBounds(a, lo, hi)
+	loB, hiB := rangext6aBounds(b, lo, hi)
+	loMax := max(loA, loB)
+	hiMin := min(hiA, hiB)
+	return loMax <= hiMin
+}
+
+// rangext6aBounds expands one limit to a closed int64 interval.
+func rangext6aBounds(r Rangext6aLimit, lo, hi int64) (int64, int64) {
+	if r.HasMin {
+		lo = r.Min
+	}
+	if r.HasMax {
+		hi = r.Max
+	}
+	return lo, hi
+}
+
+// IsStructxt6aAssignable checks structure assignability per Table 19.
+//
+// Both types share extensibility. Members correspond by ID, or by ID
+// plus name unless member names are ignored. At least one member must
+// correspond. Key members must exist on both sides. Member type detail
+// is delegated to the caller through memberAssignable so primitive,
+// string, and collection tables stay in one place. Bound and nested
+// detail in Elem is checked recursively: string bounds respect
+// IgnoreStringBounds, sequence bounds respect IgnoreSequenceBounds, and
+// nested types require recursive assignability.
+func IsStructxt6aAssignable(t1, t2 Structxt6aShape, policy TypeConsistencyxt6aPolicy, memberAssignable func(a, b FieldTypeID) bool) error {
+	if t1.Ext != t2.Ext {
+		return fmt.Errorf("types: struct extensibility %s vs %s: %w", t1.Ext.String(), t2.Ext.String(), ErrInvalid)
+	}
+	byID1 := indexStructMembers(t1.Members)
+	byID2 := indexStructMembers(t2.Members)
+	common, err := checkStructCommonMembers(byID1, byID2, policy, memberAssignable)
+	if err != nil {
+		return err
+	}
+	if common == 0 {
+		return fmt.Errorf("types: struct shares no common member: %w", ErrInvalid)
+	}
+	return checkxt6aStructKeys(byID1, byID2)
+}
+
+// indexStructMembers keys members by ID.
+func indexStructMembers(members []Structxt6aMember) map[uint32]Structxt6aMember {
+	byID := make(map[uint32]Structxt6aMember, len(members))
+	for i := range members {
+		byID[members[i].MemberID] = members[i]
+	}
+	return byID
+}
+
+// checkStructCommonMembers validates shared members and counts them.
+func checkStructCommonMembers(byID1, byID2 map[uint32]Structxt6aMember, policy TypeConsistencyxt6aPolicy, memberAssignable func(a, b FieldTypeID) bool) (int, error) {
+	common := 0
+	for id, m2 := range byID2 {
+		m1, ok := byID1[id]
+		if !ok {
+			continue
+		}
+		common++
+		if err := checkStructMemberPair(id, m1, m2, policy, memberAssignable); err != nil {
+			return 0, err
+		}
+	}
+	return common, nil
+}
+
+// checkStructMemberPair validates one shared member pair.
+func checkStructMemberPair(id uint32, m1, m2 Structxt6aMember, policy TypeConsistencyxt6aPolicy, memberAssignable func(a, b FieldTypeID) bool) error {
+	if !policy.IgnoreMemberNames && m1.Name != m2.Name {
+		return fmt.Errorf("types: struct member %d names %q vs %q: %w", id, m1.Name, m2.Name, ErrInvalid)
+	}
+	if memberAssignable != nil && !memberAssignable(m1.Type, m2.Type) {
+		return fmt.Errorf("types: struct member %d types %d vs %d: %w", id, uint8(m1.Type), uint8(m2.Type), ErrInvalid)
+	}
+	if err := checkxt6aStructMemberBound(m1, m2, policy); err != nil {
+		return fmt.Errorf("types: struct member %d: %w", id, err)
+	}
+	if err := checkxt6aStructMemberNested(m1, m2, policy); err != nil {
+		return fmt.Errorf("types: struct member %d: %w", id, err)
+	}
+	if !AreUnitsxt6aCompatible(m1.Units, m2.Units, policy) {
+		return fmt.Errorf("types: struct member %d units differ: %w", id, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aStructMemberBound enforces string and sequence bounds inside structs.
+func checkxt6aStructMemberBound(m1, m2 Structxt6aMember, policy TypeConsistencyxt6aPolicy) error {
+	if m1.Bound == 0 && m2.Bound == 0 {
+		return nil
+	}
+	if structBoundIgnored(m1, m2, policy) {
+		return nil
+	}
+	return checkStructBoundValues(m1.Bound, m2.Bound)
+}
+
+// structBoundIgnored reports whether policy ignores this bound pair.
+func structBoundIgnored(m1, m2 Structxt6aMember, policy TypeConsistencyxt6aPolicy) bool {
+	if m1.Type.IsString() || m2.Type.IsString() {
+		return policy.IgnoreStringBounds
+	}
+	if m1.Type.IsArray() || m1.Type.IsBoundedSequence() || m1.Type.IsUnboundedSequence() ||
+		m2.Type.IsArray() || m2.Type.IsBoundedSequence() || m2.Type.IsUnboundedSequence() {
+		return policy.IgnoreSequenceBounds
+	}
+	return false
+}
+
+// checkStructBoundValues enforces bounded vs unbounded and ordering.
+func checkStructBoundValues(bound1, bound2 uint32) error {
+	if bound1 == 0 {
+		return nil
+	}
+	if bound2 == 0 {
+		return fmt.Errorf("types: bounded %d vs unbounded: %w", bound1, ErrInvalid)
+	}
+	if bound1 < bound2 {
+		return fmt.Errorf("types: bounds %d vs %d: %w", bound1, bound2, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aStructMemberNested requires recursive assignability when both sides carry detail.
+func checkxt6aStructMemberNested(m1, m2 Structxt6aMember, policy TypeConsistencyxt6aPolicy) error {
+	if m1.Elem == nil && m2.Elem == nil {
+		return nil
+	}
+	if m1.Elem == nil || m2.Elem == nil {
+		return fmt.Errorf("types: nested detail missing on one side: %w", ErrInvalid)
+	}
+	if err := IsAssignablext6aFrom(*m1.Elem, *m2.Elem, policy); err != nil {
+		return fmt.Errorf("types: nested not assignable: %w", err)
+	}
+	return nil
+}
+
+// checkxt6aStructKeys requires key members to exist on both sides.
+func checkxt6aStructKeys(byID1, byID2 map[uint32]Structxt6aMember) error {
+	for id, m2 := range byID2 {
+		if !m2.IsKey {
+			continue
+		}
+		m1, ok := byID1[id]
+		if !ok || !m1.IsKey {
+			return fmt.Errorf("types: struct key member %d missing in T1: %w", id, ErrInvalid)
+		}
+	}
+	for id, m1 := range byID1 {
+		if !m1.IsKey {
+			continue
+		}
+		m2, ok := byID2[id]
+		if !ok || !m2.IsKey {
+			return fmt.Errorf("types: struct key member %d missing in T2: %w", id, ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// IsAssignablext6aFrom evaluates the is-assignable-from tables.
+//
+// It dispatches on kind: primitives need equality, strings use bound
+// rules, arrays need equal bounds, sequences and maps use bound rules,
+// enums and bitmasks use their tables, and structs and unions delegate
+// to the shape helpers. Collection element and key detail is evaluated
+// recursively.
+func IsAssignablext6aFrom(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if t1.Kind != t2.Kind {
+		return checkxt6aCrossKind(t1, t2)
+	}
+	switch t1.Kind {
+	case Kindxt6aPrimitive:
+		return checkxt6aPrimitive(t1, t2)
+	case Kindxt6aString8, Kindxt6aString16:
+		return checkxt6aString(t1, t2, policy)
+	case Kindxt6aArray, Kindxt6aSequence, Kindxt6aMap:
+		return checkxt6aCollection(t1, t2, policy)
+	case Kindxt6aEnum:
+		return checkxt6aEnumRef(t1, t2, policy)
+	case Kindxt6aBitmask:
+		return checkxt6aBitmaskRef(t1, t2)
+	case Kindxt6aStruct:
+		return checkxt6aStructRef(t1, t2, policy)
+	case Kindxt6aUnion:
+		return checkxt6aUnionRef(t1, t2, policy)
+	default:
+		return fmt.Errorf("types: unknown assignability kind %d: %w", int(t1.Kind), ErrInvalid)
+	}
+}
+
+// checkxt6aCrossKind handles uint and bitmask cross assignability.
+func checkxt6aCrossKind(t1, t2 TypeRefxt6a) error {
+	if t1.Kind == Kindxt6aPrimitive && t2.Kind == Kindxt6aBitmask && t2.Bitmask != nil {
+		if IsUintFromBitmaskxt6aAssignable(t1.Base, t2.Bitmask.BitBound) {
+			return nil
+		}
+	}
+	if t1.Kind == Kindxt6aBitmask && t2.Kind == Kindxt6aPrimitive && t1.Bitmask != nil {
+		if IsBitmaskFromUintxt6aAssignable(t1.Bitmask.BitBound, t2.Base) {
+			return nil
+		}
+	}
+	return fmt.Errorf("types: kinds %d vs %d never assignable: %w", int(t1.Kind), int(t2.Kind), ErrInvalid)
+}
+
+// checkxt6aPrimitive requires identical primitive bases.
+func checkxt6aPrimitive(t1, t2 TypeRefxt6a) error {
+	if !IsPrimitivext6aAssignable(t1.Base, t2.Base) {
+		return fmt.Errorf("types: primitives %d vs %d: %w", uint8(t1.Base), uint8(t2.Base), ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aString applies the string bound table.
+func checkxt6aString(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if !IsStringxt6aAssignable(t1.Kind, t2.Kind, t1.Bound, t2.Bound, policy.IgnoreStringBounds) {
+		return fmt.Errorf("types: strings %d vs %d bounds %d vs %d: %w", int(t1.Kind), int(t2.Kind), t1.Bound, t2.Bound, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aCollection applies the array, sequence, and map tables.
+func checkxt6aCollection(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	switch t1.Kind {
+	case Kindxt6aArray:
+		return checkxt6aArrayRef(t1, t2, policy)
+	case Kindxt6aSequence:
+		return checkxt6aSequenceRef(t1, t2, policy)
+	case Kindxt6aMap:
+		return checkxt6aMapRef(t1, t2, policy)
+	case Kindxt6aPrimitive, Kindxt6aString8, Kindxt6aString16, Kindxt6aEnum,
+		Kindxt6aBitmask, Kindxt6aStruct, Kindxt6aUnion:
+		return fmt.Errorf("types: kind %d is not a collection: %w", int(t1.Kind), ErrInvalid)
+	default:
+		return fmt.Errorf("types: collection kind %d unknown: %w", int(t1.Kind), ErrInvalid)
+	}
+}
+
+// elemAssignablext6a evaluates one nested element pair.
+func elemAssignablext6a(t1, t2 *TypeRefxt6a, policy TypeConsistencyxt6aPolicy) bool {
+	if t1 == nil || t2 == nil {
+		return false
+	}
+	err := IsAssignablext6aFrom(*t1, *t2, policy)
+	return err == nil
+}
+
+// checkxt6aArrayRef requires equal bounds plus assignable elements.
+func checkxt6aArrayRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if !IsArrayxt6aAssignable(t1.Bound, t2.Bound, elemAssignablext6a(t1.Elem, t2.Elem, policy)) {
+		return fmt.Errorf("types: arrays bounds %d vs %d: %w", t1.Bound, t2.Bound, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aSequenceRef applies sequence bound compatibility.
+func checkxt6aSequenceRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if !IsSequencext6aAssignable(t1.Bound, t2.Bound, elemAssignablext6a(t1.Elem, t2.Elem, policy), policy.IgnoreSequenceBounds) {
+		return fmt.Errorf("types: sequences bounds %d vs %d: %w", t1.Bound, t2.Bound, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aMapRef applies map key and element compatibility.
+func checkxt6aMapRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if !IsMapxt6aAssignable(t1.Bound, t2.Bound, elemAssignablext6a(t1.Key, t2.Key, policy), elemAssignablext6a(t1.Elem, t2.Elem, policy), policy.IgnoreSequenceBounds) {
+		return fmt.Errorf("types: maps bounds %d vs %d: %w", t1.Bound, t2.Bound, ErrInvalid)
+	}
+	return nil
+}
+
+// checkxt6aEnumRef delegates to the enum table with threaded extensibility.
+func checkxt6aEnumRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if t1.Enum == nil || t2.Enum == nil {
+		return fmt.Errorf("types: enum ref misses descriptor: %w", ErrInvalid)
+	}
+	err := IsEnumxt6aAssignable(*t1.Enum, *t2.Enum, t1.Ext, t2.Ext, policy.IgnoreLiteralNames)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkxt6aBitmaskRef delegates to the bitmask table with threaded extensibility.
+func checkxt6aBitmaskRef(t1, t2 TypeRefxt6a) error {
+	if t1.Bitmask == nil || t2.Bitmask == nil {
+		return fmt.Errorf("types: bitmask ref misses descriptor: %w", ErrInvalid)
+	}
+	err := IsBitmaskxt6aAssignable(*t1.Bitmask, *t2.Bitmask, t1.Ext, t2.Ext)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkxt6aStructRef delegates to the struct table with primitive equality.
+func checkxt6aStructRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if t1.Struct == nil || t2.Struct == nil {
+		return fmt.Errorf("types: struct ref misses shape: %w", ErrInvalid)
+	}
+	err := IsStructxt6aAssignable(*t1.Struct, *t2.Struct, policy, IsPrimitivext6aAssignable)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkxt6aUnionRef delegates to the union helper.
+func checkxt6aUnionRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
+	if t1.Union == nil || t2.Union == nil {
+		return fmt.Errorf("types: union ref misses shape: %w", ErrInvalid)
+	}
+	err := IsUnionxt6aAssignable(*t1.Union, *t2.Union, policy.IgnoreMemberNames)
+	if err != nil {
+		return err
+	}
+	return nil
+}

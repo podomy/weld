@@ -5,6 +5,7 @@
 package types
 
 import (
+	"crypto/md5" //nolint:gosec // G501: MD5 is mandated by DDS-XTypes 7.3.3.10 for EquivalenceHash
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -290,4 +291,131 @@ func lowerHex4(v uint16) string {
 	out[2] = digits[(v>>4)&0xf]
 	out[3] = digits[v&0xf]
 	return string(out[:])
+}
+
+// Equivalencext6aHash is the 14 byte MD5 based type equivalence hash.
+//
+// It sits alongside the RIHS01 SHA-256 hash without replacing it. The
+// model computes MD5 over the same canonical JSON used for RIHS01 and
+// keeps the first 14 bytes. The wire form in EquivalenceHash computes
+// over the serialized TypeObjectSeq CDR per 7.3.3.10; both share the
+// 14 byte width but use distinct string prefixes (EQM14_ model versus
+// EQ14_ wire) so a string never parses as the wrong kind.
+type Equivalencext6aHash struct {
+	Digest [14]byte
+}
+
+// equivalencext6aPrefix prefixes the model string form.
+const equivalencext6aPrefix = "EQM14_"
+
+// equivalencext6aHexLen is 14 bytes as 28 lowercase hex digits.
+const equivalencext6aHexLen = 28
+
+// ComputeEquivalencext6aHash returns the 14 byte equivalence hash.
+func ComputeEquivalencext6aHash(desc TypeDescription) (Equivalencext6aHash, error) {
+	s, err := CanonicalJSON(desc)
+	if err != nil {
+		return Equivalencext6aHash{}, fmt.Errorf("types: equivalence hash: %w", err)
+	}
+	sum := md5.Sum([]byte(s)) //nolint:gosec // G501: MD5 is mandated by DDS-XTypes 7.3.3.10
+	var out Equivalencext6aHash
+	copy(out.Digest[:], sum[:14])
+	return out, nil
+}
+
+// String returns EQM14_ plus 28 lowercase hex digits.
+func (h Equivalencext6aHash) String() string {
+	return equivalencext6aPrefix + hex.EncodeToString(h.Digest[:])
+}
+
+// Equal reports whether two equivalence hashes share digest bytes.
+func (h Equivalencext6aHash) Equal(o Equivalencext6aHash) bool {
+	return h.Digest == o.Digest
+}
+
+// ParseEquivalencext6aHash parses the EQM14_ string form.
+func ParseEquivalencext6aHash(s string) (Equivalencext6aHash, error) {
+	var out Equivalencext6aHash
+	if len(s) != len(equivalencext6aPrefix)+equivalencext6aHexLen {
+		return out, fmt.Errorf("types: bad equivalence hash length %d", len(s))
+	}
+	if !strings.HasPrefix(s, equivalencext6aPrefix) {
+		return out, fmt.Errorf("types: bad equivalence hash prefix %q", s)
+	}
+	raw, err := hex.DecodeString(s[len(equivalencext6aPrefix):])
+	if err != nil {
+		return out, fmt.Errorf("types: decode equivalence hash hex: %w", err)
+	}
+	copy(out.Digest[:], raw)
+	return out, nil
+}
+
+// EquivalenceHash is the wire 14 byte XTypes equivalence hash.
+//
+// It is the first 14 bytes of MD5 over the CDR serialized TypeObjectSeq
+// per DDS-XTypes 7.3.3.10. RIHS01 stays the ROS interop hash; this hash
+// sits alongside for spec discovery and registry indexing. The string
+// form uses EQ14_ while the model hash uses EQM14_; the bytes differ
+// because the inputs differ (CDR versus canonical JSON) and the prefixes
+// keep the domains distinct.
+type EquivalenceHash struct {
+	Digest [14]byte
+}
+
+// equivalencePrefix prefixes the wire string form.
+const equivalencePrefix = "EQ14_"
+
+// String returns EQ14_ plus 28 lowercase hex digits.
+func (h EquivalenceHash) String() string {
+	return equivalencePrefix + hex.EncodeToString(h.Digest[:])
+}
+
+// Equal reports whether two wire hashes share digest bytes.
+func (h EquivalenceHash) Equal(o EquivalenceHash) bool {
+	return h.Digest == o.Digest
+}
+
+// ParseEquivalenceHash parses the EQ14_ string form of the wire hash.
+//
+// It rejects the EQM14_ model prefix so model strings never parse as wire.
+func ParseEquivalenceHash(s string) (EquivalenceHash, error) {
+	var out EquivalenceHash
+	if len(s) != len(equivalencePrefix)+equivalencext6aHexLen {
+		return out, fmt.Errorf("types: bad equivalence hash length %d", len(s))
+	}
+	if !strings.HasPrefix(s, equivalencePrefix) {
+		return out, fmt.Errorf("types: bad equivalence hash prefix %q", s)
+	}
+	raw, err := hex.DecodeString(s[len(equivalencePrefix):])
+	if err != nil {
+		return out, fmt.Errorf("types: decode equivalence hash hex: %w", err)
+	}
+	copy(out.Digest[:], raw)
+	return out, nil
+}
+
+// ComputeEquivalenceHash returns the wire hash over a TypeObjectSeq CDR.
+//
+// seqBytes is the output of MarshalTypeObjectSeqCDR: sequence length
+// plus DHEADER framed TypeObjects. The hash is MD5 truncated to 14
+// bytes per 7.3.3.10.
+func ComputeEquivalenceHash(seqBytes []byte) EquivalenceHash {
+	sum := md5.Sum(seqBytes) //nolint:gosec // G501: MD5 is mandated by DDS-XTypes 7.3.3.10
+	var out EquivalenceHash
+	copy(out.Digest[:], sum[:14])
+	return out
+}
+
+// ComputeWireEquivalenceHash builds the TypeObjectSeq CDR then hashes it.
+//
+// objects holds DHEADER framed TypeObjects from MarshalTypeObject.
+// littleEndian selects the sequence count byte order. The returned hash
+// pins the wire form; the model Equivalencext6aHash over canonical JSON
+// is kept for indexing and differs.
+func ComputeWireEquivalenceHash(objects [][]byte, littleEndian bool) (EquivalenceHash, error) {
+	seq, err := MarshalTypeObjectSeqCDR(objects, littleEndian)
+	if err != nil {
+		return EquivalenceHash{}, fmt.Errorf("types: wire equivalence hash: %w", err)
+	}
+	return ComputeEquivalenceHash(seq), nil
 }

@@ -156,16 +156,36 @@ type FieldType struct {
 }
 
 // Field is one named field with a type and an IDL default value.
+//
+// MemberID carries the XTypes member id; HasMemberID distinguishes an
+// explicit 0 from unset. Unset skips the uniqueness check. Optional marks
+// XTypes optional members. Units carries the 7.2.2.9 unit string; empty
+// means unspecified. MemberID, HasMemberID, Optional, and Units are additive
+// metadata ignored by the Minimal hash in hash.go, so existing RIHS01
+// vectors never change.
 type Field struct {
 	Name         string    `json:"name"`
 	Type         FieldType `json:"type"`
 	DefaultValue string    `json:"default_value"`
+	MemberID     uint32    `json:"member_id"`
+	// HasMemberID marks an explicit member id, including explicit 0.
+	// Zero MemberID with false HasMemberID means unset.
+	HasMemberID bool   `json:"has_member_id,omitempty"`
+	Optional    bool   `json:"optional"`
+	Units       string `json:"units"`
 }
 
 // IndividualTypeDescription is one type with its fields in IDL order.
+//
+// Units carries alias level units per 7.2.3.2.2.2; empty means
+// unspecified. Extensibility carries the aggregated type kind with the
+// zero value meaning final. Both are additive and ignored by the
+// Minimal hash in hash.go.
 type IndividualTypeDescription struct {
-	TypeName string  `json:"type_name"`
-	Fields   []Field `json:"fields"`
+	TypeName      string        `json:"type_name"`
+	Fields        []Field       `json:"fields"`
+	Units         string        `json:"units"`
+	Extensibility Extensibility `json:"extensibility"`
 }
 
 // TypeDescription is one description plus its referenced descriptions.
@@ -351,7 +371,92 @@ func (f Field) Validate() error {
 	if err != nil {
 		return fmt.Errorf("types: validate field %q: %w", f.Name, err)
 	}
+	err = f.validatext6aMeta()
+	if err != nil {
+		return fmt.Errorf("types: validate field %q: %w", f.Name, err)
+	}
 	return nil
+}
+
+// memberIDSet reports whether a field carries an explicit member id.
+// An explicit 0 (HasMemberID true) counts as set; otherwise nonzero
+// MemberID counts as set for backward compatibility with callers that
+// set MemberID without the flag.
+func memberIDSet(f Field) bool {
+	return f.HasMemberID || f.MemberID != 0
+}
+
+// maxxt6aMemberID caps XTypes member ids at 28 bits per extensible.go.
+const maxxt6aMemberID = 0x0FFFFFFF
+
+// validatext6aMeta checks member id range plus optional and unit rules.
+func (f Field) validatext6aMeta() error {
+	if f.MemberID > maxxt6aMemberID {
+		return fmt.Errorf("types: field %q member id %d exceeds 28 bits", f.Name, f.MemberID)
+	}
+	if f.Optional && f.DefaultValue != "" {
+		return fmt.Errorf("types: field %q optional must not carry a default value", f.Name)
+	}
+	err := Validatext6aUnits(f.Units)
+	if err != nil {
+		return fmt.Errorf("types: field %q units: %w", f.Name, err)
+	}
+	return nil
+}
+
+// Validatext6aUnits checks one 7.2.2.9 unit string.
+//
+// Empty means unspecified and passes. Otherwise the string is a
+// semicolon separated list of alternative names; each name must be
+// non-empty after trimming spaces and use printable ASCII 0x22 to
+// 0x7E except 0x3B. Whitespace around names is ignored and names are
+// case sensitive. The reserved name __ANY__ is accepted like any name;
+// wildcard handling belongs to assignability, not syntax.
+// INTERFACE REQUEST: wire framing of applied unit annotations in
+// TypeObject CDR belongs to cdr.go; propose Encodext6aUnitAnnotation
+// plus Decodext6aUnitAnnotation when that batch lands.
+func Validatext6aUnits(s string) error {
+	if s == "" {
+		return nil
+	}
+	start := 0
+	for i := range len(s) + 1 {
+		if i == len(s) || s[i] == ';' {
+			err := validatext6aUnitElement(s, trimxt6aSpaces(s[start:i]))
+			if err != nil {
+				return err
+			}
+			start = i + 1
+		}
+	}
+	return nil
+}
+
+// validatext6aUnitElement checks one trimmed unit name for bad bytes.
+func validatext6aUnitElement(full, name string) error {
+	if name == "" {
+		return fmt.Errorf("types: units %q has an empty element", full)
+	}
+	for j := range len(name) {
+		c := name[j]
+		if c < 0x22 || c > 0x7e || c == ';' {
+			return fmt.Errorf("types: units %q has bad byte %#02x", full, c)
+		}
+	}
+	return nil
+}
+
+// trimxt6aSpaces trims ASCII spaces and tabs around a unit name.
+func trimxt6aSpaces(s string) string {
+	lo := 0
+	for lo < len(s) && (s[lo] == ' ' || s[lo] == '\t') {
+		lo++
+	}
+	hi := len(s)
+	for hi > lo && (s[hi-1] == ' ' || s[hi-1] == '\t') {
+		hi--
+	}
+	return s[lo:hi]
 }
 
 // Validate checks the type name plus every field plus duplicate field names.
@@ -360,7 +465,15 @@ func (d IndividualTypeDescription) Validate() error {
 	if err != nil {
 		return fmt.Errorf("types: validate individual %q: %w", d.TypeName, err)
 	}
+	err = Validatext6aUnits(d.Units)
+	if err != nil {
+		return fmt.Errorf("types: validate individual %q units: %w", d.TypeName, err)
+	}
+	if d.Extensibility != ExtFinal && d.Extensibility != ExtAppendable && d.Extensibility != ExtMutable {
+		return fmt.Errorf("types: individual %q bad extensibility %d", d.TypeName, int(d.Extensibility))
+	}
 	seen := make(map[string]bool, len(d.Fields))
+	seenIDs := make(map[uint32]string, len(d.Fields))
 	for i := range d.Fields {
 		err = d.Fields[i].Validate()
 		if err != nil {
@@ -370,6 +483,12 @@ func (d IndividualTypeDescription) Validate() error {
 			return fmt.Errorf("types: individual %q duplicate field %q", d.TypeName, d.Fields[i].Name)
 		}
 		seen[d.Fields[i].Name] = true
+		if memberIDSet(d.Fields[i]) {
+			if prev, ok := seenIDs[d.Fields[i].MemberID]; ok {
+				return fmt.Errorf("types: individual %q duplicate member id %d on %q and %q", d.TypeName, d.Fields[i].MemberID, prev, d.Fields[i].Name)
+			}
+			seenIDs[d.Fields[i].MemberID] = d.Fields[i].Name
+		}
 	}
 	return nil
 }
@@ -441,9 +560,13 @@ func sortIndividuals(refs []IndividualTypeDescription) {
 // Nil Fields normalize to an empty slice so callers never observe a nil
 // versus empty distinction. CanonicalJSON encodes both forms identically,
 // and the normalized copy keeps registry lookups mutation safe.
+// Units and Extensibility are preserved; dropping them would lose
+// appendable/mutable kinds through normalize/store/lookup.
 func cloneIndividual(d IndividualTypeDescription) IndividualTypeDescription {
 	out := IndividualTypeDescription{
-		TypeName: d.TypeName,
+		TypeName:      d.TypeName,
+		Units:         d.Units,
+		Extensibility: d.Extensibility,
 	}
 	if d.Fields != nil {
 		out.Fields = make([]Field, len(d.Fields))
@@ -457,6 +580,12 @@ func cloneIndividual(d IndividualTypeDescription) IndividualTypeDescription {
 // equalIndividual reports whether two descriptions carry identical fields.
 func equalIndividual(a, b IndividualTypeDescription) bool {
 	if a.TypeName != b.TypeName {
+		return false
+	}
+	if a.Units != b.Units {
+		return false
+	}
+	if a.Extensibility != b.Extensibility {
 		return false
 	}
 	if len(a.Fields) != len(b.Fields) {

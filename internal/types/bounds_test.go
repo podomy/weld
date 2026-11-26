@@ -784,16 +784,23 @@ func TestBoundsCovarianceDefaults(t *testing.T) {
 	}
 }
 
-// TestBoundsRuneCounts checks rune bound agreement with CDR.
+// TestBoundsRuneCounts checks octet bound agreement with CDR.
+// Bounds count octets (bytes) to match cdr.go readStringWithBound, not
+// runes: "a✅" is 2 runes but 4 octets, so it exceeds bound 2. This pins
+// the fail-closed octet rule per DDS-XTypes 7.2.3.1.2 wire length.
 func TestBoundsRuneCounts(t *testing.T) {
 	bound := StringBound{StringUpperBound: 2}
-	err := CheckStringLength("a✅", bound)
+	err := CheckStringLength("ab", bound)
 	if err != nil {
-		t.Fatalf("two runes within bound 2 rejected: %v", err)
+		t.Fatalf("two octets within bound 2 rejected: %v", err)
+	}
+	err = CheckStringLength("a✅", bound)
+	if err == nil {
+		t.Fatal("four octets above bound 2 accepted, want rejection")
 	}
 	err = CheckStringLength("abc", bound)
 	if err == nil {
-		t.Fatal("three runes above bound 2 accepted, want rejection")
+		t.Fatal("three octets above bound 2 accepted, want rejection")
 	}
 	multi := "a✅b"
 	if countRunes(multi) != 3 {
@@ -801,5 +808,9 @@ func TestBoundsRuneCounts(t *testing.T) {
 	}
 	if len(multi) == countRunes(multi) {
 		t.Fatal("fixture must be multi byte to pin rune versus byte")
+	}
+	// "a✅" is 2 runes but 4 bytes: rune and octet counts differ.
+	if len("a✅") <= countRunes("a✅") {
+		t.Fatal("multibyte fixture must have more bytes than runes")
 	}
 }

@@ -410,7 +410,10 @@ static weld_cdr_status_t encode_one(
         set_err(w->err, w->err_len, "weld: string overflows uint32");
         return WELD_CDR_INVALID;
       }
-      // Encode bounds are left to decode: overlong values still encode.
+      if (m->string_upper_bound_ > 0 && len > m->string_upper_bound_) {
+        set_err(w->err, w->err_len, "weld: string over bound");
+        return WELD_CDR_INVALID;
+      }
       if (!writer_u32(w, (uint32_t)total)) {
         return WELD_CDR_NO_MEM;
       }
@@ -426,6 +429,10 @@ static weld_cdr_status_t encode_one(
       size_t i = 0;
       if (total > (uint64_t)0xFFFFFFFFU) {
         set_err(w->err, w->err_len, "weld: wstring overflows uint32");
+        return WELD_CDR_INVALID;
+      }
+      if (m->string_upper_bound_ > 0 && units > m->string_upper_bound_) {
+        set_err(w->err, w->err_len, "weld: wstring over bound");
         return WELD_CDR_INVALID;
       }
       if (!writer_u32(w, (uint32_t)total)) {
@@ -574,10 +581,7 @@ weld_cdr_status_t weld_cdr_encode_members(
   w.payload_start = WELD_CDR_HEADER_SIZE;
   w.err = errbuf;
   w.err_len = errbuf_len;
-  header[0] = 0x00;
-  header[1] = little_endian ? 0x01 : 0x00;
-  header[2] = 0x00;
-  header[3] = 0x00;
+  weld_cdr_xt6b_make_encapsulation(header, WELD_xt6b_FINAL, little_endian);
   writer_bytes(&w, header, sizeof(header));
   if (w.no_mem) {
     free(w.buf);
@@ -855,7 +859,6 @@ static weld_cdr_status_t decode_one(
     case rosidl_typesupport_introspection_c__ROS_TYPE_STRING: {
       rosidl_runtime_c__String * s = (rosidl_runtime_c__String *)elem;
       uint32_t total = 0;
-      size_t runes = 0;
       if (!reader_u32(r, &total)) {
         return WELD_CDR_TRUNCATED;
       }
@@ -882,8 +885,7 @@ static weld_cdr_status_t decode_one(
       }
       r->off += total;
       if (m->string_upper_bound_ > 0) {
-        runes = count_runes(s->data, s->size);
-        if (runes > m->string_upper_bound_) {
+        if (s->size > m->string_upper_bound_) {
           set_err(r->err, r->err_len, "weld: string over bound");
           return WELD_CDR_INVALID;
         }
@@ -898,7 +900,6 @@ static weld_cdr_status_t decode_one(
       size_t units = 0;
       uint16_t last = 0;
       size_t i = 0;
-      size_t runes = 0;
       bool ok = false;
       if (!reader_u32(r, &total)) {
         return WELD_CDR_TRUNCATED;
@@ -940,8 +941,7 @@ static weld_cdr_status_t decode_one(
       }
       r->off += (size_t)bytes;
       if (m->string_upper_bound_ > 0) {
-        runes = count_utf16(s->data, s->size);
-        if (runes > m->string_upper_bound_) {
+        if (s->size > m->string_upper_bound_) {
           set_err(r->err, r->err_len, "weld: wstring over bound");
           return WELD_CDR_INVALID;
         }
@@ -1154,17 +1154,20 @@ weld_cdr_status_t weld_cdr_decode_members(
     set_err(errbuf, errbuf_len, "weld: buffer too short for header");
     return WELD_CDR_TRUNCATED;
   }
-  if (data[0] != 0x00) {
-    set_err(errbuf, errbuf_len, "weld: bad header first byte 0x%02x",
-      data[0]);
-    return WELD_CDR_INVALID;
+  {
+    weld_xt6b_ext_t ext = WELD_xt6b_FINAL;
+    weld_xt6b_ver_t ver = WELD_xt6b_V1;
+    bool le = false;
+    weld_cdr_status_t pst = weld_cdr_xt6b_parse_encapsulation(
+      data, &ext, &ver, &le, NULL);
+    if (pst != WELD_CDR_OK) {
+      set_err(errbuf, errbuf_len, "weld: bad encapsulation header");
+      return pst;
+    }
+    (void)ext;
+    (void)ver;
+    r.le = le;
   }
-  if (data[1] > 0x01) {
-    set_err(errbuf, errbuf_len, "weld: bad header endian flag 0x%02x",
-      data[1]);
-    return WELD_CDR_INVALID;
-  }
-  r.le = data[1] == 0x01;
   r.off = WELD_CDR_HEADER_SIZE;
   st = decode_body(members, (uint8_t *)ros_message, &r);
   if (st != WELD_CDR_OK) {
@@ -1214,4 +1217,451 @@ weld_cdr_status_t weld_cdr_decode(
   }
   return weld_cdr_decode_members(m, data, size, ros_message, errbuf,
     errbuf_len);
+}
+
+// Select the V1 ID for a kind.
+static weld_cdr_status_t xt6b_rep_v1(weld_xt6b_ext_t ext, bool le, uint16_t * out)
+{
+  switch (ext) {
+    case WELD_xt6b_FINAL:
+    case WELD_xt6b_APPENDABLE:
+      *out = le ? (uint16_t)WELD_xt6b_CDR_LE : (uint16_t)WELD_xt6b_CDR_BE;
+      return WELD_CDR_OK;
+    case WELD_xt6b_MUTABLE:
+      *out = le ? (uint16_t)WELD_xt6b_PL_CDR_LE : (uint16_t)WELD_xt6b_PL_CDR_BE;
+      return WELD_CDR_OK;
+    default:
+      break;
+  }
+  return WELD_CDR_UNSUPPORTED;
+}
+
+// Select the V2 ID for a kind.
+static weld_cdr_status_t xt6b_rep_v2(weld_xt6b_ext_t ext, bool le, uint16_t * out)
+{
+  switch (ext) {
+    case WELD_xt6b_FINAL:
+      *out = le ? (uint16_t)WELD_xt6b_CDR2_LE : (uint16_t)WELD_xt6b_CDR2_BE;
+      return WELD_CDR_OK;
+    case WELD_xt6b_APPENDABLE:
+      *out = le ? (uint16_t)WELD_xt6b_D_CDR2_LE : (uint16_t)WELD_xt6b_D_CDR2_BE;
+      return WELD_CDR_OK;
+    case WELD_xt6b_MUTABLE:
+      *out = le ? (uint16_t)WELD_xt6b_PL_CDR2_LE : (uint16_t)WELD_xt6b_PL_CDR2_BE;
+      return WELD_CDR_OK;
+    default:
+      break;
+  }
+  return WELD_CDR_UNSUPPORTED;
+}
+
+weld_cdr_status_t weld_cdr_xt6b_representation_for(
+  weld_xt6b_ext_t ext,
+  weld_xt6b_ver_t ver,
+  bool little_endian,
+  uint16_t * out)
+{
+  if (out == NULL) {
+    return WELD_CDR_BAD_ARG;
+  }
+  if (ver == WELD_xt6b_V2) {
+    return xt6b_rep_v2(ext, little_endian, out);
+  }
+  if (ver == WELD_xt6b_V1) {
+    return xt6b_rep_v1(ext, little_endian, out);
+  }
+  return WELD_CDR_UNSUPPORTED;
+}
+
+weld_cdr_status_t weld_cdr_xt6b_parse_encapsulation(
+  const uint8_t hdr[4],
+  weld_xt6b_ext_t * ext,
+  weld_xt6b_ver_t * ver,
+  bool * little_endian,
+  uint16_t * representation)
+{
+  uint16_t id = 0;
+
+  if (hdr == NULL) {
+    return WELD_CDR_BAD_ARG;
+  }
+  if (hdr[0] != 0x00) {
+    return WELD_CDR_INVALID;
+  }
+  id = (uint16_t)(((uint16_t)hdr[0] << 8) | (uint16_t)hdr[1]);
+  if (representation != NULL) {
+    *representation = id;
+  }
+  if (little_endian != NULL) {
+    *little_endian = (id & 0x0001U) != 0;
+  }
+  switch (id) {
+    case (uint16_t)WELD_xt6b_CDR_BE:
+    case (uint16_t)WELD_xt6b_CDR_LE:
+      if (ext != NULL) {
+        *ext = WELD_xt6b_FINAL;
+      }
+      if (ver != NULL) {
+        *ver = WELD_xt6b_V1;
+      }
+      return WELD_CDR_OK;
+    case (uint16_t)WELD_xt6b_PL_CDR_BE:
+    case (uint16_t)WELD_xt6b_PL_CDR_LE:
+      if (ext != NULL) {
+        *ext = WELD_xt6b_MUTABLE;
+      }
+      if (ver != NULL) {
+        *ver = WELD_xt6b_V1;
+      }
+      return WELD_CDR_OK;
+    case (uint16_t)WELD_xt6b_CDR2_BE:
+    case (uint16_t)WELD_xt6b_CDR2_LE:
+      if (ext != NULL) {
+        *ext = WELD_xt6b_FINAL;
+      }
+      if (ver != NULL) {
+        *ver = WELD_xt6b_V2;
+      }
+      return WELD_CDR_OK;
+    case (uint16_t)WELD_xt6b_D_CDR2_BE:
+    case (uint16_t)WELD_xt6b_D_CDR2_LE:
+      if (ext != NULL) {
+        *ext = WELD_xt6b_APPENDABLE;
+      }
+      if (ver != NULL) {
+        *ver = WELD_xt6b_V2;
+      }
+      return WELD_CDR_OK;
+    case (uint16_t)WELD_xt6b_PL_CDR2_BE:
+    case (uint16_t)WELD_xt6b_PL_CDR2_LE:
+      if (ext != NULL) {
+        *ext = WELD_xt6b_MUTABLE;
+      }
+      if (ver != NULL) {
+        *ver = WELD_xt6b_V2;
+      }
+      return WELD_CDR_OK;
+    default:
+      break;
+  }
+  return WELD_CDR_INVALID;
+}
+
+void weld_cdr_xt6b_make_encapsulation(
+  uint8_t hdr[4],
+  weld_xt6b_ext_t ext,
+  bool little_endian)
+{
+  weld_xt6b_ver_t ver = WELD_xt6b_V1;
+  uint16_t id = 0;
+
+  if (hdr == NULL) {
+    return;
+  }
+  if (ext != WELD_xt6b_FINAL) {
+    ver = WELD_xt6b_V2;
+  }
+  if (weld_cdr_xt6b_representation_for(ext, ver, little_endian, &id) !=
+    WELD_CDR_OK)
+  {
+    id = little_endian ? (uint16_t)WELD_xt6b_CDR_LE : (uint16_t)WELD_xt6b_CDR_BE;
+  }
+  hdr[0] = (uint8_t)(id >> 8);
+  hdr[1] = (uint8_t)(id & 0x00FFU);
+  hdr[2] = 0x00;
+  hdr[3] = 0x00;
+}
+
+size_t weld_cdr_xt6b_maxalign(weld_xt6b_ver_t ver)
+{
+  if (ver == WELD_xt6b_V2) {
+    return 4;
+  }
+  return 8;
+}
+
+size_t weld_cdr_xt6b_align_width(size_t width)
+{
+  if (width == 8 || width == 16) {
+    return 4;
+  }
+  return width;
+}
+
+weld_cdr_status_t weld_cdr_xt6b_check_long_double(void)
+{
+  return WELD_CDR_UNSUPPORTED;
+}
+
+int weld_cdr_xt6b_cmp_i8(int8_t a, int8_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_u8(uint8_t a, uint8_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_i16(int16_t a, int16_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_u16(uint16_t a, uint16_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_i32(int32_t a, int32_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_u32(uint32_t a, uint32_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_i64(int64_t a, int64_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_u64(uint64_t a, uint64_t b)
+{
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+int weld_cdr_xt6b_cmp_str(const char * a, const char * b)
+{
+  if (a == b) {
+    return 0;
+  }
+  if (a == NULL) {
+    return -1;
+  }
+  if (b == NULL) {
+    return 1;
+  }
+  return strcmp(a, b);
+}
+
+int weld_cdr_xt6b_cmp_wstr(const uint16_t * a, size_t an, const uint16_t * b, size_t bn)
+{
+  size_t i = 0;
+  size_t n = 0;
+
+  if (a == b && an == bn) {
+    return 0;
+  }
+  if (a == NULL && b == NULL) {
+    if (an < bn) {
+      return -1;
+    }
+    if (an > bn) {
+      return 1;
+    }
+    return 0;
+  }
+  if (a == NULL) {
+    return -1;
+  }
+  if (b == NULL) {
+    return 1;
+  }
+  n = an < bn ? an : bn;
+  for (i = 0; i < n; i++) {
+    if (a[i] < b[i]) {
+      return -1;
+    }
+    if (a[i] > b[i]) {
+      return 1;
+    }
+  }
+  if (an < bn) {
+    return -1;
+  }
+  if (an > bn) {
+    return 1;
+  }
+  return 0;
+}
+
+// Store a 32 bit value in wire order without alignment assumptions.
+static void xt6b_store_u32(uint8_t out[4], uint32_t v, bool le)
+{
+  if (le) {
+    out[0] = (uint8_t)v;
+    out[1] = (uint8_t)(v >> 8);
+    out[2] = (uint8_t)(v >> 16);
+    out[3] = (uint8_t)(v >> 24);
+  } else {
+    out[0] = (uint8_t)(v >> 24);
+    out[1] = (uint8_t)(v >> 16);
+    out[2] = (uint8_t)(v >> 8);
+    out[3] = (uint8_t)v;
+  }
+}
+
+// Load a 32 bit value in wire order without alignment assumptions.
+static uint32_t xt6b_load_u32(const uint8_t data[4], bool le)
+{
+  if (le) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+      ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+  }
+  return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+    ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+}
+
+void weld_cdr_xt6b_dheader_encode(
+  uint8_t out[4],
+  uint32_t size,
+  bool little_endian)
+{
+  if (out == NULL) {
+    return;
+  }
+  xt6b_store_u32(out, size, little_endian);
+}
+
+weld_cdr_status_t weld_cdr_xt6b_dheader_decode(
+  const uint8_t * data,
+  size_t remaining,
+  bool little_endian,
+  uint32_t * out_size)
+{
+  uint32_t size = 0;
+
+  if (data == NULL || out_size == NULL) {
+    return WELD_CDR_BAD_ARG;
+  }
+  if (remaining < 4) {
+    return WELD_CDR_TRUNCATED;
+  }
+  size = xt6b_load_u32(data, little_endian);
+  if ((uint64_t)size > (uint64_t)(remaining - 4)) {
+    return WELD_CDR_TRUNCATED;
+  }
+  *out_size = size;
+  return WELD_CDR_OK;
+}
+
+uint8_t weld_cdr_xt6b_length_code(uint32_t size)
+{
+  switch (size) {
+    case 1:
+      return 0;
+    case 2:
+      return 1;
+    case 4:
+      return 2;
+    case 8:
+      return 3;
+    default:
+      break;
+  }
+  return 4;
+}
+
+weld_cdr_status_t weld_cdr_xt6b_emheader_encode(
+  uint32_t * out,
+  bool must_understand,
+  uint8_t lc,
+  uint32_t member_id)
+{
+  uint32_t v = 0;
+
+  if (out == NULL) {
+    return WELD_CDR_BAD_ARG;
+  }
+  if (lc > 7) {
+    return WELD_CDR_INVALID;
+  }
+  if (member_id > 0x0FFFFFFFU) {
+    return WELD_CDR_INVALID;
+  }
+  v = ((uint32_t)lc << 28) | member_id;
+  if (must_understand) {
+    v |= 0x80000000U;
+  }
+  *out = v;
+  return WELD_CDR_OK;
+}
+
+void weld_cdr_xt6b_emheader_decode(
+  uint32_t v,
+  bool * must_understand,
+  uint8_t * lc,
+  uint32_t * member_id)
+{
+  if (must_understand != NULL) {
+    *must_understand = (v & 0x80000000U) != 0;
+  }
+  if (lc != NULL) {
+    *lc = (uint8_t)((v >> 28) & 0x07U);
+  }
+  if (member_id != NULL) {
+    *member_id = v & 0x0FFFFFFFU;
+  }
+}
+
+weld_cdr_status_t weld_cdr_xt6b_must_understand(
+  bool must_understand,
+  uint32_t member_id)
+{
+  (void)member_id;
+  if (must_understand) {
+    return WELD_CDR_INVALID;
+  }
+  return WELD_CDR_OK;
 }

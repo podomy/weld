@@ -21,7 +21,7 @@ Full docs live in [docs/](/docs).
 | Transport | Spec | Status |
 |-----------|------|--------|
 | DDS | DDSI-RTPS 2.5, DDS 1.4, DDS-XTypes 1.4, DDS-SECURITY 1.2 | Fully supported |
-| MQTT | MQTT v5 | Fully supported |
+| MQTT | MQTT v5, MQTT v3.1.1 | Fully supported |
 
 Weld can bridge topics and services across transports on request, so DDS data can go out as MQTT and back.
 

@@ -311,6 +311,7 @@ func weldCollectBridgeLocked(key int64) ([]weldPubEntry, []weldSubEntry, []weldS
 	}
 	delete(weldBridgeNodes, key)
 	delete(weldBridges, key)
+	weldDropBridgeExtrasLocked(key)
 	return pubs, subs, svcs
 }
 
@@ -789,6 +790,7 @@ func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
 	delete(weldSubs, key)
 	delete(weldSubPending, key)
 	delete(weldSubTypes, key)
+	weldDropSubExtrasLocked(key)
 	weldMu.Unlock()
 	err := e.sub.Close()
 	if err != nil {
@@ -961,6 +963,7 @@ func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
 	delete(weldServices, key)
 	delete(weldSvcStash, key)
 	delete(weldSvcSeq, key)
+	weldDropSvcExtrasLocked(key)
 	for rkey := range weldSvcReplies {
 		if rkey.svc == key {
 			delete(weldSvcReplies, rkey)

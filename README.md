@@ -25,6 +25,10 @@ Full docs live in [docs/](/docs).
 
 Weld can bridge topics and services across transports on request, so DDS data can go out as MQTT and back.
 
+## ROS 2
+
+Weld runs ROS 2 nodes through `rmw_weld` (`RMW_IMPLEMENTATION=rmw_weld`): init, node, pub, sub, QoS, services, guard conditions, and waitsets are live against the Weld backend. Loans are owned-heap with tracking, not zero-copy shared memory. The following are explicitly out, with reasons: network flow endpoints (per-endpoint socket data not exposed); event types other than message-lost (no DDS source wired); publisher GID and sequence numbers in take info (takes carry no writer identity, sequences untracked); remote endpoint QoS and node names (unavailable from SEDP); N servers on one service name (requests race, use one server with N clients).
+
 ## Commercial Licensing
 
 Commercial licenses are available. See [podomy.com/projects](https://podomy.com/projects/) for pricing, or contact [contact@podomy.com](mailto:contact@podomy.com).

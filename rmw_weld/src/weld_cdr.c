@@ -1219,6 +1219,241 @@ weld_cdr_status_t weld_cdr_decode(
     errbuf_len);
 }
 
+// Size the maximum encoding of one member, mirroring the encoder.
+//
+// The sizer tracks the running wire offset so alignment pads match the
+// encoder byte for byte. Unbounded strings, wstrings, and sequences
+// set the unsupported flag instead of guessing. All arithmetic is
+// overflow checked and failures set the fail flag with a message.
+struct weld_sizer
+{
+  size_t off;
+  char * err;
+  size_t err_len;
+  bool unsupported;
+  bool fail;
+};
+
+// Add n bytes to the running offset, failing on overflow.
+static void sizer_add(struct weld_sizer * s, size_t n)
+{
+  if (s->fail || s->unsupported) {
+    return;
+  }
+  if (n > (size_t)-1 - s->off) {
+    s->fail = true;
+    set_err(s->err, s->err_len, "weld: size overflows");
+    return;
+  }
+  s->off += n;
+}
+
+// Pad the running offset to a multiple of n relative to payload start.
+static void sizer_align(struct weld_sizer * s, size_t n)
+{
+  size_t pad = 0;
+  if (s->fail || s->unsupported) {
+    return;
+  }
+  if (n != 1 && n != 2 && n != 4 && n != 8) {
+    s->fail = true;
+    set_err(s->err, s->err_len, "weld: bad align %lu", (unsigned long)n);
+    return;
+  }
+  pad = pad_to(s->off - WELD_CDR_HEADER_SIZE, n);
+  sizer_add(s, pad);
+}
+
+// Forward declaration for recursion through nested messages.
+static void size_body(const weld_members_t * m, struct weld_sizer * s);
+
+// Size one scalar or string element already stripped of array framing.
+static void size_one(const weld_member_t * m, struct weld_sizer * s)
+{
+  const weld_members_t * sub = NULL;
+  if (s->fail || s->unsupported) {
+    return;
+  }
+  switch (m->type_id_) {
+    case rosidl_typesupport_introspection_c__ROS_TYPE_FLOAT:
+      sizer_align(s, 4);
+      sizer_add(s, 4);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_DOUBLE:
+      sizer_align(s, 8);
+      sizer_add(s, 8);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_LONG_DOUBLE:
+      if (sizeof(long double) != 16) {
+        s->unsupported = true;
+        set_err(s->err, s->err_len, "weld: long double width is not 16");
+        return;
+      }
+      sizer_align(s, 8);
+      sizer_add(s, 16);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_CHAR:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_OCTET:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_UINT8:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_INT8:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_BOOLEAN:
+      sizer_add(s, 1);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_WCHAR:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_UINT16:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_INT16:
+      sizer_align(s, 2);
+      sizer_add(s, 2);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_UINT32:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_INT32:
+      sizer_align(s, 4);
+      sizer_add(s, 4);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_UINT64:
+    case rosidl_typesupport_introspection_c__ROS_TYPE_INT64:
+      sizer_align(s, 8);
+      sizer_add(s, 8);
+      return;
+    case rosidl_typesupport_introspection_c__ROS_TYPE_STRING: {
+      uint64_t total = 0;
+      if (m->string_upper_bound_ == 0) {
+        s->unsupported = true;
+        set_err(s->err, s->err_len, "weld: unbounded string has no max size");
+        return;
+      }
+      total = (uint64_t)m->string_upper_bound_ + 1;
+      if (total > (uint64_t)((size_t)-1) - 4) {
+        s->fail = true;
+        set_err(s->err, s->err_len, "weld: string bound overflows");
+        return;
+      }
+      sizer_align(s, 4);
+      sizer_add(s, (size_t)total + 4);
+      return;
+    }
+    case rosidl_typesupport_introspection_c__ROS_TYPE_WSTRING: {
+      uint64_t total = 0;
+      if (m->string_upper_bound_ == 0) {
+        s->unsupported = true;
+        set_err(s->err, s->err_len, "weld: unbounded wstring has no max size");
+        return;
+      }
+      total = ((uint64_t)m->string_upper_bound_ + 1) * 2;
+      if (total > (uint64_t)((size_t)-1) - 4) {
+        s->fail = true;
+        set_err(s->err, s->err_len, "weld: wstring bound overflows");
+        return;
+      }
+      sizer_align(s, 4);
+      sizer_add(s, (size_t)total + 4);
+      return;
+    }
+    case rosidl_typesupport_introspection_c__ROS_TYPE_MESSAGE:
+      sub = sub_table(m, s->err, s->err_len);
+      if (sub == NULL) {
+        s->fail = true;
+        return;
+      }
+      if (sub->member_count_ == 0) {
+        // An empty nested struct contributes one dummy byte inline,
+        // matching the encoder.
+        sizer_add(s, 1);
+        return;
+      }
+      size_body(sub, s);
+      return;
+    default:
+      break;
+  }
+  s->unsupported = true;
+  set_err(s->err, s->err_len, "weld: unknown type %u", m->type_id_);
+}
+
+// Size one member, dispatching scalar, sequence, and fixed array.
+static void size_member(const weld_member_t * m, struct weld_sizer * s)
+{
+  size_t n = 0;
+  size_t i = 0;
+  if (s->fail || s->unsupported) {
+    return;
+  }
+  if (!m->is_array_) {
+    size_one(m, s);
+    return;
+  }
+  if (is_sequence(m)) {
+    if (!m->is_upper_bound_) {
+      s->unsupported = true;
+      set_err(
+        s->err, s->err_len, "weld: member %s unbounded sequence has no max",
+        m->name_);
+      return;
+    }
+    n = m->array_size_;
+  } else {
+    n = m->array_size_;
+  }
+  sizer_align(s, 4);
+  sizer_add(s, 4);
+  for (i = 0; i < n; i++) {
+    size_one(m, s);
+    if (s->fail || s->unsupported) {
+      return;
+    }
+  }
+}
+
+// Size every member of one message struct in declaration order.
+static void size_body(const weld_members_t * m, struct weld_sizer * s)
+{
+  uint32_t i = 0;
+  for (i = 0; i < m->member_count_; i++) {
+    size_member(&m->members_[i], s);
+    if (s->fail || s->unsupported) {
+      return;
+    }
+  }
+}
+
+weld_cdr_status_t weld_cdr_max_serialized_size(
+  const rosidl_typesupport_introspection_c__MessageMembers * members,
+  size_t * out_size,
+  char * errbuf,
+  size_t errbuf_len)
+{
+  struct weld_sizer s;
+  size_t pad = 0;
+  if (members == NULL || out_size == NULL) {
+    set_err(errbuf, errbuf_len, "weld: null max size argument");
+    return WELD_CDR_BAD_ARG;
+  }
+  (void)memset(&s, 0, sizeof(s));
+  s.off = WELD_CDR_HEADER_SIZE;
+  s.err = errbuf;
+  s.err_len = errbuf_len;
+  size_body(members, &s);
+  if (s.unsupported) {
+    return WELD_CDR_UNSUPPORTED;
+  }
+  if (s.fail) {
+    return WELD_CDR_INVALID;
+  }
+  if (s.off == WELD_CDR_HEADER_SIZE) {
+    sizer_add(&s, 1);
+    if (s.fail) {
+      return WELD_CDR_INVALID;
+    }
+  }
+  pad = pad_to(s.off, 4);
+  sizer_add(&s, pad);
+  if (s.fail) {
+    return WELD_CDR_INVALID;
+  }
+  *out_size = s.off;
+  return WELD_CDR_OK;
+}
+
 // Select the V1 ID for a kind.
 static weld_cdr_status_t xt6b_rep_v1(weld_xt6b_ext_t ext, bool le, uint16_t * out)
 {

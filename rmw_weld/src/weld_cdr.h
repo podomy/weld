@@ -94,6 +94,19 @@ weld_cdr_status_t weld_cdr_decode(
   char * errbuf,
   size_t errbuf_len);
 
+// Report the maximum encoded size for a message, including the 4 byte
+// header and the final zero pad.
+//
+// Only bounded members have a finite size: unbounded strings,
+// wstrings, and sequences report WELD_CDR_UNSUPPORTED, as does a long
+// double that is not 16 bytes wide. On success out_size holds the byte
+// count. errbuf takes a bounded message, or NULL.
+weld_cdr_status_t weld_cdr_max_serialized_size(
+  const rosidl_typesupport_introspection_c__MessageMembers * members,
+  size_t * out_size,
+  char * errbuf,
+  size_t errbuf_len);
+
 // XCDR extensibility kinds for Table 32 emit.
 typedef enum weld_xt6b_ext
 {

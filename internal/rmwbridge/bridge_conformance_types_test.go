@@ -108,8 +108,8 @@ func checkCDRBadWire(t *testing.T, bridge *rmwbridge.Bridge) {
 	requireError(t, err, "decode short wire")
 	_, err = rmwbridge.DecodeCDR([]byte{0x01, 0x01, 0x00, 0x00, 0x00})
 	requireError(t, err, "decode bad first byte")
-	_, err = rmwbridge.DecodeCDR([]byte{0x00, 0x02, 0x00, 0x00, 0x00})
-	requireError(t, err, "decode bad endian flag")
+	_, err = rmwbridge.DecodeCDR([]byte{0x00, 0x04, 0x00, 0x00, 0x00})
+	requireError(t, err, "decode bad representation id")
 	_, err = bridge.DecodeCDR([]byte{0x00})
 	requireError(t, err, "bridge decode short wire")
 }

@@ -44,17 +44,19 @@ const userHistoryMaxBytes = 64 << 20
 // userRepairWindow caps seq scanned per ACKNACK to bound work. Larger gaps converge over later ACKs.
 const userRepairWindow = 64
 
-// userAckBitsMax caps ACKNACK bits to bound decode work. Larger receipts are rejected as invalid.
-const userAckBitsMax = 1024
+// userAckBitsMax caps ACKNACK bits per RTPS 8.3.5.5 (max-min below 256).
+// Larger receipts are rejected as invalid to bound decode work.
+const userAckBitsMax = 256
 
 // selectiveNackBitmap builds a bitmap requesting only missing sequences for
 // n sequences from base. Sequences at or below contiguity or in the
 // out-of-order seen set are already received, so their bits stay clear to
 // avoid duplicate retransmits that fill the demux queue and never advance
 // contiguity. Bits use MSB packing matching sedpNackBitmap so CycloneDDS
-// queues repair: base is the MSB of the first word. Counts cap at
-// userAckBitsMax like the full-range path. A nil tracker requests the full
-// range. Zero counts request nothing.
+// queues repair: base is the MSB of the first word. Counts bound at
+// userAckBitsMax as a window, not a silent drop: larger ranges converge
+// over later ACKs as the reader advances on GAP and repair. A nil tracker
+// requests the full range. Zero counts request nothing.
 func selectiveNackBitmap(n, base uint64, tracker *remoteTracker) ([]uint32, uint32) {
 	if n == 0 {
 		return nil, 0
@@ -124,6 +126,52 @@ var ErrDataFragDropped = errors.New("dds: fragmented sample dropped")
 
 // userAckCount counts sent ACKNACKs process wide. Zero is never emitted.
 var userAckCount atomic.Int32
+
+// ackRtps1Key identifies one writer-side ACK source for duplicate suppression.
+type ackRtps1Key struct {
+	backend *Backend
+	reader  WriterGUID
+	writer  rtps.EntityID
+}
+
+// ackRtps1Mu guards ackRtps1Last.
+var ackRtps1Mu sync.Mutex
+
+// ackRtps1Last tracks last applied ACK Count per reader.
+var ackRtps1Last = make(map[ackRtps1Key]int32)
+
+// shouldRtps1SkipAck reports whether an ACK Count replays the last applied.
+// Zero counts never suppress. New counts record and bound the table by
+// maxTrackedWriters with loud eviction after unlock.
+func shouldRtps1SkipAck(backend *Backend, reader WriterGUID, writer rtps.EntityID, count int32) bool {
+	if count == 0 {
+		return false
+	}
+	ackRtps1Mu.Lock()
+	last, seen := ackRtps1Last[ackRtps1Key{backend: backend, reader: reader, writer: writer}]
+	if seen && count <= last {
+		ackRtps1Mu.Unlock()
+		return true
+	}
+	ackRtps1Last[ackRtps1Key{backend: backend, reader: reader, writer: writer}] = count
+	var evicted ackRtps1Key
+	haveEvicted := false
+	if len(ackRtps1Last) > maxTrackedWriters {
+		for k := range ackRtps1Last {
+			if k.backend == backend {
+				evicted = k
+				haveEvicted = true
+				delete(ackRtps1Last, k)
+				break
+			}
+		}
+	}
+	ackRtps1Mu.Unlock()
+	if haveEvicted {
+		log.Printf("dds: ack table full evict reader=%x writer=%x", evicted.reader, evicted.writer)
+	}
+	return false
+}
 
 // userHistory stores sent RTPS payloads per writer GUID for ACKNACK repair.
 //
@@ -1607,7 +1655,9 @@ func (b *Backend) buildAckSubmessage(
 
 // buildAckMessage wraps one ACKNACK for a remote writer. Reader names the
 // local reader the receipt belongs to and base is next wanted. NumBits 0
-// with no bitmap requests nothing and only advances the writer.
+// with no bitmap requests nothing and only advances the writer. Pure ACKs
+// set Final so the writer slows to keepalive pace, while NACKs clear it so
+// the writer keeps repairing, mirroring the SEDP path.
 func (b *Backend) buildAckMessage(
 	remote WriterGUID,
 	reader rtps.EntityID,
@@ -1640,7 +1690,8 @@ func (b *Backend) buildAckMessage(
 
 	header := rtps.DefaultHeader(prefix)
 
-	raw, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap, false)
+	final := numBits == 0
+	raw, err := b.buildAckSubmessage(remote, reader, base, numBits, bitmap, final)
 	if err != nil {
 		return nil, err
 	}
@@ -1671,9 +1722,9 @@ func (b *Backend) buildAckMessage(
 //
 // INFO_DST names the writer participant so CycloneDDS resolves the target
 // writer; without it Cyclone logs not a connection and drops the NACK
-// silently. Final is never set on the user path: every user ACKNACK
-// either requests repair or stays open for the next heartbeat, so a
-// response must always stay possible. The send fans out to the writer
+// silently. Pure ACKs set Final so the writer slows to keepalive pace,
+// while NACKs clear it so the writer keeps repairing, mirroring the SEDP
+// path. The send fans out to the writer
 // participant's route ports and falls back to all routes when the
 // participant has none yet, since NACKs during discovery must still go
 // out. Fallback broadcasts are rate limited per writer to one per
@@ -2520,11 +2571,6 @@ func (b *Backend) readerEntityForWriter(guid WriterGUID) rtps.EntityID {
 	return rtps.EntityUnknown
 }
 
-// ackUserHeartbeat answers one user HEARTBEAT with ACKNACK. Base is next wanted from remote tracking.
-//
-// It validates First through Last like the SEDP path, ignores replayed
-// heartbeats by Count, and never regresses the Last bound. ACK sends queue
-// through the per-backend worker so demux never blocks on the socket.
 // heartbeatTrackerFor returns the contiguity tracker for a remote writer,
 // allocating it under the backend lock. The caller must hold b.mu for write
 // and logs any table eviction after unlock.
@@ -2567,12 +2613,31 @@ func recordHeartbeatBound(beat rtps.Heartbeat, tracker *remoteTracker) {
 	}
 }
 
+// ackUserHeartbeat answers one user HEARTBEAT with ACKNACK. Base is next
+// wanted from remote tracking. It validates First through Last like the
+// SEDP path, ignores replayed heartbeats by Count, and never regresses the
+// Last bound. Pure ACKs set Final and NACKs clear it through the queued
+// send, mirroring SEDP. Liveliness-flag heartbeats renew the manual lease.
+// ACK sends queue through the per-backend worker so demux never blocks.
 func (b *Backend) ackUserHeartbeat(
 	header rtps.Header,
 	beat rtps.Heartbeat,
+	flags uint8,
 ) {
 	if !isUserWriterEntity(beat.WriterID) {
 		return
+	}
+
+	if flags&rtps.HeartbeatFlagLiveliness != 0 {
+		var remote WriterGUID
+		copy(remote[:12], header.Prefix[:])
+		copy(remote[12:16], beat.WriterID[:])
+		b.mu.RLock()
+		recv := b.receiver
+		b.mu.RUnlock()
+		if recv != nil {
+			recv.AssertParticipant(participantNameForWriter(remote))
+		}
 	}
 
 	if beat.FirstSequence == 0 {
@@ -2797,12 +2862,20 @@ func (b *Backend) maybePromptNackOnData(
 // handleUserAck routes one ACKNACK for a user writer to repair, not to dataCh.
 //
 // The caller decodes once via decodeUserAckNack and shares the result so
-// the sub is not decoded twice. Teardown races skip quietly: a close
+// the sub is not decoded twice. Duplicate Counts per reader skip quietly
+// as replays. Teardown races skip quietly: a close
 // between demux and queue is not a fault.
 func (b *Backend) handleUserAck(
 	ctx context.Context,
+	header rtps.Header,
 	req ackRequest,
 ) {
+	var reader WriterGUID
+	copy(reader[:12], header.Prefix[:])
+	copy(reader[12:16], req.reader[:])
+	if shouldRtps1SkipAck(b, reader, req.writer, req.count) {
+		return
+	}
 	err := b.repairFromAck(ctx, req.writer, req.base)
 	if err != nil {
 		if b.isClosed() {
@@ -2875,12 +2948,13 @@ func (b *Backend) handleUserNackFrag(
 // handleUserHeartbeat routes one HEARTBEAT for a user writer to ACK, not to dataCh.
 //
 // The caller decodes once via DecodeHeartbeat and shares the result so the
-// sub is not decoded twice.
+// sub is not decoded twice. Flags carry the liveliness bit for lease renewal.
 func (b *Backend) handleUserHeartbeat(
 	header rtps.Header,
 	beat rtps.Heartbeat,
+	flags uint8,
 ) {
-	b.ackUserHeartbeat(header, beat)
+	b.ackUserHeartbeat(header, beat, flags)
 }
 
 // handleUserGapRaw decodes one GAP submessage and routes it to skip,
@@ -2965,7 +3039,7 @@ func (b *Backend) handleUserControl(
 			return false
 		}
 
-		b.handleUserAck(ctx, rawReq)
+		b.handleUserAck(ctx, header, rawReq)
 
 		return true
 	case rtps.SubmessageNackFrag:
@@ -2989,7 +3063,7 @@ func (b *Backend) handleUserControl(
 			return false
 		}
 
-		b.handleUserHeartbeat(header, beat)
+		b.handleUserHeartbeat(header, beat, sub.Flags)
 
 		return true
 	case rtps.SubmessageGap:

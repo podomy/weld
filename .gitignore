@@ -25,3 +25,7 @@ cmd/weld/cmd-weld
 
 # History folder
 .history/
+
+# TLA+ TLC working files (regenerable proof artifacts)
+**/proof/states/
+*_TTrace*

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
 
@@ -902,5 +903,199 @@ func TestSelectiveNackBitmapRequestsOnlyMissing(t *testing.T) {
 	empty, emptyBits := selectiveNackBitmap(0, 6, tracker)
 	if emptyBits != 0 || empty != nil {
 		t.Fatalf("zero count bits = %d bitmap = %v, want 0 nil", emptyBits, empty)
+	}
+}
+
+// TestAckRtps1DuplicateSuppressesReplay pins writer-side Count dedup.
+//
+// It runs serially because it shares the global ackRtps1Last table with
+// TestAckRtps1TableBounds; parallel runs evict each other's entries.
+func TestAckRtps1DuplicateSuppressesReplay(t *testing.T) {
+	backend := &Backend{}
+	var reader WriterGUID
+	reader[0] = 0xA1
+	var writer rtps.EntityID
+	writer[3] = 0x03
+
+	if shouldRtps1SkipAck(backend, reader, writer, 0) {
+		t.Fatalf("count 0 skipped, want never suppress")
+	}
+	if shouldRtps1SkipAck(backend, reader, writer, 5) {
+		t.Fatalf("first count 5 skipped, want apply")
+	}
+	if !shouldRtps1SkipAck(backend, reader, writer, 5) {
+		t.Fatalf("replay count 5 applied, want skip")
+	}
+	if !shouldRtps1SkipAck(backend, reader, writer, 4) {
+		t.Fatalf("old count 4 applied, want skip")
+	}
+	if shouldRtps1SkipAck(backend, reader, writer, 6) {
+		t.Fatalf("new count 6 skipped, want apply")
+	}
+	ackRtps1Mu.Lock()
+	for k := range ackRtps1Last {
+		if k.backend == backend {
+			delete(ackRtps1Last, k)
+		}
+	}
+	ackRtps1Mu.Unlock()
+}
+
+// TestAckRtps1TableBounds pins bounded dedup table.
+//
+// It runs serially because it shares the global ackRtps1Last table with
+// TestAckRtps1DuplicateSuppressesReplay; parallel runs evict entries.
+func TestAckRtps1TableBounds(t *testing.T) {
+	backend := &Backend{}
+	var writer rtps.EntityID
+	writer[3] = 0x03
+	for i := range maxTrackedWriters + 10 {
+		var reader WriterGUID
+		binary.LittleEndian.PutUint64(reader[:8], uint64(i+1))
+		shouldRtps1SkipAck(backend, reader, writer, 1)
+	}
+	ackRtps1Mu.Lock()
+	n := 0
+	for k := range ackRtps1Last {
+		if k.backend == backend {
+			n++
+		}
+	}
+	ackRtps1Mu.Unlock()
+	if n > maxTrackedWriters {
+		t.Fatalf("ack table = %d above %d", n, maxTrackedWriters)
+	}
+	ackRtps1Mu.Lock()
+	for k := range ackRtps1Last {
+		if k.backend == backend {
+			delete(ackRtps1Last, k)
+		}
+	}
+	ackRtps1Mu.Unlock()
+}
+
+// checkPureAckFinal pins that a pure ACK carries the Final flag.
+func checkPureAckFinal(t *testing.T, backend *Backend, remote WriterGUID, reader rtps.EntityID) {
+	t.Helper()
+
+	pureMsg, err := backend.buildAckMessage(remote, reader, 6, 0, nil)
+	if err != nil {
+		t.Fatalf("build pure ack: %v", err)
+	}
+	_, subs, err := rtps.DecodeMessage(pureMsg, nil)
+	if err != nil {
+		t.Fatalf("decode pure ack: %v", err)
+	}
+	foundPure := false
+	for _, sub := range subs {
+		if sub.ID != rtps.SubmessageAckNack {
+			continue
+		}
+		foundPure = true
+		if sub.Flags&rtps.AckNackFlagFinal == 0 {
+			t.Fatalf("pure ack flags %#02x missing Final", sub.Flags)
+		}
+	}
+	if !foundPure {
+		t.Fatalf("pure ack message misses ACKNACK")
+	}
+}
+
+// checkNackClearsFinal pins that a NACK omits the Final flag.
+func checkNackClearsFinal(t *testing.T, backend *Backend, remote WriterGUID, reader rtps.EntityID) {
+	t.Helper()
+
+	bitmap, numBits, need := planSedpNack(1, 4)
+	if !need {
+		t.Fatalf("need = false for missing range, want NACK")
+	}
+	nackMsg, err := backend.buildAckMessage(remote, reader, 1, numBits, bitmap)
+	if err != nil {
+		t.Fatalf("build nack: %v", err)
+	}
+	_, nsubs, err := rtps.DecodeMessage(nackMsg, nil)
+	if err != nil {
+		t.Fatalf("decode nack: %v", err)
+	}
+	for _, sub := range nsubs {
+		if sub.ID != rtps.SubmessageAckNack {
+			continue
+		}
+		if sub.Flags&rtps.AckNackFlagFinal != 0 {
+			t.Fatalf("nack flags %#02x has Final, want without", sub.Flags)
+		}
+	}
+}
+
+// TestUserAckRtps1FinalDiscipline pins pure ACKs set Final, NACKs clear it.
+func TestUserAckRtps1FinalDiscipline(t *testing.T) {
+	t.Parallel()
+
+	local, err := NewLocalParticipant(0, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local participant: %v", err)
+	}
+	backend := &Backend{local: local}
+	remote := testNackGUID(0xF1)
+	reader := rtps.EntityID{0x00, 0x00, 0x02, 0xC7}
+	checkPureAckFinal(t, backend, remote, reader)
+	checkNackClearsFinal(t, backend, remote, reader)
+}
+
+// TestAckUserHeartbeatRtps1LivelinessRenewsLease pins manual lease renewal.
+func TestAckUserHeartbeatRtps1LivelinessRenewsLease(t *testing.T) {
+	t.Parallel()
+
+	local, err := NewLocalParticipant(0, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local participant: %v", err)
+	}
+	recv := NewDataReceiver()
+	fake := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	recv.now = func() time.Time {
+		return fake
+	}
+	backend := &Backend{
+		local:       local,
+		receiver:    recv,
+		remoteTrack: make(map[WriterGUID]*remoteTracker),
+		repairQueue: make(chan repairTask, repairQueueDepth),
+		repairGen:   9,
+	}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(0xB0 + i)
+	}
+	userWriter := rtps.EntityID{0x00, 0x00, 0x02, 0x02}
+	var remote WriterGUID
+	copy(remote[:12], prefix[:])
+	copy(remote[12:16], userWriter[:])
+	name := participantNameForWriter(remote)
+	recv.SetParticipantLease(name, core.NewDuration(10, 0))
+	if !recv.AssertParticipantAt(name, fake.Add(-30*time.Second).UnixNano()) {
+		t.Fatalf("initial assert failed")
+	}
+	if got := recv.ParticipantState(name, fake.UnixNano()); got != core.LivelinessExpired {
+		t.Fatalf("state = %v, want expired before renew", got)
+	}
+	before := recv.ParticipantGeneration(name)
+	header := rtps.DefaultHeader(prefix)
+	beat := rtps.Heartbeat{
+		ReaderID:      rtps.EntityUnknown,
+		WriterID:      userWriter,
+		FirstSequence: 1,
+		LastSequence:  1,
+		Count:         1,
+	}
+	backend.ackUserHeartbeat(header, beat, rtps.HeartbeatFlagLiveliness)
+	if got := recv.ParticipantGeneration(name); got != before+1 {
+		t.Fatalf("generation = %d, want %d after liveliness renew", got, before+1)
+	}
+	beatNoLive := beat
+	beatNoLive.Count = 2
+	beforeNoLive := recv.ParticipantGeneration(name)
+	backend.ackUserHeartbeat(header, beatNoLive, 0)
+	if got := recv.ParticipantGeneration(name); got != beforeNoLive {
+		t.Fatalf("generation moved %d to %d without liveliness, want stable", beforeNoLive, got)
 	}
 }

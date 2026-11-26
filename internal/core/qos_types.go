@@ -77,7 +77,9 @@ func (p ReliabilityPolicy) String() string {
 // DurabilityPolicy names the durability kind of a QoS profile.
 type DurabilityPolicy int
 
-// Durability policies.
+// Durability policies. Ordering for RxO is volatile less than
+// transient local less than transient less than persistent per DDS 1.4
+// section 2.2.3.4.
 const (
 	// DurabilitySystemDefault means not set; ResolveSystemDefaults maps it to volatile.
 	DurabilitySystemDefault DurabilityPolicy = iota
@@ -93,6 +95,14 @@ const (
 	DurabilityUnknown
 )
 
+// Durability extended kinds for TRANSIENT and PERSISTENT per DDS 1.4 section 2.2.3.4.
+const (
+	// Durabilityqos4Transient keeps data in memory beyond the writer lifecycle.
+	Durabilityqos4Transient DurabilityPolicy = 5
+	// Durabilityqos4Persistent keeps data on permanent storage.
+	Durabilityqos4Persistent DurabilityPolicy = 6
+)
+
 // String renders the policy in lowercase RMW form.
 func (p DurabilityPolicy) String() string {
 	switch p {
@@ -106,6 +116,10 @@ func (p DurabilityPolicy) String() string {
 		return "best_available"
 	case DurabilityUnknown:
 		return "unknown"
+	case Durabilityqos4Transient:
+		return "transient"
+	case Durabilityqos4Persistent:
+		return "persistent"
 	default:
 		return "invalid"
 	}
@@ -114,8 +128,10 @@ func (p DurabilityPolicy) String() string {
 // LivelinessPolicy names the liveliness kind of a QoS profile.
 type LivelinessPolicy int
 
-// Liveliness policies. Core models automatic plus manual by topic, the two
-// kinds on the standard ROS wire.
+// Liveliness policies. Ordering for RxO is automatic less than
+// manual by participant less than manual by topic per DDS 1.4 section
+// 2.2.3.11. Core models all three kinds; wire refusal of kind 1 stays in
+// writerqos as a separate layer.
 const (
 	// LivelinessSystemDefault means not set; ResolveSystemDefaults maps it to automatic.
 	LivelinessSystemDefault LivelinessPolicy = iota
@@ -128,6 +144,12 @@ const (
 	LivelinessBestAvailable
 	// LivelinessUnknown marks an unrecognized policy and is rejected by Validate.
 	LivelinessUnknown
+)
+
+// Liveliness extended kind for MANUAL_BY_PARTICIPANT per DDS 1.4 section 2.2.3.11.
+const (
+	// Livelinessqos4ManualByParticipant requires a participant assert to deduce all entities alive.
+	Livelinessqos4ManualByParticipant LivelinessPolicy = 5
 )
 
 // String renders the policy in lowercase RMW form.
@@ -143,9 +165,114 @@ func (p LivelinessPolicy) String() string {
 		return "best_available"
 	case LivelinessUnknown:
 		return "unknown"
+	case Livelinessqos4ManualByParticipant:
+		return "manual_by_participant"
 	default:
 		return "invalid"
 	}
+}
+
+// Ownershipqos4Policy names the ownership kind of a QoS profile.
+type Ownershipqos4Policy int
+
+// Ownership kinds. RxO requires exact match per DDS 1.4 section 2.2.3.9.2.
+// Zero value is shared for backward compat with profiles created before
+// ownership existed.
+const (
+	// Ownershipqos4Shared delivers every writer for the instance.
+	Ownershipqos4Shared Ownershipqos4Policy = iota
+	// Ownershipqos4Exclusive delivers only the arbitrated owner.
+	Ownershipqos4Exclusive
+	// Ownershipqos4SystemDefault means not set; ResolveSystemDefaults maps it to shared.
+	Ownershipqos4SystemDefault
+	// Ownershipqos4BestAvailable resolves once at endpoint creation.
+	Ownershipqos4BestAvailable
+	// Ownershipqos4Unknown marks an unrecognized policy and is rejected by Validate.
+	Ownershipqos4Unknown
+)
+
+// String renders the policy in lowercase RMW form.
+func (p Ownershipqos4Policy) String() string {
+	switch p {
+	case Ownershipqos4Shared:
+		return "shared"
+	case Ownershipqos4Exclusive:
+		return "exclusive"
+	case Ownershipqos4SystemDefault:
+		return "system_default"
+	case Ownershipqos4BestAvailable:
+		return "best_available"
+	case Ownershipqos4Unknown:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
+// PresentationAccessScope names the presentation access scope kind.
+type PresentationAccessScope int
+
+// Presentation access scopes. Ordering for RxO is instance less than
+// topic less than group per DDS 1.4 section 2.2.3.6: a broader offered
+// scope satisfies a narrower request. Zero value is instance, the DDS
+// default, so omitted presentation is concrete and needs no resolution.
+const (
+	// PresentationInstance scopes coherent and ordered access per instance.
+	PresentationInstance PresentationAccessScope = iota
+	// PresentationTopic scopes access across one topic.
+	PresentationTopic
+	// PresentationGroup scopes access across the publisher or subscriber group.
+	PresentationGroup
+)
+
+// String renders the scope in lowercase form.
+func (s PresentationAccessScope) String() string {
+	switch s {
+	case PresentationInstance:
+		return "instance"
+	case PresentationTopic:
+		return "topic"
+	case PresentationGroup:
+		return "group"
+	default:
+		return "invalid"
+	}
+}
+
+// PresentationQosPolicy is the presentation QoS policy per DDS 1.4 section 2.2.3.6.
+type PresentationQosPolicy struct {
+	// AccessScope is the presentation access scope, default instance.
+	AccessScope PresentationAccessScope
+	// CoherentAccess requests coherent changes when true.
+	CoherentAccess bool
+	// OrderedAccess requests ordered changes when true.
+	OrderedAccess bool
+}
+
+// String renders the policy in lowercase form.
+func (p PresentationQosPolicy) String() string {
+	coherent := "false"
+	if p.CoherentAccess {
+		coherent = "true"
+	}
+	ordered := "false"
+	if p.OrderedAccess {
+		ordered = "true"
+	}
+	return p.AccessScope.String() + " coherent=" + coherent + " ordered=" + ordered
+}
+
+// LatencyBudgetQosPolicy is the latency budget QoS policy per DDS 1.4 section 2.2.3.8.
+type LatencyBudgetQosPolicy struct {
+	// Duration is the maximum acceptable delay. Zero is the DDS default
+	// of no extra delay hint and the concrete value carried by omitted
+	// profiles, so it needs no resolution.
+	Duration Duration
+}
+
+// String renders the policy as its duration in lowercase form.
+func (l LatencyBudgetQosPolicy) String() string {
+	return l.Duration.String()
 }
 
 // QoSProfile is the RMW QoS profile: history plus depth, reliability,
@@ -165,16 +292,25 @@ type QoSProfile struct {
 	Depth uint64
 	// Reliability is reliable, best effort, system default, best available, or unknown.
 	Reliability ReliabilityPolicy
-	// Durability is transient local, volatile, system default, best available, or unknown.
+	// Durability is volatile, transient local, transient, persistent, system default, best available, or unknown.
 	Durability DurabilityPolicy
 	// Deadline is the freshness contract. Unspecified means the default.
 	Deadline Duration
 	// Lifespan is publisher only message expiry. Unspecified means no expiry.
 	Lifespan Duration
-	// Liveliness is automatic, manual by topic, system default, best available, or unknown.
+	// Liveliness is automatic, manual by participant, manual by topic, system default, best available, or unknown.
 	Liveliness LivelinessPolicy
 	// LeaseDuration names how long silence means gone. Unspecified means the default.
 	LeaseDuration Duration
+	// Ownershipqos4 is shared, exclusive, system default, best available, or unknown.
+	// Zero value is shared for backward compat with profiles built before ownership existed.
+	Ownershipqos4 Ownershipqos4Policy
+	// Presentation is the coherent and ordered access contract per DDS 1.4 section 2.2.3.6.
+	// Zero value is instance scope without coherent or ordered access, the DDS default.
+	Presentation PresentationQosPolicy
+	// LatencyBudget is the maximum acceptable delay hint per DDS 1.4 section 2.2.3.8.
+	// Zero value carries a zero duration, the DDS default, so omitted profiles stay concrete.
+	LatencyBudget LatencyBudgetQosPolicy
 	// AvoidROSNamespaceConventions skips the rt prefix for native DDS topics.
 	AvoidROSNamespaceConventions bool
 }
@@ -274,11 +410,12 @@ func RosoutQoS() QoSProfile {
 // It must pass through ResolveSystemDefaults before entity creation.
 func SystemDefaultQoS() QoSProfile {
 	return QoSProfile{
-		History:     HistorySystemDefault,
-		Depth:       0,
-		Reliability: ReliabilitySystemDefault,
-		Durability:  DurabilitySystemDefault,
-		Liveliness:  LivelinessSystemDefault,
+		History:       HistorySystemDefault,
+		Depth:         0,
+		Reliability:   ReliabilitySystemDefault,
+		Durability:    DurabilitySystemDefault,
+		Liveliness:    LivelinessSystemDefault,
+		Ownershipqos4: Ownershipqos4SystemDefault,
 	}
 }
 
@@ -313,11 +450,12 @@ func BestAvailableQoS() QoSProfile {
 // and CheckCompatibility warns on it; it must never reach entity creation.
 func UnknownQoS() QoSProfile {
 	return QoSProfile{
-		History:     HistoryUnknown,
-		Depth:       0,
-		Reliability: ReliabilityUnknown,
-		Durability:  DurabilityUnknown,
-		Liveliness:  LivelinessUnknown,
+		History:       HistoryUnknown,
+		Depth:         0,
+		Reliability:   ReliabilityUnknown,
+		Durability:    DurabilityUnknown,
+		Liveliness:    LivelinessUnknown,
+		Ownershipqos4: Ownershipqos4Unknown,
 	}
 }
 
@@ -337,6 +475,12 @@ const (
 	PolicyLiveliness PolicyKind = "liveliness"
 	// PolicyLeaseDuration marks lease duration incompatibilities.
 	PolicyLeaseDuration PolicyKind = "lease_duration"
+	// Policyqos4Ownership marks ownership incompatibilities per DDS 1.4 section 2.2.3.9.2.
+	Policyqos4Ownership PolicyKind = "ownership"
+	// PolicyPresentation marks presentation incompatibilities per DDS 1.4 section 2.2.3.6.
+	PolicyPresentation PolicyKind = "presentation"
+	// PolicyLatencyBudget marks latency budget incompatibilities per DDS 1.4 section 2.2.3.8.
+	PolicyLatencyBudget PolicyKind = "latency_budget"
 )
 
 // CompatibilityIssue is one error or warning from a compatibility check,
@@ -414,4 +558,64 @@ func joinIssues(issues []CompatibilityIssue) string {
 		parts = append(parts, issue.String())
 	}
 	return strings.Join(parts, "; ")
+}
+
+// TypeConsistencyEnforcementKind names the 7.6.3.4.1 enforcement kind.
+//
+// Disallow requires minimal type equivalence (EXACT_TYPE matching per
+// 7.2.5: the reader and writer types must assign both ways). Allow
+// evaluates reader-from-writer assignability (MINIMAL matching) with
+// the ignore flags below relaxing table comparisons.
+type TypeConsistencyEnforcementKind int
+
+// Type consistency enforcement kinds per 7.6.3.4.1.
+const (
+	// TypeConsistencyDisallowCoercion requires exact minimal equivalence.
+	TypeConsistencyDisallowCoercion TypeConsistencyEnforcementKind = iota
+	// TypeConsistencyAllowCoercion permits coercion via assignability.
+	TypeConsistencyAllowCoercion
+)
+
+// String renders the kind in spec form.
+func (k TypeConsistencyEnforcementKind) String() string {
+	switch k {
+	case TypeConsistencyDisallowCoercion:
+		return "DISALLOW_TYPE_COERCION"
+	case TypeConsistencyAllowCoercion:
+		return "ALLOW_TYPE_COERCION"
+	default:
+		return "invalid"
+	}
+}
+
+// TypeConsistencyEnforcementQosPolicy is the 7.6.3.4.1 enforcement policy.
+//
+// It selects exact versus minimal matching plus the bound, name, and
+// validation relaxations applied during reader versus writer matching.
+// The zero value disallows coercion with no relaxations and fails
+// closed; DefaultTypeConsistencyEnforcement returns the spec default of
+// allow with no relaxations.
+type TypeConsistencyEnforcementQosPolicy struct {
+	// Kind selects exact equivalence or minimal assignability.
+	Kind TypeConsistencyEnforcementKind
+	// IgnoreSequenceBounds relaxes sequence and map bound comparison.
+	IgnoreSequenceBounds bool
+	// IgnoreStringBounds relaxes string bound comparison.
+	IgnoreStringBounds bool
+	// IgnoreMemberNames relaxes struct and union member name comparison.
+	IgnoreMemberNames bool
+	// IgnoreLiteralNames relaxes enumerated literal name comparison.
+	IgnoreLiteralNames bool
+	// PreventTypeWidening rejects writer types wider than reader types.
+	PreventTypeWidening bool
+	// ForceTypeValidation denies matching without full type information.
+	ForceTypeValidation bool
+}
+
+// DefaultTypeConsistencyEnforcement returns allow coercion per 7.6.3.4.1.
+//
+// All relaxations stay false so only the kind permits coercion; every
+// other comparison runs strict.
+func DefaultTypeConsistencyEnforcement() TypeConsistencyEnforcementQosPolicy {
+	return TypeConsistencyEnforcementQosPolicy{Kind: TypeConsistencyAllowCoercion}
 }

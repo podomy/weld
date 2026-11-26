@@ -31,9 +31,12 @@ import (
 // Writer QoS PID values not present in rtps/pid.go.
 //
 // The DDSI-RTPS parameter table assigns deadline 0x0023, lifespan 0x002b,
-// and liveliness 0x001b; reliability 0x001a, durability 0x001d, and history
-// 0x0040 reuse the existing rtps constants. The values below match the
-// Wireshark packet-rtps.c dissector PID table.
+// liveliness 0x001b, presentation 0x0021 (DDS 1.4 section 2.2.3.6), and
+// latency budget 0x0027 (DDS 1.4 section 2.2.3.8); reliability 0x001a,
+// durability 0x001d, and history 0x0040 reuse the existing rtps constants.
+// Values match the DDSI-RTPS Table 9.13 PID table and the Wireshark
+// packet-rtps.c dissector PID table. rtps/pid.go carries no presentation or
+// latency constants, so they live here to avoid touching the frozen file.
 const (
 	// writerQoSPIDDeadline carries the deadline period.
 	writerQoSPIDDeadline uint16 = 0x0023
@@ -41,6 +44,10 @@ const (
 	writerQoSPIDLifespan uint16 = 0x002b
 	// writerQoSPIDLiveliness carries the liveliness kind plus lease.
 	writerQoSPIDLiveliness uint16 = 0x001b
+	// writerQoSPIDPresentation carries the presentation access scope plus flags.
+	writerQoSPIDPresentation uint16 = 0x0021
+	// writerQoSPIDLatencyBudget carries the latency budget duration.
+	writerQoSPIDLatencyBudget uint16 = 0x0027
 )
 
 // Writer QoS wire kind values.
@@ -48,9 +55,10 @@ const (
 // DDS reliability kinds are best effort 1 and reliable 2. DDS durability
 // kinds are volatile 0, transient local 1, transient 2, and persistent 3.
 // DDS history kinds are keep last 0 and keep all 1. DDS liveliness kinds
-// are automatic 0, manual by participant 1, and manual by topic 2. Core
-// models only automatic plus manual by topic; transient, persistent, and
-// manual by participant have no core counterpart and reverse to unknown.
+// are automatic 0, manual by participant 1, and manual by topic 2. Forward
+// announces all 4 durability and all 3 liveliness kinds per DDS 1.4 sections
+// 2.2.3.4 and 2.2.3.11 so peers see our offer; RxO ordering lives in
+// core/matcher. Reverse keeps a lenient form for caps-aware matching.
 const (
 	// writerQoSReliabilityBestEffort is the DDS best effort kind.
 	writerQoSReliabilityBestEffort uint32 = 1
@@ -214,7 +222,8 @@ func decodeWireDuration(raw []byte, policy WriterPolicyKind) (WireDuration, erro
 //
 // It follows the ForwardQoS table shape: reliability kind plus
 // blocking time, durability kind only, history kind plus depth, deadline,
-// lifespan, and liveliness kind plus lease. Unspecified core durations map
+// lifespan, liveliness kind plus lease, presentation scope plus flags, and
+// latency budget. Unspecified core durations map
 // to DDS infinite, matching the forward rule; core matching treats
 // an unspecified offer and an infinite offer identically, so the mapping
 // preserves every RxO verdict.
@@ -223,9 +232,9 @@ type WireQoS struct {
 	ReliabilityKind uint32
 	// MaxBlockingTime is infinite for reliable and zero for best effort.
 	MaxBlockingTime WireDuration
-	// DurabilityKind is volatile 0 or transient local 1 on forward. The wire
-	// can also carry transient 2, persistent 3, or an unknown kind;
-	// ReverseQoS refuses those loudly with WireQoSReverseRefusal.
+	// DurabilityKind is volatile 0, transient local 1, transient 2, or
+	// persistent 3 on forward per DDS 1.4 section 2.2.3.4. Unknown kinds
+	// refuse loudly on strict reverse; the lenient caps path maps 2 and 3.
 	DurabilityKind uint32
 	// HistoryKind is keep last 0 or keep all 1.
 	HistoryKind uint32
@@ -235,11 +244,19 @@ type WireQoS struct {
 	Deadline WireDuration
 	// Lifespan is message expiry in DDS range.
 	Lifespan WireDuration
-	// LivelinessKind is automatic 0 or manual by topic 2 on forward. The wire
-	// can also carry manual by participant 1; ReverseQoS refuses it loudly.
+	// LivelinessKind is automatic 0, manual by participant 1, or manual by
+	// topic 2 on forward per DDS 1.4 section 2.2.3.11.
 	LivelinessKind uint32
 	// LeaseDuration is liveliness lease in DDS range.
 	LeaseDuration WireDuration
+	// PresentationScope is instance 0, topic 1, or group 2 per DDS 1.4 section 2.2.3.6.
+	PresentationScope uint32
+	// PresentationCoherent is 1 when coherent access is offered.
+	PresentationCoherent uint32
+	// PresentationOrdered is 1 when ordered access is offered.
+	PresentationOrdered uint32
+	// LatencyBudget is the maximum acceptable delay per DDS 1.4 section 2.2.3.8.
+	LatencyBudget WireDuration
 }
 
 // WireQoSRefusal is the typed loud refusal for an untranslatable setting.
@@ -361,12 +378,20 @@ func forwardReliabilityKind(topic, publisher, subscriber string, r core.Reliabil
 }
 
 // forwardDurabilityKind maps durability to the wire kind.
+//
+// All four DDS 1.4 section 2.2.3.4 kinds announce: volatile 0, transient
+// local 1, transient 2, persistent 3. Peers must see our offer for interop;
+// RxO ordering lives in core/matcher. Only unresolved markers refuse.
 func forwardDurabilityKind(topic, publisher, subscriber string, d core.DurabilityPolicy) (uint32, error) {
 	switch d { //nolint:exhaustive // default refuses unresolved markers with a typed error
 	case core.DurabilityVolatile:
 		return sedpDurabilityVolatile, nil
 	case core.DurabilityTransientLocal:
 		return sedpDurabilityTransientLocal, nil
+	case core.Durabilityqos4Transient:
+		return writerQoSDurabilityTransient, nil
+	case core.Durabilityqos4Persistent:
+		return writerQoSDurabilityPersistent, nil
 	default:
 		err := refuseWriterQoSError(topic, publisher, subscriber, core.PolicyDurability,
 			"durability %v needs resolution before forward translation", d)
@@ -401,10 +426,16 @@ func forwardHistoryKind(topic, publisher, subscriber string, h core.HistoryPolic
 }
 
 // forwardLivelinessKind maps liveliness to the wire kind.
+//
+// All three DDS 1.4 section 2.2.3.11 kinds announce: automatic 0, manual by
+// participant 1, manual by topic 2. Participant egress (ParticipantMessage)
+// stays backend-owned; this only announces the data-writer offer.
 func forwardLivelinessKind(topic, publisher, subscriber string, l core.LivelinessPolicy) (uint32, error) {
 	switch l { //nolint:exhaustive // default refuses unresolved markers with a typed error
 	case core.LivelinessAutomatic:
 		return writerQoSLivelinessAutomatic, nil
+	case core.Livelinessqos4ManualByParticipant:
+		return writerQoSLivelinessManualByParticipant, nil
 	case core.LivelinessManualByTopic:
 		return writerQoSLivelinessManualByTopic, nil
 	default:
@@ -412,6 +443,45 @@ func forwardLivelinessKind(topic, publisher, subscriber string, l core.Livelines
 			"liveliness %v needs resolution before forward translation", l)
 		return 0, err
 	}
+}
+
+// forwardPresentation maps presentation to wire scope plus flags.
+//
+// Access scope instance 0, topic 1, or group 2 announces directly per DDS 1.4
+// section 2.2.3.6; invalid scopes refuse loudly. Flags announce as 0/1.
+func forwardPresentation(topic, publisher, subscriber string, p core.PresentationQosPolicy) (uint32, uint32, uint32, error) {
+	switch p.AccessScope {
+	case core.PresentationInstance:
+		return 0, boolToWire(p.CoherentAccess), boolToWire(p.OrderedAccess), nil
+	case core.PresentationTopic:
+		return 1, boolToWire(p.CoherentAccess), boolToWire(p.OrderedAccess), nil
+	case core.PresentationGroup:
+		return 2, boolToWire(p.CoherentAccess), boolToWire(p.OrderedAccess), nil
+	default:
+		err := refuseWriterQoSError(topic, publisher, subscriber, core.PolicyPresentation,
+			"presentation scope %v needs resolution before forward translation", p.AccessScope)
+		return 0, 0, 0, err
+	}
+}
+
+// boolToWire renders one flag as 0/1 for the wire.
+func boolToWire(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// forwardLatencyBudget maps a latency budget to DDS range.
+//
+// Zero (unspecified) stays zero per DDS 1.4 section 2.2.3.8: it is the
+// concrete default of no extra delay, not infinite. Infinite maps to
+// infinite. All other values refuse like forwardWireDuration.
+func forwardLatencyBudget(topic, publisher, subscriber string, d core.Duration) (WireDuration, error) {
+	if d.IsUnspecified() {
+		return WireDuration{}, nil
+	}
+	return forwardWireDuration(topic, publisher, subscriber, d, core.PolicyLatencyBudget)
 }
 
 // forwardLifeDurations maps deadline, lifespan, and lease to DDS range.
@@ -436,15 +506,19 @@ func forwardLifeDurations(topic, publisher, subscriber string, p core.QoSProfile
 
 // ForwardQoS translates a resolved core profile to the SEDP-announced wire QoS.
 //
-// The input must carry concrete history, reliability, durability, and
-// liveliness: system default, best available, unknown, and invalid values
-// refuse loudly with the policy kind named. Keep last with depth zero
-// refuses; keep last depth above the uint32 wire range refuses; keep all
-// encodes depth zero because depth is ignored for keep all. Reliable maps
-// to infinite blocking and best effort to zero blocking. Unspecified
-// deadline, lifespan, and lease map to DDS infinite, matching the forward
-// rule. Topic plus publisher plus subscriber scope every refusal so
-// the loud event carries the full endpoint pair.
+// The input must carry concrete history, reliability, durability,
+// liveliness, and presentation: system default, best available, unknown,
+// and invalid values refuse loudly with the policy kind named. Keep last
+// with depth zero refuses; keep last depth above the uint32 wire range
+// refuses; keep all encodes depth zero because depth is ignored for keep
+// all. Reliable maps to infinite blocking and best effort to zero blocking.
+// Unspecified deadline, lifespan, and lease map to DDS infinite, matching
+// the forward rule. Presentation scope plus flags and latency budget announce
+// directly per DDS 1.4 sections 2.2.3.6 and 2.2.3.8. ParticipantMessage
+// egress for manual-by-participant assertion stays backend-owned (see
+// backend TODO); this only announces the data-writer offer. Topic plus
+// publisher plus subscriber scope every refusal so the loud event carries
+// the full endpoint pair.
 func ForwardQoS(topic, publisher, subscriber string, p core.QoSProfile) (WireQoS, error) {
 	var out WireQoS
 
@@ -477,6 +551,22 @@ func ForwardQoS(topic, publisher, subscriber string, p core.QoSProfile) (WireQoS
 	}
 
 	out.LivelinessKind = livelinessKind
+
+	scope, coherent, ordered, err := forwardPresentation(topic, publisher, subscriber, p.Presentation)
+	if err != nil {
+		return WireQoS{}, err
+	}
+
+	out.PresentationScope = scope
+	out.PresentationCoherent = coherent
+	out.PresentationOrdered = ordered
+
+	latency, err := forwardLatencyBudget(topic, publisher, subscriber, p.LatencyBudget.Duration)
+	if err != nil {
+		return WireQoS{}, err
+	}
+
+	out.LatencyBudget = latency
 
 	deadline, lifespan, lease, err := forwardLifeDurations(topic, publisher, subscriber, p)
 	if err != nil {
@@ -522,14 +612,42 @@ func (q WireQoS) encodeLiveliness() []byte {
 	return out
 }
 
+// encodePresentation renders the presentation PID value: scope plus flags.
+//
+// Layout is scope uint32 plus coherent uint32 plus ordered uint32 (12 bytes
+// LE) per the DDS PresentationQosPolicy shape in 2.2.3.6; flags are 0/1.
+func (q WireQoS) encodePresentation() []byte {
+	out := make([]byte, 0, 12)
+	out = binary.LittleEndian.AppendUint32(out, q.PresentationScope)
+	out = binary.LittleEndian.AppendUint32(out, q.PresentationCoherent)
+	out = binary.LittleEndian.AppendUint32(out, q.PresentationOrdered)
+
+	return out
+}
+
+// encodeLatencyBudget renders the latency budget PID value: duration only.
+func (q WireQoS) encodeLatencyBudget() []byte {
+	return q.LatencyBudget.encode()
+}
+
+// decodePresentation parses one 12 byte presentation value.
+func decodePresentation(raw []byte) (uint32, uint32, uint32, error) {
+	if len(raw) != 12 {
+		return 0, 0, 0, refuseParseError(core.PolicyPresentation, "presentation length %d, want 12", len(raw))
+	}
+
+	return binary.LittleEndian.Uint32(raw[:4]), binary.LittleEndian.Uint32(raw[4:8]), binary.LittleEndian.Uint32(raw[8:12]), nil
+}
+
 // Validate checks that q carries only announcable wire values.
 //
 // It mirrors the forward contract: reliability best effort or reliable,
-// durability volatile or transient local, history keep last with positive
-// depth or keep all with zero depth, liveliness automatic or manual by
-// topic, and durations either infinite or finite in DDS range with
-// nanoseconds below one second. Blocking matches reliability: infinite for
-// reliable, zero for best effort. Failures return a loud
+// durability volatile, transient local, transient, or persistent, history
+// keep last with positive depth or keep all with zero depth, liveliness
+// automatic, manual by participant, or manual by topic, presentation scope
+// 0-2 with 0/1 flags, and durations either infinite or finite in DDS range
+// with nanoseconds below one second. Blocking matches reliability: infinite
+// for reliable, zero for best effort. Failures return a loud
 // WireQoSParseRefusal naming the policy so callers fail closed before
 // encoding. It never touches topic context; forward refusals with topic
 // come from ForwardQoS.
@@ -571,32 +689,56 @@ func (q WireQoS) Validate() error {
 	if err := q.validateWireReliability(); err != nil {
 		return err
 	}
-
-	if q.DurabilityKind != sedpDurabilityVolatile && q.DurabilityKind != sedpDurabilityTransientLocal {
-		return refuseParseError(core.PolicyDurability, "durability kind %d is not announcable", q.DurabilityKind)
+	if err := q.validateWireDurability(); err != nil {
+		return err
 	}
-
 	if err := q.validateWireHistory(); err != nil {
 		return err
 	}
+	if err := q.validateWireDeadlines(); err != nil {
+		return err
+	}
+	if err := q.validateWireLiveliness(); err != nil {
+		return err
+	}
+	return q.validateWirePresentation()
+}
 
+// validateWireDurability checks durability kind announcability.
+func (q WireQoS) validateWireDurability() error {
+	if q.DurabilityKind == sedpDurabilityVolatile || q.DurabilityKind == sedpDurabilityTransientLocal ||
+		q.DurabilityKind == writerQoSDurabilityTransient || q.DurabilityKind == writerQoSDurabilityPersistent {
+		return nil
+	}
+	return refuseParseError(core.PolicyDurability, "durability kind %d is not announcable", q.DurabilityKind)
+}
+
+// validateWireDeadlines checks deadline plus lifespan durations.
+func (q WireQoS) validateWireDeadlines() error {
 	if err := validateWireDuration(q.Deadline, core.PolicyDeadline); err != nil {
 		return err
 	}
+	return validateWireDuration(q.Lifespan, WriterPolicyLifespan)
+}
 
-	if err := validateWireDuration(q.Lifespan, WriterPolicyLifespan); err != nil {
-		return err
-	}
-
-	if q.LivelinessKind != writerQoSLivelinessAutomatic && q.LivelinessKind != writerQoSLivelinessManualByTopic {
+// validateWireLiveliness checks liveliness kind plus lease duration.
+func (q WireQoS) validateWireLiveliness() error {
+	if q.LivelinessKind != writerQoSLivelinessAutomatic && q.LivelinessKind != writerQoSLivelinessManualByParticipant &&
+		q.LivelinessKind != writerQoSLivelinessManualByTopic {
 		return refuseParseError(core.PolicyLiveliness, "liveliness kind %d is not announcable", q.LivelinessKind)
 	}
+	return validateWireDuration(q.LeaseDuration, core.PolicyLeaseDuration)
+}
 
-	if err := validateWireDuration(q.LeaseDuration, core.PolicyLeaseDuration); err != nil {
-		return err
+// validateWirePresentation checks presentation scope plus flags and latency.
+func (q WireQoS) validateWirePresentation() error {
+	if q.PresentationScope > 2 {
+		return refuseParseError(core.PolicyPresentation, "presentation scope %d is unknown", q.PresentationScope)
 	}
-
-	return nil
+	if q.PresentationCoherent > 1 || q.PresentationOrdered > 1 {
+		return refuseParseError(core.PolicyPresentation, "presentation flags must be 0/1")
+	}
+	return validateWireDuration(q.LatencyBudget, core.PolicyLatencyBudget)
 }
 
 // validateWireDuration checks one wire duration is infinite or finite in range.
@@ -640,15 +782,21 @@ func (q WireQoS) ValidatedParams() ([]rtps.Param, error) {
 		{ID: writerQoSPIDDeadline, Value: q.Deadline.encode()},
 		{ID: writerQoSPIDLifespan, Value: q.Lifespan.encode()},
 		{ID: writerQoSPIDLiveliness, Value: q.encodeLiveliness()},
+		{ID: writerQoSPIDPresentation, Value: q.encodePresentation()},
+		{ID: writerQoSPIDLatencyBudget, Value: q.encodeLatencyBudget()},
 	}, nil
 }
 
 // Params renders q as SEDP inline QoS params in canonical order.
 //
-// Order is reliability, history, durability, then deadline, lifespan, and
-// liveliness: the first three keep their existing SerializeSEDPDATA
-// relative order and the new PIDs append after, so a future announce call
-// site can splice this list in without reordering the old bytes. It
+// Order is reliability, history, durability, then deadline, lifespan,
+// liveliness, presentation, and latency budget: the first three keep their
+// existing SerializeSEDPDATA relative order and the new PIDs append after,
+// so a future announce call site can splice this list in without reordering
+// the old bytes. SEDP announce wiring lives in sedp.go (NOT owned here):
+// TODO backend agent - splice ValidatedParams/Params into SerializeSEDPDATA
+// and decode PID 0x0021/0x0027 in sedpEndpointFields via the
+// DecodePresentation/DecodeLatencyBudget helpers below.
 // validates before encoding and panics loudly on invalid input because a
 // manually constructed invalid WireQoS is a programmer error; production
 // ForwardQoS output always validates. Never call Params with
@@ -715,42 +863,130 @@ func parseWireHistory(byID map[uint16][]byte) (uint32, uint32, error) {
 	return binary.LittleEndian.Uint32(raw[:4]), binary.LittleEndian.Uint32(raw[4:8]), nil
 }
 
-// parseWireOptionalDurations decodes optional deadline, lifespan, and liveliness.
+// parseWireOptionalDurations decodes optional deadline, lifespan, liveliness, presentation, and latency budget.
 func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
-	if raw, seen := byID[writerQoSPIDDeadline]; seen {
-		deadline, err := decodeWireDuration(raw, core.PolicyDeadline)
-		if err != nil {
-			return err
-		}
-
-		out.Deadline = deadline
+	if err := parseWireDeadline(byID, out); err != nil {
+		return err
 	}
-
-	if raw, seen := byID[writerQoSPIDLifespan]; seen {
-		lifespan, err := decodeWireDuration(raw, WriterPolicyLifespan)
-		if err != nil {
-			return err
-		}
-
-		out.Lifespan = lifespan
+	if err := parseWireLifespan(byID, out); err != nil {
+		return err
 	}
-
-	if raw, seen := byID[writerQoSPIDLiveliness]; seen {
-		if len(raw) != 12 {
-			return refuseParseError(core.PolicyLiveliness, "liveliness length %d, want 12", len(raw))
-		}
-
-		out.LivelinessKind = binary.LittleEndian.Uint32(raw[:4])
-
-		lease, err := decodeWireDuration(raw[4:12], core.PolicyLeaseDuration)
-		if err != nil {
-			return err
-		}
-
-		out.LeaseDuration = lease
+	if err := parseWireLiveliness(byID, out); err != nil {
+		return err
 	}
+	if err := parseWirePresentation(byID, out); err != nil {
+		return err
+	}
+	return parseWireLatencyBudget(byID, out)
+}
 
+// parseWireDeadline decodes optional deadline duration.
+func parseWireDeadline(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDDeadline]
+	if !seen {
+		return nil
+	}
+	deadline, err := decodeWireDuration(raw, core.PolicyDeadline)
+	if err != nil {
+		return err
+	}
+	out.Deadline = deadline
 	return nil
+}
+
+// parseWireLifespan decodes optional lifespan duration.
+func parseWireLifespan(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDLifespan]
+	if !seen {
+		return nil
+	}
+	lifespan, err := decodeWireDuration(raw, WriterPolicyLifespan)
+	if err != nil {
+		return err
+	}
+	out.Lifespan = lifespan
+	return nil
+}
+
+// parseWireLiveliness decodes optional liveliness kind plus lease.
+func parseWireLiveliness(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDLiveliness]
+	if !seen {
+		return nil
+	}
+	if len(raw) != 12 {
+		return refuseParseError(core.PolicyLiveliness, "liveliness length %d, want 12", len(raw))
+	}
+	out.LivelinessKind = binary.LittleEndian.Uint32(raw[:4])
+	lease, err := decodeWireDuration(raw[4:12], core.PolicyLeaseDuration)
+	if err != nil {
+		return err
+	}
+	out.LeaseDuration = lease
+	return nil
+}
+
+// parseWirePresentation decodes optional presentation value.
+func parseWirePresentation(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDPresentation]
+	if !seen {
+		return nil
+	}
+	scope, coherent, ordered, err := decodePresentation(raw)
+	if err != nil {
+		return err
+	}
+	out.PresentationScope = scope
+	out.PresentationCoherent = coherent
+	out.PresentationOrdered = ordered
+	return nil
+}
+
+// parseWireLatencyBudget decodes optional latency budget duration.
+func parseWireLatencyBudget(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDLatencyBudget]
+	if !seen {
+		return nil
+	}
+	budget, err := decodeWireDuration(raw, core.PolicyLatencyBudget)
+	if err != nil {
+		return err
+	}
+	out.LatencyBudget = budget
+	return nil
+}
+
+// DecodePresentation parses one presentation value for SEDP wiring.
+//
+// Layout is scope plus coherent plus ordered (12 bytes LE). It exists here
+// so sedp.go (NOT owned) can wire PID 0x0021 without touching this file:
+// TODO backend agent - call DecodePresentation in sedpEndpointFields for
+// PID 0x0021 and carry scope plus flags on SEDPEndpoint.
+func DecodePresentation(raw []byte) (scope, coherent, ordered uint32, err error) {
+	return decodePresentation(raw)
+}
+
+// EncodePresentation renders one presentation value for SEDP announce.
+func EncodePresentation(scope, coherent, ordered uint32) []byte {
+	out := make([]byte, 0, 12)
+	out = binary.LittleEndian.AppendUint32(out, scope)
+	out = binary.LittleEndian.AppendUint32(out, coherent)
+	out = binary.LittleEndian.AppendUint32(out, ordered)
+
+	return out
+}
+
+// DecodeLatencyBudget parses one latency budget value for SEDP wiring.
+//
+// TODO backend agent - call DecodeLatencyBudget in sedpEndpointFields for
+// PID 0x0027 and carry the duration on SEDPEndpoint.
+func DecodeLatencyBudget(raw []byte) (WireDuration, error) {
+	return decodeWireDuration(raw, core.PolicyLatencyBudget)
+}
+
+// EncodeLatencyBudget renders one latency budget value for SEDP announce.
+func EncodeLatencyBudget(d WireDuration) []byte {
+	return d.encode()
 }
 
 // ParseWireQoS decodes observed vendor SEDP QoS params into wire values.
@@ -806,6 +1042,10 @@ func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	out.Lifespan = InfiniteWireDuration()
 	out.LivelinessKind = writerQoSLivelinessAutomatic
 	out.LeaseDuration = InfiniteWireDuration()
+	out.PresentationScope = 0
+	out.PresentationCoherent = 0
+	out.PresentationOrdered = 0
+	out.LatencyBudget = WireDuration{}
 
 	err = parseWireOptionalDurations(byID, &out)
 	if err != nil {
@@ -826,6 +1066,75 @@ func ParseWireQoSEndian(params []rtps.Param, littleEndian bool) (WireQoS, error)
 	}
 
 	return ParseWireQoS(params)
+}
+
+// sedp3FacadeWireQoSsedp3 returns the wire QoS matching the facade announce.
+//
+// The facade always announces reliable keep-last depth 100 with infinite
+// deadline, lifespan, lease and automatic liveliness, varying only
+// durability: volatile for readers that request volatile (ros2 topic echo
+// semantics) and transient local otherwise. This differs from the DDS spec
+// defaults for absent QoS (best-effort, volatile, keep-last depth 1 per DDS
+// 1.4 2.2.3), which ParseWireQoSsedp3WithDefaults applies to peers that omit
+// PIDs: the facade is Weld's chosen interop offer, not the spec default,
+// so a blank peer decodes to best-effort while Weld announces reliable,
+// and the blank-peer matrix stays asymmetric by design.
+func sedp3FacadeWireQoSsedp3(volatile bool) WireQoS {
+	durability := sedpDurabilityTransientLocal
+	if volatile {
+		durability = sedpDurabilityVolatile
+	}
+
+	return WireQoS{
+		ReliabilityKind: sedpReliabilityReliable,
+		MaxBlockingTime: InfiniteWireDuration(),
+		DurabilityKind:  durability,
+		HistoryKind:     sedpHistoryKeepLast,
+		Depth:           sedpHistoryDepth,
+		Deadline:        InfiniteWireDuration(),
+		Lifespan:        InfiniteWireDuration(),
+		LivelinessKind:  writerQoSLivelinessAutomatic,
+		LeaseDuration:   InfiniteWireDuration(),
+	}
+}
+
+// ParseWireQoSsedp3WithDefaults decodes vendor SEDP QoS params with DDS spec
+// defaults for absent policies.
+//
+// DDS 1.4 2.2.3: an unspecified QoS policy means its default value, so
+// absent reliability, durability, or history PIDs decode to best-effort
+// with zero blocking, volatile, and keep-last depth 1 instead of failing.
+// Present-but-malformed values still fail loudly, and big-endian params
+// refuse loudly like ParseWireQoSEndian. First-wins preserves inline over
+// payload on conflict.
+func ParseWireQoSsedp3WithDefaults(params []rtps.Param, littleEndian bool) (WireQoS, error) {
+	if !littleEndian {
+		return WireQoS{}, &WireQoSParseRefusal{Policy: core.PolicyReliability, Detail: "big-endian SEDP QoS params are not supported"}
+	}
+
+	byID := make(map[uint16][]byte, len(params))
+	for _, param := range params {
+		if _, seen := byID[param.ID]; seen {
+			continue
+		}
+		byID[param.ID] = param.Value
+	}
+
+	filled := append([]rtps.Param(nil), params...)
+	if _, seen := byID[rtps.PIDReliability]; !seen {
+		def := WireQoS{ReliabilityKind: writerQoSReliabilityBestEffort, MaxBlockingTime: WireDuration{}}
+		filled = append(filled, rtps.Param{ID: rtps.PIDReliability, Value: def.encodeReliability()})
+	}
+	if _, seen := byID[rtps.PIDDurability]; !seen {
+		def := WireQoS{DurabilityKind: sedpDurabilityVolatile}
+		filled = append(filled, rtps.Param{ID: rtps.PIDDurability, Value: def.encodeDurability()})
+	}
+	if _, seen := byID[rtps.PIDHistory]; !seen {
+		def := WireQoS{HistoryKind: sedpHistoryKeepLast, Depth: 1}
+		filled = append(filled, rtps.Param{ID: rtps.PIDHistory, Value: def.encodeHistory()})
+	}
+
+	return ParseWireQoS(filled)
 }
 
 // reverseWireDuration maps a wire duration back to a core duration.
@@ -879,17 +1188,19 @@ func reverseReliability(q WireQoS) (core.ReliabilityPolicy, WriterPolicyKind, er
 
 // reverseDurability maps wire durability kind to core durability.
 //
-// Volatile and transient local map directly. Transient, persistent, and
-// any unknown kind refuse loudly instead of mapping to Unknown: Unknown
-// would pass compat silently and misroute durability enforcement.
+// All four DDS 1.4 section 2.2.3.4 kinds map directly for interop; unknown
+// kinds refuse loudly instead of mapping to Unknown that would pass compat
+// silently and misroute durability enforcement.
 func reverseDurability(q WireQoS) (core.DurabilityPolicy, WriterPolicyKind, error) {
 	switch q.DurabilityKind {
 	case sedpDurabilityVolatile:
 		return core.DurabilityVolatile, "", nil
 	case sedpDurabilityTransientLocal:
 		return core.DurabilityTransientLocal, "", nil
-	case writerQoSDurabilityTransient, writerQoSDurabilityPersistent:
-		return core.DurabilityPolicy(0), core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d needs crypto-backed transient storage", q.DurabilityKind)
+	case writerQoSDurabilityTransient:
+		return core.Durabilityqos4Transient, "", nil
+	case writerQoSDurabilityPersistent:
+		return core.Durabilityqos4Persistent, "", nil
 	default:
 		return core.DurabilityPolicy(0), core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d is unknown", q.DurabilityKind)
 	}
@@ -897,20 +1208,44 @@ func reverseDurability(q WireQoS) (core.DurabilityPolicy, WriterPolicyKind, erro
 
 // reverseLiveliness maps wire liveliness kind to core liveliness.
 //
-// Automatic and manual by topic map directly. Manual by participant
-// refuses loudly instead of mapping to Unknown: Unknown would pass
-// compat silently. Unknown kinds refuse loudly with the policy named.
+// All three DDS 1.4 section 2.2.3.11 kinds map directly for interop. Unknown
+// kinds refuse loudly with the policy named.
 func reverseLiveliness(q WireQoS) (core.LivelinessPolicy, WriterPolicyKind, error) {
 	switch q.LivelinessKind {
 	case writerQoSLivelinessAutomatic:
 		return core.LivelinessAutomatic, "", nil
+	case writerQoSLivelinessManualByParticipant:
+		return core.Livelinessqos4ManualByParticipant, "", nil
 	case writerQoSLivelinessManualByTopic:
 		return core.LivelinessManualByTopic, "", nil
-	case writerQoSLivelinessManualByParticipant:
-		return core.LivelinessPolicy(0), core.PolicyLiveliness, refuseReverseError(core.PolicyLiveliness, "manual by participant kind %d has no core counterpart", q.LivelinessKind)
 	default:
 		return core.LivelinessPolicy(0), core.PolicyLiveliness, refuseReverseError(core.PolicyLiveliness, "liveliness kind %d is unknown", q.LivelinessKind)
 	}
+}
+
+// reversePresentation maps wire presentation to the core policy.
+//
+// Scope 0-2 maps to instance/topic/group; flags nonzero mean true. Out of
+// range scopes or flags above 1 refuse loudly fail-closed per DDS 1.4
+// section 2.2.3.6.
+func reversePresentation(q WireQoS) (core.PresentationQosPolicy, WriterPolicyKind, error) {
+	var out core.PresentationQosPolicy
+	switch q.PresentationScope {
+	case 0:
+		out.AccessScope = core.PresentationInstance
+	case 1:
+		out.AccessScope = core.PresentationTopic
+	case 2:
+		out.AccessScope = core.PresentationGroup
+	default:
+		return core.PresentationQosPolicy{}, core.PolicyPresentation, refuseReverseError(core.PolicyPresentation, "presentation scope %d is unknown", q.PresentationScope)
+	}
+	if q.PresentationCoherent > 1 || q.PresentationOrdered > 1 {
+		return core.PresentationQosPolicy{}, core.PolicyPresentation, refuseReverseError(core.PolicyPresentation, "presentation flags must be 0/1")
+	}
+	out.CoherentAccess = q.PresentationCoherent == 1
+	out.OrderedAccess = q.PresentationOrdered == 1
+	return out, "", nil
 }
 
 // reverseLifeDurations maps wire deadline, lifespan, and lease to core durations.
@@ -976,19 +1311,31 @@ func reverseWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 	out.Lifespan = lifespan
 	out.LeaseDuration = lease
 
+	presentation, policy, err := reversePresentation(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Presentation = presentation
+
+	latency, err := reverseWireDuration(q.LatencyBudget, core.PolicyLatencyBudget)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyLatencyBudget, err
+	}
+
+	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
+
 	return out, "", nil
 }
 
 // ReverseQoS translates a wire QoS back to a core profile for matching.
 //
-// It mirrors the ReverseQoS shape: keep all maps directly and
-// reliable plus best effort map directly, while transient, persistent,
-// and manual by participant kinds refuse loudly with typed
-// WireQoSReverseRefusal instead of mapping to Unknown that would pass
-// compat silently. Unknown history, reliability, durability, and
-// liveliness kinds refuse loudly with the policy kind named. Durations
-// convert with infinite mapping. The avoidance flag is never carried on
-// the wire and returns false.
+// All durability, liveliness, presentation, and latency kinds map directly
+// per DDS 1.4 sections 2.2.3.4, 2.2.3.11, 2.2.3.6, and 2.2.3.8. Unknown
+// history, reliability, durability, liveliness, and presentation values
+// refuse loudly with the policy kind named. Durations convert with infinite
+// mapping. The avoidance flag is never carried on the wire and returns
+// false.
 func ReverseQoS(q WireQoS) (core.QoSProfile, error) {
 	out, policy, err := reverseWithPolicy(q)
 	if err != nil {
@@ -1000,12 +1347,15 @@ func ReverseQoS(q WireQoS) (core.QoSProfile, error) {
 
 // reverseRxOWithPolicy translates only RxO-relevant wire fields back for matching.
 //
-// It reverses reliability, durability, deadline, liveliness, and lease and
-// delegates to core.CheckCompatibility, so history, depth, lifespan, and the
-// avoidance flag never affect the verdict, matching the documented contract
-// and core semantics. Non-RxO translation failures are ignored; RxO failures
-// yield a refusing policy for the loud incompatible report. ReverseQoS stays
-// for callers that need the full profile including history and lifespan.
+// It reverses reliability, durability, deadline, liveliness, lease,
+// presentation, and latency budget and delegates to core.CheckCompatibility,
+// so the verdict reuses the exact matcher semantics for those policies:
+// translated offers match identically to facade offers. History, depth,
+// lifespan, and the avoidance flag never affect the verdict, matching the
+// documented contract and core semantics. Non-RxO translation failures are
+// ignored; RxO failures yield a refusing policy for the loud incompatible
+// report. ReverseQoS stays for callers that need the full profile including
+// history and lifespan.
 func reverseRxOWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 	var out core.QoSProfile
 
@@ -1044,21 +1394,78 @@ func reverseRxOWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) 
 
 	out.LeaseDuration = lease
 
+	presentation, policy, err := reversePresentation(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Presentation = presentation
+
+	latency, err := reverseWireDuration(q.LatencyBudget, core.PolicyLatencyBudget)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyLatencyBudget, err
+	}
+
+	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
+
 	return out, "", nil
 }
 
 // CheckWireCompatibility applies the core RxO rules to translated wire values.
 //
-// It reverses only RxO-relevant fields (reliability, durability, deadline,
-// liveliness, lease) back to core profiles and delegates to
-// core.CheckCompatibility, so the verdict reuses the exact matcher
-// semantics for those policies: translated offers match identically to
-// facade offers. History, depth, lifespan, and the avoidance flag never
-// affect the result, matching core. A side that fails RxO reverse
-// translation yields an incompatible report naming the refusing policy
-// instead of flowing silently. ReverseQoS stays for callers that need the
-// full profile.
-func CheckWireCompatibility(offered, requested WireQoS) core.CompatibilityReport {
+// It reverses RxO-relevant fields (reliability, durability, deadline,
+// liveliness, lease, presentation, latency budget) back to core profiles
+// and delegates to core.CheckCompatibility, so the verdict reuses the exact
+// matcher semantics: translated offers match identically to facade offers.
+// History, depth, lifespan, and the avoidance flag never affect the result,
+// matching core. A side that fails RxO reverse translation yields an
+// incompatible report naming the refusing policy instead of flowing
+// silently. ReverseQoS stays for callers that need the full profile.
+//
+// Durability-service caps are optional: with no caps the verdict is the
+// plain core check and VOLATILE plus TRANSIENT_LOCAL pairs stay
+// byte-identical. With exactly two caps (offered, requested) the path
+// reverses durability leniently (wire 2 maps to core transient, wire 3 to
+// core persistent) then delegates to Checkqos4CompatibilityWithDurabilityService,
+// so TRANSIENT and PERSISTENT pairs enforce caps while VOLATILE and
+// TRANSIENT_LOCAL still bypass. Any other caps count fails closed as
+// incompatible, never silently. SEDP callers should pass each endpoint's
+// DurabilityService caps once both sides carry them; see durability.go.
+func CheckWireCompatibility(offered, requested WireQoS, caps ...DurabilityServiceQoS) core.CompatibilityReport {
+	if len(caps) == 0 {
+		return checkWireCompatibilityStrict(offered, requested)
+	}
+	if len(caps) != 2 {
+		return core.CompatibilityReport{
+			Compatible: false,
+			Errors: []core.CompatibilityIssue{
+				{Kind: core.PolicyDurability, Detail: "durability service caps must be offered plus requested pair"},
+			},
+		}
+	}
+	offeredProfile, offeredPolicy, offeredErr := reverseRxOLenient(offered)
+	requestedProfile, requestedPolicy, requestedErr := reverseRxOLenient(requested)
+	if offeredErr != nil || requestedErr != nil {
+		report := core.CompatibilityReport{Compatible: false}
+		if offeredErr != nil {
+			report.Errors = append(report.Errors, core.CompatibilityIssue{
+				Kind:   offeredPolicy,
+				Detail: "offered wire QoS refuses reverse translation: " + offeredErr.Error(),
+			})
+		}
+		if requestedErr != nil {
+			report.Errors = append(report.Errors, core.CompatibilityIssue{
+				Kind:   requestedPolicy,
+				Detail: "requested wire QoS refuses reverse translation: " + requestedErr.Error(),
+			})
+		}
+		return report
+	}
+	return Checkqos4CompatibilityWithDurabilityService(offeredProfile, requestedProfile, caps[0], caps[1])
+}
+
+// checkWireCompatibilityStrict applies the plain core RxO rules without caps.
+func checkWireCompatibilityStrict(offered, requested WireQoS) core.CompatibilityReport {
 	offeredProfile, offeredPolicy, offeredErr := reverseRxOWithPolicy(offered)
 	requestedProfile, requestedPolicy, requestedErr := reverseRxOWithPolicy(requested)
 
@@ -1083,4 +1490,87 @@ func CheckWireCompatibility(offered, requested WireQoS) core.CompatibilityReport
 	}
 
 	return core.CheckCompatibility(offeredProfile, requestedProfile)
+}
+
+// CheckWireCompatibilityWithDurabilityService applies the core RxO rules
+// plus durability-service caps to translated wire values.
+//
+// It reverses RxO fields (all durability and liveliness kinds map directly
+// since forward announces every kind) then delegates to
+// Checkqos4CompatibilityWithDurabilityService. VOLATILE and TRANSIENT_LOCAL
+// pairs return the core report unchanged; TRANSIENT and PERSISTENT pairs
+// enforce caps fail-closed. A side that fails reverse still yields
+// an incompatible report naming the refusing policy. Prefer passing caps
+// through CheckWireCompatibility; this named form exists for callers that
+// always carry caps.
+func CheckWireCompatibilityWithDurabilityService(offered, requested WireQoS, offeredCaps, requestedCaps DurabilityServiceQoS) core.CompatibilityReport {
+	return CheckWireCompatibility(offered, requested, offeredCaps, requestedCaps)
+}
+
+// reverseRxOLenient translates RxO wire fields with transient and persistent
+// durability mapped instead of refused.
+//
+// All durability, liveliness, presentation, and latency kinds map exactly
+// like reverseRxOWithPolicy; this lenient form is kept for the caps-aware
+// compatibility path so durability-service enforces per DDS 1.4 section
+// 2.2.3.5. It now delegates to the shared reverse helpers.
+func reverseRxOLenient(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
+	var out core.QoSProfile
+
+	reliability, policy, err := reverseReliability(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Reliability = reliability
+
+	switch q.DurabilityKind {
+	case sedpDurabilityVolatile:
+		out.Durability = core.DurabilityVolatile
+	case sedpDurabilityTransientLocal:
+		out.Durability = core.DurabilityTransientLocal
+	case writerQoSDurabilityTransient:
+		out.Durability = core.Durabilityqos4Transient
+	case writerQoSDurabilityPersistent:
+		out.Durability = core.Durabilityqos4Persistent
+	default:
+		return core.QoSProfile{}, core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d is unknown", q.DurabilityKind)
+	}
+
+	liveliness, policy, err := reverseLiveliness(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Liveliness = liveliness
+
+	deadline, err := reverseWireDuration(q.Deadline, core.PolicyDeadline)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyDeadline, err
+	}
+
+	out.Deadline = deadline
+
+	lease, err := reverseWireDuration(q.LeaseDuration, core.PolicyLeaseDuration)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyLeaseDuration, err
+	}
+
+	out.LeaseDuration = lease
+
+	presentation, policy, err := reversePresentation(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Presentation = presentation
+
+	latency, err := reverseWireDuration(q.LatencyBudget, core.PolicyLatencyBudget)
+	if err != nil {
+		return core.QoSProfile{}, core.PolicyLatencyBudget, err
+	}
+
+	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
+
+	return out, "", nil
 }

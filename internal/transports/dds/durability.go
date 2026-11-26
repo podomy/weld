@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 )
 
@@ -739,6 +740,83 @@ func checkResourceLimit(name string, offered, requested int32) string {
 	return ""
 }
 
+// Checkqos4CompatibilityWithDurabilityService checks core RxO plus durability-service.
+//
+// It delegates to core.CheckCompatibility first and returns directly when
+// incompatible, preserving error order. When compatible and either side
+// uses TRANSIENT or PERSISTENT durability it also runs
+// CheckDurabilityServiceCompat and appends any mismatch as a durability
+// error. VOLATILE and TRANSIENT_LOCAL pairs return the core report
+// unchanged, so those paths stay byte-identical. Missing caps use the
+// zero value where unstated fields impose no constraint.
+func Checkqos4CompatibilityWithDurabilityService(offered, requested core.QoSProfile, offeredCaps, requestedCaps DurabilityServiceQoS) core.CompatibilityReport {
+	report := core.CheckCompatibility(offered, requested)
+	if !report.Compatible {
+		return report
+	}
+	if !needsqos4DurabilityServiceCheck(offered.Durability, requested.Durability) {
+		return report
+	}
+	result := CheckDurabilityServiceCompat(offeredCaps, requestedCaps)
+	if result.Compatible {
+		return report
+	}
+	report.Compatible = false
+	report.Errors = append(report.Errors, core.CompatibilityIssue{Kind: core.PolicyDurability, Detail: result.Reason})
+	return report
+}
+
+// needsqos4DurabilityServiceCheck reports whether durability-service applies.
+func needsqos4DurabilityServiceCheck(offered, requested core.DurabilityPolicy) bool {
+	return offered == core.Durabilityqos4Transient || offered == core.Durabilityqos4Persistent || requested == core.Durabilityqos4Transient || requested == core.Durabilityqos4Persistent
+}
+
+// ExpiredByLifespan reports whether one sample expired under its lifespan
+// per DDS 1.4 section 2.2.3.16.
+//
+// nowNanos and sourceTimestampNanos are nanosecond timestamps on one clock
+// (compare with the deadline tracker int64 nanos basis). Unspecified and
+// infinite lifespans never expire. Malformed lifespans (negative seconds,
+// nanoseconds at or above one second, or the best available sentinel)
+// expire fail-closed so skipped validation can never serve stale data
+// silently. A source timestamp after now never expires, so clock skew keeps
+// rather than drops. Otherwise the sample expires when now minus source
+// exceeds the lifespan total.
+func ExpiredByLifespan(nowNanos, sourceTimestampNanos int64, lifespan core.Duration) bool {
+	if lifespan.IsUnspecified() || lifespan.IsInfinite() {
+		return false
+	}
+	if lifespan.Seconds < 0 || lifespan.Nanoseconds >= 1000000000 || core.IsBestAvailableDuration(lifespan) {
+		return true
+	}
+	if sourceTimestampNanos > nowNanos {
+		return false
+	}
+	return nowNanos-sourceTimestampNanos > lifespan.TotalNanoseconds()
+}
+
+// SweepLifespan filters samples expired under lifespan per DDS 1.4 section
+// 2.2.3.16.
+//
+// sourceTimestamp extracts the source nanosecond timestamp of one sample.
+// Unspecified and infinite lifespans keep every sample with no allocation
+// beyond the output slice shape; malformed lifespans drop every sample
+// fail-closed through ExpiredByLifespan. Future timestamps are kept. It
+// returns the kept samples in input order plus the expired count for loud
+// accounting. Datapath wiring (calling this on the history cache before
+// read or take) lives outside this file; see the INTEGRATION note below.
+func SweepLifespan[T any](nowNanos int64, lifespan core.Duration, samples []T, sourceTimestamp func(T) int64) (kept []T, expired int) {
+	kept = make([]T, 0, len(samples))
+	for _, s := range samples {
+		if ExpiredByLifespan(nowNanos, sourceTimestamp(s), lifespan) {
+			expired++
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return kept, expired
+}
+
 // INTEGRATION state for durability-service wiring:
 //
 //  1. DONE sedp.go announce: DurabilityServiceParam(WeldDurabilityServiceQoS())
@@ -752,10 +830,25 @@ func checkResourceLimit(name string, offered, requested int32) string {
 //     total; ReplayBound stays as the keyless single-instance wrapper with
 //     identical behavior. The single reliability.go caller still passes the
 //     keyless path (read only here); keyed callers pass the live count next.
-//  4. matcher.go extension: call CheckDurabilityServiceCompat from the
-//     endpoint pair path next to CheckCompatibility
-//     (internal/core/matcher.go:234) once SEDPEndpoint carries both sides;
-//     history, depth, and lifespan stay RxO neutral there as today.
+//  4. DONE matcher extension: Checkqos4CompatibilityWithDurabilityService
+//     calls core.CheckCompatibility plus CheckDurabilityServiceCompat for
+//     TRANSIENT and PERSISTENT kinds only; VOLATILE and TRANSIENT_LOCAL
+//     return the core report unchanged.
+//     DONE wire path: CheckWireCompatibilityWithDurabilityService in
+//     writerqos.go reverses RxO fields then delegates here; the plain
+//     CheckWireCompatibility variadic caps path enforces TRANSIENT and
+//     PERSISTENT when both caps are supplied and bypasses otherwise, so
+//     VOLATILE and TRANSIENT_LOCAL stay byte-identical. History, depth,
+//     and lifespan stay RxO neutral there as today.
 //  5. actual-QoS getter: surface NegotiateDepth through an EffectiveDepth
 //     field on the endpoint actual profile shape (see ActualQoS in
 //     internal/core/endpoint.go:169) without changing RequestedQoS.
+
+// Lifespan expiry (DDS 1.4 section 2.2.3.16): ExpiredByLifespan plus
+// SweepLifespan above implement the pure expiry predicate and filter.
+// TODO backend agent (datapath owner, NOT this file): call SweepLifespan
+// from the datapath Take/TakeFrom paths and the readtake collect path
+// (collectMatching/scanHistoryLocked) plus observeData before serving
+// history, count expired loudly, and never serve an expired sample once
+// its lifespan lapsed. Lifespan is publisher-side expiry and stays RxO
+// neutral in matching; this is enforcement, not compatibility.

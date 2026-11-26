@@ -93,6 +93,12 @@ func policyValue(kind PolicyKind, p QoSProfile) string {
 		return p.Liveliness.String()
 	case PolicyLeaseDuration:
 		return p.LeaseDuration.String()
+	case Policyqos4Ownership:
+		return p.Ownershipqos4.String()
+	case PolicyPresentation:
+		return p.Presentation.String()
+	case PolicyLatencyBudget:
+		return p.LatencyBudget.String()
 	default:
 		return "invalid"
 	}

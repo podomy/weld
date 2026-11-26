@@ -1705,7 +1705,12 @@ func compareFilterNumsOrdered(op filterTokenKind, left, right filterNum) (bool, 
 		return false, errors.New("dds: content filter eval lossy int/float equality above 2^53") //nolint:wrapcheck // new error, nothing to wrap
 	}
 
-	return compareFilterOp(op, compareFilterNums(left, right)), nil
+	matched, err := compareFilterOp(op, compareFilterNums(left, right))
+	if err != nil {
+		return false, err
+	}
+
+	return matched, nil
 }
 
 // isLossyIntFloatEq reports whether an equality mixes a float with an
@@ -1774,7 +1779,12 @@ func compareFilterValues(op filterTokenKind, left, right filterValue) (bool, err
 	case fvNum:
 		return compareFilterNumsOrdered(op, left.num, right.num)
 	case fvStr:
-		return compareFilterOp(op, strings.Compare(left.str, right.str)), nil
+		matched, err := compareFilterOp(op, strings.Compare(left.str, right.str))
+		if err != nil {
+			return false, err
+		}
+
+		return matched, nil
 	case fvBool:
 		return compareFilterBool(op, left.boolean, right.boolean)
 	case fvNull, fvUnsupported:
@@ -1803,26 +1813,25 @@ func isFilterNaN(n filterNum) bool {
 
 // compareFilterOp maps one ordering to one comparison operator result.
 //
-// The parser constrains op to the six comparison kinds, so the default is
-// unreachable by construction. It fails loudly instead of returning a
-// quiet ordering so a future caller passing a logic or LIKE kind cannot
-// silently read as greater-or-equal.
-func compareFilterOp(op filterTokenKind, cmp int) bool {
-	switch op { //nolint:exhaustive // default panics loudly on non-comparison ops unreachable by construction
+// The parser constrains op to the six comparison kinds. Any other kind
+// reports an error instead of panicking so a future caller passing a
+// logic or LIKE kind cannot silently read as greater-or-equal.
+func compareFilterOp(op filterTokenKind, cmp int) (bool, error) {
+	switch op { //nolint:exhaustive // default returns an error for non-comparison ops
 	case tokEq:
-		return cmp == 0
+		return cmp == 0, nil
 	case tokNe:
-		return cmp != 0
+		return cmp != 0, nil
 	case tokLt:
-		return cmp < 0
+		return cmp < 0, nil
 	case tokLe:
-		return cmp <= 0
+		return cmp <= 0, nil
 	case tokGt:
-		return cmp > 0
+		return cmp > 0, nil
 	case tokGe:
-		return cmp >= 0
+		return cmp >= 0, nil
 	default:
-		panic(fmt.Sprintf("dds: content filter invalid comparison op %d", int(op)))
+		return false, fmt.Errorf("dds: content filter invalid comparison op %d", int(op))
 	}
 }
 
@@ -1943,18 +1952,168 @@ type ContentFilter struct {
 	root filterNode
 }
 
+// filterNumericInt scans a signed digit run, returning end or -1.
+func filterNumericInt(s string, i int) int {
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	start := i
+	for i < len(s) && isFilterDigit(s[i]) {
+		i++
+	}
+	if i == start {
+		return -1
+	}
+	return i
+}
+
+// filterNumericFrac scans an optional fraction starting at i.
+func filterNumericFrac(s string, i int) int {
+	if i >= len(s) || s[i] != '.' {
+		return i
+	}
+	i++
+	for i < len(s) && isFilterDigit(s[i]) {
+		i++
+	}
+	return i
+}
+
+// filterNumericExp scans an optional exponent, returning end or -1.
+func filterNumericExp(s string, i int) int {
+	if i >= len(s) || (s[i] != 'e' && s[i] != 'E') {
+		return i
+	}
+	i++
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	start := i
+	for i < len(s) && isFilterDigit(s[i]) {
+		i++
+	}
+	if i == start {
+		return -1
+	}
+	return i
+}
+
+// isFilterNumericParam reports whether s matches the DDS numeric grammar.
+func isFilterNumericParam(s string) bool {
+	i := filterNumericInt(s, 0)
+	if i < 0 {
+		return false
+	}
+	i = filterNumericFrac(s, i)
+	i = filterNumericExp(s, i)
+	if i < 0 {
+		return false
+	}
+	return i == len(s)
+}
+
+// quoteFilterParam quotes s as a single-quoted literal, doubling quotes.
+func quoteFilterParam(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// bindFilterQuote appends one quote and updates the in-string state.
+func bindFilterQuote(sb *strings.Builder, expr string, i int, inStr bool) (int, bool) {
+	sb.WriteByte('\'') //nolint:errcheck // strings.Builder writes never fail
+	i++
+	if !inStr {
+		return i, true
+	}
+	if i < len(expr) && expr[i] == '\'' {
+		sb.WriteByte('\'') //nolint:errcheck // strings.Builder writes never fail
+		return i + 1, true
+	}
+	return i, false
+}
+
+// bindFilterParamIndex parses the placeholder index starting after %.
+func bindFilterParamIndex(expr string, i int) (int, int, error) {
+	j := i + 1
+	for j < len(expr) && isFilterDigit(expr[j]) {
+		j++
+	}
+	if j == i+1 {
+		return 0, 0, &ParseError{Pos: i, Msg: "bare % without parameter index"}
+	}
+	idx, err := strconv.Atoi(expr[i+1 : j])
+	if err != nil {
+		return 0, 0, &ParseError{Pos: i, Msg: "bad parameter index"}
+	}
+	return idx, j, nil
+}
+
+// bindFilterParam appends the bound value for the placeholder at i.
+func bindFilterParam(sb *strings.Builder, expr string, i int, params []string) (int, error) {
+	idx, next, err := bindFilterParamIndex(expr, i)
+	if err != nil {
+		return 0, err
+	}
+	if idx < 0 || idx >= len(params) {
+		return 0, &ParseError{Pos: i, Msg: "missing expression parameter"}
+	}
+	p := params[idx]
+	if isFilterNumericParam(p) {
+		sb.WriteString(p) //nolint:errcheck // strings.Builder writes never fail
+	} else {
+		sb.WriteString(quoteFilterParam(p)) //nolint:errcheck // strings.Builder writes never fail
+	}
+	return next, nil
+}
+
+// bindFilterParams substitutes %n placeholders outside string literals.
+func bindFilterParams(expr string, params []string) (string, error) {
+	var sb strings.Builder
+	sb.Grow(len(expr) + 8*len(params))
+	inStr := false
+	i := 0
+	for i < len(expr) {
+		c := expr[i]
+		switch {
+		case c == '\'':
+			var nextIn bool
+			i, nextIn = bindFilterQuote(&sb, expr, i, inStr)
+			inStr = nextIn
+		case c == '%' && !inStr:
+			next, err := bindFilterParam(&sb, expr, i, params)
+			if err != nil {
+				return "", err
+			}
+			i = next
+		default:
+			sb.WriteByte(c) //nolint:errcheck // strings.Builder writes never fail
+			i++
+		}
+	}
+	return sb.String(), nil
+}
+
 // CompileContentFilter parses one filter expression for later evaluation.
 //
 // An empty expression or any grammar violation returns an error joining
 // ErrContentFilterParse with a *ParseError naming the byte position.
-func CompileContentFilter(expr string) (*ContentFilter, error) {
+// Expression parameters bind before parsing: each %n outside a string
+// literal substitutes params[n], numeric-looking values verbatim and all
+// other values single-quoted with embedded quotes doubled. A %n with no corresponding
+// parameter, or a bare % outside a string literal, fails loudly. LIKE
+// wildcards inside string literals are not placeholders.
+func CompileContentFilter(expr string, params ...string) (*ContentFilter, error) {
 	if strings.TrimSpace(expr) == "" {
 		perr := &ParseError{Pos: 0, Msg: "empty expression"}
 
 		return nil, fmt.Errorf("dds: compile content filter: %w", errors.Join(ErrContentFilterParse, perr))
 	}
 
-	toks, err := lexFilter(expr)
+	bound, err := bindFilterParams(expr, params)
+	if err != nil {
+		return nil, fmt.Errorf("dds: compile content filter: %w", errors.Join(ErrContentFilterParse, err))
+	}
+
+	toks, err := lexFilter(bound)
 	if err != nil {
 		return nil, fmt.Errorf("dds: compile content filter: %w", errors.Join(ErrContentFilterParse, err))
 	}
@@ -1964,7 +2123,7 @@ func CompileContentFilter(expr string) (*ContentFilter, error) {
 		return nil, fmt.Errorf("dds: compile content filter: %w", errors.Join(ErrContentFilterParse, err))
 	}
 
-	return &ContentFilter{expr: expr, root: root}, nil
+	return &ContentFilter{expr: bound, root: root}, nil
 }
 
 // Expression returns the source text this filter was compiled from.

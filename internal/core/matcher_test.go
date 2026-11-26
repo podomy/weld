@@ -50,14 +50,14 @@ type presetCase struct {
 // presetCases returns every preset expectation.
 func presetCases() []presetCase {
 	return []presetCase{
-		{"default", DefaultQoS(), QoSProfile{History: HistoryKeepLast, Depth: 10, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic}},
-		{"sensor data", SensorDataQoS(), QoSProfile{History: HistoryKeepLast, Depth: 5, Reliability: ReliabilityBestEffort, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic}},
-		{"parameters", ParametersQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic}},
-		{"services default", ServicesDefaultQoS(), QoSProfile{History: HistoryKeepLast, Depth: 10, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic}},
-		{"parameter events", ParameterEventsQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic}},
-		{"rosout", RosoutQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityTransientLocal, Lifespan: NewDuration(10, 0), Liveliness: LivelinessAutomatic}},
-		{"system default", SystemDefaultQoS(), QoSProfile{History: HistorySystemDefault, Reliability: ReliabilitySystemDefault, Durability: DurabilitySystemDefault, Liveliness: LivelinessSystemDefault}},
-		{"unknown", UnknownQoS(), QoSProfile{History: HistoryUnknown, Reliability: ReliabilityUnknown, Durability: DurabilityUnknown, Liveliness: LivelinessUnknown}},
+		{"default", DefaultQoS(), QoSProfile{History: HistoryKeepLast, Depth: 10, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"sensor data", SensorDataQoS(), QoSProfile{History: HistoryKeepLast, Depth: 5, Reliability: ReliabilityBestEffort, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"parameters", ParametersQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"services default", ServicesDefaultQoS(), QoSProfile{History: HistoryKeepLast, Depth: 10, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"parameter events", ParameterEventsQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityVolatile, Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"rosout", RosoutQoS(), QoSProfile{History: HistoryKeepLast, Depth: 1000, Reliability: ReliabilityReliable, Durability: DurabilityTransientLocal, Lifespan: NewDuration(10, 0), Liveliness: LivelinessAutomatic, Ownershipqos4: Ownershipqos4Shared}},
+		{"system default", SystemDefaultQoS(), QoSProfile{History: HistorySystemDefault, Reliability: ReliabilitySystemDefault, Durability: DurabilitySystemDefault, Liveliness: LivelinessSystemDefault, Ownershipqos4: Ownershipqos4SystemDefault}},
+		{"unknown", UnknownQoS(), QoSProfile{History: HistoryUnknown, Reliability: ReliabilityUnknown, Durability: DurabilityUnknown, Liveliness: LivelinessUnknown, Ownershipqos4: Ownershipqos4Unknown}},
 	}
 }
 
@@ -940,4 +940,300 @@ func withLease(p QoSProfile, d Duration) QoSProfile {
 func withLiveliness(p QoSProfile, l LivelinessPolicy) QoSProfile {
 	p.Liveliness = l
 	return p
+}
+
+// withqos4Ownership returns p with ownership replaced.
+func withqos4Ownership(p QoSProfile, o Ownershipqos4Policy) QoSProfile {
+	p.Ownershipqos4 = o
+	return p
+}
+
+// TestOwnershipqos4ExactMatch pins offered equals requested for ownership.
+func TestOwnershipqos4ExactMatch(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	shared := withqos4Ownership(base, Ownershipqos4Shared)
+	exclusive := withqos4Ownership(base, Ownershipqos4Exclusive)
+	if report := CheckCompatibility(shared, shared); !report.Compatible {
+		t.Fatalf("shared shared must be compatible, got %q", report.Reason())
+	}
+	if report := CheckCompatibility(exclusive, exclusive); !report.Compatible {
+		t.Fatalf("exclusive exclusive must be compatible, got %q", report.Reason())
+	}
+	for _, pair := range [][2]QoSProfile{{shared, exclusive}, {exclusive, shared}} {
+		report := CheckCompatibility(pair[0], pair[1])
+		if report.Compatible {
+			t.Fatal("shared versus exclusive must be incompatible")
+		}
+		if len(report.Errors) != 1 || report.Errors[0].Kind != Policyqos4Ownership {
+			t.Fatalf("ownership mismatch must error on ownership, got %+v", report.Errors)
+		}
+	}
+}
+
+// TestOwnershipqos4MissingDefaultsShared pins zero value defaults to shared.
+func TestOwnershipqos4MissingDefaultsShared(t *testing.T) {
+	t.Parallel()
+	var missing QoSProfile
+	if missing.Ownershipqos4 != Ownershipqos4Shared {
+		t.Fatalf("zero ownership must be shared, got %s", missing.Ownershipqos4)
+	}
+	base := resolvedBase(t)
+	if report := CheckCompatibility(missing, base); report.Compatible {
+		// missing has system defaults elsewhere so it warns, but ownership itself must not error.
+		for _, e := range report.Errors {
+			if e.Kind == Policyqos4Ownership {
+				t.Fatalf("missing ownership must not error, got %+v", report.Errors)
+			}
+		}
+	}
+	resolved := ResolveSystemDefaults(SystemDefaultQoS())
+	if resolved.Ownershipqos4 != Ownershipqos4Shared {
+		t.Fatalf("system default must resolve to shared, got %s", resolved.Ownershipqos4)
+	}
+	if err := Validate(resolved); err != nil {
+		t.Fatalf("resolved system default must validate: %v", err)
+	}
+}
+
+// TestDurabilityqos4Ordering pins volatile less than transient local less than transient less than persistent.
+func TestDurabilityqos4Ordering(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	kinds := []DurabilityPolicy{DurabilityVolatile, DurabilityTransientLocal, Durabilityqos4Transient, Durabilityqos4Persistent}
+	for i, offered := range kinds {
+		for j, requested := range kinds {
+			report := CheckCompatibility(withDurability(base, offered), withDurability(base, requested))
+			wantCompatible := i >= j
+			if report.Compatible != wantCompatible {
+				t.Fatalf("offered %s versus requested %s compatible=%v want %v: %q", offered, requested, report.Compatible, wantCompatible, report.Reason())
+			}
+			if !wantCompatible && (len(report.Errors) != 1 || report.Errors[0].Kind != PolicyDurability) {
+				t.Fatalf("durability mismatch must error once on durability, got %+v", report.Errors)
+			}
+		}
+	}
+}
+
+// TestLivelinessqos4Ordering pins automatic less than manual by participant less than manual by topic.
+func TestLivelinessqos4Ordering(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	kinds := []LivelinessPolicy{LivelinessAutomatic, Livelinessqos4ManualByParticipant, LivelinessManualByTopic}
+	for i, offered := range kinds {
+		for j, requested := range kinds {
+			report := CheckCompatibility(withLiveliness(base, offered), withLiveliness(base, requested))
+			wantCompatible := i >= j
+			if report.Compatible != wantCompatible {
+				t.Fatalf("offered %s versus requested %s compatible=%v want %v: %q", offered, requested, report.Compatible, wantCompatible, report.Reason())
+			}
+			if !wantCompatible && (len(report.Errors) != 1 || report.Errors[0].Kind != PolicyLiveliness) {
+				t.Fatalf("liveliness mismatch must error once on liveliness, got %+v", report.Errors)
+			}
+		}
+	}
+	// Lease still enforces shorter offered satisfies longer request.
+	offered := withLease(withLiveliness(base, Livelinessqos4ManualByParticipant), NewDuration(4, 0))
+	requested := withLease(withLiveliness(base, Livelinessqos4ManualByParticipant), NewDuration(10, 0))
+	if report := CheckCompatibility(offered, requested); !report.Compatible {
+		t.Fatalf("shorter offered lease must satisfy longer request, got %q", report.Reason())
+	}
+}
+
+// withPresentation returns p with presentation replaced.
+func withPresentation(p QoSProfile, pres PresentationQosPolicy) QoSProfile {
+	p.Presentation = pres
+	return p
+}
+
+// withLatencyBudget returns p with latency budget replaced.
+func withLatencyBudget(p QoSProfile, d Duration) QoSProfile {
+	p.LatencyBudget = LatencyBudgetQosPolicy{Duration: d}
+	return p
+}
+
+// TestPresentationOrdering pins instance less than topic less than group
+// with coherent and ordered flags requiring the offered flag.
+func TestPresentationOrdering(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	scopes := []PresentationAccessScope{PresentationInstance, PresentationTopic, PresentationGroup}
+	for i, offered := range scopes {
+		for j, requested := range scopes {
+			o := withPresentation(base, PresentationQosPolicy{AccessScope: offered})
+			r := withPresentation(base, PresentationQosPolicy{AccessScope: requested})
+			report := CheckCompatibility(o, r)
+			wantCompatible := i >= j
+			if report.Compatible != wantCompatible {
+				t.Fatalf("offered %s versus requested %s compatible=%v want %v: %q", offered, requested, report.Compatible, wantCompatible, report.Reason())
+			}
+			if !wantCompatible && (len(report.Errors) != 1 || report.Errors[0].Kind != PolicyPresentation) {
+				t.Fatalf("presentation scope mismatch must error once on presentation, got %+v", report.Errors)
+			}
+		}
+	}
+}
+
+// TestPresentationFlags pins coherent and ordered requests need the offered flag.
+func TestPresentationFlags(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	plain := PresentationQosPolicy{AccessScope: PresentationGroup}
+	coherent := PresentationQosPolicy{AccessScope: PresentationGroup, CoherentAccess: true}
+	ordered := PresentationQosPolicy{AccessScope: PresentationGroup, OrderedAccess: true}
+	both := PresentationQosPolicy{AccessScope: PresentationGroup, CoherentAccess: true, OrderedAccess: true}
+	if report := CheckCompatibility(withPresentation(base, both), withPresentation(base, both)); !report.Compatible {
+		t.Fatalf("equal presentation flags must be compatible, got %q", report.Reason())
+	}
+	if report := CheckCompatibility(withPresentation(base, coherent), withPresentation(base, plain)); !report.Compatible {
+		t.Fatalf("stronger offered coherent must satisfy weaker request, got %q", report.Reason())
+	}
+	for _, tc := range []struct {
+		name      string
+		offered   PresentationQosPolicy
+		requested PresentationQosPolicy
+	}{
+		{"coherent needs offered", plain, coherent},
+		{"ordered needs offered", plain, ordered},
+		{"both needs offered", coherent, both},
+	} {
+		report := CheckCompatibility(withPresentation(base, tc.offered), withPresentation(base, tc.requested))
+		if report.Compatible {
+			t.Fatalf("%s must be incompatible", tc.name)
+		}
+		found := false
+		for _, e := range report.Errors {
+			if e.Kind == PolicyPresentation {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s must error on presentation, got %+v", tc.name, report.Errors)
+		}
+	}
+}
+
+// TestPresentationInvalidWarns pins invalid scopes warn without blocking.
+func TestPresentationInvalidWarns(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	bad := withPresentation(base, PresentationQosPolicy{AccessScope: PresentationAccessScope(99)})
+	report := CheckCompatibility(bad, base)
+	if !report.Compatible {
+		t.Fatalf("invalid presentation scope must warn only, got %q", report.Reason())
+	}
+	if len(report.Errors) != 0 {
+		t.Fatalf("invalid presentation scope must not error, got %+v", report.Errors)
+	}
+	found := false
+	for _, w := range report.Warnings {
+		if w.Kind == PolicyPresentation {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("invalid presentation scope must warn on presentation, got %+v", report.Warnings)
+	}
+	if err := Validate(bad); err == nil {
+		t.Fatal("invalid presentation scope must fail validation")
+	}
+}
+
+// TestLatencyBudgetRule pins offered at most requested is compatible.
+func TestLatencyBudgetRule(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	fast := NewDuration(0, 10000000)
+	slow := NewDuration(0, 100000000)
+	if report := CheckCompatibility(withLatencyBudget(base, fast), withLatencyBudget(base, slow)); !report.Compatible {
+		t.Fatalf("faster offered latency must satisfy slower request, got %q", report.Reason())
+	}
+	if report := CheckCompatibility(withLatencyBudget(base, slow), withLatencyBudget(base, slow)); !report.Compatible {
+		t.Fatalf("equal latency budgets must be compatible, got %q", report.Reason())
+	}
+	report := CheckCompatibility(withLatencyBudget(base, slow), withLatencyBudget(base, fast))
+	if report.Compatible {
+		t.Fatal("slower offered latency must be incompatible")
+	}
+	if len(report.Errors) != 1 || report.Errors[0].Kind != PolicyLatencyBudget {
+		t.Fatalf("latency mismatch must error once on latency budget, got %+v", report.Errors)
+	}
+	if len(report.Warnings) != 0 {
+		t.Fatalf("latency errors must suppress warnings, got %+v", report.Warnings)
+	}
+}
+
+// TestLatencyBudgetInfinite pins infinite requested flows and infinite
+// offered stays slow against finite requests.
+func TestLatencyBudgetInfinite(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	finite := NewDuration(0, 10000000)
+	if report := CheckCompatibility(withLatencyBudget(base, finite), withLatencyBudget(base, InfiniteDuration())); !report.Compatible {
+		t.Fatalf("finite offered infinite requested latency must flow, got %q", report.Reason())
+	}
+	report := CheckCompatibility(withLatencyBudget(base, InfiniteDuration()), withLatencyBudget(base, finite))
+	if report.Compatible {
+		t.Fatal("infinite offered latency must stay slow against finite request")
+	}
+	if len(report.Errors) != 1 || report.Errors[0].Kind != PolicyLatencyBudget {
+		t.Fatalf("slow offered latency must error on latency budget, got %+v", report.Errors)
+	}
+}
+
+// TestLatencyBudgetMalformed pins negative and oversized durations fail loudly.
+func TestLatencyBudgetMalformed(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	for _, tc := range []struct {
+		name      string
+		offered   QoSProfile
+		requested QoSProfile
+		malformed QoSProfile
+	}{
+		{"negative offered", withLatencyBudget(base, Duration{Seconds: -1}), base, withLatencyBudget(base, Duration{Seconds: -1})},
+		{"negative requested", base, withLatencyBudget(base, Duration{Seconds: -1}), withLatencyBudget(base, Duration{Seconds: -1})},
+		{"oversized offered", withLatencyBudget(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), base, withLatencyBudget(base, Duration{Seconds: 1, Nanoseconds: 2000000000})},
+		{"oversized requested", base, withLatencyBudget(base, Duration{Seconds: 1, Nanoseconds: 2000000000}), withLatencyBudget(base, Duration{Seconds: 1, Nanoseconds: 2000000000})},
+	} {
+		report := CheckCompatibility(tc.offered, tc.requested)
+		if report.Compatible {
+			t.Fatalf("%s must be incompatible", tc.name)
+		}
+		if len(report.Errors) == 0 || report.Errors[0].Kind != PolicyLatencyBudget {
+			t.Fatalf("%s must error on latency budget, got %+v", tc.name, report.Errors)
+		}
+		if err := Validate(tc.malformed); err == nil {
+			t.Fatalf("%s must fail validation", tc.name)
+		}
+	}
+}
+
+// TestLatencyBudgetSentinelWarns pins best available sentinels warn only.
+func TestLatencyBudgetSentinelWarns(t *testing.T) {
+	t.Parallel()
+	base := resolvedBase(t)
+	sentinel := withLatencyBudget(base, BestAvailableDuration())
+	report := CheckCompatibility(sentinel, base)
+	if !report.Compatible {
+		t.Fatalf("sentinel offered latency must warn only, got %q", report.Reason())
+	}
+	if len(report.Errors) != 0 {
+		t.Fatalf("sentinel offered latency must not error, got %+v", report.Errors)
+	}
+	found := false
+	for _, w := range report.Warnings {
+		if w.Kind == PolicyLatencyBudget {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("sentinel latency must warn on latency budget, got %+v", report.Warnings)
+	}
+	if err := Validate(sentinel); err == nil {
+		t.Fatal("sentinel latency must fail validation")
+	}
 }

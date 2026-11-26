@@ -1732,3 +1732,46 @@ func checkAvoidBestAvailableService(t *testing.T) {
 		t.Fatalf("avoid flag must never affect matching: %q", report.Reason())
 	}
 }
+
+// checkTypeConsistencyEnforcementDefault pins the spec default of allow.
+func checkTypeConsistencyEnforcementDefault(t *testing.T) {
+	t.Helper()
+
+	got := DefaultTypeConsistencyEnforcement()
+	if got.Kind != TypeConsistencyAllowCoercion {
+		t.Fatalf("default kind must allow coercion, got %v", got.Kind)
+	}
+
+	if got.IgnoreSequenceBounds || got.IgnoreStringBounds || got.IgnoreMemberNames ||
+		got.IgnoreLiteralNames || got.PreventTypeWidening || got.ForceTypeValidation {
+		t.Fatalf("default relaxations must be false, got %+v", got)
+	}
+
+	var zero TypeConsistencyEnforcementQosPolicy
+	if zero.Kind != TypeConsistencyDisallowCoercion {
+		t.Fatalf("zero kind must disallow coercion fail-closed, got %v", zero.Kind)
+	}
+}
+
+// checkTypeConsistencyEnforcementStrings pins kind rendering.
+func checkTypeConsistencyEnforcementStrings(t *testing.T) {
+	t.Helper()
+
+	if TypeConsistencyDisallowCoercion.String() != "DISALLOW_TYPE_COERCION" {
+		t.Fatalf("disallow string wrong, got %q", TypeConsistencyDisallowCoercion.String())
+	}
+
+	if TypeConsistencyAllowCoercion.String() != "ALLOW_TYPE_COERCION" {
+		t.Fatalf("allow string wrong, got %q", TypeConsistencyAllowCoercion.String())
+	}
+
+	if TypeConsistencyEnforcementKind(99).String() != "invalid" {
+		t.Fatalf("unknown kind string wrong, got %q", TypeConsistencyEnforcementKind(99).String())
+	}
+}
+
+// TestTypeConsistencyEnforcementQoS pins the 7.6.3.4.1 enforcement policy.
+func TestTypeConsistencyEnforcementQoS(t *testing.T) {
+	t.Run("default", checkTypeConsistencyEnforcementDefault)
+	t.Run("strings", checkTypeConsistencyEnforcementStrings)
+}

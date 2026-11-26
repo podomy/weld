@@ -49,7 +49,8 @@ const DefaultHistoryDepth = 10
 // this call. Keep all depth is preserved verbatim but ignored. Best available
 // and unknown markers pass through for endpoint resolution and validation.
 // Unspecified lifespan passes through untouched because lifespan is publisher
-// side expiry, not an RxO promise. The avoidance flag is never resolved, per
+// side expiry, not an RxO promise. Presentation and latency budget pass
+// through untouched as concrete DDS defaults. The avoidance flag is never resolved, per
 // the actual getter rule.
 func ResolveSystemDefaults(p QoSProfile) QoSProfile {
 	out := p
@@ -67,6 +68,9 @@ func ResolveSystemDefaults(p QoSProfile) QoSProfile {
 	}
 	if out.Liveliness == LivelinessSystemDefault {
 		out.Liveliness = LivelinessAutomatic
+	}
+	if out.Ownershipqos4 == Ownershipqos4SystemDefault {
+		out.Ownershipqos4 = Ownershipqos4Shared
 	}
 	if out.Deadline.IsUnspecified() {
 		out.Deadline = InfiniteDuration()
@@ -93,6 +97,8 @@ func Validate(p QoSProfile) error {
 	problems = append(problems, validateReliability(p)...)
 	problems = append(problems, validateDurability(p)...)
 	problems = append(problems, validateLiveliness(p)...)
+	problems = append(problems, validateqos4Ownership(p)...)
+	problems = append(problems, validatePresentation(p)...)
 	problems = append(problems, validateDurations(p)...)
 	if len(problems) == 0 {
 		return nil
@@ -141,7 +147,7 @@ func validateReliability(p QoSProfile) []string {
 func validateDurability(p QoSProfile) []string {
 	var problems []string
 	switch p.Durability {
-	case DurabilityTransientLocal, DurabilityVolatile:
+	case DurabilityTransientLocal, DurabilityVolatile, Durabilityqos4Transient, Durabilityqos4Persistent:
 	case DurabilitySystemDefault:
 		problems = append(problems, "durability: system default is not resolved; call ResolveSystemDefaults first")
 	case DurabilityBestAvailable:
@@ -154,11 +160,28 @@ func validateDurability(p QoSProfile) []string {
 	return problems
 }
 
+// validateqos4Ownership rejects unresolved markers and invalid ownership values.
+func validateqos4Ownership(p QoSProfile) []string {
+	var problems []string
+	switch p.Ownershipqos4 {
+	case Ownershipqos4Shared, Ownershipqos4Exclusive:
+	case Ownershipqos4SystemDefault:
+		problems = append(problems, "ownership: system default is not resolved; call ResolveSystemDefaults first")
+	case Ownershipqos4BestAvailable:
+		problems = append(problems, "ownership: best available is not resolved; resolve at endpoint creation first")
+	case Ownershipqos4Unknown:
+		problems = append(problems, "ownership: unknown policy is not supported")
+	default:
+		problems = append(problems, fmt.Sprintf("ownership: invalid policy %d", p.Ownershipqos4))
+	}
+	return problems
+}
+
 // validateLiveliness rejects unresolved markers and invalid liveliness values.
 func validateLiveliness(p QoSProfile) []string {
 	var problems []string
 	switch p.Liveliness {
-	case LivelinessAutomatic, LivelinessManualByTopic:
+	case LivelinessAutomatic, LivelinessManualByTopic, Livelinessqos4ManualByParticipant:
 	case LivelinessSystemDefault:
 		problems = append(problems, "liveliness: system default is not resolved; call ResolveSystemDefaults first")
 	case LivelinessBestAvailable:
@@ -169,6 +192,18 @@ func validateLiveliness(p QoSProfile) []string {
 		problems = append(problems, fmt.Sprintf("liveliness: invalid policy %d", p.Liveliness))
 	}
 	return problems
+}
+
+// validatePresentation rejects invalid presentation access scopes.
+// The zero value instance scope with both flags false is the DDS default
+// and always valid; only out of range scopes fail.
+func validatePresentation(p QoSProfile) []string {
+	switch p.Presentation.AccessScope {
+	case PresentationInstance, PresentationTopic, PresentationGroup:
+		return nil
+	default:
+		return []string{fmt.Sprintf("presentation: invalid access scope %d", p.Presentation.AccessScope)}
+	}
 }
 
 // validateDurations rejects negative seconds, nanoseconds at or above one
@@ -206,6 +241,19 @@ func validateDurationShape(p QoSProfile) []string {
 	if p.LeaseDuration.Nanoseconds >= nanosPerSecond {
 		problems = append(problems, "lease duration: nanoseconds >= 1e9 are malformed; normalize with NewDuration first")
 	}
+	if p.LatencyBudget.Duration.Seconds < 0 {
+		problems = append(problems, "latency budget: negative seconds are malformed")
+	}
+	if p.LatencyBudget.Duration.Nanoseconds >= nanosPerSecond {
+		problems = append(problems, "latency budget: nanoseconds >= 1e9 are malformed; normalize with NewDuration first")
+	}
+	problems = append(problems, validateSentinelDurations(p)...)
+	return problems
+}
+
+// validateSentinelDurations rejects surviving best available sentinels.
+func validateSentinelDurations(p QoSProfile) []string {
+	var problems []string
 	if IsBestAvailableDuration(p.Deadline) {
 		problems = append(problems, "deadline: best available is not resolved; resolve at endpoint creation first")
 	}
@@ -214,6 +262,9 @@ func validateDurationShape(p QoSProfile) []string {
 	}
 	if IsBestAvailableDuration(p.LeaseDuration) {
 		problems = append(problems, "lease duration: best available is not resolved; resolve at endpoint creation first")
+	}
+	if IsBestAvailableDuration(p.LatencyBudget.Duration) {
+		problems = append(problems, "latency budget: best available is not resolved; resolve at endpoint creation first")
 	}
 	return problems
 }
@@ -231,21 +282,37 @@ func validateSaturatingDurations(p QoSProfile) []string {
 	if isSaturatingToInfinite(p.LeaseDuration) {
 		problems = append(problems, "lease duration: huge finite duration saturates to infinite; use InfiniteDuration explicitly")
 	}
+	if isSaturatingToInfinite(p.LatencyBudget.Duration) {
+		problems = append(problems, "latency budget: huge finite duration saturates to infinite; use InfiniteDuration explicitly")
+	}
 	return problems
 }
 
 // CheckCompatibility applies the shared DDS truth table to an offered
 // publisher profile versus a requested subscription profile.
 //
-// The six incompatible combinations each yield an error: best effort offered
-// with reliable requested; volatile offered with transient local requested;
-// default deadline offered with non default requested; requested deadline
-// faster than offered; automatic liveliness offered with manual by topic
-// requested; default lease offered with non default requested. A requested
+// Incompatible combinations each yield an error: best effort offered
+// with reliable requested; durability offered rank below requested rank
+// per volatile less than transient local less than transient less than
+// persistent (DDS 1.4 section 2.2.3.4); default deadline offered with non
+// default requested; requested deadline faster than offered; liveliness
+// offered rank below requested rank per automatic less than manual by
+// participant less than manual by topic (DDS 1.4 section 2.2.3.11);
+// default lease offered with non default requested; requested lease
+// shorter than offered; ownership offered not exactly equal to requested
+// (DDS 1.4 section 2.2.3.9.2); presentation offered scope narrower than
+// requested, or coherent or ordered requested without the offered flag
+// (DDS 1.4 section 2.2.3.6); latency budget offered slower than requested
+// per offered duration at most requested duration (DDS 1.4 section
+// 2.2.3.8). A requested
 // infinite deadline or lease means no constraint and always flows, while an
-// offered infinite stays slow and is incompatible with a finite request. All
-// other DDS combinations pass, including reliable to best effort, transient
-// local to volatile, equal values, and reverse liveliness. History, depth,
+// offered infinite stays slow and is incompatible with a finite request. Latency
+// compares numerically with no unspecified short-circuit: zero is the concrete
+// DDS default of no extra delay, infinite requested accepts any offer, and an
+// infinite offer only satisfies an infinite request. All
+// other DDS combinations pass, including reliable to best effort, stronger
+// durability or liveliness to weaker, equal values, and equal ownership.
+// History, depth,
 // lifespan, and the avoidance flag are never checked.
 //
 // Warn-versus-error contract: Validate is the error path for invalid enums,
@@ -275,6 +342,9 @@ func CheckCompatibility(offered, requested QoSProfile) CompatibilityReport {
 	checkDeadline(offered, requested, &report)
 	checkLiveliness(offered, requested, &report)
 	checkLease(offered, requested, &report)
+	checkqos4Ownership(offered, requested, &report)
+	checkPresentation(offered, requested, &report)
+	checkLatencyBudget(offered, requested, &report)
 	if len(report.Errors) > 0 {
 		report.Compatible = false
 		return report
@@ -284,9 +354,9 @@ func CheckCompatibility(offered, requested QoSProfile) CompatibilityReport {
 }
 
 // checkNegativeDurations records an error when either side carries a
-// malformed deadline or lease duration: negative seconds or nanoseconds at
-// or above one second. Lifespan never participates in matching so it is
-// ignored here and rejected loudly by Validate instead. This guard runs
+// malformed deadline, latency budget, or lease duration: negative seconds or
+// nanoseconds at or above one second. Lifespan never participates in matching
+// so it is ignored here and rejected loudly by Validate instead. This guard runs
 // first so skipped validation still fails loudly in matching.
 func checkNegativeDurations(offered, requested QoSProfile, report *CompatibilityReport) {
 	if offered.Deadline.Seconds < 0 || requested.Deadline.Seconds < 0 {
@@ -313,6 +383,25 @@ func checkNegativeDurations(offered, requested QoSProfile, report *Compatibility
 			Detail: "malformed lease duration nanoseconds >= 1e9; normalize with NewDuration first",
 		})
 	}
+	checkLatencyBudgetShape(offered, requested, report)
+}
+
+// checkLatencyBudgetShape records an error when either side carries a
+// malformed latency budget duration: negative seconds or nanoseconds at or
+// above one second.
+func checkLatencyBudgetShape(offered, requested QoSProfile, report *CompatibilityReport) {
+	if offered.LatencyBudget.Duration.Seconds < 0 || requested.LatencyBudget.Duration.Seconds < 0 {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyLatencyBudget,
+			Detail: "malformed negative latency budget seconds; call Validate first",
+		})
+	}
+	if offered.LatencyBudget.Duration.Nanoseconds >= nanosPerSecond || requested.LatencyBudget.Duration.Nanoseconds >= nanosPerSecond {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyLatencyBudget,
+			Detail: "malformed latency budget nanoseconds >= 1e9; normalize with NewDuration first",
+		})
+	}
 }
 
 // checkReliability records an error when a best effort publisher meets a
@@ -326,14 +415,37 @@ func checkReliability(offered, requested QoSProfile, report *CompatibilityReport
 	}
 }
 
-// checkDurability records an error when a volatile publisher meets a
-// transient local subscription.
+// checkDurability records an error when offered durability rank sits below
+// requested rank per volatile less than transient local less than transient
+// less than persistent (DDS 1.4 section 2.2.3.4). Unresolved markers on
+// either side skip the error check so the pair warns instead.
 func checkDurability(offered, requested QoSProfile, report *CompatibilityReport) {
-	if offered.Durability == DurabilityVolatile && requested.Durability == DurabilityTransientLocal {
+	if isDurabilityMarker(offered.Durability) || isDurabilityMarker(requested.Durability) {
+		return
+	}
+	if durabilityqos4Rank(offered.Durability) < durabilityqos4Rank(requested.Durability) {
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind:   PolicyDurability,
-			Detail: "offered volatile keeps no history for requested transient_local",
+			Detail: "offered " + offered.Durability.String() + " is weaker than requested " + requested.Durability.String(),
 		})
+	}
+}
+
+// durabilityqos4Rank orders durability kinds for RxO comparison.
+func durabilityqos4Rank(p DurabilityPolicy) int {
+	switch p {
+	case DurabilityVolatile:
+		return 0
+	case DurabilityTransientLocal:
+		return 1
+	case Durabilityqos4Transient:
+		return 2
+	case Durabilityqos4Persistent:
+		return 3
+	case DurabilitySystemDefault, DurabilityBestAvailable, DurabilityUnknown:
+		return -1
+	default:
+		return -1
 	}
 }
 
@@ -372,13 +484,123 @@ func checkDeadline(offered, requested QoSProfile, report *CompatibilityReport) {
 	}
 }
 
-// checkLiveliness records an error when an automatic publisher meets a
-// manual by topic subscription. The reverse always flows.
+// checkLiveliness records an error when offered liveliness rank sits below
+// requested rank per automatic less than manual by participant less than
+// manual by topic (DDS 1.4 section 2.2.3.11). Unresolved markers on either
+// side skip the error check so the pair warns instead.
 func checkLiveliness(offered, requested QoSProfile, report *CompatibilityReport) {
-	if offered.Liveliness == LivelinessAutomatic && requested.Liveliness == LivelinessManualByTopic {
+	if isLivelinessMarker(offered.Liveliness) || isLivelinessMarker(requested.Liveliness) {
+		return
+	}
+	if livelinessqos4Rank(offered.Liveliness) < livelinessqos4Rank(requested.Liveliness) {
 		report.Errors = append(report.Errors, CompatibilityIssue{
 			Kind:   PolicyLiveliness,
-			Detail: "offered automatic cannot satisfy requested manual_by_topic",
+			Detail: "offered " + offered.Liveliness.String() + " is weaker than requested " + requested.Liveliness.String(),
+		})
+	}
+}
+
+// livelinessqos4Rank orders liveliness kinds for RxO comparison.
+func livelinessqos4Rank(p LivelinessPolicy) int {
+	switch p {
+	case LivelinessAutomatic:
+		return 0
+	case Livelinessqos4ManualByParticipant:
+		return 1
+	case LivelinessManualByTopic:
+		return 2
+	case LivelinessSystemDefault, LivelinessBestAvailable, LivelinessUnknown:
+		return -1
+	default:
+		return -1
+	}
+}
+
+// checkqos4Ownership records an error when offered ownership kind does not
+// exactly equal requested kind per DDS 1.4 section 2.2.3.9.2. Unresolved
+// markers on either side skip the error check so the pair warns instead.
+// Missing kinds default to shared via the zero value for backward compat.
+// Warn (not fail-closed error) is kept for markers by design: endpoint
+// creation resolves markers via ResolveSystemDefaults and Validate rejects
+// survivors, so matching only sees markers on legacy or unknown peers;
+// existing matcher tests pin warn-only for unknown/system-default/invalid
+// markers and flipping to error would break that contract.
+func checkqos4Ownership(offered, requested QoSProfile, report *CompatibilityReport) {
+	if isOwnershipqos4Marker(offered.Ownershipqos4) || isOwnershipqos4Marker(requested.Ownershipqos4) {
+		return
+	}
+	if offered.Ownershipqos4 != requested.Ownershipqos4 {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   Policyqos4Ownership,
+			Detail: "offered " + offered.Ownershipqos4.String() + " does not match requested " + requested.Ownershipqos4.String(),
+		})
+	}
+}
+
+// checkPresentation records an error when the offered presentation cannot
+// satisfy the request per DDS 1.4 section 2.2.3.6: offered access scope rank
+// below requested rank (instance less than topic less than group), or a
+// requested coherent or ordered flag without the offered flag. Invalid scopes
+// on either side skip the error check so the pair warns instead, matching
+// the invalid enum warn path. Fail-closed: every mismatch is an error,
+// never a silent match.
+func checkPresentation(offered, requested QoSProfile, report *CompatibilityReport) {
+	if isPresentationMarker(offered.Presentation) || isPresentationMarker(requested.Presentation) {
+		return
+	}
+	if presentationRank(offered.Presentation.AccessScope) < presentationRank(requested.Presentation.AccessScope) {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyPresentation,
+			Detail: "offered " + offered.Presentation.AccessScope.String() + " is narrower than requested " + requested.Presentation.AccessScope.String(),
+		})
+	}
+	if requested.Presentation.CoherentAccess && !offered.Presentation.CoherentAccess {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyPresentation,
+			Detail: "requested coherent access needs offered coherent access",
+		})
+	}
+	if requested.Presentation.OrderedAccess && !offered.Presentation.OrderedAccess {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind:   PolicyPresentation,
+			Detail: "requested ordered access needs offered ordered access",
+		})
+	}
+}
+
+// presentationRank orders access scopes for RxO comparison.
+func presentationRank(s PresentationAccessScope) int {
+	switch s {
+	case PresentationInstance:
+		return 0
+	case PresentationTopic:
+		return 1
+	case PresentationGroup:
+		return 2
+	default:
+		return -1
+	}
+}
+
+// checkLatencyBudget records an error when the offered latency budget is
+// slower than the requested budget per DDS 1.4 section 2.2.3.8: compatible
+// exactly when offered duration is at most requested duration. Zero is the
+// concrete DDS default with no short-circuit, infinite requested accepts any
+// offer numerically, and an infinite offer only satisfies an infinite
+// request. Best available sentinels on either side skip the error check so
+// the pair warns instead. Malformed durations fail loudly in
+// checkNegativeDurations; Validate still rejects sentinels and saturating
+// values loudly. Fail-closed: a slower offer is incompatible, never a
+// silent match.
+func checkLatencyBudget(offered, requested QoSProfile, report *CompatibilityReport) {
+	if IsBestAvailableDuration(offered.LatencyBudget.Duration) || IsBestAvailableDuration(requested.LatencyBudget.Duration) {
+		return
+	}
+	if offered.LatencyBudget.Duration.Compare(requested.LatencyBudget.Duration) > 0 {
+		report.Errors = append(report.Errors, CompatibilityIssue{
+			Kind: PolicyLatencyBudget,
+			Detail: "offered latency budget " + offered.LatencyBudget.Duration.String() +
+				" is slower than requested " + requested.LatencyBudget.Duration.String(),
 		})
 	}
 }
@@ -420,6 +642,9 @@ func checkLease(offered, requested QoSProfile, report *CompatibilityReport) {
 // durations for deadline and lease. History, depth, lifespan, and the
 // avoidance flag never warn: they do not affect matching. Lifespan sentinels
 // stay silent here by rule and are rejected loudly by Validate instead.
+// Presentation warns on invalid scopes; latency budget warns on sentinels.
+// Omitted presentation (instance without flags) and zero latency budget are
+// concrete DDS defaults and never warn.
 func warnUnresolvedMarkers(offered, requested QoSProfile, report *CompatibilityReport) {
 	warnMarker(report, PolicyReliability, offered.Reliability.String(), requested.Reliability.String(),
 		isReliabilityMarker(offered.Reliability) || isReliabilityMarker(requested.Reliability))
@@ -427,11 +652,18 @@ func warnUnresolvedMarkers(offered, requested QoSProfile, report *CompatibilityR
 		isDurabilityMarker(offered.Durability) || isDurabilityMarker(requested.Durability))
 	warnMarker(report, PolicyLiveliness, offered.Liveliness.String(), requested.Liveliness.String(),
 		isLivelinessMarker(offered.Liveliness) || isLivelinessMarker(requested.Liveliness))
+	warnMarker(report, Policyqos4Ownership, offered.Ownershipqos4.String(), requested.Ownershipqos4.String(),
+		isOwnershipqos4Marker(offered.Ownershipqos4) || isOwnershipqos4Marker(requested.Ownershipqos4))
+	warnMarker(report, PolicyPresentation, offered.Presentation.String(), requested.Presentation.String(),
+		isPresentationMarker(offered.Presentation) || isPresentationMarker(requested.Presentation))
 	if IsBestAvailableDuration(offered.Deadline) || IsBestAvailableDuration(requested.Deadline) {
 		warnMarker(report, PolicyDeadline, offered.Deadline.String(), requested.Deadline.String(), true)
 	}
 	if IsBestAvailableDuration(offered.LeaseDuration) || IsBestAvailableDuration(requested.LeaseDuration) {
 		warnMarker(report, PolicyLeaseDuration, offered.LeaseDuration.String(), requested.LeaseDuration.String(), true)
+	}
+	if IsBestAvailableDuration(offered.LatencyBudget.Duration) || IsBestAvailableDuration(requested.LatencyBudget.Duration) {
+		warnMarker(report, PolicyLatencyBudget, offered.LatencyBudget.Duration.String(), requested.LatencyBudget.Duration.String(), true)
 	}
 }
 
@@ -457,12 +689,25 @@ func isReliabilityMarker(p ReliabilityPolicy) bool {
 // concrete value, including system default, unknown, best available, and
 // invalid enums.
 func isDurabilityMarker(p DurabilityPolicy) bool {
-	return p != DurabilityTransientLocal && p != DurabilityVolatile
+	return p != DurabilityTransientLocal && p != DurabilityVolatile && p != Durabilityqos4Transient && p != Durabilityqos4Persistent
 }
 
 // isLivelinessMarker reports whether p still needs resolution: any non
 // concrete value, including system default, unknown, best available, and
 // invalid enums.
 func isLivelinessMarker(p LivelinessPolicy) bool {
-	return p != LivelinessAutomatic && p != LivelinessManualByTopic
+	return p != LivelinessAutomatic && p != LivelinessManualByTopic && p != Livelinessqos4ManualByParticipant
+}
+
+// isOwnershipqos4Marker reports whether p still needs resolution: any non
+// concrete value, including system default, unknown, best available, and
+// invalid enums. Missing zero value is shared and concrete.
+func isOwnershipqos4Marker(p Ownershipqos4Policy) bool {
+	return p != Ownershipqos4Shared && p != Ownershipqos4Exclusive
+}
+
+// isPresentationMarker reports whether p still needs resolution: any
+// presentation with an invalid access scope, including out of range enums.
+func isPresentationMarker(p PresentationQosPolicy) bool {
+	return p.AccessScope != PresentationInstance && p.AccessScope != PresentationTopic && p.AccessScope != PresentationGroup
 }

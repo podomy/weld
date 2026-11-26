@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/podomy/weld/internal/core"
 )
 
 // TestDurabilityServiceGolden pins the exact wire bytes for Cyclone defaults.
@@ -656,5 +658,146 @@ func TestDurabilityReplayMalformedCapsFailClosed(t *testing.T) {
 	unlimited.MaxSamples = -1
 	if got := ReplayBound(100, 10, durabilityKindTransient, unlimited); got == 0 {
 		t.Fatalf("unlimited -1 replay = 0, want positive (unlimited is not malformed)")
+	}
+}
+
+// coreDefaultQoSForqos4Test returns a resolved core default profile for service tests.
+func coreDefaultQoSForqos4Test() core.QoSProfile {
+	return core.ResolveSystemDefaults(core.DefaultQoS())
+}
+
+// TestCheckqos4CompatibilityVolatileTransientLocalIdentical pins byte-identical paths.
+func TestCheckqos4CompatibilityVolatileTransientLocalIdentical(t *testing.T) {
+	t.Parallel()
+	caps := DefaultDurabilityServiceQoS()
+	badCaps := DurabilityServiceQoS{HistoryKind: 99}
+	offered := coreDefaultQoSForqos4Test()
+	requested := coreDefaultQoSForqos4Test()
+	requested.Durability = core.DurabilityTransientLocal
+	report := Checkqos4CompatibilityWithDurabilityService(offered, requested, caps, caps)
+	if report.Compatible {
+		t.Fatalf("volatile versus transient local must stay incompatible")
+	}
+	offered.Durability = core.DurabilityTransientLocal
+	requested.Durability = core.DurabilityVolatile
+	report = Checkqos4CompatibilityWithDurabilityService(offered, requested, badCaps, badCaps)
+	if !report.Compatible {
+		t.Fatalf("transient local versus volatile must ignore caps, got %q", report.Reason())
+	}
+}
+
+// TestCheckqos4CompatibilityTransientEnforcesService pins transient kinds enforce caps.
+func TestCheckqos4CompatibilityTransientEnforcesService(t *testing.T) {
+	t.Parallel()
+	offered := coreDefaultQoSForqos4Test()
+	requested := coreDefaultQoSForqos4Test()
+	offered.Durability = core.Durabilityqos4Transient
+	requested.Durability = core.Durabilityqos4Transient
+	offerCaps := DefaultDurabilityServiceQoS()
+	requestCaps := DefaultDurabilityServiceQoS()
+	requestCaps.HistoryDepth = 10
+	report := Checkqos4CompatibilityWithDurabilityService(offered, requested, offerCaps, requestCaps)
+	if report.Compatible {
+		t.Fatalf("transient depth 1 versus 10 must mismatch on service")
+	}
+	if len(report.Errors) == 0 {
+		t.Fatalf("service mismatch must error")
+	}
+	// Matching caps stay compatible.
+	requestCaps.HistoryDepth = 1
+	report = Checkqos4CompatibilityWithDurabilityService(offered, requested, offerCaps, requestCaps)
+	if !report.Compatible {
+		t.Fatalf("matching transient caps must stay compatible, got %q", report.Reason())
+	}
+}
+
+// TestCheckqos4CompatibilityPersistentEnforcesService pins persistent kinds enforce caps.
+func TestCheckqos4CompatibilityPersistentEnforcesService(t *testing.T) {
+	t.Parallel()
+	offered := coreDefaultQoSForqos4Test()
+	requested := coreDefaultQoSForqos4Test()
+	offered.Durability = core.Durabilityqos4Persistent
+	requested.Durability = core.Durabilityqos4Persistent
+	offerCaps := DefaultDurabilityServiceQoS()
+	requestCaps := DefaultDurabilityServiceQoS()
+	requestCaps.HistoryDepth = 10
+	report := Checkqos4CompatibilityWithDurabilityService(offered, requested, offerCaps, requestCaps)
+	if report.Compatible {
+		t.Fatalf("persistent depth 1 versus 10 must mismatch on service")
+	}
+}
+
+// lifespanSample carries one source timestamp for sweep tests.
+type lifespanSample struct {
+	sourceNanos int64
+	payload     int
+}
+
+// lifespanTimestamp extracts the source timestamp of one sample.
+func lifespanTimestamp(s lifespanSample) int64 {
+	return s.sourceNanos
+}
+
+// TestExpiredByLifespan pins the per sample expiry predicate.
+func TestExpiredByLifespan(t *testing.T) {
+	t.Parallel()
+	lifespan := core.NewDuration(10, 0)
+	const lifespanNanos = int64(10000000000)
+	if ExpiredByLifespan(lifespanNanos, 0, core.UnspecifiedDuration()) {
+		t.Fatal("unspecified lifespan must never expire")
+	}
+	if ExpiredByLifespan(lifespanNanos, 0, core.InfiniteDuration()) {
+		t.Fatal("infinite lifespan must never expire")
+	}
+	if ExpiredByLifespan(lifespanNanos, lifespanNanos, lifespan) {
+		t.Fatal("fresh sample at exactly now must not expire")
+	}
+	if !ExpiredByLifespan(2*lifespanNanos+1, 0, lifespan) {
+		t.Fatal("sample older than lifespan must expire")
+	}
+	if ExpiredByLifespan(lifespanNanos, lifespanNanos+1, lifespan) {
+		t.Fatal("future source timestamp must never expire")
+	}
+	if !ExpiredByLifespan(0, 0, core.Duration{Seconds: -1}) {
+		t.Fatal("negative lifespan must expire fail-closed")
+	}
+	if !ExpiredByLifespan(0, 0, core.Duration{Seconds: 1, Nanoseconds: 1000000000}) {
+		t.Fatal("oversized lifespan must expire fail-closed")
+	}
+	if !ExpiredByLifespan(0, 0, core.BestAvailableDuration()) {
+		t.Fatal("sentinel lifespan must expire fail-closed")
+	}
+}
+
+// TestSweepLifespan pins filtering keeps order and counts expired.
+func TestSweepLifespan(t *testing.T) {
+	t.Parallel()
+	lifespan := core.NewDuration(10, 0)
+	samples := []lifespanSample{
+		{sourceNanos: 0, payload: 1},
+		{sourceNanos: 5000000000, payload: 2},
+		{sourceNanos: 95000000000, payload: 3},
+	}
+	kept, expired := SweepLifespan(100000000000, lifespan, samples, lifespanTimestamp)
+	if expired != 2 {
+		t.Fatalf("expired = %d, want 2", expired)
+	}
+	if len(kept) != 1 || kept[0].payload != 3 {
+		t.Fatalf("kept = %+v, want only payload 3", kept)
+	}
+	kept, expired = SweepLifespan(100000000000, core.UnspecifiedDuration(), samples, lifespanTimestamp)
+	if expired != 0 || len(kept) != 3 {
+		t.Fatalf("unspecified lifespan must keep all: kept=%+v expired=%d", kept, expired)
+	}
+	kept, expired = SweepLifespan(100000000000, core.InfiniteDuration(), samples, lifespanTimestamp)
+	if expired != 0 || len(kept) != 3 {
+		t.Fatalf("infinite lifespan must keep all: kept=%+v expired=%d", kept, expired)
+	}
+	if kept, expired := SweepLifespan(0, lifespan, nil, lifespanTimestamp); expired != 0 || len(kept) != 0 {
+		t.Fatalf("empty input must stay empty: kept=%+v expired=%d", kept, expired)
+	}
+	malformed := []lifespanSample{{sourceNanos: 0, payload: 1}}
+	if _, expired := SweepLifespan(0, core.Duration{Seconds: -1}, malformed, lifespanTimestamp); expired != 1 {
+		t.Fatalf("malformed lifespan must drop every sample fail-closed, expired=%d", expired)
 	}
 }

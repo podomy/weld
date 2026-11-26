@@ -372,6 +372,19 @@ type takeHookSnapshot struct {
 	tracker *core.LivelinessTracker
 	// deadline is the topic deadline tracker, nil when untracked.
 	deadline *core.DeadlineTracker
+	// participant names the writer participant slot for manual-by-participant gating.
+	participant string
+	// participantState is the lease stage for the writer participant.
+	participantState core.LivelinessState
+}
+
+// participantNameForWriter derives the participant slot for one writer GUID.
+//
+// The first 12 GUID bytes are the participant prefix per DDS GUID layout;
+// hex encoding names the SetParticipantLease slot consulted on the take
+// path so participant leases gate delivery without SEDP coupling.
+func participantNameForWriter(guid WriterGUID) string {
+	return hex.EncodeToString(guid[:12])
 }
 
 // livelyTrackerCap bounds the lazy tracker map under writer churn.
@@ -473,14 +486,19 @@ func (r *DataReceiver) ensureLivelyLocked(topic string, guid WriterGUID, cfg liv
 // ensureLivelyLocked, which evicts an arbitrary entry on cap since the
 // bound is memory, not fairness.
 func (r *DataReceiver) snapshotTakeHooks(topic string, guid WriterGUID) takeHookSnapshot {
+	nowNanos := r.receiverNow()().UnixNano()
 	r.mu.RLock()
 	snap := takeHookSnapshot{
-		filter:   r.contentFilters[topic],
-		tracker:  r.lively[guid],
-		deadline: r.deadlines[topic],
+		filter:           r.contentFilters[topic],
+		tracker:          r.lively[guid],
+		deadline:         r.deadlines[topic],
+		participant:      participantNameForWriter(guid),
+		participantState: core.LivelinessAlive,
 	}
 	cfg, hasCfg := r.livelyCfg[topic]
 	r.mu.RUnlock()
+
+	snap.participantState = r.ParticipantState(snap.participant, nowNanos)
 
 	if hasCfg && snap.tracker == nil {
 		matched := r.isMatchedWriter(guid)
@@ -577,8 +595,24 @@ func (r *DataReceiver) UnsetLivelinessTrackerForTopic(topic string) {
 // SetDeadlineTrackerForTopic records the deadline contract for one topic.
 //
 // Missed deadlines drop loudly naming the deadline policy. A zero or
-// unspecified deadline disables the check while keeping the tracker.
-func (r *DataReceiver) SetDeadlineTrackerForTopic(topic string, deadline core.Duration) {
+// unspecified deadline disables the check while keeping the tracker. It
+// refuses an inconsistent deadline where period is below the current
+// time-filter minimum separation per DDS 1.4 sections 2.2.3.7 and 2.2.3.12,
+// which require period >= minimum_separation. The reverse direction,
+// raising minimum separation above an installed deadline, belongs to the
+// time-filter setter and must fail there the same way.
+func (r *DataReceiver) SetDeadlineTrackerForTopic(topic string, deadline core.Duration) error {
+	st := r.readerStateFor()
+	st.mu.Lock()
+	minimum := st.timeFilter.minimum
+	st.mu.Unlock()
+	if minimum > 0 && !deadline.IsUnspecified() && !deadline.IsInfinite() {
+		err := r.checkLife5DeadlineConsistent(minimum, deadline)
+		if err != nil {
+			return err
+		}
+	}
+
 	nowNanos := r.receiverNow()().UnixNano()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -589,6 +623,17 @@ func (r *DataReceiver) SetDeadlineTrackerForTopic(topic string, deadline core.Du
 
 	tracker := core.NewDeadlineTracker(topic, "reader", deadline, nowNanos)
 	r.deadlines[topic] = &tracker
+
+	return nil
+}
+
+// checkLife5DeadlineConsistent refuses a deadline below minimum separation.
+func (r *DataReceiver) checkLife5DeadlineConsistent(minimum int64, deadline core.Duration) error {
+	if deadline.TotalNanoseconds() < minimum {
+		return fmt.Errorf("dds: deadline %d below time filter minimum %d: %w", deadline.TotalNanoseconds(), minimum, ErrOwnershipRefused)
+	}
+
+	return nil
 }
 
 // writerGUIDLabel renders a writer GUID for tracker naming.
@@ -599,22 +644,20 @@ func writerGUIDLabel(guid WriterGUID) string {
 // evalTakeHooks runs content filtering, keyed extraction, and liveliness
 // gating for one validated sample against a snapshot.
 //
-// Receipt asserts liveliness and anchors the deadline even when the sample
-// is later filtered: the assert runs before filter evaluation so filtered
-// traffic still proves the writer alive. An expired writer sending only
-// filtered traffic therefore surfaces as a filter miss, not expiry.
-// The deadline miss flag is captured before anchoring, so the current
+// Filter and keyed checks run first so discarded samples never assert
+// liveliness or anchor deadlines: only delivered samples prove the writer
+// alive. An expired writer sending only filtered traffic therefore stays
+// expired instead of surfacing as a filter miss. The deadline miss flag is
+// captured after gating passes and before anchoring, so the current
 // sample still drops on a miss instead of hiding behind its own anchor.
 // It never counts and never takes receiver locks: the caller counts
 // reasoned drops exactly once and propagates holds uncounted. Order after
-// the assert is filter, then keyed, then liveliness gate, so dashboards
-// blame the earliest applicable cause. A nil return means deliver. It
-// never panics.
+// gating is filter, then keyed, then assert, then liveliness gate, so
+// dashboards blame the earliest applicable cause. A nil return means
+// deliver. It never panics.
 //
 //nolint:unparam // topic documents the sampled topic for call-site symmetry though the snapshot already carries the filter
 func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte, guid WriterGUID, keyed bool, now int64) *takeHookReject {
-	deadlineMissed := assertTakeReceipt(snap, now)
-
 	if snap.filter != nil && snap.filter.filter != nil {
 		if rej := applyContentFilterHook(snap.filter, payload); rej != nil {
 			return rej
@@ -627,7 +670,44 @@ func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte,
 		}
 	}
 
-	return evalLivelinessHook(snap, deadlineMissed, now)
+	deadlineMissed := assertTakeReceipt(snap, now)
+
+	if rej := evalLivelinessHook(snap, deadlineMissed, now); rej != nil {
+		return rej
+	}
+
+	return evalParticipantHook(snap, deadlineMissed)
+}
+
+// evalParticipantHook gates delivery by manual-by-participant lease.
+//
+// Unknown participants report alive so unregistered writers pass through.
+// It reuses GateParticipantDelivery so participant writers hold while
+// stale and drop when expired exactly like other manual writers. Holds
+// carry no reason and stay uncounted; drops map to liveliness-expired.
+func evalParticipantHook(snap takeHookSnapshot, deadlineMissed bool) *takeHookReject {
+	outcome := GateParticipantDelivery(snap.participantState, deadlineMissed)
+
+	switch outcome.Decision {
+	case core.GateDeliver:
+		return nil
+	case core.GateHold:
+		return &takeHookReject{err: fmt.Errorf("dds: take held stale participant: %w", ErrLivelinessHold)}
+	case core.GateDrop:
+		reason := DropReasonLivelinessExpired
+
+		return &takeHookReject{
+			reason: &reason,
+			err:    fmt.Errorf("dds: take expired participant: %w", errors.Join(ErrLivelinessExpired, errors.New(outcome.Reason))),
+		}
+	default:
+		reason := DropReasonLivelinessExpired
+
+		return &takeHookReject{
+			reason: &reason,
+			err:    fmt.Errorf("dds: take invalid participant gate decision %d: %w", int(outcome.Decision), errors.Join(ErrLivelinessExpired, errors.New("invalid gate decision"))),
+		}
+	}
 }
 
 // assertTakeReceipt records one receipt against liveliness and deadline.
@@ -635,7 +715,7 @@ func evalTakeHooks(snap takeHookSnapshot, topic, typeIDL string, payload []byte,
 // Automatic writers assert through RecordSampleAt; manual writers never ride
 // free on data. The deadline miss flag is captured before MarkSeen so the
 // caller gates on the pre-receipt miss while the anchor still moves forward
-// for filtered traffic. It reports the pre-anchor miss for the gate step.
+// for delivered samples. It reports the pre-anchor miss for the gate step.
 func assertTakeReceipt(snap takeHookSnapshot, now int64) bool {
 	var missed bool
 	if snap.deadline != nil {

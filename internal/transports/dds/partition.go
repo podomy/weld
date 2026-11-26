@@ -525,15 +525,15 @@ func FindPartitionParamEndian(params []rtps.Param, littleEndian bool) ([]string,
 // string stay isolated across partitions; see the backend.go INTEGRATION
 // note for the wiring step. Topic plus names must be NUL-free because
 // MatchPartitions treats elements as opaque bytes: a NUL inside any input
-// panics loudly with ErrInvalidPartition instead of forging a colliding key.
-func PartitionRouteKey(ddsTopic string, partitions []string) string {
+// fails loudly with ErrInvalidPartition instead of forging a colliding key.
+func PartitionRouteKey(ddsTopic string, partitions []string) (string, error) {
 	if strings.IndexByte(ddsTopic, 0x00) >= 0 {
-		panic(fmt.Errorf("dds: partition route key topic carries NUL: %w", ErrInvalidPartition))
+		return "", fmt.Errorf("dds: partition route key topic carries NUL: %w", ErrInvalidPartition)
 	}
 
 	for _, name := range partitions {
 		if strings.IndexByte(name, 0x00) >= 0 {
-			panic(fmt.Errorf("dds: partition route key name carries NUL: %w", ErrInvalidPartition))
+			return "", fmt.Errorf("dds: partition route key name carries NUL: %w", ErrInvalidPartition)
 		}
 	}
 
@@ -542,7 +542,32 @@ func PartitionRouteKey(ddsTopic string, partitions []string) string {
 	slices.Sort(sorted)
 	sorted = slices.Compact(sorted)
 
-	return ddsTopic + "\x00" + strings.Join(sorted, "\x00")
+	return ddsTopic + "\x00" + strings.Join(sorted, "\x00"), nil
+}
+
+// PartitionRouteKeyForEndpoint returns the discovery route key for one endpoint.
+//
+// It canonicalizes the partition set exactly like PartitionRouteKey so
+// backend route maps, DATA demux, and retention keyed by this string stay
+// isolated across partitions: the same DDS topic on different partitions
+// never shares endpoints, routes, or history.
+func PartitionRouteKeyForEndpoint(ddsTopic string, partitions []string) (string, error) {
+	return PartitionRouteKey(ddsTopic, partitions)
+}
+
+// PartitionRetentionKey returns the retention key for one writer on one topic.
+//
+// It joins the partition route key with the writer GUID hex so per-writer
+// repair history and take-path sequence state scope to the partition
+// route: a GUID reused across partitions restarts retention instead of
+// inheriting another partition's sequences.
+func PartitionRetentionKey(ddsTopic string, guid [16]byte, partitions []string) (string, error) {
+	route, err := PartitionRouteKey(ddsTopic, partitions)
+	if err != nil {
+		return "", err
+	}
+
+	return route + "\x00" + string(guid[:]), nil
 }
 
 // INTEGRATION state: per-participant tables are the recorded design, so no
@@ -556,6 +581,14 @@ func PartitionRouteKey(ddsTopic string, partitions []string) string {
 // INTEGRATION: DONE matcher.go: SEDPEndpointsMatch gates on
 //   MatchPartitions so partition mismatch stays a quiet non-match
 //   (no_common_partition) instead of an RxO error.
-// INTEGRATION: backend.go: key discovery routes and DATA demux by
-//   PartitionRouteKey(ddsTopic, partitions) so the same DDS topic on
-//   different partitions never shares endpoints, routes, or retention.
+// INTEGRATION: DONE backend.go plus datapath.go: routes map stays keyed by
+//   GUIDPrefix for wire compat while demux plus retention scope by
+//   PartitionRouteKeyForEndpoint plus PartitionRetentionKey, so the same DDS
+//   topic on different partitions never shares endpoints, retention, or
+//   delivery. Demux partitionAllowsDelivery plus take partitionGateReject
+//   allow unknown writers, nil indexes, and pre-discovery topics so flow
+//   stays byte-identical before discovery, and enforce strict post-discovery
+//   once writers plus local readers are known. Backend rekeyBackendRetention
+//   evicts repairHistory plus remoteTrack plus fragSend plus SEDP bounds on
+//   route-key change, mirroring datapath rekeyRetentionForWriter for take
+//   state.

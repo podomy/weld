@@ -537,12 +537,43 @@ type DataReceiver struct {
 	// SetLivelinessTracker and SetDeadlineTracker. Absent means untracked:
 	// delivery flows exactly as before.
 	lively map[WriterGUID]*core.LivelinessTracker
+	// writerLively tracks writer-side liveliness for LIVELINESS_LOST
+	// accounting, set via SetWriterLivelinessTracker. Absent means no
+	// writer-side polling: delivery flows exactly as before and reader
+	// expiry drops never count writer loss.
+	writerLively map[WriterGUID]*core.LivelinessTracker
+	// secureGate closes the provisional fast-path when security is
+	// enabled. False keeps tolerance mode: unknown writers install a
+	// provisional record and deliver. True fails closed: unknown writers
+	// drop until SEDP confirms them. Set via SetSecureProvisionalGate.
+	secureGate bool
+	// writerRouteKeys scopes retention by partition route key. The stored
+	// key comes from PartitionRouteKeyForEndpoint for the writer endpoint;
+	// a change evicts per-writer sequence state so retention never leaks
+	// across partitions.
+	writerRouteKeys map[WriterGUID]string
 	// livelyCfg holds per-topic liveliness configs for lazy tracker
 	// creation. Writers discovered after subscribe still get tracked on
 	// their first take, so enforcement needs no re-subscribe.
 	livelyCfg map[string]livelyConfig
-	// deadlines holds per-topic deadline trackers by ROS topic.
+	// deadlines holds per-topic requested deadline trackers by ROS topic.
+	// Requested and offered sides use separate tracker instances so polling
+	// one never moves the other's watermark; see offeredDeadlines.
 	deadlines map[string]*core.DeadlineTracker
+	// offeredDeadlines holds per-topic writer-side deadline trackers by ROS
+	// topic. CheckOfferedDeadline polls here while snapshotTakeHooks plus
+	// CheckRequestedDeadline poll deadlines, so the two sides never share
+	// state.
+	offeredDeadlines map[string]*core.DeadlineTracker
+	// lifespans holds per-topic lifespan contracts by ROS topic. Unset
+	// means infinite: takes flow byte-identically. Set via
+	// SetLifespanForTopic; take paths sweep expired samples fail-closed.
+	lifespans map[string]core.Duration
+	// sample holds the DDS 1.4 API-surface side channel: sample infos,
+	// instances, controls, ownership, filters, statuses, and listeners.
+	// Recording only appends; delivery flows exactly as before with or
+	// without readers of this state.
+	sample *readerState
 }
 
 // livelyConfig names the liveliness contract for one subscribed topic.
@@ -568,6 +599,8 @@ const (
 	DropReasonLivelinessExpired DropReason = "liveliness-expired"
 	// DropReasonNackSendFailed counts gap NACKs that failed to send.
 	DropReasonNackSendFailed DropReason = "nack-send-failed"
+	// DropReasonPartitionMismatch counts samples dropped with no common partition.
+	DropReasonPartitionMismatch DropReason = "partition-mismatch"
 )
 
 var (
@@ -579,6 +612,8 @@ var (
 	ErrDeadlineMissed = errors.New("dds: deadline missed")
 	// ErrLivelinessExpired reports a sample dropped from an expired writer.
 	ErrLivelinessExpired = errors.New("dds: liveliness expired")
+	// ErrPartitionMismatch reports a sample dropped with no common partition.
+	ErrPartitionMismatch = errors.New("dds: partition mismatch")
 )
 
 // ProvisionalQoS carries DATA inline QoS for one unknown writer sample.
@@ -640,6 +675,7 @@ func NewDataReceiver() *DataReceiver {
 		provisional:  make(map[WriterGUID]ProvisionalEndpoint),
 		reasonCounts: make(map[DropReason]uint64),
 		now:          time.Now,
+		sample:       newReaderState(),
 	}
 }
 
@@ -772,21 +808,27 @@ func (r *DataReceiver) DropReasonCount(reason DropReason) uint64 {
 
 // EvictWriter drops per-writer take state for one removed writer.
 //
-// It deletes sequence tracking, plain NACK state, provisional records, and
-// liveliness trackers so a later writer reusing the GUID restarts clean
-// instead of inheriting stale gaps or NACK bases. It self-locks and is safe
-// for concurrent use.
+// It deletes sequence tracking, delivered sets, plain NACK state,
+// provisional records, and liveliness trackers so a later writer reusing
+// the GUID restarts clean instead of inheriting stale gaps or NACK bases.
+// It also forgets the liveliness-changed edge so alive counts never retain
+// a removed writer. It self-locks and is safe for concurrent use.
 func (r *DataReceiver) EvictWriter(guid WriterGUID) {
 	if r == nil {
 		return
 	}
+	var handle [16]byte
+	copy(handle[:], guid[:])
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	delete(r.last, guid)
+	delete(r.delivered, guid)
 	delete(r.plainNack, guid)
 	delete(r.provisional, guid)
 	delete(r.lively, guid)
+	delete(r.writerLively, guid)
+	delete(r.writerRouteKeys, guid)
+	r.mu.Unlock()
+	r.ForgetWriter(handle)
 }
 
 // ProvisionalForGUID returns the provisional record for one writer GUID.
@@ -1282,6 +1324,10 @@ func (r *DataReceiver) decodePlainCDRWithQoS(guid WriterGUID, payload []byte, qo
 		return decodeConfirmedPlainCDR(ep, payload)
 	}
 
+	if r.secureGateClosed() {
+		return empty, false
+	}
+
 	prov, _ := r.ensureProvisional(guid, qos, hasQoS)
 	return decodeProvisionalPlainCDR(prov, payload)
 }
@@ -1291,22 +1337,35 @@ func (r *DataReceiver) decodePlainCDRWithQoS(guid WriterGUID, payload []byte, qo
 // It shares sequence tracking and copy once ownership used by Take and
 // TakeFrom so both paths handle gaps, duplicates, and payload copies
 // identically. The decoded frame, payload view, and ROS topic must already
-// be validated. It locks internally for ordering.
+// be validated. It locks internally for ordering. The returned info carries
+// the pre-take state so TakeSampled pairing is atomic with no separate
+// lookup. Drops note deadline, liveness, and writer statuses for
+// dashboards.
 func (r *DataReceiver) takeDecoded(
 	decoded decodedFrame,
 	payloadView []byte,
 	rosTopic string,
-) (transports.IncomingMessage, error) {
+) (transports.IncomingMessage, SampleInfo, error) {
 	var empty transports.IncomingMessage
+	var emptyInfo SampleInfo
+
+	r.rekeyRetentionForWriter(decoded.guid)
+	if rej := r.provisionalGateReject(decoded.guid); rej != nil {
+		return empty, emptyInfo, r.countTakeHookReject(rej)
+	}
+	if rej := r.partitionGateReject(decoded.guid, rosTopic); rej != nil {
+		return empty, emptyInfo, r.countTakeHookReject(rej)
+	}
 
 	snap := r.snapshotTakeHooks(rosTopic, decoded.guid)
+	r.feedOwnershipStatus(decoded.guid, snap, r.receiverNow()().UnixNano())
 
 	r.mu.Lock()
 
 	evicted, evictedOk, err := r.trackSequenceLocked(decoded.guid, decoded.seq)
 	if err != nil {
 		r.mu.Unlock()
-		return empty, fmt.Errorf("dds: take sequence: %w", err)
+		return empty, emptyInfo, fmt.Errorf("dds: take sequence: %w", err)
 	}
 
 	var outPayload []byte
@@ -1322,8 +1381,11 @@ func (r *DataReceiver) takeDecoded(
 		logTakeEvict(evicted)
 	}
 
-	if rej := evalTakeHooks(snap, rosTopic, decoded.typeName, payloadView[:decoded.userLen], decoded.guid, writerGUIDKeyed(decoded.guid), r.receiverNow()().UnixNano()); rej != nil {
-		return empty, r.countTakeHookReject(rej)
+	now := r.receiverNow()().UnixNano()
+	if rej := evalTakeHooks(snap, rosTopic, decoded.typeName, payloadView[:decoded.userLen], decoded.guid, writerGUIDKeyed(decoded.guid), now); rej != nil {
+		r.noteTakeReject(rosTopic, decoded.typeName, decoded.guid, payloadView[:decoded.userLen], rej)
+
+		return empty, emptyInfo, r.countTakeHookReject(rej)
 	}
 
 	msg := transports.IncomingMessage{
@@ -1332,7 +1394,398 @@ func (r *DataReceiver) takeDecoded(
 		Payload:   outPayload,
 	}
 
-	return msg, nil
+	info, err := r.observeData(rosTopic, decoded.typeName, decoded.guid, decoded.seq, payloadView[:decoded.userLen], r.receiverNow()())
+	if err != nil {
+		if errors.Is(err, ErrOwnershipRefused) {
+			return empty, emptyInfo, fmt.Errorf("dds: take resource exhausted: %w", err)
+		}
+
+		return empty, emptyInfo, fmt.Errorf("dds: take observe: %w", err)
+	}
+	sourceNanos := info.ReceptionTimestamp.UnixNano()
+	if !info.SourceTimestamp.IsZero() {
+		sourceNanos = info.SourceTimestamp.UnixNano()
+	}
+	if r.lifespanExpiredForTake(rosTopic, sourceNanos, r.receiverNow()().UnixNano()) {
+		r.dropUndeliverableLife5Take(info)
+		r.countDropReason(DropReasonDeadlineMissed)
+		return empty, emptyInfo, fmt.Errorf("dds: take lifespan expired: %w", ErrDeadlineMissed)
+	}
+	if !r.deliverableLife5Take(msg, info) {
+		r.dropUndeliverableLife5Take(info)
+
+		return empty, emptyInfo, fmt.Errorf("dds: take not deliverable: %w", ErrNoSample)
+	}
+	st := r.readerStateFor()
+	st.mu.Lock()
+	st.flipLife5DeliveredTakeLocked(info)
+	st.mu.Unlock()
+	r.noteWriterDeliveredLife5(rosTopic, decoded.guid)
+	r.CheckWriterLiveliness(decoded.guid)
+	r.CheckOfferedDeadline(rosTopic, r.receiverNow()().UnixNano())
+	r.NotifyData(rosTopic, SampledMessage{Msg: msg, Info: info})
+
+	return msg, info, nil
+}
+
+// noteWriterDeliveredLife5 marks one writer alive and notifies once per edge.
+//
+// It fans out liveliness only when the aliveness actually changed.
+func (r *DataReceiver) noteWriterDeliveredLife5(topic string, guid WriterGUID) {
+	var handle [16]byte
+	copy(handle[:], guid[:])
+	if r.NoteWriterAlive(handle, true) {
+		r.NotifyLiveliness(topic, handle, true)
+	}
+}
+
+// deliverableLife5Take reports whether one just-observed sample passes
+// ownership plus time-filter gating with take-means-drop semantics.
+//
+// It shares the TakeNext verdict path so immediate takes filter exactly
+// like takes from history. Ownership gates first so a suppressed sample
+// never touches the time-filter watermark. The time basis is the source
+// timestamp when known, else the reception time: source order reflects
+// the writer cadence named by DDS 1.4 section 2.2.3.12, while v1 DATA
+// frames and plain samples carry no source stamp and fall back to
+// reception. Time-filtered takes count filtered and drop; ownership
+// filtered takes drop without counting.
+func (r *DataReceiver) deliverableLife5Take(msg transports.IncomingMessage, info SampleInfo) bool {
+	st := r.readerStateFor()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	sample := SampledMessage{Msg: msg, Info: info}
+	if !st.ownershipDeliverableLocked(sample) {
+		return false
+	}
+
+	nowNanos := info.ReceptionTimestamp.UnixNano()
+	if !info.SourceTimestamp.IsZero() {
+		nowNanos = info.SourceTimestamp.UnixNano()
+	}
+
+	return st.timeFilterPassLocked(info.InstanceHandle, nowNanos)
+}
+
+// dropUndeliverableLife5Take removes the just-observed history entry.
+//
+// Arrival never flips view, so a filtered take leaves the instance
+// unviewed with no restore needed: the flip happens only after gating
+// passes. The generation counters already recorded by observe stay, since
+// the instance did transition.
+func (r *DataReceiver) dropUndeliverableLife5Take(info SampleInfo) {
+	st := r.readerStateFor()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if len(st.history) > 0 {
+		last := st.history[len(st.history)-1]
+		if last != nil && last.sample.Info.InstanceHandle == info.InstanceHandle && last.sample.Info.SampleSequence == info.SampleSequence {
+			st.history[len(st.history)-1] = nil
+			st.history = st.history[:len(st.history)-1]
+		}
+	}
+}
+
+// SetWriterLivelinessTracker registers a writer-side liveliness tracker.
+//
+// The tracker drives LIVELINESS_LOST accounting via CheckWriterLiveliness
+// without touching reader gating: reader expiry drops never count writer
+// loss. A nil tracker clears the entry. It self-locks and is safe for
+// concurrent use.
+func (r *DataReceiver) SetWriterLivelinessTracker(guid WriterGUID, tracker *core.LivelinessTracker) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.writerLively == nil {
+		r.writerLively = make(map[WriterGUID]*core.LivelinessTracker)
+	}
+	if tracker == nil {
+		delete(r.writerLively, guid)
+		return
+	}
+	r.writerLively[guid] = tracker
+}
+
+// CheckWriterLiveliness polls one writer-side tracker and notes loss.
+//
+// It reports true when the writer reads expired at the receiver clock. On
+// expiry it notes LIVELINESS_LOST plus the changed edge and fans out the
+// liveliness listener once per edge. Missing trackers report false with no
+// delivery change, so take paths stay byte-identical without writer contracts.
+func (r *DataReceiver) CheckWriterLiveliness(guid WriterGUID) bool {
+	r.mu.RLock()
+	tracker := r.writerLively[guid]
+	r.mu.RUnlock()
+	if tracker == nil {
+		return false
+	}
+	now := r.receiverNow()().UnixNano()
+	if tracker.StateAt(now) != core.LivelinessExpired {
+		return false
+	}
+	var handle [16]byte
+	copy(handle[:], guid[:])
+	if !r.NoteWriterAlive(handle, false) {
+		return false
+	}
+	r.NoteLivelinessLost()
+	r.NotifyLiveliness(tracker.Topic(), handle, false)
+	return true
+}
+
+// CheckOfferedDeadline polls the topic deadline tracker and notes a writer-side miss.
+//
+// It polls the writer-side offered tracker, separate from the requested
+// tracker used by snapshotTakeHooks plus CheckRequestedDeadline, so the two
+// sides never share watermarks. When no offered tracker exists it falls back
+// to the shared deadlines entry for compat with callers that only set the
+// requested side; SetDeadlineTrackerForTopic installs separate instances on
+// both sides. A missing tracker reports no alert.
+func (r *DataReceiver) CheckOfferedDeadline(topic string, now int64) (core.DeadlineAlert, bool) {
+	r.mu.RLock()
+	tracker := r.offeredDeadlines[topic]
+	fallback := r.deadlines[topic]
+	r.mu.RUnlock()
+	if tracker == nil {
+		tracker = fallback
+	}
+	if tracker == nil {
+		return core.DeadlineAlert{}, false
+	}
+	alert, ok := tracker.Check(now)
+	if !ok {
+		return core.DeadlineAlert{}, false
+	}
+	handle := r.instanceHandleForTopic(topic)
+	r.NoteOfferedDeadlineMissed(handle)
+	r.NotifyDeadline(topic)
+	return alert, true
+}
+
+// SetOfferedDeadlineTrackerForTopic records the writer-side deadline contract.
+//
+// It installs a separate tracker instance from the requested side so the two
+// never share state; polling offered never moves the requested watermark.
+// A zero or unspecified deadline disables the check while keeping the entry.
+func (r *DataReceiver) SetOfferedDeadlineTrackerForTopic(topic string, deadline core.Duration) {
+	nowNanos := r.receiverNow()().UnixNano()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.offeredDeadlines == nil {
+		r.offeredDeadlines = make(map[string]*core.DeadlineTracker)
+	}
+	tracker := core.NewDeadlineTracker(topic, "writer", deadline, nowNanos)
+	r.offeredDeadlines[topic] = &tracker
+}
+
+// SetLifespanForTopic records the lifespan contract for one topic.
+//
+// Unspecified or infinite lifespans keep every sample. Set via QoS profile
+// lifespan; take paths sweep via ExpiredByLifespan fail-closed. It
+// self-locks and is safe for concurrent use.
+func (r *DataReceiver) SetLifespanForTopic(topic string, lifespan core.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lifespans == nil {
+		r.lifespans = make(map[string]core.Duration)
+	}
+	r.lifespans[topic] = lifespan
+}
+
+// lifespanForTopic returns the lifespan contract for one topic, false when unset.
+func (r *DataReceiver) lifespanForTopic(topic string) (core.Duration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	lifespan, ok := r.lifespans[topic]
+	if !ok {
+		return core.Duration{}, false
+	}
+	return lifespan, true
+}
+
+// lifespanExpiredForTake reports whether one take must drop on lifespan expiry.
+//
+// It calls ExpiredByLifespan in durability.go (owned by the durability
+// agent) with the take now plus the sample source time. Unset, unspecified,
+// or infinite lifespans never expire, keeping tolerance flow byte-identical.
+// Future source times never expire. Malformed lifespans expire fail-closed.
+func (r *DataReceiver) lifespanExpiredForTake(topic string, sourceNanos, nowNanos int64) bool {
+	lifespan, ok := r.lifespanForTopic(topic)
+	if !ok {
+		return false
+	}
+	return ExpiredByLifespan(nowNanos, sourceNanos, lifespan)
+}
+
+// SetSecureProvisionalGate closes or opens the provisional fast-path.
+//
+// False keeps tolerance mode: unknown writers install a provisional record
+// and deliver. True fails closed: unknown writers drop until SEDP confirms
+// them. The backend sets it from the security suite on subscribe.
+func (r *DataReceiver) SetSecureProvisionalGate(closed bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.secureGate = closed
+}
+
+// secureGateClosed reports whether provisional delivery must fail closed.
+func (r *DataReceiver) secureGateClosed() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.secureGate
+}
+
+// provisionalGateReject reports whether one take must drop on the secure gate.
+//
+// Tolerance mode (gate open) never rejects so pre-discovery flow stays
+// byte-identical. When the suite closes the gate (SetSecureProvisionalGate
+// true via Join plus SetSecuritySuite plus subscribeReader plus publish),
+// unknown writers without a confirmed SEDP remote drop fail-closed until
+// SEDP confirms them; confirmed writers always pass.
+func (r *DataReceiver) provisionalGateReject(guid WriterGUID) *takeHookReject {
+	if !r.secureGateClosed() {
+		return nil
+	}
+	if _, ok := r.remoteForGUID(guid); ok {
+		return nil
+	}
+	reason := DropReasonUnknownWriter
+	return &takeHookReject{
+		reason: &reason,
+		err:    fmt.Errorf("dds: take unknown writer guid=%x gate closed: %w", guid, ErrUnknownWriter),
+	}
+}
+
+// feedOwnershipStatus feeds exclusive arbitration liveness plus deadline state.
+//
+// Alive derives from the take-hooks snapshot liveliness gate outcome and
+// deadlineClean from the snapshot deadline miss flag, so dead or
+// deadline-missed writers drop from exclusive arbitration. It calls
+// FeedOwnershipqos4Status (owned by the ownership agent) in takeDecoded
+// and tryPlainFallbacks.
+func (r *DataReceiver) feedOwnershipStatus(guid WriterGUID, snap takeHookSnapshot, now int64) {
+	alive := true
+	deadlineClean := true
+	if snap.tracker != nil && snap.tracker.StateAt(now) == core.LivelinessExpired {
+		alive = false
+	}
+	if snap.deadline != nil && snap.deadline.MissedAt(now) {
+		deadlineClean = false
+	}
+	r.FeedOwnershipqos4Status(guid, alive, deadlineClean)
+}
+
+// writerRouteInfo resolves the partition route inputs for one writer.
+//
+// Confirmed SEDP remotes win; otherwise the provisional record supplies the
+// DDS topic with no partitions. Unknown writers report false.
+func (r *DataReceiver) writerRouteInfo(guid WriterGUID) (string, []string, bool) {
+	if ep, ok := r.remoteForGUID(guid); ok {
+		return ep.DDSTopic, ep.Partitions, true
+	}
+	if prov, ok := r.ProvisionalForGUID(guid); ok {
+		return prov.DDSTopic, nil, true
+	}
+	return "", nil, false
+}
+
+// rekeyRetentionForWriter evicts per-writer retention when the partition route changes.
+//
+// Retention (sequence tracking, delivered sets, NACK state, trackers) scopes
+// by PartitionRouteKeyForEndpoint so a GUID reused across partitions never
+// inherits another partition's history. Unchanged keys and unknown writers
+// are no-ops, keeping tolerance flow byte-identical.
+func (r *DataReceiver) rekeyRetentionForWriter(guid WriterGUID) {
+	ddsTopic, partitions, ok := r.writerRouteInfo(guid)
+	if !ok || ddsTopic == "" {
+		return
+	}
+	key, err := PartitionRouteKeyForEndpoint(ddsTopic, partitions)
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.writerRouteKeys == nil {
+		r.writerRouteKeys = make(map[WriterGUID]string)
+	}
+	if prev, seen := r.writerRouteKeys[guid]; seen && prev == key {
+		return
+	}
+	delete(r.last, guid)
+	delete(r.delivered, guid)
+	delete(r.plainNack, guid)
+	delete(r.lively, guid)
+	delete(r.writerLively, guid)
+	r.writerRouteKeys[guid] = key
+}
+
+// partitionGateReject reports whether one take must drop on partition mismatch.
+//
+// It resolves the writer endpoint and requires a local reader sharing the
+// DDS topic plus a common partition via SEDPEndpointsMatch. Unknown
+// writers, a nil index, provisional writers, topics with no local readers,
+// and empty endpoint topics pass so pre-discovery flow stays
+// byte-identical; isolation bites only once both sides are known.
+func (r *DataReceiver) partitionGateReject(guid WriterGUID, rosTopic string) *takeHookReject {
+	ep, ok := r.remoteForGUID(guid)
+	if !ok {
+		return nil
+	}
+	r.mu.RLock()
+	idx := r.sedp
+	r.mu.RUnlock()
+	if idx == nil {
+		return nil
+	}
+	locals := idx.LocalEndpoints()
+	anyForTopic := false
+	for _, local := range locals {
+		if !local.IsReader {
+			continue
+		}
+		if local.ROSTopic != rosTopic {
+			continue
+		}
+		anyForTopic = true
+		if SEDPEndpointsMatch(local, ep) {
+			return nil
+		}
+	}
+	if !anyForTopic {
+		return nil
+	}
+	reason := DropReasonPartitionMismatch
+	return &takeHookReject{
+		reason: &reason,
+		err:    fmt.Errorf("dds: take partition mismatch writer %x topic %q: %w", guid, rosTopic, ErrPartitionMismatch),
+	}
+}
+
+// noteTakeReject notes deadline and liveliness statuses for one take-path drop.
+//
+// Reader-side expired-writer drops update only change counters via
+// NoteWriterAlive; the writer-side LIVELINESS_LOST count stays for writers.
+func (r *DataReceiver) noteTakeReject(topic, typeIDL string, guid WriterGUID, payload []byte, rej *takeHookReject) {
+	if rej == nil {
+		return
+	}
+
+	if errors.Is(rej.err, ErrDeadlineMissed) {
+		handle := r.instanceHandleForDrop(topic, typeIDL, guid, payload)
+		r.NoteRequestedDeadlineMissed(handle)
+		r.NoteOfferedDeadlineMissed(handle)
+		r.NotifyDeadline(topic)
+	}
+
+	if errors.Is(rej.err, ErrLivelinessExpired) {
+		var handle [16]byte
+		copy(handle[:], guid[:])
+		if r.NoteWriterAlive(handle, false) {
+			r.NotifyLiveliness(topic, handle, false)
+		}
+	}
 }
 
 // Take decodes one DATA frame and returns the user message.
@@ -1382,7 +1835,7 @@ func (r *DataReceiver) Take(frame []byte) (transports.IncomingMessage, error) {
 		return empty, fmt.Errorf("dds: take topic %q: %w", decoded.ddsTopic, err)
 	}
 
-	msg, err := r.takeDecoded(decoded, payloadView, rosTopic)
+	msg, _, err := r.takeDecoded(decoded, payloadView, rosTopic)
 	if err != nil {
 		return empty, err
 	}
@@ -1400,32 +1853,112 @@ func (r *DataReceiver) Take(frame []byte) (transports.IncomingMessage, error) {
 // zero means the queue predates sequence tracking, so those samples deliver
 // without tracking: they can neither dedupe nor advance NACK contiguity,
 // which keeps unknown seqs from poisoning loss accounting.
-func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, seq uint64, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, *takeHookReject, bool) {
+func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, seq uint64, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, SampleInfo, *takeHookReject, bool) {
 	var empty transports.IncomingMessage
+	var emptyInfo SampleInfo
 
-	msg, ok := r.decodePlainCDRWithQoS(guid, payload, qos, hasQoS)
+	msg, ok := r.decodePlainFallbackMessage(guid, payload, qos, hasQoS)
 	if !ok {
-		var chatterOk bool
-		msg, chatterOk = r.decodeCycloneChatter(guid, payload)
-		ok = chatterOk
-	}
-	if !ok {
-		return empty, nil, false
+		return empty, emptyInfo, nil, false
 	}
 
-	if seq != 0 {
-		err := r.trackPlainSequence(guid, seq)
-		if err != nil {
-			return empty, &takeHookReject{err: err}, false
-		}
-		r.notePlainSample(ctx, guid, seq)
+	if rej := r.trackPlainFallbackSeq(ctx, guid, seq); rej != nil {
+		return empty, emptyInfo, rej, false
+	}
+	r.rekeyRetentionForWriter(guid)
+	if rej := r.provisionalGateReject(guid); rej != nil {
+		return empty, emptyInfo, rej, false
+	}
+	if rej := r.partitionGateReject(guid, msg.TopicName); rej != nil {
+		return empty, emptyInfo, rej, false
 	}
 	snap := r.snapshotTakeHooks(msg.TopicName, guid)
-	if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid), r.receiverNow()().UnixNano()); rej != nil {
-		return empty, rej, false
+	now := r.receiverNow()().UnixNano()
+	r.feedOwnershipStatus(guid, snap, now)
+	if rej := evalTakeHooks(snap, msg.TopicName, msg.TypeName, payload, guid, writerGUIDKeyed(guid), now); rej != nil {
+		r.noteTakeReject(msg.TopicName, msg.TypeName, guid, payload, rej)
+
+		return empty, emptyInfo, rej, false
 	}
 
-	return msg, nil, true
+	info, rej, ok := r.observePlainFallback(msg, guid, seq)
+	if !ok {
+		return empty, emptyInfo, rej, false
+	}
+	if rej := r.checkPlainFallbackDeliverable(msg, info); rej != nil {
+		return empty, emptyInfo, rej, false
+	}
+	r.finishPlainFallbackDelivery(msg, info, guid)
+
+	return msg, info, nil, true
+}
+
+// decodePlainFallbackMessage tries QoS-aware CDR then Cyclone chatter.
+func (r *DataReceiver) decodePlainFallbackMessage(guid WriterGUID, payload []byte, qos ProvisionalQoS, hasQoS bool) (transports.IncomingMessage, bool) {
+	msg, ok := r.decodePlainCDRWithQoS(guid, payload, qos, hasQoS)
+	if ok {
+		return msg, true
+	}
+	msg, chatterOk := r.decodeCycloneChatter(guid, payload)
+	return msg, chatterOk
+}
+
+// trackPlainFallbackSeq records plain sequence and notes the sample.
+func (r *DataReceiver) trackPlainFallbackSeq(ctx context.Context, guid WriterGUID, seq uint64) *takeHookReject {
+	if seq == 0 {
+		return nil
+	}
+	err := r.trackPlainSequence(guid, seq)
+	if err != nil {
+		return &takeHookReject{err: err}
+	}
+	r.notePlainSample(ctx, guid, seq)
+	return nil
+}
+
+// observePlainFallback observes data and maps errors to rejects.
+func (r *DataReceiver) observePlainFallback(msg transports.IncomingMessage, guid WriterGUID, seq uint64) (SampleInfo, *takeHookReject, bool) {
+	var emptyInfo SampleInfo
+	info, err := r.observeData(msg.TopicName, msg.TypeName, guid, seq, msg.Payload, r.receiverNow()())
+	if err != nil {
+		if errors.Is(err, ErrOwnershipRefused) {
+			return emptyInfo, &takeHookReject{err: fmt.Errorf("dds: take from resource exhausted: %w", err)}, false
+		}
+
+		return emptyInfo, &takeHookReject{err: fmt.Errorf("dds: take from observe: %w", err)}, false
+	}
+	return info, nil, true
+}
+
+// checkPlainFallbackDeliverable enforces lifespan and deliverability.
+func (r *DataReceiver) checkPlainFallbackDeliverable(msg transports.IncomingMessage, info SampleInfo) *takeHookReject {
+	sourceNanos := info.ReceptionTimestamp.UnixNano()
+	if !info.SourceTimestamp.IsZero() {
+		sourceNanos = info.SourceTimestamp.UnixNano()
+	}
+	if r.lifespanExpiredForTake(msg.TopicName, sourceNanos, r.receiverNow()().UnixNano()) {
+		r.dropUndeliverableLife5Take(info)
+		reason := DropReasonDeadlineMissed
+		return &takeHookReject{reason: &reason, err: fmt.Errorf("dds: take from lifespan expired: %w", ErrDeadlineMissed)}
+	}
+	if !r.deliverableLife5Take(msg, info) {
+		r.dropUndeliverableLife5Take(info)
+
+		return &takeHookReject{err: fmt.Errorf("dds: take from not deliverable: %w", ErrNoSample)}
+	}
+	return nil
+}
+
+// finishPlainFallbackDelivery records delivery and notifies.
+func (r *DataReceiver) finishPlainFallbackDelivery(msg transports.IncomingMessage, info SampleInfo, guid WriterGUID) {
+	plainState := r.readerStateFor()
+	plainState.mu.Lock()
+	plainState.flipLife5DeliveredTakeLocked(info)
+	plainState.mu.Unlock()
+	r.noteWriterDeliveredLife5(msg.TopicName, guid)
+	r.CheckWriterLiveliness(guid)
+	r.CheckOfferedDeadline(msg.TopicName, r.receiverNow()().UnixNano())
+	r.NotifyData(msg.TopicName, SampledMessage{Msg: msg, Info: info})
 }
 
 // trackPlainSequence records one plain-path sequence for dedupe and loss.
@@ -1448,17 +1981,18 @@ func (r *DataReceiver) trackPlainSequence(guid WriterGUID, seq uint64) error {
 }
 
 // takeValidatedFrame finishes TakeFrom for one validated Weld frame.
-func (r *DataReceiver) takeValidatedFrame(decoded decodedFrame) (transports.IncomingMessage, error) {
+func (r *DataReceiver) takeValidatedFrame(decoded decodedFrame) (transports.IncomingMessage, SampleInfo, error) {
 	var empty transports.IncomingMessage
+	var emptyInfo SampleInfo
 	payloadView, err := validateEnvelopePayload(decoded.envelope, decoded.userLen)
 	if err != nil {
 		r.countDrop()
-		return empty, fmt.Errorf("dds: take from envelope: %w", err)
+		return empty, emptyInfo, fmt.Errorf("dds: take from envelope: %w", err)
 	}
 	rosTopic, _, err := ParseTopicName(decoded.ddsTopic)
 	if err != nil {
 		r.countDrop()
-		return empty, fmt.Errorf("dds: take from topic %q: %w", decoded.ddsTopic, err)
+		return empty, emptyInfo, fmt.Errorf("dds: take from topic %q: %w", decoded.ddsTopic, err)
 	}
 	return r.takeDecoded(decoded, payloadView, rosTopic)
 }
@@ -1483,20 +2017,37 @@ func (r *DataReceiver) takeValidatedFrame(decoded decodedFrame) (transports.Inco
 // inline QoS supplies the provisional topic, type, and hash where present,
 // else the provisional marks hash-unset.
 func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.IncomingMessage, error) {
+	msg, _, err := r.takeFromWithInfo(ctx, s)
+	if err != nil {
+		var empty transports.IncomingMessage
+
+		return empty, err
+	}
+
+	return msg, nil
+}
+
+// takeFromWithInfo reads one RTPS payload and returns message plus pre-take info.
+//
+// It shares TakeFrom decoding and recording exactly so TakeFromSampled
+// pairing is atomic with no separate lookup. Drops note statuses like
+// the framed path.
+func (r *DataReceiver) takeFromWithInfo(ctx context.Context, s FrameSource) (transports.IncomingMessage, SampleInfo, error) {
 	var empty transports.IncomingMessage
+	var emptyInfo SampleInfo
 
 	if s == nil {
-		return empty, fmt.Errorf("dds: take from nil source: %w", ErrInvalidFrame)
+		return empty, emptyInfo, fmt.Errorf("dds: take from nil source: %w", ErrInvalidFrame)
 	}
 
 	err := ctx.Err()
 	if err != nil {
-		return empty, err //nolint:wrapcheck // ctx error passes through unchanged
+		return empty, emptyInfo, err //nolint:wrapcheck // ctx error passes through unchanged
 	}
 
 	guid, seq, payload, qos, hasQoS, err := readFrameWithQoS(ctx, s)
 	if err != nil {
-		return empty, fmt.Errorf("dds: take from read: %w", err)
+		return empty, emptyInfo, fmt.Errorf("dds: take from read: %w", err)
 	}
 
 	if weldTakeDebug() {
@@ -1506,27 +2057,27 @@ func (r *DataReceiver) TakeFrom(ctx context.Context, s FrameSource) (transports.
 
 	frame, err := ParseRTPSPayload(payload)
 	if err != nil {
-		if msg, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
-			return msg, nil
+		if msg, info, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
+			return msg, info, nil
 		} else if rej != nil {
-			return empty, r.countTakeHookReject(rej)
+			return empty, emptyInfo, r.countTakeHookReject(rej)
 		}
-		return empty, r.countPlainDrop(guid, err, "payload")
+		return empty, emptyInfo, r.countPlainDrop(guid, err, "payload")
 	}
 
 	decoded, err := decodeFrame(frame)
 	if err != nil {
 		r.countDrop()
-		return empty, fmt.Errorf("dds: take from decode: %w", err)
+		return empty, emptyInfo, fmt.Errorf("dds: take from decode: %w", err)
 	}
 
 	if decoded.guid != guid {
-		if msg, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
-			return msg, nil
+		if msg, info, rej, ok := r.tryPlainFallbacks(ctx, guid, seq, payload, qos, hasQoS); ok {
+			return msg, info, nil
 		} else if rej != nil {
-			return empty, r.countTakeHookReject(rej)
+			return empty, emptyInfo, r.countTakeHookReject(rej)
 		}
-		return empty, r.countPlainDrop(guid, ErrInvalidFrame, "guid mismatch")
+		return empty, emptyInfo, r.countPlainDrop(guid, ErrInvalidFrame, "guid mismatch")
 	}
 
 	return r.takeValidatedFrame(decoded)
@@ -1628,6 +2179,35 @@ func (r *DataReceiver) markDeliveredLocked(guid WriterGUID, seq uint64) bool {
 	return false
 }
 
+// trackOldSequenceLocked handles one sequence at or below the high-water.
+//
+// A duplicate below the delivered window was forgotten and drops as stale
+// without re-delivering or decrementing lost. A repair inside the window
+// delivers and un-counts one loss; a true redelivery drops stale. The
+// caller must hold mu for write.
+func (r *DataReceiver) trackOldSequenceLocked(guid WriterGUID, seq, last uint64) (WriterGUID, bool, error) {
+	var none WriterGUID
+	floor := uint64(0)
+	if last > deliveredCap {
+		floor = last - deliveredCap
+	}
+	if seq < floor {
+		r.drops++
+
+		return none, false, fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
+	}
+	if r.markDeliveredLocked(guid, seq) {
+		r.drops++
+
+		return none, false, fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
+	}
+	if r.lost > 0 {
+		r.lost--
+	}
+
+	return none, false, nil
+}
+
 func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) (WriterGUID, bool, error) {
 	var none WriterGUID
 	if r.last == nil {
@@ -1641,18 +2221,14 @@ func (r *DataReceiver) trackSequenceLocked(guid WriterGUID, seq uint64) (WriterG
 		return r.installFirstSequenceLocked(guid, seq)
 	}
 
+	if seq <= last {
+		return r.trackOldSequenceLocked(guid, seq, last)
+	}
+
 	if r.markDeliveredLocked(guid, seq) {
 		r.drops++
 
 		return none, false, fmt.Errorf("dds: stale seq %d last %d: %w", seq, last, ErrStaleSequence)
-	}
-
-	if seq <= last {
-		if r.lost > 0 {
-			r.lost--
-		}
-
-		return none, false, nil
 	}
 
 	if seq > last+1 {

@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
 )
 
 // clearBackendEnv unsets the domain variable for deterministic tests.
@@ -2423,5 +2425,755 @@ func TestServePathsSkipQuietlyAfterClose(t *testing.T) {
 	backend.serveFragRepair(repairTask{kind: repairTaskFragRepair, writer: writer, seq: 1, fragNums: []uint32{1}})
 	if got := backend.demuxErrorCount() - before; got != 0 {
 		t.Fatalf("demux errors after close = %d, want 0 silent", got)
+	}
+}
+
+// TestBackendwir10RouteAtomicStaleNeverInstalls pins atomic route plus table advance.
+func TestBackendwir10RouteAtomicStaleNeverInstalls(t *testing.T) {
+	t.Parallel()
+
+	backend := newTestBackend(t, SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
+	clock := &fakeClock{}
+	base := time.Unix(7100, 0).UTC()
+	clock.setNow(base)
+	backend.mu.Lock()
+	backend.clock = clock
+	backend.remotes = NewRemoteTable(nil)
+	backend.mu.Unlock()
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	guid := testGUID(0xD3)
+	first := mustMarshalAlive(t, guid, 70, 5, 10*time.Second)
+	backend.handleSpdpBytesOnce(first, 70, nil, base)
+	backend.mu.RLock()
+	firstPorts := append([]int(nil), backend.routes[guid.Prefix]...)
+	backend.mu.RUnlock()
+	if len(firstPorts) == 0 {
+		t.Fatalf("missing route after seq 5")
+	}
+	stale := mustMarshalAlive(t, guid, 70, 3, 10*time.Second)
+	backend.handleSpdpBytesOnce(stale, 70, nil, base.Add(time.Second))
+	backend.mu.RLock()
+	kept := append([]int(nil), backend.routes[guid.Prefix]...)
+	backend.mu.RUnlock()
+	if !slices.Equal(firstPorts, kept) {
+		t.Fatalf("stale seq 3 rewrote routes %v want %v", kept, firstPorts)
+	}
+	backend.mu.RLock()
+	remotes := backend.remotes
+	backend.mu.RUnlock()
+	info, ok := remotes.Get(guid.Prefix)
+	if !ok {
+		t.Fatalf("missing table entry after seq 5")
+	}
+	if info.LastSeq != 5 {
+		t.Fatalf("table LastSeq = %d, want 5 (stale must not advance)", info.LastSeq)
+	}
+}
+
+// TestBackendwir10RouteAtomicSameSeqLeaseOnly pins the narrow lease window.
+func TestBackendwir10RouteAtomicSameSeqLeaseOnly(t *testing.T) {
+	t.Parallel()
+
+	backend := newTestBackend(t, SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
+	clock := &fakeClock{}
+	base := time.Unix(7200, 0).UTC()
+	clock.setNow(base)
+	backend.mu.Lock()
+	backend.clock = clock
+	backend.remotes = NewRemoteTable(nil)
+	backend.mu.Unlock()
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	guid := testGUID(0xD4)
+	first := mustMarshalAlive(t, guid, 70, 9, 10*time.Second)
+	backend.handleSpdpBytesOnce(first, 70, nil, base)
+	backend.mu.RLock()
+	firstPorts := append([]int(nil), backend.routes[guid.Prefix]...)
+	firstExpiry := backend.routeExpiry[guid.Prefix]
+	backend.mu.RUnlock()
+	later := base.Add(9 * time.Second)
+	clock.setNow(later)
+	dup := mustMarshalAlive(t, guid, 70, 9, 10*time.Second)
+	backend.handleSpdpBytesOnce(dup, 70, nil, later)
+	backend.mu.RLock()
+	kept := append([]int(nil), backend.routes[guid.Prefix]...)
+	refreshed := backend.routeExpiry[guid.Prefix]
+	backend.mu.RUnlock()
+	if !slices.Equal(firstPorts, kept) {
+		t.Fatalf("same-seq alive rewrote ports %v want %v (lease-only)", kept, firstPorts)
+	}
+	if !refreshed.After(firstExpiry) {
+		t.Fatalf("same-seq alive did not refresh lease %v want after %v", refreshed, firstExpiry)
+	}
+}
+
+// TestBackendwir10SelfLoopbackDropsBeforeTake pins user DATA self drop.
+func TestBackendwir10SelfLoopbackDropsBeforeTake(t *testing.T) {
+	t.Parallel()
+
+	backend := newTestBackend(t, SidecarConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0})
+	local, err := NewLocalParticipant(71, DefaultLeaseDuration)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	backend.mu.Lock()
+	backend.local = local
+	backend.mu.Unlock()
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	lg := local.GUID()
+	var hdr rtps.Header
+	copy(hdr.Prefix[:], lg.Prefix[:])
+	decoded := &rtps.Data{
+		WriterID:       rtps.EntityID{0x00, 0x10, 0x00, 0x03},
+		SequenceNumber: 1,
+		Payload:        []byte{0x01, 0x02, 0x03},
+	}
+	ch := make(chan dataItem, 4)
+	before := backend.demuxErrorCount()
+	backend.enqueueDataWithDecoded(context.Background(), ch, hdr, decoded)
+	if len(ch) != 0 {
+		t.Fatalf("self loopback queued %d, want 0 dropped before Take", len(ch))
+	}
+	if backend.demuxErrorCount() != before+1 {
+		t.Fatalf("self drop did not count demux error")
+	}
+}
+
+// TestBackendwir10StrictMatchHonesty pins topic-only versus full match.
+func TestBackendwir10StrictMatchHonesty(t *testing.T) {
+	t.Parallel()
+
+	backend := newTestBackend(t, SidecarConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0})
+	defer func() {
+		err := backend.Close()
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	backend.mu.Lock()
+	backend.sedp = mustSEDPIndexWithPrefix(t, 0x31)
+	backend.mu.Unlock()
+	writerEp, err := backend.sedp.DeclareWriter("/honest", "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare writer: %v", err)
+	}
+	peer := mustSEDPIndexWithPrefix(t, 0x32)
+	bad, err := peer.DeclareReader("/honest", "std_msgs__msg__String", "RIHS01_mismatch", nil)
+	if err != nil {
+		t.Fatalf("declare bad reader: %v", err)
+	}
+	err = backend.sedp.UpsertRemote(bad)
+	if err != nil {
+		t.Fatalf("upsert bad: %v", err)
+	}
+	if !backend.HasRemoteEndpoint("/honest") {
+		t.Fatalf("topic-only probe misses /honest, want true")
+	}
+	if backend.hasMatchingRemoteReader(writerEp) {
+		t.Fatalf("full match hits mismatched hash, want false (DATA must not rely on topic-only)")
+	}
+	if backend.hasStrictRemoteReaderwir10("/honest", "std_msgs__msg__String", StringTypeHash) {
+		t.Fatalf("strict helper hits mismatched hash, want false")
+	}
+	good, err := peer.DeclareReader("/honest", "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare good reader: %v", err)
+	}
+	err = backend.sedp.UpsertRemote(good)
+	if err != nil {
+		t.Fatalf("upsert good: %v", err)
+	}
+	if !backend.hasMatchingRemoteReader(writerEp) {
+		t.Fatalf("full match misses compatible reader, want true")
+	}
+	if !backend.hasStrictRemoteReaderwir10("/honest", "std_msgs__msg__String", StringTypeHash) {
+		t.Fatalf("strict helper misses compatible reader, want true")
+	}
+}
+
+// TestBackendwir10HeartbeatPartitionFilter pins read-only partition gating.
+func TestBackendwir10HeartbeatPartitionFilter(t *testing.T) {
+	t.Parallel()
+
+	localIdx, err := NewSEDPIndex(sedpTestPrefix(), 42)
+	if err != nil {
+		t.Fatalf("new index: %v", err)
+	}
+	writer, err := localIdx.DeclareWriter("/part", "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare writer: %v", err)
+	}
+	writer.Partitions = []string{"a"}
+	peerIdx, err := NewSEDPIndex(sedpPeerPrefix(), 42)
+	if err != nil {
+		t.Fatalf("new peer: %v", err)
+	}
+	reader, err := peerIdx.DeclareReader("/part", "std_msgs__msg__String", StringTypeHash, nil)
+	if err != nil {
+		t.Fatalf("declare reader: %v", err)
+	}
+	reader.Partitions = []string{"b"}
+	if hasPartitionedRemoteReaderwir10(writer, []SEDPEndpoint{reader}) {
+		t.Fatalf("mismatched partitions match, want skip")
+	}
+	reader.Partitions = []string{"a"}
+	if !hasPartitionedRemoteReaderwir10(writer, []SEDPEndpoint{reader}) {
+		t.Fatalf("common partition misses, want heartbeat")
+	}
+	var empty SEDPEndpoint
+	empty.DDSTopic = writer.DDSTopic
+	if !hasPartitionedRemoteReaderwir10(empty, []SEDPEndpoint{{DDSTopic: empty.DDSTopic, IsReader: true}}) {
+		t.Fatalf("default partitions miss, want match")
+	}
+	if !PartitionsMatch(nil, nil) {
+		t.Fatalf("PartitionsMatch nil nil is false, want true for default")
+	}
+}
+
+// TestBackendwir10NilSuiteNegativePins pins tolerance mode boundaries.
+func TestBackendwir10NilSuiteNegativePins(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	handled, err := HandleProtectedSubmessage(recv, rtps.RawSubmessage{ID: SecuredSubmessageSecPrefix})
+	if !handled {
+		t.Fatalf("protected prefix not handled, want loud drop")
+	}
+	if !errors.Is(err, ErrSecuredTransformUnavailable) {
+		t.Fatalf("protected drop = %v, want ErrSecuredTransformUnavailable", err)
+	}
+	if recv.DropReasonCount(DropReasonSecuredTransformUnavailable) == 0 {
+		t.Fatalf("protected drop did not count secured-transform-unavailable")
+	}
+	handled, err = HandleProtectedSubmessage(recv, rtps.RawSubmessage{ID: 0x15})
+	if handled {
+		t.Fatalf("plain DATA handled as protected, want passthrough")
+	}
+	if err != nil {
+		t.Fatalf("plain DATA err = %v, want nil byte-identical", err)
+	}
+	backend := newTestBackend(t, DefaultSidecarConfig())
+	defer func() {
+		cerr := backend.Close()
+		if cerr != nil {
+			t.Errorf("close: %v", cerr)
+		}
+	}()
+	if backend.HasRemoteEndpoint("/plain") {
+		t.Fatalf("empty backend reports endpoint, want false (zero handshake state)")
+	}
+	if backend.hasStrictRemoteReaderwir10("/plain", "std_msgs__msg__String", StringTypeHash) {
+		t.Fatalf("strict helper hits with no index, want false (zero token installs)")
+	}
+	plain := []byte{0x01, 0x02, 0x03}
+	cp := append([]byte(nil), plain...)
+	if !bytes.Equal(plain, cp) {
+		t.Fatalf("plain topic bytes changed, want byte-identical")
+	}
+}
+
+// TestBackendInvalidSubmessageDropsRest pins 8.3.4.1 rule 6 in dispatch.
+// A poison DATA followed by valid DATA must drop the valid tail and count
+// a demux error instead of queueing the second sample.
+func TestBackendInvalidSubmessageDropsRest(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{
+		routes: make(map[GUIDPrefix][]int),
+		spdpCh: make(chan []byte, demuxQueueDepth),
+		sedpCh: make(chan []byte, demuxQueueDepth),
+		dataCh: make(chan dataItem, demuxQueueDepth),
+	}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 21)
+	}
+	header := rtps.DefaultHeader(prefix)
+	userWriter := rtps.EntityID{writerEntityUserB12, writerEntityUserB13, writerEntityUserB14, writerEntityUserB15}
+	poison := rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: 0x05, Body: []byte{0x01}}
+	validData := rtps.Data{ReaderID: rtps.EntityUnknown, WriterID: userWriter, SequenceNumber: 7, Payload: []byte{0x09}}
+	validRaw, err := validData.Submessage(true)
+	if err != nil {
+		t.Fatalf("valid submessage: %v", err)
+	}
+	msg, err := rtps.EncodeMessage(header, []rtps.RawSubmessage{poison, validRaw})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	before := backend.demuxErrorCount()
+	backend.dispatchRTPS(t.Context(), msg, backend.spdpCh, backend.sedpCh, backend.dataCh)
+	if len(backend.dataCh) != 0 {
+		t.Fatalf("data queue = %d, want 0 dropped rest", len(backend.dataCh))
+	}
+	if backend.demuxErrorCount() <= before {
+		t.Fatalf("demux errors did not increase, want drop count")
+	}
+}
+
+// TestBackendInfoSrcValidPasses pins INFO_SRC passthrough in dispatch.
+// A valid INFO_SRC before DATA must not drop the DATA sample.
+func TestBackendInfoSrcValidPasses(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{
+		routes: make(map[GUIDPrefix][]int),
+		spdpCh: make(chan []byte, demuxQueueDepth),
+		sedpCh: make(chan []byte, demuxQueueDepth),
+		dataCh: make(chan dataItem, demuxQueueDepth),
+	}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 31)
+	}
+	header := rtps.DefaultHeader(prefix)
+	userWriter := rtps.EntityID{writerEntityUserB12, writerEntityUserB13, writerEntityUserB14, writerEntityUserB15}
+	src := rtps.InfoSrc{Major: 2, Minor: 5, Vendor: [2]byte{0x01, 0x10}}
+	infoRaw := rtps.RawSubmessage{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: src.Encode()}
+	validData := rtps.Data{ReaderID: rtps.EntityUnknown, WriterID: userWriter, SequenceNumber: 9, Payload: []byte{0x0A}}
+	validRaw, err := validData.Submessage(true)
+	if err != nil {
+		t.Fatalf("valid submessage: %v", err)
+	}
+	msg, err := rtps.EncodeMessage(header, []rtps.RawSubmessage{infoRaw, validRaw})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	backend.dispatchRTPS(t.Context(), msg, backend.spdpCh, backend.sedpCh, backend.dataCh)
+	if len(backend.dataCh) != 1 {
+		t.Fatalf("data queue = %d, want 1 INFO_SRC passthrough", len(backend.dataCh))
+	}
+}
+
+// TestBackendInfoSrcInvalidDropsRest pins fail-closed INFO_SRC in dispatch.
+// A malformed INFO_SRC must drop the trailing DATA per 8.3.4.1 rule 6.
+func TestBackendInfoSrcInvalidDropsRest(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{
+		routes: make(map[GUIDPrefix][]int),
+		spdpCh: make(chan []byte, demuxQueueDepth),
+		sedpCh: make(chan []byte, demuxQueueDepth),
+		dataCh: make(chan dataItem, demuxQueueDepth),
+	}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 41)
+	}
+	header := rtps.DefaultHeader(prefix)
+	userWriter := rtps.EntityID{writerEntityUserB12, writerEntityUserB13, writerEntityUserB14, writerEntityUserB15}
+	badInfo := rtps.RawSubmessage{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: []byte{0x01, 0x02, 0x03}}
+	validData := rtps.Data{ReaderID: rtps.EntityUnknown, WriterID: userWriter, SequenceNumber: 11, Payload: []byte{0x0B}}
+	validRaw, err := validData.Submessage(true)
+	if err != nil {
+		t.Fatalf("valid submessage: %v", err)
+	}
+	msg, err := rtps.EncodeMessage(header, []rtps.RawSubmessage{badInfo, validRaw})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	before := backend.demuxErrorCount()
+	backend.dispatchRTPS(t.Context(), msg, backend.spdpCh, backend.sedpCh, backend.dataCh)
+	if len(backend.dataCh) != 0 {
+		t.Fatalf("data queue = %d, want 0 malformed INFO_SRC drops rest", len(backend.dataCh))
+	}
+	if backend.demuxErrorCount() <= before {
+		t.Fatalf("demux errors did not increase, want drop count")
+	}
+}
+
+// TestBackendHandleInfoSrcDispatchValid pins INFO_SRC passthrough.
+// A valid minimal-form INFO_SRC is handled without identity override and
+// attribution stays with the RTPS header prefix.
+func TestBackendHandleInfoSrcDispatchValid(t *testing.T) {
+	t.Parallel()
+
+	src := rtps.InfoSrc{Major: 2, Minor: 5, Vendor: [2]byte{0x01, 0x10}}
+	valid := rtps.RawSubmessage{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: src.Encode()}
+	handled, invalid := handleInfoSrc(valid)
+	if !handled || invalid {
+		t.Fatalf("valid INFO_SRC handled=%v invalid=%v, want true false", handled, invalid)
+	}
+	if handled, invalid := preHandleUserSub(valid); !handled || invalid {
+		t.Fatalf("preHandle valid INFO_SRC handled=%v invalid=%v, want true false", handled, invalid)
+	}
+
+	other := rtps.RawSubmessage{ID: rtps.SubmessageData, Flags: 0x01, Body: []byte{0x00}}
+	if handled, invalid := handleInfoSrc(other); handled || invalid {
+		t.Fatalf("non INFO_SRC handled=%v invalid=%v, want false false", handled, invalid)
+	}
+
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 51)
+	}
+	header := rtps.DefaultHeader(prefix)
+	if got := attributionPrefixForDispatch(header); got != GUIDPrefix(header.Prefix) {
+		t.Fatalf("attribution prefix = %x, want header prefix", got)
+	}
+}
+
+// TestBackendHandleInfoSrcDispatchMalformed pins fail-closed validation.
+// Malformed INFO_SRC bodies report invalid so the caller drops the rest
+// per 8.3.4.1 rule 6.
+func TestBackendHandleInfoSrcDispatchMalformed(t *testing.T) {
+	t.Parallel()
+
+	malformed := []rtps.RawSubmessage{
+		{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: []byte{0x01, 0x02, 0x03}},
+		{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: []byte{0x01, 0x02, 0x05, 0x10}},
+		{ID: rtps.SubmessageInfoSrc, Flags: 0x01, Body: []byte{0x00, 0x01, 0x05, 0x10}},
+	}
+	for i, bad := range malformed {
+		if handled, invalid := handleInfoSrc(bad); handled || !invalid {
+			t.Fatalf("malformed %d handled=%v invalid=%v, want false true", i, handled, invalid)
+		}
+		if handled, invalid := preHandleUserSub(bad); handled || !invalid {
+			t.Fatalf("preHandle malformed %d handled=%v invalid=%v, want false true", i, handled, invalid)
+		}
+	}
+}
+
+// TestBackendParticipantMessageIDs pins the 8.4.13.5 endpoint identities.
+// The P2M writer and reader use the second entity byte, distinct from the
+// SEDP Topics writer and from user writers.
+func TestBackendParticipantMessageIDs(t *testing.T) {
+	t.Parallel()
+
+	if got := participantMessageWriter(); got != (rtps.EntityID{0x00, 0x02, 0x00, 0xC2}) {
+		t.Fatalf("participant writer = %v, want 000200c2", got)
+	}
+	if got := participantMessageReader(); got != (rtps.EntityID{0x00, 0x02, 0x00, 0xC7}) {
+		t.Fatalf("participant reader = %v, want 000200c7", got)
+	}
+	if !isParticipantMessageWriter(participantMessageWriter()) {
+		t.Fatalf("writer not recognized, want true")
+	}
+	if !isParticipantMessageReader(participantMessageReader()) {
+		t.Fatalf("reader not recognized, want true")
+	}
+	user := rtps.EntityID{writerEntityUserB12, writerEntityUserB13, writerEntityUserB14, writerEntityUserB15}
+	if isParticipantMessageWriter(user) || isParticipantMessageReader(user) {
+		t.Fatalf("user writer recognized as participant message, want false")
+	}
+}
+
+// TestBackendParticipantMessageLiveliness pins the liveliness assertion.
+// Incoming ParticipantMessage DATA asserts the participant lease without
+// queueing user DATA.
+func TestBackendParticipantMessageLiveliness(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{receiver: NewDataReceiver()}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 61)
+	}
+	name := participantNameForWriter(writerGUIDFromPrefix(GUIDPrefix(prefix), participantMessageWriter()))
+	backend.receiver.SetParticipantLease(name, core.NewDuration(60, 0))
+	if !backend.receiver.AssertParticipant(name) {
+		t.Fatalf("participant assert before note failed, want true")
+	}
+	header := rtps.DefaultHeader(prefix)
+	decoded := &rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       participantMessageWriter(),
+		SequenceNumber: 3,
+		Payload:        []byte{0x01, 0x02},
+	}
+	backend.noteParticipantMessageData(header, decoded)
+	if state := backend.receiver.ParticipantState(name, backend.receiver.receiverNow()().UnixNano()); state != core.LivelinessAlive {
+		t.Fatalf("participant state = %v, want alive", state)
+	}
+
+	dataCh := make(chan dataItem, 4)
+	raw, err := decoded.Submessage(true)
+	if err != nil {
+		t.Fatalf("participant submessage: %v", err)
+	}
+	if backend.enqueueUserDataSub(t.Context(), header, raw, dataCh) {
+		t.Fatalf("participant DATA reported drop-rest, want skip")
+	}
+	if len(dataCh) != 0 {
+		t.Fatalf("participant DATA queued %d, want 0", len(dataCh))
+	}
+}
+
+// TestBackendHasRemoteEndpointStrict pins the strict topic plus type probe.
+// A topic-only match stays true while the strict probe requires type and
+// hash agreement.
+func TestBackendHasRemoteEndpointStrict(t *testing.T) {
+	t.Parallel()
+
+	backend := &Backend{}
+	backend.sedp = mustSEDPIndexWithPrefix(t, 0x70)
+	mustSEDPWriter(t, backend.sedp, "/strict", "RIHS01_abc")
+	peer := mustSEDPIndexWithPrefix(t, 0x71)
+	reader := mustSEDPReader(t, peer, "/strict", "RIHS01_abc")
+	if err := backend.sedp.UpsertRemote(reader); err != nil {
+		t.Fatalf("upsert remote: %v", err)
+	}
+	if !backend.HasRemoteEndpoint("/strict") {
+		t.Fatalf("topic probe misses, want true")
+	}
+	if !backend.HasRemoteEndpointStrict("/strict", "std_msgs__msg__String", "RIHS01_abc") {
+		t.Fatalf("strict probe with matching type misses, want true")
+	}
+	if backend.HasRemoteEndpointStrict("/strict", "std_msgs__msg__String", "nope") {
+		t.Fatalf("strict probe with wrong hash hit, want false")
+	}
+	if backend.HasRemoteEndpointStrict("/missing", "std_msgs__msg__String", "") {
+		t.Fatalf("strict probe on missing topic hit, want false")
+	}
+}
+
+// TestBackendPartitionDemuxGate pins partition-scoped DATA demux.
+// A writer on a disjoint partition drops while a common partition queues.
+func TestBackendPartitionDemuxGate(t *testing.T) {
+	t.Parallel()
+
+	idx := mustSEDPIndexWithPrefix(t, 0x72)
+	local, err := idx.DeclareReaderWithDurability("/part", "std_msgs__msg__String", "", nil, true)
+	if err != nil {
+		t.Fatalf("declare reader: %v", err)
+	}
+	idx.StampLocalPartitions("/part", "std_msgs__msg__String", []string{"A"})
+
+	var remotePrefix GUIDPrefix
+	for i := range remotePrefix {
+		remotePrefix[i] = byte(i + 0x80)
+	}
+	writerEntity := rtps.EntityID{0x00, 0x00, 0x02, 0x03}
+	remote := SEDPEndpoint{
+		ID:         SEDPGUID{Prefix: SEDPGUIDPrefix(remotePrefix), Entity: SEDPEntityID(writerEntity)},
+		ROSTopic:   local.ROSTopic,
+		DDSTopic:   local.DDSTopic,
+		Kind:       local.Kind,
+		TypeDDS:    local.TypeDDS,
+		TypeIDL:    local.TypeIDL,
+		IsReader:   false,
+		DomainID:   local.DomainID,
+		Partitions: []string{"B"},
+	}
+	if err := idx.UpsertRemote(remote); err != nil {
+		t.Fatalf("upsert remote: %v", err)
+	}
+
+	backend := &Backend{
+		sedp:   idx,
+		routes: make(map[GUIDPrefix][]int),
+		dataCh: make(chan dataItem, 4),
+	}
+	var headerPrefix [12]byte
+	copy(headerPrefix[:], remotePrefix[:])
+	header := rtps.DefaultHeader(headerPrefix)
+	decoded := &rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       writerEntity,
+		SequenceNumber: 1,
+		Payload:        []byte{0x0A, 0x0B},
+	}
+	before := backend.demuxErrorCount()
+	backend.enqueueDataWithDecoded(t.Context(), backend.dataCh, header, decoded)
+	if len(backend.dataCh) != 0 {
+		t.Fatalf("disjoint partition queued, want drop")
+	}
+	if backend.demuxErrorCount() <= before {
+		t.Fatalf("demux errors did not increase on partition drop")
+	}
+
+	remote.Partitions = []string{"A"}
+	if err := idx.UpsertRemote(remote); err != nil {
+		t.Fatalf("upsert remote common: %v", err)
+	}
+	decoded.SequenceNumber = 2
+	backend.enqueueDataWithDecoded(t.Context(), backend.dataCh, header, decoded)
+	if len(backend.dataCh) != 1 {
+		t.Fatalf("common partition queued %d, want 1", len(backend.dataCh))
+	}
+}
+
+// enabledTestSuite returns an enabled suite with dummy paths for gate tests.
+// NewSuite stores config without reading files, so dummy paths exercise the
+// enabled fail-closed branches without crypto material.
+func enabledTestSuite(t *testing.T) *ddssecurity.Suite {
+	t.Helper()
+	suite, err := ddssecurity.NewSuite(ddssecurity.SuiteConfig{
+		Enabled:                 true,
+		IdentityCertificatePath: "test-cert",
+		IdentityPrivateKeyPath:  "test-key",
+		PermissionsCAPath:       "test-ca",
+		GovernancePath:          "test-gov",
+		PermissionsDocumentPath: "test-perms",
+	})
+	if err != nil {
+		t.Fatalf("new enabled suite: %v", err)
+	}
+	return suite
+}
+
+// TestBackendUnknownWriterGate pins the provisional fast-path gate.
+// Tolerance mode queues unknown writers while an enabled suite drops them
+// until SEDP confirms.
+func TestBackendUnknownWriterGate(t *testing.T) {
+	t.Parallel()
+
+	plain := &Backend{}
+	var unknown WriterGUID
+	unknown[0] = 0xEE
+	if !plain.unknownWriterAllowed(unknown) {
+		t.Fatalf("tolerance unknown writer denied, want allow")
+	}
+
+	secured := &Backend{secSuite: enabledTestSuite(t)}
+	if secured.unknownWriterAllowed(unknown) {
+		t.Fatalf("secured unknown writer allowed, want deny")
+	}
+
+	idx := mustSEDPIndexWithPrefix(t, 0x73)
+	peer := mustSEDPIndexWithPrefix(t, 0x74)
+	writer := mustSEDPWriter(t, peer, "/gate", "RIHS01_abc")
+	if err := idx.UpsertRemote(writer); err != nil {
+		t.Fatalf("upsert remote: %v", err)
+	}
+	secured.sedp = idx
+	var guid WriterGUID
+	copy(guid[:12], writer.ID.Prefix[:])
+	copy(guid[12:16], writer.ID.Entity[:])
+	if !secured.unknownWriterAllowed(guid) {
+		t.Fatalf("secured confirmed writer denied, want allow")
+	}
+}
+
+// TestBackendAuthenticateSenderOrdersBeforeSelf pins auth before suppression.
+// Tolerance keeps legacy self drops byte-identical while an enabled suite
+// drops unauthenticated senders fail-closed.
+func TestBackendAuthenticateSenderOrdersBeforeSelf(t *testing.T) {
+	t.Parallel()
+
+	plain := &Backend{}
+	var prefix [12]byte
+	for i := range prefix {
+		prefix[i] = byte(i + 3)
+	}
+	header := rtps.DefaultHeader(prefix)
+	if !plain.authenticateSender(header) {
+		t.Fatalf("tolerance sender denied, want allow")
+	}
+
+	secured := &Backend{secSuite: enabledTestSuite(t)}
+	if secured.authenticateSender(header) {
+		t.Fatalf("secured unauthenticated sender allowed, want deny")
+	}
+}
+
+// TestBackendAuthorizeEgress pins fail-closed deny-plain for protected topics.
+// Tolerance allows while an enabled suite without verified governance denies.
+func TestBackendAuthorizeEgress(t *testing.T) {
+	t.Parallel()
+
+	plain := &Backend{}
+	if err := plain.authorizeEgress("/open", 0); err != nil {
+		t.Fatalf("tolerance egress denied: %v", err)
+	}
+
+	secured := &Backend{secSuite: enabledTestSuite(t)}
+	if err := secured.authorizeEgress("/open", 0); err == nil {
+		t.Fatalf("secured egress without governance allowed, want deny")
+	} else if !errors.Is(err, ddssecurity.ErrNotAllowedBySecurity) {
+		t.Fatalf("secured egress err = %v, want not-allowed-by-security denial", err)
+	}
+}
+
+// TestBackendAuthorizeRemoteParticipant pins token identity threading.
+// Tolerance admits while an enabled suite denies peers without identity
+// tokens and refuses tokened peers at Phase 1 fail-closed.
+func TestBackendAuthorizeRemoteParticipant(t *testing.T) {
+	t.Parallel()
+
+	plain := &Backend{}
+	ann := Announcement{GUID: GUID{Prefix: GUIDPrefix{0x01}}, DomainID: 0, Alive: true, Lease: DefaultLeaseDuration}
+	if err := plain.authorizeRemoteParticipant(ann); err != nil {
+		t.Fatalf("tolerance admission denied: %v", err)
+	}
+
+	secured := &Backend{secSuite: enabledTestSuite(t)}
+	if err := secured.authorizeRemoteParticipant(ann); err == nil {
+		t.Fatalf("secured admission without token allowed, want deny")
+	}
+
+	before := secured.demuxErrorCount()
+	secured.storeAnnouncementWithTableAdvancewir10(ann, []int{1234}, time.Now())
+	if len(secured.routes) != 0 {
+		t.Fatalf("secured routes installed without token, want none")
+	}
+	if secured.demuxErrorCount() <= before {
+		t.Fatalf("secured admission did not count a demux error")
+	}
+}
+
+// TestBackendOriginAADBinds pins origin binding in the egress wrap.
+// The same inner plus key under different origins must seal differently so
+// a ciphertext cut from one origin never verifies under another.
+func TestBackendOriginAADBinds(t *testing.T) {
+	t.Parallel()
+
+	inner := []byte{0x15, 0x01, 0x02, 0x00, 0xAA, 0xBB}
+	key := bytes.Repeat([]byte{0x07}, 16)
+	var originA, originB [16]byte
+	originA[0] = 0xA1
+	originB[0] = 0xB2
+	first, err := secWrapSubmessageWithOrigin(secKindAES128GCM, 1, 9, 1, key, originA, inner)
+	if err != nil {
+		t.Fatalf("wrap origin A: %v", err)
+	}
+	second, err := secWrapSubmessageWithOrigin(secKindAES128GCM, 1, 9, 1, key, originB, inner)
+	if err != nil {
+		t.Fatalf("wrap origin B: %v", err)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatalf("origin A and B seals match, want origin binding")
+	}
+	third, err := secWrapSubmessageWithOrigin(secKindAES128GCM, 2, 10, 2, key, originA, inner)
+	if err != nil {
+		t.Fatalf("wrap origin A rotated: %v", err)
+	}
+	if bytes.Equal(first, third) {
+		t.Fatalf("rotated seal matches, want session binding")
+	}
+
+	gmacA, err := secWrapSubmessageWithOrigin(secKindAES128GMAC, 1, 9, 1, key, originA, inner)
+	if err != nil {
+		t.Fatalf("gmac wrap origin A: %v", err)
+	}
+	gmacB, err := secWrapSubmessageWithOrigin(secKindAES128GMAC, 1, 9, 1, key, originB, inner)
+	if err != nil {
+		t.Fatalf("gmac wrap origin B: %v", err)
+	}
+	if bytes.Equal(gmacA, gmacB) {
+		t.Fatalf("gmac origin A and B seals match, want origin binding")
+	}
+
+	if _, err := secWrapSubmessageWithOrigin(99, 1, 9, 1, key, originA, inner); err == nil {
+		t.Fatalf("bad kind wrapped, want error")
+	}
+	if _, err := secWrapSubmessageWithOrigin(secKindAES128GCM, 1, 9, 1, key[:8], originA, inner); err == nil {
+		t.Fatalf("short key wrapped, want error")
 	}
 }

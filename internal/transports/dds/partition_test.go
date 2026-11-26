@@ -349,34 +349,43 @@ func TestPartitionParamRoundTrip(t *testing.T) {
 func TestPartitionRouteKey(t *testing.T) {
 	t.Parallel()
 
-	base := PartitionRouteKey("rt/chatter", nil)
-	def := PartitionRouteKey("rt/chatter", []string{""})
+	routeKey := func(topic string, partitions []string) string {
+		key, err := PartitionRouteKey(topic, partitions)
+		if err != nil {
+			t.Fatalf("route key %q %q: %v", topic, partitions, err)
+		}
+
+		return key
+	}
+
+	base := routeKey("rt/chatter", nil)
+	def := routeKey("rt/chatter", []string{""})
 	if base != def {
 		t.Fatalf("empty vs explicit default differ: %q vs %q", base, def)
 	}
 
-	other := PartitionRouteKey("rt/chatter", []string{"A"})
+	other := routeKey("rt/chatter", []string{"A"})
 	if base == other {
 		t.Fatalf("default and partition A share key %q", base)
 	}
 
-	second := PartitionRouteKey("rt/chatter", []string{"B"})
+	second := routeKey("rt/chatter", []string{"B"})
 	if other == second {
 		t.Fatalf("partitions A and B share key %q", other)
 	}
 
-	reordered := PartitionRouteKey("rt/chatter", []string{"B", "A"})
-	ordered := PartitionRouteKey("rt/chatter", []string{"A", "B"})
+	reordered := routeKey("rt/chatter", []string{"B", "A"})
+	ordered := routeKey("rt/chatter", []string{"A", "B"})
 	if reordered != ordered {
 		t.Fatalf("order changes key: %q vs %q", reordered, ordered)
 	}
 
-	dup := PartitionRouteKey("rt/chatter", []string{"A", "A"})
+	dup := routeKey("rt/chatter", []string{"A", "A"})
 	if dup != other {
 		t.Fatalf("duplicate names change key: %q vs %q", dup, other)
 	}
 
-	topic := PartitionRouteKey("rt/other", []string{"A"})
+	topic := routeKey("rt/other", []string{"A"})
 	if topic == other {
 		t.Fatalf("different topics share key %q", other)
 	}
@@ -397,14 +406,78 @@ func TestPartitionRouteKeyRejectsNUL(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		func() {
-			defer func() {
-				r := recover()
-				if r == nil {
-					t.Fatalf("%s succeeded, want loud NUL panic", tc.name)
-				}
-			}()
-			_ = PartitionRouteKey(tc.topic, tc.partitions)
-		}()
+		_, err := PartitionRouteKey(tc.topic, tc.partitions)
+		if err == nil {
+			t.Fatalf("%s succeeded, want loud NUL error", tc.name)
+		}
+	}
+}
+
+// TestPartitionRouteKeyForEndpoint pins endpoint route key isolation.
+// The same topic on different partitions never shares a key while the same
+// set in different orders shares one.
+func TestPartitionRouteKeyForEndpoint(t *testing.T) {
+	t.Parallel()
+
+	key := func(topic string, partitions []string) string {
+		key, err := PartitionRouteKeyForEndpoint(topic, partitions)
+		if err != nil {
+			t.Fatalf("route key %q %q: %v", topic, partitions, err)
+		}
+		return key
+	}
+
+	base := key("rt/chatter", nil)
+	if key("rt/chatter", []string{"A"}) == base {
+		t.Fatalf("partition A shares default key %q", base)
+	}
+	if got := key("rt/chatter", []string{"B", "A"}); got != key("rt/chatter", []string{"A", "B"}) {
+		t.Fatalf("order changes key: %q", got)
+	}
+	if _, err := PartitionRouteKeyForEndpoint("rt/bad\x00x", []string{"A"}); err == nil {
+		t.Fatalf("NUL topic succeeded, want loud error")
+	}
+	if _, err := PartitionRouteKeyForEndpoint("rt/chatter", []string{"A\x00B"}); err == nil {
+		t.Fatalf("NUL partition succeeded, want loud error")
+	}
+}
+
+// TestPartitionRetentionKey pins per-writer retention scoping.
+// The same GUID on different partitions never shares retention while the
+// same route plus GUID is stable.
+func TestPartitionRetentionKey(t *testing.T) {
+	t.Parallel()
+
+	var guid [16]byte
+	guid[0] = 0x9A
+	keyA, err := PartitionRetentionKey("rt/chatter", guid, []string{"A"})
+	if err != nil {
+		t.Fatalf("retention key A: %v", err)
+	}
+	keyB, err := PartitionRetentionKey("rt/chatter", guid, []string{"B"})
+	if err != nil {
+		t.Fatalf("retention key B: %v", err)
+	}
+	if keyA == keyB {
+		t.Fatalf("partitions A and B share retention key %q", keyA)
+	}
+	again, err := PartitionRetentionKey("rt/chatter", guid, []string{"A"})
+	if err != nil {
+		t.Fatalf("retention key A again: %v", err)
+	}
+	if again != keyA {
+		t.Fatalf("retention key unstable: %q vs %q", again, keyA)
+	}
+	var other [16]byte
+	other[0] = 0x9B
+	otherKey, err := PartitionRetentionKey("rt/chatter", other, []string{"A"})
+	if err != nil {
+		t.Fatalf("retention key other: %v", err)
+	}
+	if otherKey == keyA {
+		t.Fatalf("different GUIDs share retention key %q", keyA)
+	}
+	if _, err := PartitionRetentionKey("rt/bad\x00x", guid, []string{"A"}); err == nil {
+		t.Fatalf("NUL topic succeeded, want loud error")
 	}
 }

@@ -38,10 +38,11 @@ import (
 // carries PID_PARTITION natively; see the INTEGRATION notes in
 // partition.go), SerializeSEDPDATA frames the DATA, ParseSEDPDATAs parses
 // it back, and FindPartitionParam recovers the lists. MatchPartitions and
-// PartitionRouteKey then decide the outcome. DATA-path enforcement (the
-// backend dropping samples for non-matching partitions) still awaits the
-// backend route-key wiring, so this gate proves discovery-layer isolation
-// plus the wire codec, not DATA drops.
+// PartitionRouteKey then decide the outcome. DATA-path enforcement rides
+// the same route key in the backend (partitionAllowsDelivery on demux plus
+// partitionGateReject and retention rekeying on take, pinned by unit
+// tests); this gate proves discovery-layer isolation plus the wire codec
+// because the live peers expose no partition control for DATA legs.
 //
 // Each test takes one exclusive domain from the parallel pool, uses a
 // per-run topic and live ID, skips only when no peer container is present,
@@ -266,6 +267,33 @@ func TestGatePartitionIsolationLive(t *testing.T) {
 	requestedA := partitionLiveRequested(t, readerIdx, topic, []string{"A"})
 	requestedB := partitionLiveRequested(t, readerIdx, topic, []string{"B"})
 
+	ddsTopic := offeredDDSTopic(t, writerIdx, topic)
+	offeredKey := partitionLiveRouteKey(t, ddsTopic, offered)
+	partitionLiveCheckIsolated(t, offered, requestedA, offeredKey, partitionLiveRouteKey(t, ddsTopic, requestedA))
+	partitionLiveCheckFlows(t, offered, requestedB, offeredKey, partitionLiveRouteKey(t, ddsTopic, requestedB))
+
+	cycloneOffered := []string(nil)
+	if !dds.PartitionsMatch(nil, cycloneOffered) {
+		t.Fatalf("default Cyclone offer missed default Weld request")
+	}
+}
+
+// partitionLiveRouteKey returns the discovery route key or fails the test.
+func partitionLiveRouteKey(t *testing.T, ddsTopic string, partitions []string) string {
+	t.Helper()
+
+	key, err := dds.PartitionRouteKey(ddsTopic, partitions)
+	if err != nil {
+		t.Fatalf("route key: %v", err)
+	}
+
+	return key
+}
+
+// partitionLiveCheckIsolated pins discovery isolation between partitions.
+func partitionLiveCheckIsolated(t *testing.T, offered, requestedA []string, offeredKey, requestedAKey string) {
+	t.Helper()
+
 	outcome := dds.MatchPartitions(offered, requestedA)
 	if outcome.Matched {
 		t.Fatalf("partition A reader matched partition B writer, want isolation: %+v", outcome)
@@ -273,22 +301,21 @@ func TestGatePartitionIsolationLive(t *testing.T) {
 	if outcome.Reason != dds.PartitionMismatchNoCommonPartition {
 		t.Fatalf("isolation reason = %q, want %q", outcome.Reason, dds.PartitionMismatchNoCommonPartition)
 	}
-	ddsTopic := offeredDDSTopic(t, writerIdx, topic)
-	if dds.PartitionRouteKey(ddsTopic, offered) == dds.PartitionRouteKey(ddsTopic, requestedA) {
+	if offeredKey == requestedAKey {
 		t.Fatalf("partitions A and B share discovery route key")
 	}
+}
+
+// partitionLiveCheckFlows pins discovery flow for matching partitions.
+func partitionLiveCheckFlows(t *testing.T, offered, requestedB []string, offeredKey, requestedBKey string) {
+	t.Helper()
 
 	flow := dds.MatchPartitions(offered, requestedB)
 	if !flow.Matched {
 		t.Fatalf("partition B reader missed partition B writer: %+v", flow)
 	}
-	if dds.PartitionRouteKey(ddsTopic, offered) != dds.PartitionRouteKey(ddsTopic, requestedB) {
+	if offeredKey != requestedBKey {
 		t.Fatalf("matching partitions differ in discovery route key")
-	}
-
-	cycloneOffered := []string(nil)
-	if !dds.PartitionsMatch(nil, cycloneOffered) {
-		t.Fatalf("default Cyclone offer missed default Weld request")
 	}
 }
 

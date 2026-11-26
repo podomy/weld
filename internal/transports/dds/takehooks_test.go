@@ -543,7 +543,9 @@ func TestTakeHooksEvalUsesReceiverClock(t *testing.T) {
 	recv.now = func() time.Time {
 		return frozen
 	}
-	recv.SetDeadlineTrackerForTopic("/clocked", core.NewDuration(10, 0))
+	if err := recv.SetDeadlineTrackerForTopic("/clocked", core.NewDuration(10, 0)); err != nil {
+		t.Fatalf("set deadline clocked: %v", err)
+	}
 
 	snap := recv.snapshotTakeHooks("/clocked", WriterGUID{})
 	if snap.deadline == nil {

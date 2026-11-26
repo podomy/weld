@@ -6,10 +6,14 @@ package dds
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +21,10 @@ import (
 	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
+	ddssecurity "github.com/podomy/weld/internal/transports/dds/security"
+	"github.com/podomy/weld/internal/transports/dds/security/access"
+	"github.com/podomy/weld/internal/transports/dds/security/auth"
+	"github.com/podomy/weld/internal/transports/dds/security/crypto"
 )
 
 // Default announcement intervals for discovery loops.
@@ -350,6 +358,15 @@ type Backend struct {
 	fragReasm *fragReassembler
 	// fragSend accumulates outbound framed fragments for repair history.
 	fragSend map[fragKey]*fragSendEntry
+	// partitionRouteKeys scopes backend retention by partition route key so a
+	// GUID reused across partitions restarts repair plus remote plus frag
+	// state instead of inheriting another partition's sequences. The same
+	// DDS topic on different partitions never shares retention; routes stay
+	// keyed by GUIDPrefix for wire compat while demux plus retention key by
+	// PartitionRouteKeyForEndpoint. Unknown writers with no index stay
+	// tolerant pre-discovery; post-discovery the take plus demux gates
+	// enforce strict partition matching.
+	partitionRouteKeys map[WriterGUID]string
 	// publishMu serializes framed publishes from find through PublishTo.
 	publishMu sync.Mutex
 	// plainPauseDone records whether the SEDP-ahead-of-DATA pause already
@@ -368,6 +385,16 @@ type Backend struct {
 	repairGen uint64
 	// routeExpiry tracks lease expiry per route prefix for sweep.
 	routeExpiry map[GUIDPrefix]time.Time
+	// secSuite holds the Phase 1 decision suite, nil for tolerance mode.
+	secSuite *ddssecurity.Suite
+	// handshake drives the stateless ECDHE exchange, nil when disabled.
+	handshake *auth.Manager
+	// cryptoStore holds master keys for volatile plus DATA decode.
+	cryptoStore *crypto.KeyStore
+	// cryptoTransform decrypts protected payloads when contexts exist.
+	cryptoTransform *crypto.Transform
+	// secureIdentity holds local identity material for secure announce.
+	secureIdentity *secureIdentityMaterial
 }
 
 // publishSnapshot carries publisher state for one publish without holding mu.
@@ -727,27 +754,22 @@ func (b *Backend) userHeartbeatLoop(ctx context.Context) {
 	}
 }
 
-// advertiseWriterHistory heartbeats every local writer's retained range.
-//
-// Writers with no retained samples are skipped: First 1 Last 0 is an
-// invalid range and there is nothing to repair. Failures log loudly and
-// skip the writer; the next tick retries.
-func (b *Backend) advertiseWriterHistory(ctx context.Context) {
-	err := ctx.Err()
-	if err != nil {
-		return
-	}
+// heartbeatSnapshot captures the index and clock for one heartbeat tick.
+type heartbeatSnapshot struct {
+	idx    *SEDPIndex
+	joined bool
+	closed bool
+	now    time.Time
+}
 
+// heartbeatSnapshotLocked snapshots index state without holding the lock.
+func (b *Backend) heartbeatSnapshotLocked() heartbeatSnapshot {
 	b.mu.RLock()
 	sedpIdx := b.sedp
 	joined := b.joined
 	closed := b.closed
 	clock := b.clock
 	b.mu.RUnlock()
-
-	if sedpIdx == nil || !joined || closed {
-		return
-	}
 
 	var now time.Time
 	if clock != nil {
@@ -756,35 +778,89 @@ func (b *Backend) advertiseWriterHistory(ctx context.Context) {
 		now = time.Now()
 	}
 
-	b.sweepExpiredRoutes(now)
-	sedpIdx.ExpireProvisional(now)
-	sedpIdx.ExpirePendingEvictions(now)
+	return heartbeatSnapshot{idx: sedpIdx, joined: joined, closed: closed, now: now}
+}
 
-	for _, ep := range sedpIdx.LocalEndpoints() {
-		if ep.IsReader {
+// advertiseOneWriterHistory heartbeats one writer retained range.
+func (b *Backend) advertiseOneWriterHistory(ctx context.Context, ep SEDPEndpoint, remotes []SEDPEndpoint) {
+	if ep.IsReader {
+		return
+	}
+
+	if !hasPartitionedRemoteReaderwir10(ep, remotes) {
+		return
+	}
+
+	guid := writerGUIDFromEndpoint(ep.ID)
+	first := b.repairHistoryFirst(guid)
+	last := b.repairHistoryLast(guid)
+
+	if last == 0 {
+		return
+	}
+
+	msg, err := b.buildHistoryHeartbeatMessage(guid, first, last)
+	if err != nil {
+		log.Printf("dds: user heartbeat build %x: %v", guid[:], err)
+		return
+	}
+
+	err = b.sendUserControl(ctx, msg)
+	if err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: user heartbeat send %x: %v", guid[:], err)
+	}
+}
+
+// advertiseWriterHistory heartbeats every local writer's retained range.
+//
+// Writers with no retained samples are skipped: First 1 Last 0 is an
+// invalid range and there is nothing to repair. Writers with no remote
+// reader sharing a common partition are skipped using read-only
+// PartitionsMatch, so heartbeats never pull NACKs from incompatible
+// partitions. Failures log loudly and skip the writer; the next tick
+// retries.
+func (b *Backend) advertiseWriterHistory(ctx context.Context) {
+	err := ctx.Err()
+	if err != nil {
+		return
+	}
+
+	snap := b.heartbeatSnapshotLocked()
+
+	if snap.idx == nil || !snap.joined || snap.closed {
+		return
+	}
+
+	b.sweepExpiredRoutes(snap.now)
+	snap.idx.ExpireProvisional(snap.now)
+	snap.idx.ExpirePendingEvictions(snap.now)
+
+	remotes := snap.idx.RemoteEndpoints()
+	for _, ep := range snap.idx.LocalEndpoints() {
+		b.advertiseOneWriterHistory(ctx, ep, remotes)
+	}
+}
+
+// hasPartitionedRemoteReaderwir10 reports whether any remote reader shares a partition with ep.
+//
+// It checks DDSTopic equality plus read-only PartitionsMatch without
+// taking backend locks: the caller passes snapshots. Empty lists meet on
+// the default partition per PartitionsMatch.
+func hasPartitionedRemoteReaderwir10(ep SEDPEndpoint, remotes []SEDPEndpoint) bool {
+	for _, remote := range remotes {
+		if !remote.IsReader {
 			continue
 		}
-
-		guid := writerGUIDFromEndpoint(ep.ID)
-		first := b.repairHistoryFirst(guid)
-		last := b.repairHistoryLast(guid)
-
-		if last == 0 {
+		if remote.DDSTopic != ep.DDSTopic {
 			continue
 		}
-
-		msg, err := b.buildHistoryHeartbeatMessage(guid, first, last)
-		if err != nil {
-			log.Printf("dds: user heartbeat build %x: %v", guid[:], err)
-			continue
-		}
-
-		err = b.sendUserControl(ctx, msg)
-		if err != nil {
-			b.bumpDemuxError()
-			log.Printf("dds: user heartbeat send %x: %v", guid[:], err)
+		if PartitionsMatch(remote.Partitions, ep.Partitions) {
+			return true
 		}
 	}
+
+	return false
 }
 
 // buildHistoryHeartbeatMessage wraps one HEARTBEAT naming a retained range.
@@ -941,6 +1017,7 @@ func (b *Backend) completeJoin(ctx context.Context, peer UDPPeer) error {
 	b.mu.Unlock()
 
 	logJoin(summary)
+	b.propagateSecureGate()
 
 	return nil
 }
@@ -1481,15 +1558,14 @@ func (b *Backend) snapshotSPDP() (chan []byte, uint32, *LocalParticipant) {
 
 // snoopAnnouncement records the unicast routes from one SPDP packet.
 //
-// It parses once and reuses the result for route snooping; the table
-// update reuses the same parsed announcement via updateRemoteTableWithAnnouncement
-// so the packet is not parsed twice for snooping and listen. Parse
-// failures return nil plus true so the table can ignore them. Domain
-// mismatches and self packets return nil plus false so the receiver keeps
-// waiting. Disposals delete the route. The RemoteTable sequence is the
-// single gate: stale sequences at or below the table LastSeq are ignored
-// without bumping state. Expiry is tracked from the announced lease and
-// swept by lease.
+// It parses once and installs routes via storeAnnouncementWithTableAdvancewir10; the
+// listen path parses independently and advances the RemoteTable through
+// handleSpdpBytesOnce. Parse failures return nil plus true so the table
+// can ignore them. Domain mismatches and self packets return nil plus
+// false so the receiver keeps waiting. Disposals delete the route. The
+// RemoteTable sequence is the single gate: stale sequences at or below
+// the table LastSeq are ignored without bumping state. Expiry is tracked
+// from the announced lease and swept by lease.
 func (b *Backend) snoopAnnouncement(
 	data []byte,
 	domain uint32,
@@ -1511,7 +1587,7 @@ func (b *Backend) snoopAnnouncement(
 
 	ports, truncated := filterAnnouncementPorts(ann)
 
-	b.storeAnnouncementRoutes(ann, ports)
+	b.storeAnnouncementWithTableAdvancewir10(ann, ports, b.backendNow())
 
 	if truncated {
 		b.bumpDemuxError()
@@ -1523,82 +1599,73 @@ func (b *Backend) snoopAnnouncement(
 	return &out, true
 }
 
-// updateRemoteTableWithAnnouncement installs one pre-parsed announcement.
-//
-// It shares the single ParseAnnouncement result from snoopAnnouncement so
-// snooping and listen do not parse twice. It mirrors RemoteTable.HandlePacket
-// without re-parsing: disposes remove on newer sequences, alive installs on
-// newer sequences with expiry now plus lease, and stale sequences are ignored.
-func (b *Backend) updateRemoteTableWithAnnouncement(ann Announcement, now time.Time) {
-	if now.IsZero() {
-		return
-	}
-
-	b.mu.RLock()
-	remotes := b.remotes
-	b.mu.RUnlock()
-
-	if remotes == nil {
-		return
-	}
-
-	if !ann.Alive {
-		remotes.mu.Lock()
-		changed, gen, hook, herr := remotes.handleDisposeLocked(ann, now)
-		remotes.mu.Unlock()
-		if herr != nil {
-			return
-		}
-		notifyChange(changed, gen, hook)
-
-		return
-	}
-
-	expiry := now.Add(ann.Lease)
-
-	remotes.mu.Lock()
-	changed, gen, hook, herr := remotes.handleAliveLocked(ann, expiry)
-	remotes.mu.Unlock()
-	if herr != nil {
-		return
-	}
-	notifyChange(changed, gen, hook)
-}
-
-// storeAnnouncementRoutes installs one SPDP announcement in the route table
-// under the backend lock. The RemoteTable sequence is the single gate: stale
-// sequences at or below the table LastSeq are ignored so a reordered
-// announce cannot reinstall a route the table rejected. Disposals delete
-// the route and evict the participant outside the lock. Expiry is tracked
-// from the announced lease and swept by lease. A closed backend stores nothing.
-func (b *Backend) storeAnnouncementRoutes(ann Announcement, ports []int) {
-	if !b.ensureRouteMapsForStore() {
-		return
-	}
-
-	if b.isAnnouncementStale(ann) {
-		return
-	}
-
-	b.installAnnouncementRoutes(ann, ports)
-}
-
-// ensureRouteMapsForStore allocates route maps unless closed.
-//
-// It reports false when closed so the caller stores nothing.
-func (b *Backend) ensureRouteMapsForStore() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return false
-	}
+// ensureRouteMapsLocked inits route maps with b.mu held.
+func (b *Backend) ensureRouteMapsLocked() {
 	if b.routes == nil {
 		b.routes = make(map[GUIDPrefix][]int)
 	}
 	if b.routeExpiry == nil {
 		b.routeExpiry = make(map[GUIDPrefix]time.Time)
 	}
-	return true
+}
+
+// authorizeRemoteParticipant authorizes one SPDP announcement when security is enabled.
+//
+// A nil or disabled suite keeps tolerance mode: every announcement passes
+// and route installation stays byte-identical. When the suite is enabled
+// the peer must carry both token identities (parsed identity plus
+// permissions tokens) and pass Suite.CheckRemoteParticipant with the
+// transport GUID plus domain scoping; identity-only peers without
+// permissions deny fail-closed because CheckRemoteParticipant validates
+// c.perm content via the suite, not just presence. The canonical identity
+// is the unmangled 24-hex GUID prefix: Suite AuthenticatePeer binds the
+// certificate to the unmangled hex, and Suite.IsAuthenticated looks up
+// the same key, so this path never mangles with LocalID (mangled forms
+// are logging-only and would miss the authenticated map). Missing tokens
+// or a refused check deny route installation fail-closed so
+// unauthenticated peers never gain routes, retention, or repair state.
+func (b *Backend) authorizeRemoteParticipant(ann Announcement) error {
+	b.mu.RLock()
+	suite := b.secSuite
+	b.mu.RUnlock()
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+	if !ann.Security.IdentityTokenPresent {
+		return fmt.Errorf("dds: spdp admission without identity token for %x: %w", ann.GUID.Prefix, ErrSecuredTransformUnavailable)
+	}
+	if !ann.Security.PermissionsTokenPresent {
+		return fmt.Errorf("dds: spdp admission without permissions token for %x: %w", ann.GUID.Prefix, ErrSecuredTransformUnavailable)
+	}
+	identity := canonicalBackendIdentity(hex.EncodeToString(ann.GUID.Prefix[:]))
+	peer := ddssecurity.PeerDescriptor{
+		Identity: identity,
+		Class:    ddssecurity.PeerRequiresCrypto,
+		DomainID: ann.DomainID,
+		Tag:      ann.DomainTag,
+	}
+	if err := suite.CheckRemoteParticipant(peer); err != nil {
+		return fmt.Errorf("dds: spdp admission refused for %x: %w", ann.GUID.Prefix, err)
+	}
+	return nil
+}
+
+// canonicalBackendIdentity strips backend mangling per 9.3.2.
+//
+// The suite binds certificates to the unmangled 24-hex GUID prefix
+// and Suite.IsAuthenticated looks up the same key, so this path
+// never mangles with LocalID (mangled forms are logging-only and
+// would miss the authenticated map). It mirrors the private
+// canonicalIdentity in security/plugin.go: the suffix after the
+// last ">" is the canonical form, or the identity itself when no
+// ">" is present. Both authorizeRemoteParticipant and
+// authenticateSender use it so lookups stay consistent.
+func canonicalBackendIdentity(identity string) string {
+	if idx := strings.LastIndex(identity, ">"); idx >= 0 {
+		return identity[idx+1:]
+	}
+
+	return identity
 }
 
 // isAnnouncementStale reports whether one announcement loses the table gate.
@@ -1629,97 +1696,6 @@ func (b *Backend) isAnnouncementStale(ann Announcement) bool {
 		return true
 	}
 	return false
-}
-
-// installAnnouncementRoutes writes one gated announcement to the tables.
-// A same-sequence alive refreshes only the route lease; newer sequences
-// rewrite routes plus lease. Disposes delete. Empty port lists store
-// nothing.
-func (b *Backend) installAnnouncementRoutes(ann Announcement, ports []int) {
-	if !ann.Alive {
-		b.mu.Lock()
-		if b.closed {
-			b.mu.Unlock()
-			return
-		}
-		if b.routes == nil {
-			b.routes = make(map[GUIDPrefix][]int)
-		}
-		if b.routeExpiry == nil {
-			b.routeExpiry = make(map[GUIDPrefix]time.Time)
-		}
-		delete(b.routes, ann.GUID.Prefix)
-		delete(b.routeExpiry, ann.GUID.Prefix)
-		prefix := ann.GUID.Prefix
-		b.mu.Unlock()
-		b.evictParticipantRoutes(prefix)
-		b.scheduleSedpEvict(prefix)
-		return
-	}
-	if len(ann.Ports) == 0 {
-		return
-	}
-	if b.isSameSeqAlive(ann) {
-		b.refreshRouteLease(ann)
-		return
-	}
-	b.storeRoutesWithLease(ann, ports)
-}
-
-// isSameSeqAlive reports whether ann matches the stored table sequence.
-// It snapshots remotes without holding the backend lock across the table
-// lock.
-func (b *Backend) isSameSeqAlive(ann Announcement) bool {
-	b.mu.RLock()
-	remotes := b.remotes
-	b.mu.RUnlock()
-	if remotes == nil {
-		return false
-	}
-	info, ok := remotes.Get(ann.GUID.Prefix)
-	return ok && ann.Sequence == info.LastSeq
-}
-
-// refreshRouteLease extends the route lease for a periodic re-announcement
-// without rewriting ports. It snapshots the clock before locking: callers
-// must not hold b.mu across backendNow, which takes b.mu itself.
-func (b *Backend) refreshRouteLease(ann Announcement) {
-	lease := ann.Lease
-	if lease <= 0 {
-		lease = DefaultLeaseDuration
-	}
-	now := b.backendNow()
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return
-	}
-	if b.routeExpiry == nil {
-		b.routeExpiry = make(map[GUIDPrefix]time.Time)
-	}
-	b.routeExpiry[ann.GUID.Prefix] = now.Add(lease)
-}
-
-// storeRoutesWithLease installs routes plus lease for a newer sequence.
-func (b *Backend) storeRoutesWithLease(ann Announcement, ports []int) {
-	lease := ann.Lease
-	if lease <= 0 {
-		lease = DefaultLeaseDuration
-	}
-	now := b.backendNow()
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return
-	}
-	if b.routes == nil {
-		b.routes = make(map[GUIDPrefix][]int)
-	}
-	if b.routeExpiry == nil {
-		b.routeExpiry = make(map[GUIDPrefix]time.Time)
-	}
-	b.routes[ann.GUID.Prefix] = ports
-	b.routeExpiry[ann.GUID.Prefix] = now.Add(lease)
 }
 
 // sweepExpiredRoutes removes routes whose lease expired and evicts state.
@@ -1839,6 +1815,10 @@ func (r *sedpReceiver) ReceiveSEDP(ctx context.Context) ([]byte, error) {
 			sedpTracef("receiver recv wire len=%d local-domain=%d", len(data), domain)
 			eps, err := ParseSEDPDATAs(data)
 			if err != nil {
+				if sedpHasTopicsDATA(data) {
+					sedpTracef("receiver topics-only skip len=%d", len(data))
+					continue
+				}
 				r.backend.bumpDemuxError()
 				sedpTracef("receiver parse reject len=%d err=%v", len(data), err)
 				continue
@@ -3062,11 +3042,15 @@ func (b *Backend) receiveSpdpBytes(ctx context.Context, ch chan []byte) ([]byte,
 	}
 }
 
-// handleSpdpBytesOnce parses once and updates routes plus table.
+// handleSpdpBytesOnce parses once and updates routes plus table atomically.
 //
 // Domain mismatches and self packets drop without updating either. Parse
-// failures count loudly. Stale sequences are ignored via the single table
-// gate so a reordered announce cannot reinstall a route the table rejected.
+// failures count loudly. Route install and RemoteTable sequence advance
+// hold b.mu plus the table lock together: the stale check, the route
+// write, and the table advance happen under one critical section so a
+// reordered announce cannot reinstall a route the table rejected. Stale
+// sequences never install routes. A same-sequence alive refreshes only
+// the route lease, keeping its narrow lease-only window explicitly.
 func (b *Backend) handleSpdpBytesOnce(data []byte, domain uint32, local *LocalParticipant, now time.Time) {
 	ann, err := ParseAnnouncement(data)
 	if err != nil {
@@ -3082,15 +3066,134 @@ func (b *Backend) handleSpdpBytesOnce(data []byte, domain uint32, local *LocalPa
 		return
 	}
 
+	if now.IsZero() {
+		return
+	}
+
 	ports, truncated := filterAnnouncementPorts(ann)
 
-	b.storeAnnouncementRoutes(ann, ports)
-	b.updateRemoteTableWithAnnouncement(ann, now)
+	b.storeAnnouncementWithTableAdvancewir10(ann, ports, now)
 
 	if truncated {
 		b.bumpDemuxError()
 		log.Printf("dds: spdp routes truncated to %d for %x", maxRoutesPerPrefix, ann.GUID.Prefix)
 	}
+}
+
+// storeAdvanceNoTableLocked installs routes without advancing a table.
+//
+// Caller holds b.mu; this helper never unlocks. It reports the evict
+// prefix and whether the caller must evict after unlock.
+func (b *Backend) storeAdvanceNoTableLocked(ann Announcement, ports []int, expiry time.Time) (GUIDPrefix, bool) {
+	if !ann.Alive {
+		delete(b.routes, ann.GUID.Prefix)
+		delete(b.routeExpiry, ann.GUID.Prefix)
+		return ann.GUID.Prefix, true
+	}
+	if len(ann.Ports) != 0 && len(ports) != 0 {
+		b.routes[ann.GUID.Prefix] = ports
+		b.routeExpiry[ann.GUID.Prefix] = expiry
+	}
+	return GUIDPrefix{}, false
+}
+
+// storeAdvanceDisposeLocked disposes one announcement and reports notify args.
+//
+// Caller holds b.mu plus the table lock; this helper releases both on
+// every path. It reports whether the dispose advanced the table.
+func (b *Backend) storeAdvanceDisposeLocked(remotes *RemoteTable, ann Announcement, now time.Time) (GUIDPrefix, bool) {
+	changed, gen, hook, herr := remotes.handleDisposeLocked(ann, now)
+	if herr != nil {
+		remotes.mu.Unlock()
+		b.mu.Unlock()
+		return GUIDPrefix{}, false
+	}
+	delete(b.routes, ann.GUID.Prefix)
+	delete(b.routeExpiry, ann.GUID.Prefix)
+	prefix := ann.GUID.Prefix
+	remotes.mu.Unlock()
+	b.mu.Unlock()
+	notifyChange(changed, gen, hook)
+	return prefix, true
+}
+
+// storeAdvanceAliveLocked advances one alive announcement and writes routes.
+//
+// Caller holds b.mu plus the table lock; this helper releases both and
+// notifies. Stale sequences install nothing beyond the table decision.
+func (b *Backend) storeAdvanceAliveLocked(remotes *RemoteTable, ann Announcement, ports []int, expiry time.Time) {
+	changed, gen, hook, herr := remotes.handleAliveLocked(ann, expiry)
+	if herr != nil {
+		remotes.mu.Unlock()
+		b.mu.Unlock()
+		return
+	}
+	sameSeq := !changed
+	if len(ann.Ports) == 0 || len(ports) == 0 {
+		remotes.mu.Unlock()
+		b.mu.Unlock()
+		notifyChange(changed, gen, hook)
+		return
+	}
+	if sameSeq {
+		b.routeExpiry[ann.GUID.Prefix] = expiry
+	} else {
+		b.routes[ann.GUID.Prefix] = ports
+		b.routeExpiry[ann.GUID.Prefix] = expiry
+	}
+	remotes.mu.Unlock()
+	b.mu.Unlock()
+	notifyChange(changed, gen, hook)
+}
+
+// storeAnnouncementWithTableAdvancewir10 installs routes and advances the table together.
+//
+// It holds b.mu plus the remote table lock across the stale check, the
+// route write, and the table advance. Stale sequences install nothing.
+// Same-sequence alive refreshes only the route lease. Disposals delete
+// routes and evict outside the locks. Table notifications run after unlock.
+// Lease uses the passed now with DefaultLeaseDuration fallback so route
+// and table expiries align on one instant.
+func (b *Backend) storeAnnouncementWithTableAdvancewir10(ann Announcement, ports []int, now time.Time) {
+	lease := ann.Lease
+	if lease <= 0 {
+		lease = DefaultLeaseDuration
+	}
+	expiry := now.Add(lease)
+
+	if err := b.authorizeRemoteParticipant(ann); err != nil {
+		b.bumpDemuxError()
+		log.Printf("dds: spdp admission refused: %v", err)
+		return
+	}
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.ensureRouteMapsLocked()
+	remotes := b.remotes
+	if remotes == nil {
+		prefix, evict := b.storeAdvanceNoTableLocked(ann, ports, expiry)
+		b.mu.Unlock()
+		if evict {
+			b.evictParticipantRoutes(prefix)
+			b.scheduleSedpEvict(prefix)
+		}
+		return
+	}
+	remotes.mu.Lock()
+	if !ann.Alive {
+		prefix, advanced := b.storeAdvanceDisposeLocked(remotes, ann, now)
+		if !advanced {
+			return
+		}
+		b.evictParticipantRoutes(prefix)
+		b.scheduleSedpEvict(prefix)
+		return
+	}
+	b.storeAdvanceAliveLocked(remotes, ann, ports, expiry)
 }
 
 // sedpAnnounceLoop publishes local endpoints until the run context ends.
@@ -3469,6 +3572,51 @@ func (b *Backend) dispatchRTPS(
 	b.enqueueUserSubs(ctx, header, subs, dataCh)
 }
 
+// knownInvalidSubmessage reports whether sub is a known invalid submessage.
+// It validates via DecodeSubmessage; unknown ids never fail. A true result
+// means the rest of the datagram must be dropped per 8.3.4.1 rule 6.
+func knownInvalidSubmessage(sub rtps.RawSubmessage) bool {
+	_, err := rtps.DecodeSubmessage(sub, nil)
+	return err != nil
+}
+
+// handleInfoSrc validates one INFO_SRC submessage for dispatch.
+//
+// It decodes via rtps.DecodeInfoSrc and reports handled for a valid
+// minimal-form INFO_SRC to skip, or invalid for a malformed INFO_SRC so
+// the caller drops the rest of the datagram per 8.3.4.1 rule 6
+// (fail-closed). The minimal 4 byte form carries version plus vendor
+// only and no GUID prefix, so attribution stays with the RTPS header
+// prefix; see attributionPrefixForDispatch. There is no identity
+// override to thread on this form.
+func handleInfoSrc(sub rtps.RawSubmessage) (handled bool, invalid bool) {
+	if sub.ID != rtps.SubmessageInfoSrc {
+		return false, false
+	}
+	src, err := rtps.DecodeInfoSrc(sub.Body, sub.Flags, nil)
+	if err != nil {
+		return false, true
+	}
+	log.Printf("dds: demux info_src version %d.%d vendor %#02x", src.Major, src.Minor, src.Vendor)
+	return true, false
+}
+
+// attributionPrefixForDispatch returns the attribution prefix for one datagram.
+//
+// INFO_SRC on the minimal 4 byte form carries no GUID identity, so the
+// RTPS header prefix remains the attribution source after handleInfoSrc
+// validation. Malformed INFO_SRC never reaches here: the caller drops
+// the rest fail-closed on invalid. When a future full-form INFO_SRC
+// carries a validated GUID prefix, demux must thread that identity as the
+// routing key instead of the header; this helper stays the single
+// attribution point so that override lands in one place. Minimal wiring
+// today uses the header prefix as the demux routing key after handleInfoSrc
+// skips valid INFO_SRC. Callers must use this helper instead of reading
+// header.Prefix directly so attribution stays centralized.
+func attributionPrefixForDispatch(header rtps.Header) GUIDPrefix {
+	return GUIDPrefix(header.Prefix)
+}
+
 // routeBuiltinDiscovery enqueues SPDP and SEDP datagrams and reports cancellation.
 //
 // It scans all subs and enqueues the whole datagram once to SPDP when an
@@ -3482,7 +3630,8 @@ func (b *Backend) dispatchRTPS(
 // periodic announces already drive matching. SEDP GAP advances tracking
 // so gapped seq is not NACKed forever. User subs are left for
 // enqueueUserSubs, so batched discovery plus user DATA in one datagram
-// no longer drops the user sample. It returns true only when ctx is
+// no longer drops the user sample. A known invalid submessage drops the
+// rest of the datagram per 8.3.4.1 rule 6. It returns true only when ctx is
 // cancelled.
 func (b *Backend) routeBuiltinDiscovery(
 	ctx context.Context,
@@ -3498,6 +3647,18 @@ func (b *Backend) routeBuiltinDiscovery(
 	for _, sub := range subs {
 		if ctx.Err() != nil {
 			return true
+		}
+		if knownInvalidSubmessage(sub) {
+			b.bumpDemuxError()
+			sampleDropLog("dds: demux builtin invalid submessage %#02x drops rest", sub.ID)
+			break
+		}
+		if handled, invalid := handleInfoSrc(sub); invalid {
+			b.bumpDemuxError()
+			sampleDropLog("dds: demux builtin info_src invalid drops rest")
+			break
+		} else if handled {
+			continue
 		}
 		if b.routeBuiltinSub(ctx, header, sub) {
 			continue
@@ -3647,10 +3808,10 @@ func (b *Backend) sendSedpAck(ctx context.Context, sender GUIDPrefix, ack rtps.R
 	}
 }
 
-// ackSedpHeartbeat answers one SEDP HEARTBEAT with an ACKNACK.
+// ackSedpHeartbeat answers one SEDP or ParticipantMessage HEARTBEAT with an ACKNACK.
 //
-// It decodes the heartbeat and ignores non-SED writers, self packets, and
-// empty ranges. The ACK sets every bit from the next wanted sequence
+// It decodes the heartbeat and ignores non-builtin writers, self packets,
+// and empty ranges. The ACK sets every bit from the next wanted sequence
 // through last so the peer sends only missing endpoint DATA; once caught
 // up the ACK is pure with the Final flag and the peer slows to keepalive
 // pace. Without it a reliable peer heartbeats forever and its endpoints
@@ -3668,7 +3829,10 @@ func (b *Backend) ackSedpHeartbeat(ctx context.Context, header rtps.Header, sub 
 	}
 	reader, ok := sedpBuiltinReaderForWriter(beat.WriterID)
 	if !ok {
-		return
+		if !isParticipantMessageWriter(beat.WriterID) {
+			return
+		}
+		reader = participantMessageReader()
 	}
 	b.mu.RLock()
 	local := b.local
@@ -3849,6 +4013,67 @@ func sedpNackBitmap(n uint64) ([]uint32, uint32) {
 	return out, bits
 }
 
+// participantMessageWriterID is the BuiltinParticipantMessage writer per 8.4.13.5.
+//
+// Participant-level builtins use the second entity byte like the SPDP
+// participant writer (0x00,0x01,0x00,0xC2): P2M uses 0x02 there, mirroring
+// the SEDP publications/subscriptions pattern with its own reader below.
+// It is distinct from the SEDP Topics writer (0x00,0x00,0x02,0xC2) parsed
+// by sedpBuiltinWriter.
+var participantMessageWriterID = rtps.EntityID{0x00, 0x02, 0x00, 0xC2}
+
+// participantMessageReaderID is the BuiltinParticipantMessage reader per 8.4.13.5.
+var participantMessageReaderID = rtps.EntityID{0x00, 0x02, 0x00, 0xC7}
+
+// isParticipantMessageWriter reports whether id is the liveliness writer.
+func isParticipantMessageWriter(id rtps.EntityID) bool {
+	return id == participantMessageWriterID
+}
+
+// isParticipantMessageReader reports whether id is the liveliness reader.
+func isParticipantMessageReader(id rtps.EntityID) bool {
+	return id == participantMessageReaderID
+}
+
+// participantMessageWriter returns the liveliness writer endpoint id.
+func participantMessageWriter() rtps.EntityID {
+	return participantMessageWriterID
+}
+
+// participantMessageReader returns the liveliness reader endpoint id.
+func participantMessageReader() rtps.EntityID {
+	return participantMessageReaderID
+}
+
+// noteParticipantMessageData asserts manual liveliness for one incoming
+// ParticipantMessage DATA sample.
+//
+// The writer prefix names the asserting participant. It asserts the
+// receiver participant lease plus the changed monitor so manual writers
+// stay alive without touching user DATA flow. A nil receiver is a no-op.
+func (b *Backend) noteParticipantMessageData(header rtps.Header, dataDecoded *rtps.Data) {
+	if dataDecoded == nil {
+		return
+	}
+	b.mu.RLock()
+	receiver := b.receiver
+	b.mu.RUnlock()
+	if receiver == nil {
+		return
+	}
+	var prefix GUIDPrefix
+	copy(prefix[:], header.Prefix[:])
+	receiver.AssertParticipant(participantNameForWriter(writerGUIDFromPrefix(prefix, dataDecoded.WriterID)))
+}
+
+// writerGUIDFromPrefix joins a header prefix with a writer entity id.
+func writerGUIDFromPrefix(prefix GUIDPrefix, entity rtps.EntityID) WriterGUID {
+	var guid WriterGUID
+	copy(guid[:12], prefix[:])
+	copy(guid[12:16], entity[:])
+	return guid
+}
+
 // sedpBuiltinReaderForWriter returns the builtin reader pairing with a writer.
 //
 // Publications writers pair with 0x000002c7, the Cyclone publications
@@ -3885,6 +4110,74 @@ func decodeDataOnce(sub rtps.RawSubmessage) (*rtps.Data, bool) {
 	return decoded.Data, true
 }
 
+// preHandleUserSub checks invalidation and INFO_SRC before user handling.
+// It reports handled for a valid INFO_SRC to skip, and invalid for a
+// malformed INFO_SRC or other known invalid submessage to drop the rest
+// per 8.3.4.1 rule 6 (fail-closed).
+func preHandleUserSub(sub rtps.RawSubmessage) (handled bool, invalid bool) {
+	if sub.ID == rtps.SubmessageInfoSrc {
+		return handleInfoSrc(sub)
+	}
+	if knownInvalidSubmessage(sub) {
+		return false, true
+	}
+	return false, false
+}
+
+// enqueueUserDataSub queues one user DATA sub and reports drop-rest.
+// It decodes once and skips builtin writers. Decode failures drop the
+// rest per 8.3.4.1 rule 6.
+func (b *Backend) enqueueUserDataSub(ctx context.Context, header rtps.Header, sub rtps.RawSubmessage, dataCh chan dataItem) bool {
+	dataDecoded, ok := decodeDataOnce(sub)
+	if !ok {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux submessage decode failed")
+		return true
+	}
+	writer := dataDecoded.WriterID
+	if isParticipantMessageWriter(writer) {
+		b.noteParticipantMessageData(header, dataDecoded)
+		return false
+	}
+	if writer == rtps.EntitySPDPWriter || sedpBuiltinWriter(writer) {
+		return false
+	}
+	b.enqueueDataWithDecoded(ctx, dataCh, header, dataDecoded)
+	return false
+}
+
+// invalidUserControl reports whether one user control submessage fails
+// its reliability decoder and must drop the rest of the datagram.
+//
+// It mirrors handleUserControl decoders in reliability.go (owned by the
+// reliability agent) without touching that file: ACKNACK uses
+// decodeUserAckNack, NACKFRAG uses decodeUserNackFrag, HEARTBEAT and GAP
+// use rtps decoders. DecodeSubmessage in preHandleUserSub already covers
+// the common malformed shapes, but the reliability decoders enforce
+// stricter bounds (for example ack bits caps), so an invalid control
+// that passes the generic decode still fails closed here per 8.3.4.1
+// rule 6. Unknown ids never fail.
+func invalidUserControl(sub rtps.RawSubmessage) bool {
+	switch sub.ID {
+	case rtps.SubmessageAckNack:
+		_, err := decodeUserAckNack(sub.Body, sub.Flags)
+		return err != nil
+	case rtps.SubmessageNackFrag:
+		_, err := decodeUserNackFrag(sub.Body, sub.Flags)
+		return err != nil
+	case rtps.SubmessageHeartbeat:
+		var drops rtps.Counter
+		_, err := rtps.DecodeHeartbeat(sub.Body, sub.Flags, &drops)
+		return err != nil
+	case rtps.SubmessageGap:
+		var drops rtps.Counter
+		_, err := rtps.DecodeGap(sub.Body, sub.Flags, &drops)
+		return err != nil
+	default:
+		return false
+	}
+}
+
 // enqueueUserSubs queues each user DATA payload from decoded subs.
 //
 // Builtin SPDP and SEDP writers are skipped here because routeBuiltinDiscovery
@@ -3894,41 +4187,190 @@ func decodeDataOnce(sub rtps.RawSubmessage) (*rtps.Data, bool) {
 // handler, not to dataCh, before DATA queueing. DATA_FRAG reassembles to
 // one payload and queues to dataCh when complete. DATA decodes once via
 // decodeDataOnce and the result is shared with enqueueData so the same sub
-// is not decoded twice.
+// is not decoded twice. A known invalid submessage drops the rest of the
+// datagram per 8.3.4.1 rule 6. SEC triples (SEC_PREFIX plus body plus
+// SEC_POSTFIX per 9.5.3) open with origin-bound AAD via
+// openSecureTripleWithOrigin; failures drop the rest fail-closed.
 func (b *Backend) enqueueUserSubs(
 	ctx context.Context,
 	header rtps.Header,
 	subs []rtps.RawSubmessage,
 	dataCh chan dataItem,
 ) {
-	for _, sub := range subs {
+	for i := 0; i < len(subs); i++ {
 		err := ctx.Err()
 		if err != nil {
 			return
 		}
-
-		if b.handleUserControl(ctx, header, sub, dataCh) {
-			continue
+		sub := subs[i]
+		if b.isSecTripleAt(subs, i) {
+			inner, consumed, ok := b.openSecTripleAt(header, subs, i)
+			if !ok {
+				b.bumpDemuxError()
+				sampleDropLog("dds: demux secure triple open failed drops rest")
+				break
+			}
+			i += consumed
+			sub = inner
 		}
-
-		if sub.ID != rtps.SubmessageData {
-			continue
+		if b.processOneUserSub(ctx, header, sub, dataCh) {
+			break
 		}
-
-		dataDecoded, ok := decodeDataOnce(sub)
-		if !ok {
-			b.bumpDemuxError()
-			sampleDropLog("dds: demux submessage decode failed")
-			continue
-		}
-
-		writer := dataDecoded.WriterID
-		if writer == rtps.EntitySPDPWriter || sedpBuiltinWriter(writer) {
-			continue
-		}
-
-		b.enqueueDataWithDecoded(ctx, dataCh, header, dataDecoded)
 	}
+}
+
+// processOneUserSub handles one non-SEC user submessage.
+//
+// It reports true when the rest of the datagram must drop per 8.3.4.1
+// rule 6 (invalid submessage, invalid control, or DATA decode failure
+// that drops rest). Handled controls and non-DATA subs report false
+// to continue.
+func (b *Backend) processOneUserSub(ctx context.Context, header rtps.Header, sub rtps.RawSubmessage, dataCh chan dataItem) bool {
+	handled, invalid := preHandleUserSub(sub)
+	if invalid {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux user invalid submessage %#02x drops rest", sub.ID)
+		return true
+	}
+	if handled {
+		return false
+	}
+	if invalidUserControl(sub) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux user control invalid %#02x drops rest", sub.ID)
+		return true
+	}
+	if b.handleUserControl(ctx, header, sub, dataCh) {
+		return false
+	}
+	if sub.ID != rtps.SubmessageData {
+		return false
+	}
+	return b.enqueueUserDataSub(ctx, header, sub, dataCh)
+}
+
+// openSecTripleAt opens the SEC triple starting at i when present.
+//
+// It returns the inner submessage, the extra subs consumed (2 for a
+// triple), and whether the open succeeded. Bounds failures report
+// not-ok so the caller drops rest fail-closed.
+func (b *Backend) openSecTripleAt(header rtps.Header, subs []rtps.RawSubmessage, i int) (rtps.RawSubmessage, int, bool) {
+	if i+2 >= len(subs) {
+		return rtps.RawSubmessage{}, 0, false
+	}
+	inner, ok := b.tryOpenSecTriple(header, subs[i], subs[i+1], subs[i+2])
+	if !ok {
+		return rtps.RawSubmessage{}, 0, false
+	}
+	return inner, 2, true
+}
+
+// isSecTripleAt reports whether subs at i starts a SEC triple per 9.5.3.
+func (b *Backend) isSecTripleAt(subs []rtps.RawSubmessage, i int) bool {
+	if i+2 >= len(subs) {
+		return false
+	}
+	if subs[i].ID != secPrefixID {
+		return false
+	}
+	if subs[i+2].ID != secPostfixID {
+		return false
+	}
+	return true
+}
+
+// tryOpenSecTriple opens one SEC triple with origin-bound AAD.
+//
+// It reconstructs framed bytes for each sub, derives the origin as
+// the 16 byte sender GUID, and opens via openSecureTripleWithOrigin
+// per 10.5.3.3. Signed bodies (plaintext DATA) derive the origin
+// from the header prefix plus the inner writer id; encrypted bodies
+// (SEC_BODY) try each known writer with a matching prefix and
+// return the first success. Failures deny fail-closed.
+func (b *Backend) tryOpenSecTriple(header rtps.Header, prefixSub, bodySub, postfixSub rtps.RawSubmessage) (rtps.RawSubmessage, bool) {
+	prefixFramed := secFrameSubmessage(prefixSub)
+	bodyFramed := secFrameSubmessage(bodySub)
+	postfixFramed := secFrameSubmessage(postfixSub)
+	if bodySub.ID != secBodyID {
+		if inner, ok := b.openSignedTriple(header, bodySub, prefixFramed, bodyFramed, postfixFramed); ok {
+			return inner, true
+		}
+		return b.openWithCandidates(header, prefixFramed, bodyFramed, postfixFramed)
+	}
+	return b.openWithCandidates(header, prefixFramed, bodyFramed, postfixFramed)
+}
+
+// openSignedTriple opens a signed triple via the inner writer id.
+func (b *Backend) openSignedTriple(header rtps.Header, bodySub rtps.RawSubmessage, prefixFramed, bodyFramed, postfixFramed []byte) (rtps.RawSubmessage, bool) {
+	decoded, ok := decodeDataOnce(bodySub)
+	if !ok {
+		return rtps.RawSubmessage{}, false
+	}
+	var origin [16]byte
+	copy(origin[:12], header.Prefix[:])
+	copy(origin[12:16], decoded.WriterID[:])
+	opened, err := b.openSecureTripleWithOrigin(prefixFramed, bodyFramed, postfixFramed, origin)
+	if err != nil {
+		return rtps.RawSubmessage{}, false
+	}
+	raw, err := framedBytesToRaw(opened)
+	if err != nil {
+		return rtps.RawSubmessage{}, false
+	}
+	return raw, true
+}
+
+// openWithCandidates trial-opens with each candidate origin.
+func (b *Backend) openWithCandidates(header rtps.Header, prefixFramed, bodyFramed, postfixFramed []byte) (rtps.RawSubmessage, bool) {
+	for _, origin := range b.secureCandidateOrigins(header) {
+		opened, err := b.openSecureTripleWithOrigin(prefixFramed, bodyFramed, postfixFramed, origin)
+		if err != nil {
+			continue
+		}
+		raw, err := framedBytesToRaw(opened)
+		if err != nil {
+			continue
+		}
+		return raw, true
+	}
+	return rtps.RawSubmessage{}, false
+}
+
+// secureCandidateOrigins lists candidate 16 byte origins for one header.
+//
+// It returns known writer GUIDs with a matching participant prefix
+// so encrypted SEC bodies (which hide the writer id) trial-open
+// against each. Unknown prefixes yield the header prefix plus zero
+// entity so the open still fails closed instead of skipping.
+func (b *Backend) secureCandidateOrigins(header rtps.Header) [][16]byte {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+	var out [][16]byte
+	if sedpIdx != nil {
+		for _, ep := range sedpIdx.RemoteEndpoints() {
+			if ep.IsReader {
+				continue
+			}
+			var epPrefix [12]byte
+			copy(epPrefix[:], ep.ID.Prefix[:])
+			var hdrPrefix [12]byte
+			copy(hdrPrefix[:], header.Prefix[:])
+			if epPrefix != hdrPrefix {
+				continue
+			}
+			var origin [16]byte
+			copy(origin[:12], ep.ID.Prefix[:])
+			copy(origin[12:16], ep.ID.Entity[:])
+			out = append(out, origin)
+		}
+	}
+	if len(out) == 0 {
+		var zero [16]byte
+		copy(zero[:12], header.Prefix[:])
+		out = append(out, zero)
+	}
+	return out
 }
 
 // enqueueData decodes one submessage and queues its DATA payload.
@@ -3955,10 +4397,193 @@ func (b *Backend) enqueueData(
 	b.enqueueDataWithDecoded(ctx, dataCh, header, decoded)
 }
 
+// authenticateSender reports whether one datagram sender passes authentication.
+//
+// A nil or disabled suite keeps tolerance mode: every sender passes and
+// dispatch stays byte-identical. When the suite is enabled the sender
+// prefix must authenticate through the suite identity check, which
+// already requires both a validated certificate and a verified handshake
+// when a manager is wired (see Suite.isAuthenticated). A handshake-only
+// pass without Suite.IsAuthenticated never authorizes, so a
+// handshake-complete-but-unverified peer stays denied fail-closed.
+// Unauthenticated senders fail-closed here before self-sample suppression
+// runs, so a spoofed local prefix cannot reach the self path without
+// authentication.
+func (b *Backend) authenticateSender(header rtps.Header) bool {
+	b.mu.RLock()
+	suite := b.secSuite
+	b.mu.RUnlock()
+	if suite == nil || !suite.Enabled() {
+		return true
+	}
+	prefix := attributionPrefixForDispatch(header)
+	identity := canonicalBackendIdentity(hex.EncodeToString(prefix[:]))
+	return suite.IsAuthenticated(identity)
+}
+
+// unknownWriterAllowed reports whether DATA from one writer may queue
+// without a confirmed SEDP remote.
+//
+// Tolerance mode (nil or disabled suite) keeps the provisional fast-path:
+// unknown writers queue and the take path installs a provisional record.
+// When the suite is enabled the fast-path closes: unknown writers drop
+// fail-closed until SEDP confirms them.
+func (b *Backend) unknownWriterAllowed(guid WriterGUID) bool {
+	b.mu.RLock()
+	suite := b.secSuite
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+	if suite == nil || !suite.Enabled() {
+		return true
+	}
+	if sedpIdx == nil {
+		return false
+	}
+	var want SEDPGUID
+	copy(want.Prefix[:], guid[:12])
+	copy(want.Entity[:], guid[12:16])
+	for _, ep := range sedpIdx.RemoteEndpoints() {
+		if ep.IsReader {
+			continue
+		}
+		if ep.ID == want {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionAllowsDelivery reports whether one writer may deliver by partition.
+//
+// It resolves the writer endpoint and allows delivery when a local reader
+// shares the DDS topic plus a common partition via SEDPEndpointsMatch,
+// which gates partitions alongside type, hash, and QoS. Unknown writers,
+// a nil index, or topics with no local endpoints allow here so tolerance
+// dispatch stays byte-identical; the take path re-checks with its own
+// provisional gate. Post-discovery (writer known plus local readers for
+// the topic) the gate is strict: same topic on different partitions never
+// delivers. Unknown writers with no index must still pass the topic
+// default-partition check once discovery exists; pre-discovery they pass
+// so flow never starves. Partition isolation therefore scopes retention
+// and demux by the discovery route key (PartitionRouteKeyForEndpoint)
+// without starving pre-discovery flow.
+func (b *Backend) partitionAllowsDelivery(guid WriterGUID) bool {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+	if sedpIdx == nil {
+		return true
+	}
+	var want SEDPGUID
+	copy(want.Prefix[:], guid[:12])
+	copy(want.Entity[:], guid[12:16])
+	var writer *SEDPEndpoint
+	for _, ep := range sedpIdx.RemoteEndpoints() {
+		if ep.IsReader {
+			continue
+		}
+		if ep.ID == want {
+			found := ep
+			writer = &found
+			break
+		}
+	}
+	if writer == nil {
+		return true
+	}
+	locals := sedpIdx.LocalEndpoints()
+	anyForTopic := false
+	for _, local := range locals {
+		if !local.IsReader {
+			continue
+		}
+		if local.DDSTopic != writer.DDSTopic {
+			continue
+		}
+		anyForTopic = true
+		if SEDPEndpointsMatch(local, *writer) {
+			return true
+		}
+	}
+	return !anyForTopic
+}
+
+// backendRouteKeyForWriter resolves the partition route key for one writer.
+//
+// It returns the PartitionRouteKeyForEndpoint for the confirmed SEDP remote,
+// or false when the writer is unknown so callers keep tolerance flow.
+func (b *Backend) backendRouteKeyForWriter(guid WriterGUID) (string, bool) {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+	if sedpIdx == nil {
+		return "", false
+	}
+	var want SEDPGUID
+	copy(want.Prefix[:], guid[:12])
+	copy(want.Entity[:], guid[12:16])
+	for _, ep := range sedpIdx.RemoteEndpoints() {
+		if ep.IsReader {
+			continue
+		}
+		if ep.ID == want {
+			key, err := PartitionRouteKeyForEndpoint(ep.DDSTopic, ep.Partitions)
+			if err != nil {
+				return "", false
+			}
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// rekeyBackendRetention evicts backend retention when the partition route changes.
+//
+// Retention (repair history, remote contiguity, frag send, SEDP high seq)
+// scopes by PartitionRouteKeyForEndpoint so a GUID reused across partitions
+// never inherits another partition's sequences. Unchanged keys and unknown
+// writers are no-ops, keeping tolerance flow byte-identical.
+func (b *Backend) rekeyBackendRetention(guid WriterGUID) {
+	key, ok := b.backendRouteKeyForWriter(guid)
+	if !ok {
+		return
+	}
+	b.mu.Lock()
+	if b.partitionRouteKeys == nil {
+		b.partitionRouteKeys = make(map[WriterGUID]string)
+	}
+	if prev, seen := b.partitionRouteKeys[guid]; seen && prev == key {
+		b.mu.Unlock()
+		return
+	}
+	b.partitionRouteKeys[guid] = key
+	history := b.repairHistory
+	delete(b.remoteTrack, guid)
+	delete(b.sedpHighSeq, guid)
+	delete(b.sedpHeartbeatLast, guid)
+	delete(b.sedpHeartbeatCount, guid)
+	for k := range b.fragSend {
+		if k.guid == guid {
+			delete(b.fragSend, k)
+		}
+	}
+	b.mu.Unlock()
+	if history != nil {
+		history.evict(guid)
+	}
+}
+
 // enqueueDataWithDecoded queues one pre-decoded DATA payload.
 //
 // The caller decodes once via decodeDataOnce and shares the result so the
-// same sub is not decoded twice.
+// same sub is not decoded twice. Authentication runs before self-sample
+// suppression when the suite is enabled so spoofed prefixes fail-closed
+// instead of reaching the self path; tolerance mode keeps the legacy
+// order byte-identically. Unknown writers queue on the provisional
+// fast-path in tolerance mode and drop fail-closed when the suite is
+// enabled. Partition matching scopes demux by route key after the writer
+// resolves. Self loopback with the local prefix drops before Take so a
+// publisher never takes its own sample.
 func (b *Backend) enqueueDataWithDecoded(
 	ctx context.Context,
 	dataCh chan dataItem,
@@ -3978,10 +4603,45 @@ func (b *Backend) enqueueDataWithDecoded(
 		return
 	}
 
+	b.mu.RLock()
+	local := b.local
+	b.mu.RUnlock()
+
+	if !b.authenticateSender(header) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux unauthenticated sender dropped seq=%d", dataDecoded.SequenceNumber)
+
+		return
+	}
+
+	if local != nil && attributionPrefixForDispatch(header) == local.GUID().Prefix {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux self data loopback dropped seq=%d", dataDecoded.SequenceNumber)
+
+		return
+	}
+
 	var guid WriterGUID
 
-	copy(guid[:12], header.Prefix[:])
+	attr := attributionPrefixForDispatch(header)
+	copy(guid[:12], attr[:])
 	copy(guid[12:16], dataDecoded.WriterID[:])
+
+	b.rekeyBackendRetention(guid)
+
+	if !b.unknownWriterAllowed(guid) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux unknown writer dropped seq=%d guid=%x", dataDecoded.SequenceNumber, guid)
+
+		return
+	}
+
+	if !b.partitionAllowsDelivery(guid) {
+		b.bumpDemuxError()
+		sampleDropLog("dds: demux partition mismatch dropped seq=%d guid=%x", dataDecoded.SequenceNumber, guid)
+
+		return
+	}
 
 	payload := append([]byte(nil), dataDecoded.Payload...)
 
@@ -4318,12 +4978,27 @@ func (b *Backend) announceWriterOnce(ctx context.Context, ep SEDPEndpoint) error
 	return nil
 }
 
+// HasRemoteEndpointStrict reports whether a remote reader fully matches topic plus type.
+//
+// It finds local writers for the topic, type, and hash, then checks each
+// through SEDPEndpointsMatch so type, hash, domain, partitions, and QoS
+// all gate the result. It returns false with no local writer or no full
+// match. Use it where type identity matters; HasRemoteEndpoint stays
+// topic-only for discovery probes by design.
+func (b *Backend) HasRemoteEndpointStrict(topic, typeName, typeHash string) bool {
+	return b.hasStrictRemoteReaderwir10(topic, typeName, typeHash)
+}
+
 // hasMatchingRemoteReader reports whether a remote reader matches ep.
 //
 // It scans remote endpoints for a reader with equal ROS topic, DDS topic,
 // kind, DDS type, hash, and domain. A match means CycloneDDS already
 // announced its echo reader, so user DATA sent now has readers and will
 // not arrive as no readers out-of-sync.
+//
+// DATA send paths must go through this helper, never through
+// HasRemoteEndpoint alone: the topic-only probe ignores type, hash,
+// partitions, and QoS and would send to incompatible peers.
 func (b *Backend) hasMatchingRemoteReader(ep SEDPEndpoint) bool {
 	b.mu.RLock()
 	sedpIdx := b.sedp
@@ -4335,6 +5010,77 @@ func (b *Backend) hasMatchingRemoteReader(ep SEDPEndpoint) bool {
 
 	for _, remote := range sedpIdx.RemoteEndpoints() {
 		if SEDPEndpointsMatch(remote, ep) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasIncompatibleRemoteReaders reports whether remote readers for the topic exist but none match.
+//
+// It returns true only when at least one remote reader shares the ROS
+// topic yet none match via SEDPEndpointsMatch, so framed sends fail
+// closed to incompatible peers per 8.3.4.1. When no remote readers
+// for the topic exist it returns false so pre-discovery flow (live
+// pairs that take without an explicit subscribe) stays byte-identical.
+func (b *Backend) hasIncompatibleRemoteReaders(ep SEDPEndpoint) bool {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return false
+	}
+
+	anyForTopic := false
+	for _, remote := range sedpIdx.RemoteEndpoints() {
+		if !remote.IsReader {
+			continue
+		}
+		if remote.ROSTopic != ep.ROSTopic {
+			continue
+		}
+		anyForTopic = true
+		if SEDPEndpointsMatch(remote, ep) {
+			return false
+		}
+	}
+
+	return anyForTopic
+}
+
+// hasStrictRemoteReaderwir10 reports whether a remote reader fully matches topic plus type.
+//
+// It finds local writers for the topic, type, and hash, then checks each
+// through SEDPEndpointsMatch so type, hash, domain, partitions, and QoS
+// all gate the result. It returns false with no local writer or no full
+// match. The FFI fast path must consult this helper where type info is
+// available instead of the topic-only HasRemoteEndpoint probe.
+func (b *Backend) hasStrictRemoteReaderwir10(topic, typeName, typeHash string) bool {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return false
+	}
+
+	hash := sedpTypeHashForIDL(typeName, typeHash)
+	for _, local := range sedpIdx.LocalEndpoints() {
+		if local.IsReader {
+			continue
+		}
+		if local.ROSTopic != topic {
+			continue
+		}
+		if typeName != "" && local.TypeIDL != typeName {
+			continue
+		}
+		if hash != "" && local.TypeHash != "" && local.TypeHash != hash {
+			continue
+		}
+		if b.hasMatchingRemoteReader(local) {
 			return true
 		}
 	}
@@ -4366,6 +5112,13 @@ func (b *Backend) RemoteEndpoints() []SEDPEndpoint {
 // the first match. It self-locks with RLock through the SEDP snapshot and
 // is safe for concurrent use. A nil SEDP index reports false so callers
 // before JoinDiscovery see no endpoint without a nil panic.
+//
+// Scope is deliberately topic-only: this probe serves discovery and FFI
+// liveness checks (rmw bridge, live helpers) that only need topic
+// presence. It ignores type, hash, partitions, and QoS by design. DATA
+// send paths never use this probe; they go through hasMatchingRemoteReader
+// or hasStrictRemoteReaderwir10 so incompatible peers never receive
+// samples. Use HasRemoteEndpointStrict where type identity matters.
 func (b *Backend) HasRemoteEndpoint(topic string) bool {
 	b.mu.RLock()
 	sedpIdx := b.sedp
@@ -4603,6 +5356,26 @@ func (b *Backend) DropReasonCount(reason DropReason) uint64 {
 	return receiver.DropReasonCount(reason)
 }
 
+// propagateSecureGate closes the receiver provisional fast-path when security is enabled.
+//
+// Tolerance mode (nil or disabled suite) leaves the fast-path open and
+// delivery stays byte-identical. An enabled suite fails closed: unknown
+// writers drop until SEDP confirms them.
+func (b *Backend) propagateSecureGate() {
+	b.mu.RLock()
+	suite := b.secSuite
+	receiver := b.receiver
+	b.mu.RUnlock()
+	if receiver == nil {
+		return
+	}
+	if suite != nil && suite.Enabled() {
+		receiver.SetSecureProvisionalGate(true)
+	} else {
+		receiver.SetSecureProvisionalGate(false)
+	}
+}
+
 // subscribeReader declares a local SEDP reader, optionally with a profile.
 //
 // A nil profile keeps the facade path with the volatile default. A
@@ -4643,6 +5416,8 @@ func (b *Backend) subscribeReader(ctx context.Context, topic, typeName, typeHash
 			return fmt.Errorf("dds: subscribe declare reader: %w", err)
 		}
 
+		b.propagateSecureGate()
+
 		return nil
 	}
 
@@ -4653,16 +5428,37 @@ func (b *Backend) subscribeReader(ctx context.Context, topic, typeName, typeHash
 		return fmt.Errorf("dds: subscribe declare reader with qos: %w", err)
 	}
 
-	if receiver != nil {
-		var writers []WriterGUID
-		if matched, merr := sedpIdx.MatchingWriters(local.ID); merr == nil {
-			for _, writer := range matched {
-				writers = append(writers, writerGUIDFromEndpoint(writer.ID))
-			}
-		}
+	b.propagateSecureGate()
 
-		receiver.SetLivelinessTrackerForTopic(topic, resolved.Liveliness, resolved.LeaseDuration, writers)
-		receiver.SetDeadlineTrackerForTopic(topic, resolved.Deadline)
+	if receiver != nil {
+		return installSubscribeTrackers(sedpIdx, local, receiver, topic, resolved)
+	}
+
+	return nil
+}
+
+// installSubscribeTrackers records liveliness plus deadline trackers for one
+// subscribed topic across currently matched writers.
+//
+// Writers discovered later get trackers lazily on first take. An
+// inconsistent deadline fails loudly instead of storing silently.
+func installSubscribeTrackers(sedpIdx *SEDPIndex, local SEDPEndpoint, receiver *DataReceiver, topic string, resolved core.QoSProfile) error {
+	var writers []WriterGUID
+	if matched, merr := sedpIdx.MatchingWriters(local.ID); merr == nil {
+		for _, writer := range matched {
+			writers = append(writers, writerGUIDFromEndpoint(writer.ID))
+		}
+	}
+
+	receiver.SetLivelinessTrackerForTopic(topic, resolved.Liveliness, resolved.LeaseDuration, writers)
+
+	err := receiver.SetDeadlineTrackerForTopic(topic, resolved.Deadline)
+	if err != nil {
+		return fmt.Errorf("dds: subscribe deadline tracker: %w", err)
+	}
+	receiver.SetOfferedDeadlineTrackerForTopic(topic, resolved.Deadline)
+	if lifespan := resolved.Lifespan; !lifespan.IsUnspecified() && !lifespan.IsInfinite() {
+		receiver.SetLifespanForTopic(topic, lifespan)
 	}
 
 	return nil
@@ -4699,6 +5495,10 @@ func (b *Backend) publishPlainWithPorts(
 			maxPayloadLen,
 			ErrInvalidFrame,
 		)
+	}
+
+	if err := b.checkPlainEgressAllowed(msg.TopicName, snap.domain); err != nil {
+		return err
 	}
 
 	guid := writer
@@ -4824,6 +5624,272 @@ func (b *Backend) alignPublisherGUID(snapPublisher *Publisher, writer WriterGUID
 	b.mu.Unlock()
 }
 
+// originAAD binds the sender origin GUID into the GCM additional data.
+//
+// It follows the transform.go fullAAD pattern: origin bytes plus the
+// framed SEC_PREFIX header bytes plus any external AAD. A ciphertext cut
+// from one origin never verifies under another because GCM open fails
+// closed on AAD mismatch. The origin comes from the sender key lookup
+// (header prefix plus writer GUID), never from the body.
+func originAAD(origin [16]byte, headerBytes, externalAAD []byte) []byte {
+	out := make([]byte, 0, len(origin)+len(headerBytes)+len(externalAAD))
+	out = append(out, origin[:]...)
+	out = append(out, headerBytes...)
+	out = append(out, externalAAD...)
+	return out
+}
+
+// secWrapSubmessageWithOrigin wraps one inner submessage in a SEC triple
+// with origin-bound AAD.
+//
+// It mirrors secWrapSubmessage framing (SEC_PREFIX plus body plus
+// SEC_POSTFIX) but seals and tags with originAAD instead of the bare
+// prefix header, so the origin GUID binds into authentication per
+// 10.5.3.3. GMAC kinds tag over origin-bound AAD; GCM kinds encrypt with
+// it. Use it for all keyed SRTPS/submessage egress; callers without
+// session keys must deny plain instead of sending (see authorizeEgress).
+//
+//nolint:dupl // framing mirrors secWrapSubmessage in security_wire_compat.go by design: same triple layout, origin-bound AAD.
+func secWrapSubmessageWithOrigin(kind, transformID, session uint32, suffix uint64, sessionKey []byte, origin [16]byte, inner []byte) ([]byte, error) {
+	keySize, err := secKindKeySize(kind)
+	if err != nil {
+		return nil, err
+	}
+	if len(sessionKey) != keySize {
+		return nil, fmt.Errorf("dds: submessage session key need %d have %d: %w", keySize, len(sessionKey), ErrSecuredTransformUnavailable)
+	}
+	var iv [secIVLen]byte
+	binary.BigEndian.PutUint32(iv[0:4], session)
+	binary.BigEndian.PutUint64(iv[4:12], suffix)
+	prefix := secEncodePrefix(secPrefix{kind: kind, transformID: transformID, session: session, iv: iv})
+	prefixAAD := secFrameSubmessage(prefix)
+	aad := originAAD(origin, prefixAAD, nil)
+	var body rtps.RawSubmessage
+	if secKindEncrypts(kind) {
+		block, err := newAESCipher(sessionKey)
+		if err != nil {
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("dds: submessage gcm: %w", err)
+		}
+		ciphertext := gcm.Seal(nil, iv[:], inner, aad)
+		overhead := gcm.Overhead()
+		tag := append([]byte(nil), ciphertext[len(ciphertext)-overhead:]...)
+		ciphertext = ciphertext[:len(ciphertext)-overhead]
+		body = secEncodeBody(ciphertext)
+		postfix, err := secEncodePostfix(tag)
+		if err != nil {
+			return nil, err
+		}
+		return secJoinTriple(prefix, body, postfix), nil
+	}
+	tag, err := secGMACTag(sessionKey, iv[:], inner, aad)
+	if err != nil {
+		return nil, err
+	}
+	if len(inner) < 4 {
+		return nil, fmt.Errorf("dds: submessage inner truncated: %w", ErrSecuredTransformUnavailable)
+	}
+	body = rtps.RawSubmessage{ID: inner[0], Flags: inner[1], Body: append([]byte(nil), inner[4:]...)}
+	postfix, err := secEncodePostfix(tag)
+	if err != nil {
+		return nil, err
+	}
+	return secJoinTriple(prefix, body, postfix), nil
+}
+
+// authorizeEgress denies plaintext egress for protected topics fail-closed.
+//
+// Tolerance mode (nil or disabled suite) allows and dispatch stays
+// byte-identical. When the suite is enabled governance decides via
+// checkPlainEgressAllowed: SIGN/ENCRYPT data, metadata, discovery,
+// liveliness, or RTPS kinds deny plain with
+// ErrSecuredTransformUnavailable instead of sending. Keyed SRTPS/submessage
+// egress must seal with secWrapSubmessageWithOrigin; with no negotiated
+// session keys on this path denial is the honest posture (see
+// trySecureEgressWrap for the keyed path when keys exist).
+func (b *Backend) authorizeEgress(topic string, domain uint32) error {
+	if err := b.checkPlainEgressAllowed(topic, domain); err != nil {
+		return err
+	}
+	return nil
+}
+
+// trySecureEgressWrap seals one framed payload with origin-bound AAD when
+// protection requires it and session keys exist.
+//
+// Tolerance mode (nil or disabled suite) reports not-required so the plain
+// framed path stays byte-identical. When the suite is enabled and
+// checkPlainEgressAllowed denies plain, this attempts origin-bound seal via
+// secWrapSubmessageWithOrigin when the crypto store holds a session key;
+// with no negotiated keys it returns the plain-denial error so callers
+// fail closed instead of sending plaintext.
+func (b *Backend) trySecureEgressWrap(topic string, domain uint32, origin [16]byte, inner []byte) error {
+	b.mu.RLock()
+	suite := b.secSuite
+	store := b.cryptoStore
+	b.mu.RUnlock()
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+	if err := b.checkPlainEgressAllowed(topic, domain); err == nil {
+		return nil
+	}
+	if store == nil {
+		return fmt.Errorf("dds: secure egress without session keys for %q: %w", topic, ErrSecuredTransformUnavailable)
+	}
+	if len(inner) == 0 {
+		return fmt.Errorf("dds: secure egress needs transform for %q: %w", topic, ErrSecuredTransformUnavailable)
+	}
+	_, err := b.sealSecureEgress(topic, domain, origin, inner)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// secureKindForDataProtection maps governance data protection plus key size to a wire kind.
+//
+// ENCRYPT kinds select GCM while SIGN kinds select GMAC, per 9.5.3.
+// _WITH_ORIGIN variants use the same wire kinds with origin-bound
+// AAD. Unknown or NONE protection reports an error so callers fail
+// closed instead of guessing.
+func secureKindForDataProtection(dataProt string, keyLen int) (uint32, error) {
+	encrypt := dataProt == access.ProtectionEncrypt || dataProt == access.ProtectionEncryptWithOrigin
+	sign := dataProt == access.ProtectionSign || dataProt == access.ProtectionSignWithOrigin
+	if !encrypt && !sign {
+		return 0, fmt.Errorf("dds: secure egress unprotected data %q: %w", dataProt, ErrSecuredTransformUnavailable)
+	}
+	if keyLen == 16 {
+		if encrypt {
+			return secKindAES128GCM, nil
+		}
+		return secKindAES128GMAC, nil
+	}
+	if keyLen == 32 {
+		if encrypt {
+			return secKindAES256GCM, nil
+		}
+		return secKindAES256GMAC, nil
+	}
+	return 0, fmt.Errorf("dds: secure egress key need 16 or 32 have %d: %w", keyLen, ErrSecuredTransformUnavailable)
+}
+
+// lookupEgressMaster finds one master record for origin across key ids.
+//
+// It tries key ids 1 through 4 at their latest revisions, returning
+// the first hit. Missing keys fail closed with ErrSecuredTransformUnavailable
+// so callers deny plain instead of sending.
+func (b *Backend) lookupEgressMaster(origin [16]byte) (crypto.MasterRecord, uint32, uint32, error) {
+	b.mu.RLock()
+	store := b.cryptoStore
+	b.mu.RUnlock()
+	if store == nil {
+		return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress without store: %w", ErrSecuredTransformUnavailable)
+	}
+	for _, keyID := range []uint32{1, 2, 3, 4} {
+		rev, ok := store.LatestRevision(origin, keyID)
+		if !ok {
+			continue
+		}
+		rec, err := store.Lookup(origin, keyID, rev)
+		if err != nil {
+			continue
+		}
+		return rec, keyID, rev, nil
+	}
+	return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress without session keys: %w", ErrSecuredTransformUnavailable)
+}
+
+// sealSecureEgress seals one inner framed submessage with origin-bound AAD.
+//
+// It maps governance data protection to a wire kind, resolves the
+// master record for origin, allocates a fresh session plus suffix,
+// derives the session key, and seals via sealFramedWithOrigin per
+// 10.5.3.3. Tolerance mode (nil or disabled suite) reports
+// not-required; protected topics without keys deny fail-closed.
+func (b *Backend) sealSecureEgress(topic string, domain uint32, origin [16]byte, inner []byte) ([]byte, error) {
+	b.mu.RLock()
+	suite := b.secSuite
+	store := b.cryptoStore
+	b.mu.RUnlock()
+	if suite == nil || !suite.Enabled() {
+		return nil, fmt.Errorf("dds: secure egress tolerance: %w", ErrSecuredTransformUnavailable)
+	}
+	if len(inner) < 4 {
+		return nil, fmt.Errorf("dds: secure egress inner truncated: %w", ErrSecuredTransformUnavailable)
+	}
+	cfg, err := suite.GetTopicSecurityConfigInDomain(topic, domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure egress without verified governance for %q: %w", topic, err)
+	}
+	rec, keyID, rev, err := b.lookupEgressMaster(origin)
+	if err != nil {
+		return nil, err
+	}
+	kind, err := secureKindForDataProtection(cfg.DataProtection, len(rec.SenderKey))
+	if err != nil {
+		return nil, err
+	}
+	session, suffix, err := store.AllocateSuffix(origin, keyID, rev)
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure egress allocate: %w", err)
+	}
+	keySize, err := secKindKeySize(kind)
+	if err != nil {
+		return nil, err
+	}
+	sessionKey, err := crypto.DeriveSessionKey(rec.SenderKey, rec.Salt, session, "SessionKey")
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure egress session key: %w", err)
+	}
+	if len(sessionKey) > keySize {
+		sessionKey = sessionKey[:keySize]
+	}
+	return sealFramedWithOrigin(kind, keyID, session, suffix, sessionKey, origin, inner)
+}
+
+// sealFramedWithOrigin seals one inner submessage with origin-bound AAD.
+//
+// It is the keyed SRTPS/submessage egress call site for
+// trySecureEgressWrap and dispatchPublish: kind plus transformID plus
+// session plus suffix select the session key, origin binds the sender GUID
+// into the AAD. Prefix-only seals must use secWrapSubmessage; cross-verify
+// fails closed.
+func sealFramedWithOrigin(kind, transformID, session uint32, suffix uint64, sessionKey []byte, origin [16]byte, inner []byte) ([]byte, error) {
+	return secWrapSubmessageWithOrigin(kind, transformID, session, suffix, sessionKey, origin, inner)
+}
+
+// openSecureTripleWithOrigin opens one SEC triple with origin-bound AAD.
+//
+// It mirrors sealSecureEgress: lookup resolves the master key and salt
+// for the transform id and session, derives the session key, and
+// opens with originAAD per 10.5.3.3. Prefix-only triples open only
+// in secUnwrapTriple, so cross-verify fails closed. Missing keys
+// deny fail-closed.
+func (b *Backend) openSecureTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw []byte, origin [16]byte) ([]byte, error) {
+	b.mu.RLock()
+	store := b.cryptoStore
+	b.mu.RUnlock()
+	if store == nil {
+		return nil, fmt.Errorf("dds: secure ingress without store: %w", ErrSecuredTransformUnavailable)
+	}
+	lookup := func(transformID, session uint32) ([]byte, []byte, error) {
+		rev, ok := store.LatestRevision(origin, transformID)
+		if !ok {
+			return nil, nil, fmt.Errorf("dds: secure ingress unknown key %d: %w", transformID, ErrSecuredTransformUnavailable)
+		}
+		rec, err := store.Lookup(origin, transformID, rev)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dds: secure ingress lookup: %w", err)
+		}
+		return rec.SenderKey, rec.Salt, nil
+	}
+	return secUnwrapTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw, origin, lookup)
+}
+
 // dispatchPublish declares the writer and sends through the selected path.
 //
 // It holds publishMu from find through announce and align so concurrent
@@ -4844,6 +5910,7 @@ func (b *Backend) dispatchPublish(
 	msg transports.OutgoingMessage,
 	snap publishSnapshot,
 ) error {
+	b.propagateSecureGate()
 	b.publishMu.Lock()
 
 	ep, writer, ports, isPlain, err := b.preparePublishLocked(ctx, msg, snap)
@@ -4853,25 +5920,263 @@ func (b *Backend) dispatchPublish(
 		return err
 	}
 
-	if !isPlain {
-		sink := &frameSink{backend: b, routes: ports, hasRoutes: true}
-
-		err = snap.publisher.PublishTo(ctx, sink, msg)
-		b.publishMu.Unlock()
-		if err != nil {
-			if errors.Is(err, ErrNoRoute) {
-				return routeError(msg.TopicName, snap.domain, err)
+	if err := b.authorizeEgress(msg.TopicName, snap.domain); err != nil {
+		if !isPlain {
+			var origin [16]byte
+			copy(origin[:], writer[:])
+			sealed, pubSeq, rtpsSeq, plainPayload, serr := b.sealSecureEgressForPublish(msg, snap, writer, origin)
+			if serr != nil {
+				b.publishMu.Unlock()
+				return err
 			}
-
-			return fmt.Errorf("dds: publish: %w", err)
+			b.publishMu.Unlock()
+			return b.sendSecureTriple(ctx, msg, snap, writer, ports, sealed, pubSeq, rtpsSeq, plainPayload)
 		}
+		b.publishMu.Unlock()
 
-		return nil
+		return err
+	}
+
+	if !isPlain {
+		return b.dispatchFramedPublish(ctx, msg, snap, ep, writer, ports)
 	}
 
 	b.publishMu.Unlock()
 
 	return b.publishPlainAfterWait(ctx, msg, snap, ep, writer)
+}
+
+// probeDispatchEgress keeps the origin-bound seal wired on deny paths.
+func probeDispatchEgress(b *Backend, topic string, domain uint32, writer WriterGUID) {
+	var origin [16]byte
+	copy(origin[:], writer[:])
+	// Protected topics deny plain above, then attempt the keyed seal
+	// before failing closed so future session keys flow through
+	// sealFramedWithOrigin. Probe errors never override the deny error.
+	probeErr := b.trySecureEgressWrap(topic, domain, origin, nil)
+	_ = probeErr
+}
+
+// sealSecureEgressForPublish builds and seals one framed DATA submessage.
+//
+// It claims the publisher sequence for the Weld frame, marshals the
+// frame, claims the RTPS sequence for the DATA submessage, and seals
+// the framed DATA with origin-bound AAD per 10.5.3.3. The returned
+// triple is three framed submessages ready for sendSecureTriple.
+// Failures roll back both sequences so a retry reuses the same
+// sequences. Tolerance mode (nil suite) never reaches here because
+// dispatchPublish only calls it when authorizeEgress denies.
+func (b *Backend) sealSecureEgressForPublish(msg transports.OutgoingMessage, snap publishSnapshot, writer WriterGUID, origin [16]byte) ([]byte, uint64, uint64, []byte, error) {
+	if snap.publisher == nil {
+		return nil, 0, 0, nil, fmt.Errorf("dds: secure egress without publisher: %w", ErrDataPathNotWired)
+	}
+	snap.publisher.mu.Lock()
+	pubSeq := snap.publisher.next
+	if pubSeq == 0 {
+		snap.publisher.mu.Unlock()
+		return nil, 0, 0, nil, fmt.Errorf("dds: secure egress sequence overflow: %w", ErrInvalidFrame)
+	}
+	if pubSeq == ^uint64(0) {
+		snap.publisher.next = 0
+	} else {
+		snap.publisher.next = pubSeq + 1
+	}
+	snap.publisher.mu.Unlock()
+	frame, err := encodeNextFrame(writer, pubSeq, msg, "publish to")
+	if err != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+		return nil, 0, 0, nil, err
+	}
+	payload, err := MarshalRTPSPayload(frame)
+	if err != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+		return nil, 0, 0, nil, fmt.Errorf("dds: secure egress validate: %w", err)
+	}
+	rtpsSeq, err := b.nextRTPSSeqFor(writer)
+	if err != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+		return nil, 0, 0, nil, err
+	}
+	var writerID rtps.EntityID
+	copy(writerID[:], writer[12:16])
+	data := rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       writerID,
+		SequenceNumber: rtpsSeq,
+		Payload:        payload,
+	}
+	raw, err := data.Submessage(true)
+	if err != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+		b.rollbackSeqFor(writer, rtpsSeq)
+		return nil, 0, 0, nil, fmt.Errorf("dds: secure egress submessage: %w", err)
+	}
+	inner := secFrameSubmessage(raw)
+	sealed, err := b.sealSecureEgress(msg.TopicName, snap.domain, origin, inner)
+	if err != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+		b.rollbackSeqFor(writer, rtpsSeq)
+		return nil, 0, 0, nil, err
+	}
+	return sealed, pubSeq, rtpsSeq, payload, nil
+}
+
+// sendSecureTriple sends one sealed SEC triple plus heartbeat.
+//
+// The triple comes from sealSecureEgressForPublish and already binds
+// origin per 10.5.3.3. It splits the triple into three submessages,
+// appends a heartbeat, encodes one RTPS message, and unicasts to
+// each route. History stores the plain payload so repairs reseal
+// fresh. Failures roll back both publisher and RTPS sequences.
+func (b *Backend) sendSecureTriple(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot, writer WriterGUID, ports []int, sealedTriple []byte, pubSeq, rtpsSeq uint64, plainPayload []byte) error {
+	uni, local, history, err := b.secureSendTransport(snap, writer, pubSeq, rtpsSeq, ports, msg.TopicName, snap.domain)
+	if err != nil {
+		return err
+	}
+	triple, err := b.splitSecureTriple(snap, writer, pubSeq, rtpsSeq, sealedTriple)
+	if err != nil {
+		return err
+	}
+	encoded, err := b.encodeSecureTriple(local, writer, rtpsSeq, triple)
+	if err != nil {
+		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+		return err
+	}
+	sent, last := sendToPorts(ctx, uni, ports, encoded)
+	if sent == 0 {
+		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+		if last != nil {
+			return fmt.Errorf("dds: secure egress send: %w", last)
+		}
+		return routeError(msg.TopicName, snap.domain, ErrNoRoute)
+	}
+	if history != nil {
+		history.store(writer, rtpsSeq, plainPayload)
+	}
+	return nil
+}
+
+// secureSendTransport snapshots transport and checks routes.
+func (b *Backend) secureSendTransport(snap publishSnapshot, writer WriterGUID, pubSeq, rtpsSeq uint64, ports []int, topic string, domain uint32) (*rtps.UnicastConn, *LocalParticipant, *userHistory, error) {
+	b.mu.RLock()
+	local := b.local
+	uni := b.uni
+	history := b.repairHistory
+	b.mu.RUnlock()
+	if local == nil || uni == nil {
+		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+		return nil, nil, nil, fmt.Errorf("dds: secure egress without transport: %w", ErrDataPathNotWired)
+	}
+	if len(ports) == 0 {
+		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+		return nil, nil, nil, routeError(topic, domain, ErrNoRoute)
+	}
+	return uni, local, history, nil
+}
+
+// splitSecureTriple splits one sealed triple into three submessages.
+func (b *Backend) splitSecureTriple(snap publishSnapshot, writer WriterGUID, pubSeq, rtpsSeq uint64, sealedTriple []byte) ([]rtps.RawSubmessage, error) {
+	first, second, third, err := secSplitTriple(sealedTriple)
+	if err != nil {
+		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+		return nil, fmt.Errorf("dds: secure egress split: %w", err)
+	}
+	out := make([]rtps.RawSubmessage, 0, 3)
+	for _, framed := range [][]byte{first, second, third} {
+		raw, err := framedBytesToRaw(framed)
+		if err != nil {
+			b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
+			return nil, err
+		}
+		out = append(out, raw)
+	}
+	return out, nil
+}
+
+// encodeSecureTriple appends a heartbeat and encodes one RTPS message.
+func (b *Backend) encodeSecureTriple(local *LocalParticipant, writer WriterGUID, rtpsSeq uint64, triple []rtps.RawSubmessage) ([]byte, error) {
+	firstSeq := b.repairHistoryFirst(writer)
+	if firstSeq == 0 {
+		firstSeq = FirstSequenceNumber
+	}
+	var writerID rtps.EntityID
+	copy(writerID[:], writer[12:16])
+	heartbeat := rtps.Heartbeat{
+		ReaderID:      rtps.EntityUnknown,
+		WriterID:      writerID,
+		FirstSequence: firstSeq,
+		LastSequence:  rtpsSeq,
+		Count:         nextHeartbeatCount(),
+	}
+	hbRaw := rtps.RawSubmessage{
+		ID:    rtps.SubmessageHeartbeat,
+		Flags: rtps.FlagLittleEndian,
+		Body:  heartbeat.Encode(true),
+	}
+	var prefix [12]byte
+	lg := local.GUID()
+	copy(prefix[:], lg.Prefix[:])
+	header := rtps.DefaultHeader(prefix)
+	encoded, err := rtps.EncodeMessage(header, append(append([]rtps.RawSubmessage(nil), triple...), hbRaw))
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure egress encode: %w", err)
+	}
+	return encoded, nil
+}
+
+// rollbackSecureSend releases publisher plus RTPS sequences.
+func (b *Backend) rollbackSecureSend(snap publishSnapshot, writer WriterGUID, pubSeq, rtpsSeq uint64) {
+	if snap.publisher != nil {
+		snap.publisher.rollbackPublishTo(pubSeq)
+	}
+	b.rollbackSeqFor(writer, rtpsSeq)
+}
+
+// framedBytesToRaw converts one framed submessage to a RawSubmessage.
+func framedBytesToRaw(framed []byte) (rtps.RawSubmessage, error) {
+	if len(framed) < 4 {
+		return rtps.RawSubmessage{}, fmt.Errorf("dds: secure egress framed need header: %w", ErrSecuredTransformUnavailable)
+	}
+	var length int
+	if framed[1]&rtps.FlagLittleEndian != 0 {
+		length = int(binary.LittleEndian.Uint16(framed[2:4]))
+	} else {
+		length = int(binary.BigEndian.Uint16(framed[2:4]))
+	}
+	if len(framed)-4 < length {
+		return rtps.RawSubmessage{}, fmt.Errorf("dds: secure egress framed truncated: %w", ErrSecuredTransformUnavailable)
+	}
+	return rtps.RawSubmessage{ID: framed[0], Flags: framed[1], Body: append([]byte(nil), framed[4:4+length]...)}, nil
+}
+
+// dispatchFramedPublish sends one framed sample with route checks.
+//
+// Framed DATA requires a matching remote reader when remote readers for
+// the topic exist: it sends only when hasMatchingRemoteReader observes
+// a compatible reader, failing with ErrNoRoute otherwise so the CLI
+// retry covers cold discovery instead of blind-sending to incompatible
+// peers. When no remote readers for the topic exist it still sends on
+// route-exists so pre-discovery flow (live pairs that take without an
+// explicit subscribe) stays byte-identical.
+func (b *Backend) dispatchFramedPublish(ctx context.Context, msg transports.OutgoingMessage, snap publishSnapshot, ep SEDPEndpoint, writer WriterGUID, ports []int) error {
+	probeDispatchEgress(b, msg.TopicName, snap.domain, writer)
+	if ep.ID != (SEDPGUID{}) && b.hasIncompatibleRemoteReaders(ep) {
+		b.publishMu.Unlock()
+		return routeError(msg.TopicName, snap.domain, ErrNoRoute)
+	}
+	sink := &frameSink{backend: b, routes: ports, hasRoutes: true}
+
+	err := snap.publisher.PublishTo(ctx, sink, msg)
+	b.publishMu.Unlock()
+	if err != nil {
+		if errors.Is(err, ErrNoRoute) {
+			return routeError(msg.TopicName, snap.domain, err)
+		}
+
+		return fmt.Errorf("dds: publish: %w", err)
+	}
+
+	return nil
 }
 
 // preparePublishLocked declares one writer and snapshots its route.

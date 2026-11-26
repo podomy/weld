@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/podomy/weld/internal/core"
 	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/types"
 )
@@ -122,6 +123,10 @@ func mustTake(t *testing.T, recv *DataReceiver, frame []byte) transports.Incomin
 }
 
 // checkEnvelopeHeader verifies the LE envelope header at offset off.
+//
+// Byte 3 carries the trailing pad count in its low 2 bits per
+// DDS-XTypes 7.6.3.1.2, so it varies with payload length; the check
+// accepts 0..3 there and requires 4 byte framing instead of pinning zero.
 func checkEnvelopeHeader(t *testing.T, frame []byte, off int) {
 	t.Helper()
 
@@ -129,8 +134,12 @@ func checkEnvelopeHeader(t *testing.T, frame []byte, off int) {
 		t.Fatalf("frame length %d below envelope header at %d", len(frame), off)
 	}
 
-	if frame[off] != 0x00 || frame[off+1] != 0x01 || frame[off+2] != 0x00 || frame[off+3] != 0x00 {
+	if frame[off] != 0x00 || frame[off+1] != 0x01 || frame[off+2] != 0x00 || frame[off+3] > 0x03 {
 		t.Fatalf("bad envelope header %v at %d", frame[off:off+4], off)
+	}
+
+	if (len(frame)-off)%4 != 0 {
+		t.Fatalf("envelope at %d leaves frame length %d unaligned", off, len(frame))
 	}
 }
 
@@ -1867,5 +1876,236 @@ func TestProvisionalConfirmCleanupAndTTL(t *testing.T) {
 
 	if _, ok := recv.ProvisionalForGUID(guidC); ok {
 		t.Fatalf("stale provisional C survived confirmed cleanup")
+	}
+}
+
+// TestTakeNotesOfferedDeadlineMiss wires the writer-side deadline monitor.
+// A take past the deadline must count both the requested and offered misses
+// with one listener notification.
+func TestTakeNotesOfferedDeadlineMiss(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	var notified int
+	recv.AddListener("/offered", &DataListener{OnDeadline: func(string) { notified++ }})
+	t0 := time.Unix(7000, 0).UTC()
+	recv.now = func() time.Time { return t0 }
+	if err := recv.SetDeadlineTrackerForTopic("/offered", core.NewDuration(1, 0)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+
+	sink := &recordingWriter{}
+	pub := mustNewPublisher(t, testWriterGUID(), sink)
+	mustPublish(t, pub, transports.OutgoingMessage{TopicName: "/offered", TypeName: "std_msgs__msg__String", Payload: encodeTestString(t, "late")})
+
+	recv.now = func() time.Time { return t0.Add(2 * time.Second) }
+	if _, err := recv.Take(sink.lastFrame(t)); !errors.Is(err, ErrDeadlineMissed) {
+		t.Fatalf("take = %v, want ErrDeadlineMissed", err)
+	}
+
+	requested := recv.RequestedDeadlineMissedStatus()
+	if requested.TotalCount != 1 {
+		t.Fatalf("requested = %+v, want total 1", requested)
+	}
+	offered := recv.OfferedDeadlineMissedStatus()
+	if offered.TotalCount != 1 {
+		t.Fatalf("offered = %+v, want total 1", offered)
+	}
+	if notified != 1 {
+		t.Fatalf("deadline notifications = %d, want 1", notified)
+	}
+}
+
+// TestCheckWriterLivelinessLoss wires the writer-side loss monitor.
+// An expired writer-side tracker notes LIVELINESS_LOST with listener fan-out
+// while reader expiry drops keep counting writer loss at zero.
+func TestCheckWriterLivelinessLoss(t *testing.T) {
+	t.Parallel()
+
+	recv := NewDataReceiver()
+	var guid WriterGUID
+	guid[0] = 0xD2
+	var handle [16]byte
+	copy(handle[:], guid[:])
+	var livelyCalls int
+	recv.AddListener("/wloss", &DataListener{OnLiveliness: func([16]byte, bool) { livelyCalls++ }})
+
+	lease := core.NewDuration(0, 1)
+	start := time.Now().Add(-time.Hour).UnixNano()
+	tracker := core.NewLivelinessTracker("/wloss", "writer", core.LivelinessManualByTopic, lease, start)
+	recv.SetWriterLivelinessTracker(guid, &tracker)
+	if !recv.CheckWriterLiveliness(guid) {
+		t.Fatalf("expired writer loss not reported, want true")
+	}
+	lost := recv.LivelinessLostStatus()
+	if lost.TotalCount != 1 {
+		t.Fatalf("lost = %+v, want total 1", lost)
+	}
+	if livelyCalls != 1 {
+		t.Fatalf("liveliness notifications = %d, want 1", livelyCalls)
+	}
+	if recv.CheckWriterLiveliness(guid) {
+		t.Fatalf("repeated loss poll reported, want edge-only")
+	}
+	if got := recv.LivelinessLostStatus().TotalCount; got != 1 {
+		t.Fatalf("lost after repeat = %d, want 1", got)
+	}
+
+	unknown := WriterGUID{0xFF}
+	if recv.CheckWriterLiveliness(unknown) {
+		t.Fatalf("unknown writer loss reported, want false")
+	}
+}
+
+// TestSecureProvisionalGateFailsClosed pins the provisional security gate.
+// An open gate keeps the tolerance fast-path while a closed gate drops
+// unknown writers until SEDP confirms them.
+func TestSecureProvisionalGateFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	payload := encodeTestString(t, "hello gated")
+	qos := ProvisionalQoS{DDSTopic: "rt/chatter", TypeDDS: mustStringDDS(t), HasHash: false}
+	open := NewDataReceiver()
+	if _, ok := open.decodePlainCDRWithQoS(testWriterGUID(), payload, qos, true); !ok {
+		t.Fatalf("open gate provisional decode failed, want fast-path delivery")
+	}
+
+	closed := NewDataReceiver()
+	closed.SetSecureProvisionalGate(true)
+	if _, ok := closed.decodePlainCDRWithQoS(testWriterGUID(), payload, qos, true); ok {
+		t.Fatalf("closed gate provisional decode succeeded, want fail-closed drop")
+	}
+
+	rosTopic := "/chatter_ros_gated_994_fwd"
+	confirmed, guid := newPerRunReceiver(t, rosTopic)
+	confirmed.SetSecureProvisionalGate(true)
+	if _, ok := confirmed.decodePlainCDRWithQoS(guid, payload, ProvisionalQoS{}, false); !ok {
+		t.Fatalf("closed gate confirmed decode failed, want delivery")
+	}
+}
+
+// findLocalReader returns the local reader endpoint for one ROS topic.
+func findLocalReader(t *testing.T, idx *SEDPIndex, rosTopic string) (SEDPEndpoint, bool) {
+	t.Helper()
+	for _, local := range idx.LocalEndpoints() {
+		if local.IsReader && local.ROSTopic == rosTopic {
+			return local, true
+		}
+	}
+	return SEDPEndpoint{}, false
+}
+
+// newPartitionTakeReceiver installs one local reader plus one remote writer
+// for a per-run topic and returns the receiver, writer guid, and index for
+// partition updates.
+func newPartitionTakeReceiver(t *testing.T, rosTopic string, localParts, remoteParts []string) (*DataReceiver, WriterGUID, *SEDPIndex) {
+	t.Helper()
+
+	var prefix SEDPGUIDPrefix
+	for i := range prefix {
+		prefix[i] = byte(i + 0xA0)
+	}
+	idx, err := NewSEDPIndex(prefix, 65)
+	if err != nil {
+		t.Fatalf("new sedp index: %v", err)
+	}
+	if _, err := idx.DeclareReaderWithDurability(rosTopic, "std_msgs__msg__String", "", nil, true); err != nil {
+		t.Fatalf("declare reader: %v", err)
+	}
+	local, ok := findLocalReader(t, idx, rosTopic)
+	if !ok {
+		t.Fatalf("local reader missing for %q", rosTopic)
+	}
+	idx.StampLocalPartitions(rosTopic, "std_msgs__msg__String", localParts)
+
+	ddsTopic, err := TopicName(rosTopic, false)
+	if err != nil {
+		t.Fatalf("topic name %q: %v", rosTopic, err)
+	}
+	ddsType, err := MessageTypeName("std_msgs__msg__String")
+	if err != nil {
+		t.Fatalf("message type name: %v", err)
+	}
+	var remotePrefix SEDPGUIDPrefix
+	for i := range remotePrefix {
+		remotePrefix[i] = byte(i + 0xC0)
+	}
+	id := SEDPGUID{Prefix: remotePrefix, Entity: SEDPEntityID{0x00, 0x10, 0x00, 0x03}}
+	ep := SEDPEndpoint{
+		ID:         id,
+		ROSTopic:   rosTopic,
+		DDSTopic:   ddsTopic,
+		Kind:       local.Kind,
+		TypeDDS:    ddsType,
+		TypeIDL:    "std_msgs__msg__String",
+		IsReader:   false,
+		DomainID:   65,
+		Partitions: append([]string(nil), remoteParts...),
+	}
+	if err := idx.UpsertRemote(ep); err != nil {
+		t.Fatalf("upsert remote: %v", err)
+	}
+	recv := NewDataReceiver()
+	recv.SetSEDPIndex(idx)
+	return recv, writerGUIDForSEDP(id), idx
+}
+
+// TestPartitionGateRejectsMismatch pins partition-scoped take demux.
+// A writer on a disjoint partition drops while a common partition delivers.
+func TestPartitionGateRejectsMismatch(t *testing.T) {
+	t.Parallel()
+
+	rosTopic := "/pgate_ros_991_fwd"
+	recv, guid, _ := newPartitionTakeReceiver(t, rosTopic, []string{"A"}, []string{"B"})
+
+	sink := &recordingWriter{}
+	pub := mustNewPublisher(t, guid, sink)
+	mustPublish(t, pub, transports.OutgoingMessage{TopicName: rosTopic, TypeName: "std_msgs__msg__String", Payload: encodeTestString(t, "walled")})
+	if _, err := recv.Take(sink.lastFrame(t)); !errors.Is(err, ErrPartitionMismatch) {
+		t.Fatalf("take disjoint = %v, want ErrPartitionMismatch", err)
+	}
+	if got := recv.DropReasonCount(DropReasonPartitionMismatch); got != 1 {
+		t.Fatalf("partition drops = %d, want 1", got)
+	}
+
+	recvOK, guidOK, _ := newPartitionTakeReceiver(t, "/pgate_ros_992_fwd", []string{"A"}, []string{"A"})
+	sinkOK := &recordingWriter{}
+	pubOK := mustNewPublisher(t, guidOK, sinkOK)
+	mustPublish(t, pubOK, transports.OutgoingMessage{TopicName: "/pgate_ros_992_fwd", TypeName: "std_msgs__msg__String", Payload: encodeTestString(t, "shared")})
+	if _, err := recvOK.Take(sinkOK.lastFrame(t)); err != nil {
+		t.Fatalf("take common partition: %v", err)
+	}
+}
+
+// TestPartitionRetentionRekeys pins partition-scoped retention.
+// The same GUID on a new partition route restarts sequence tracking instead
+// of reporting stale.
+func TestPartitionRetentionRekeys(t *testing.T) {
+	t.Parallel()
+
+	rosTopic := "/prekey_ros_993_fwd"
+	recv, guid, idx := newPartitionTakeReceiver(t, rosTopic, []string{"*"}, []string{"A"})
+
+	firstSink := &recordingWriter{}
+	firstPub := mustNewPublisher(t, guid, firstSink)
+	mustPublish(t, firstPub, transports.OutgoingMessage{TopicName: rosTopic, TypeName: "std_msgs__msg__String", Payload: encodeTestString(t, "one")})
+	if _, err := recv.Take(firstSink.lastFrame(t)); err != nil {
+		t.Fatalf("take partition A: %v", err)
+	}
+
+	ep, ok := recv.remoteForGUID(guid)
+	if !ok {
+		t.Fatalf("writer remote missing, want confirmed")
+	}
+	ep.Partitions = []string{"B"}
+	if err := idx.UpsertRemote(ep); err != nil {
+		t.Fatalf("upsert remote B: %v", err)
+	}
+
+	rekeySink := &recordingWriter{}
+	rekeyPub := mustNewPublisher(t, guid, rekeySink)
+	mustPublish(t, rekeyPub, transports.OutgoingMessage{TopicName: rosTopic, TypeName: "std_msgs__msg__String", Payload: encodeTestString(t, "one")})
+	if _, err := recv.Take(rekeySink.lastFrame(t)); err != nil {
+		t.Fatalf("take partition B same seq: %v, want retention rekey", err)
 	}
 }

@@ -229,6 +229,25 @@ type LivelinessReport struct {
 	Generation uint64
 }
 
+// Leg names the traffic leg a sample belongs to.
+//
+// Data covers plain pubsub. Request and reply cover services plus the
+// service like action operations (send goal, cancel goal, get result).
+// The DDS backend leaves Leg empty on takes, which reads as data; the
+// MQTT backend always sets it. Empty on publish reads as data, so V1
+// code without the field keeps compiling and behaving as before.
+type Leg string
+
+// Traffic legs carried on the contract.
+const (
+	// LegData carries plain pubsub samples.
+	LegData Leg = "data"
+	// LegRequest carries service plus action requests.
+	LegRequest Leg = "request"
+	// LegReply carries service plus action replies.
+	LegReply Leg = "reply"
+)
+
 // OutgoingMessage is one serialized message handed to a backend for send.
 //
 // Ownership is copy once. The caller passes Payload as uniquely owned
@@ -256,6 +275,8 @@ type OutgoingMessage struct {
 	// TypeHash is the optional RIHS01 type hash such as RIHS01_ plus hex.
 	// Empty means unknown and keeps the legacy empty hash announce.
 	TypeHash string
+	// Leg selects the traffic leg. Empty means LegData.
+	Leg Leg
 }
 
 // IncomingMessage is one serialized message taken from a backend.
@@ -266,9 +287,12 @@ type OutgoingMessage struct {
 // bytes beyond the call. A nil Payload is valid and means an empty
 // sample, equivalent to zero length.
 //
-// Carries TopicName, TypeName, and Payload only. The same reserved
-// extension note as OutgoingMessage applies: type hash, QoS offer, GID,
-// and sequence number arrive later without breaking topics.
+// Carries TopicName, TypeName, and Payload only, with TypeHash as an
+// optional backward compatible extension. TypeHash carries the RIHS01
+// type hash when the sender knew it, and empty when unknown. Backends
+// that learn the hash out of band (MQTT v5 user properties, DDS
+// inline QoS) populate it; others leave it empty. V1 code without the
+// field keeps compiling because the field is optional with empty default.
 type IncomingMessage struct {
 	// TopicName is the fully qualified ROS name the bytes arrived on.
 	TopicName string
@@ -277,6 +301,12 @@ type IncomingMessage struct {
 	// Payload holds the XCDR1 CDR bytes received from the wire.
 	// See the ownership note on the parent type. Nil means empty.
 	Payload []byte
+	// TypeHash is the optional RIHS01 type hash such as RIHS01_ plus hex.
+	// Empty means unknown and keeps the legacy hash-unset behavior.
+	TypeHash string
+	// Leg names the traffic leg. Empty reads as LegData for takes that
+	// predate legs. MQTT takes always set it.
+	Leg Leg
 }
 
 // Backend is the small contract every transport bus implements.

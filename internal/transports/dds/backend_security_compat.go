@@ -214,3 +214,73 @@ func checkParticipantProtection(topic string, pcfg access.ParticipantSecurityCon
 func protectionRequiresTransform(kind string) bool {
 	return kind != "" && kind != access.ProtectionNone
 }
+
+// checkDiscoveryEgressAllowed fails closed when discovery, liveliness, or
+// RTPS protection requires a transform per 10.5.3.1 and 9.4.2.4.
+//
+// Heartbeat, SEDP announce, and SPDP announce paths call this before
+// sending plain: protected discovery denies plain with
+// ErrSecuredTransformUnavailable instead of leaking. Open participant
+// governance allows plain so tolerance flow stays byte-identical.
+func (b *Backend) checkDiscoveryEgressAllowed(domain uint32) error {
+	if b == nil {
+		return nil
+	}
+	suite := b.plainEgressSuite()
+	if suite == nil || !suite.Enabled() {
+		return nil
+	}
+	pcfg, err := suite.GetParticipantSecurityConfigInDomain("", domain)
+	if err != nil {
+		return fmt.Errorf("dds: discovery egress without verified governance: %w", err)
+	}
+	if protectionRequiresTransform(pcfg.DiscoveryProtection) {
+		return fmt.Errorf("dds: plain discovery egress refused, discovery %s needs transform: %w", pcfg.DiscoveryProtection, ErrSecuredTransformUnavailable)
+	}
+	if protectionRequiresTransform(pcfg.LivelinessProtection) {
+		return fmt.Errorf("dds: plain discovery egress refused, liveliness %s needs transform: %w", pcfg.LivelinessProtection, ErrSecuredTransformUnavailable)
+	}
+	if protectionRequiresTransform(pcfg.RTPSProtection) {
+		return fmt.Errorf("dds: plain discovery egress refused, rtps %s needs transform: %w", pcfg.RTPSProtection, ErrSecuredTransformUnavailable)
+	}
+	return nil
+}
+
+// checkHeartbeatEgressAllowed gates plain HEARTBEAT per 10.5.3.1.
+//
+// Liveliness plus RTPS protection kinds drive the decision: protected
+// liveliness denies plain heartbeat fail-closed.
+func (b *Backend) checkHeartbeatEgressAllowed(domain uint32) error {
+	return b.checkDiscoveryEgressAllowed(domain)
+}
+
+// rekeyRequiredForDomain reports whether governance demands a staged rekey.
+//
+// It wraps ddssecurity.RekeyOnEnableKeyRevision per 9.5.1.9: when the
+// domain rule carries EnableKeyRevision the caller must stage fresh
+// material via crypto factory Revise, distribute via the volatile
+// rollover signal, then Activate on ack. The factory Revise plus Activate
+// pair lives in security/crypto (foreign to this file); this helper owns
+// the publish-path trigger decision. Nil governance needs no rekey.
+func rekeyRequiredForDomain(gov *access.GovernanceDoc, domain uint32, tag string) bool {
+	return ddssecurity.RekeyOnEnableKeyRevision(gov, domain, tag)
+}
+
+// SetNegotiatedTransformKind pins the negotiated crypto kind into the suite.
+//
+// Per 9.5.3 the handshake completion selects one CryptoTransformKind and
+// the data path seals with it. The stateless handshake manager lives in
+// security/auth (foreign); backend handshake completion paths you own
+// should call this when they observe a completed handshake. Until the
+// foreign manager calls back, this setter plus unit test pins the wiring.
+// TODO(handshake-owner): call Backend.SetNegotiatedTransformKind from the
+// auth.Manager completion callback with the negotiated kind.
+func (b *Backend) SetNegotiatedTransformKind(kind uint32) {
+	b.mu.RLock()
+	suite := b.secSuite
+	b.mu.RUnlock()
+	if suite == nil {
+		return
+	}
+	suite.SetNegotiatedTransformKind(kind)
+}

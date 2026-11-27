@@ -5,8 +5,12 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/podomy/weld/internal/transports/dds/security/tokens"
@@ -18,6 +22,8 @@ var (
 	ErrDestinationMismatch = errors.New("crypto: destination mismatch")
 	// ErrUnauthenticatedPeer reports exchange before handshake completion.
 	ErrUnauthenticatedPeer = errors.New("crypto: unauthenticated peer")
+	// ErrNoKxSession reports volatile exchange without a Kx seal session.
+	ErrNoKxSession = errors.New("crypto: no kx session")
 )
 
 // KeyExchange moves key material over the volatile channel per 9.5.1.9.
@@ -26,6 +32,18 @@ type KeyExchange struct {
 	store *KeyStore
 	// authenticated reports whether a peer completed the handshake.
 	authenticated func(remote [16]byte) bool
+	// mu guards kx sessions.
+	mu sync.Mutex
+	// kx holds Kx seal keys per destination per 10.5.2.1.2.
+	kx map[[16]byte]kxKeys
+}
+
+// kxKeys holds one volatile seal session per 10.5.2.1.2.
+type kxKeys struct {
+	// salt is the 32 byte Kx salt.
+	salt []byte
+	// key is the 32 byte Kx seal key.
+	key []byte
 }
 
 // NewKeyExchange returns an exchange over one store.
@@ -38,14 +56,161 @@ func NewKeyExchange(store *KeyStore, authenticated func(remote [16]byte) bool) (
 		authenticated = func([16]byte) bool { return false }
 	}
 
-	return &KeyExchange{store: store, authenticated: authenticated}, nil
+	return &KeyExchange{store: store, authenticated: authenticated, kx: make(map[[16]byte]kxKeys)}, nil
+}
+
+// EstablishKx derives and stores one Kx seal session per 10.5.2.1.2.
+//
+// Challenge inputs plus the handshake secret derive the salt plus key via
+// DeriveKxKeys; both peers deriving from shared inputs seal compatible
+// envelopes. It fails closed on bad inputs without touching existing state.
+func (e *KeyExchange) EstablishKx(destination [16]byte, challenge1, challenge2, secret []byte) error {
+	salt, key, err := DeriveKxKeys(challenge1, challenge2, secret)
+	if err != nil {
+		return fmt.Errorf("crypto: establish kx: %w", err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.kx == nil {
+		e.kx = make(map[[16]byte]kxKeys)
+	}
+	e.kx[destination] = kxKeys{salt: salt, key: key}
+	return nil
+}
+
+// HasKx reports whether a Kx seal session exists for destination.
+func (e *KeyExchange) HasKx(destination [16]byte) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.kx[destination]
+	return ok
+}
+
+// CreateSealedLocalTokens builds and Kx-seals one volatile envelope.
+//
+// It wraps CreateLocalTokens then SealVolatile; missing authentication
+// or a missing Kx session fails closed without emitting clear key
+// material per 9.5.1.9 and 10.5.2.1.2.
+func (e *KeyExchange) CreateSealedLocalTokens(source, destination [16]byte, keyID, revision uint32) ([]byte, error) {
+	envelope, err := e.CreateLocalTokens(source, destination, keyID, revision)
+	if err != nil {
+		return nil, err
+	}
+	sealed, err := e.SealVolatile(envelope)
+	if err != nil {
+		return nil, err
+	}
+	return sealed, nil
+}
+
+// SealVolatile seals one volatile envelope with the Kx key per 10.5.2.1.2.
+//
+// The envelope encodes via tokens.EncodeVolatile, then AES-GCM seals it
+// with the destination Kx key and a fresh random nonce; output is nonce
+// plus ciphertext. GUIDs verify after open fail-closed. Missing Kx
+// sessions fail closed with ErrNoKxSession instead of sending clear.
+func (e *KeyExchange) SealVolatile(envelope tokens.VolatileEnvelope) ([]byte, error) {
+	e.mu.Lock()
+	keys, ok := e.kx[envelope.DestinationGUID]
+	e.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("crypto: seal volatile without kx for peer: %w", ErrNoKxSession)
+	}
+	plain, err := tokens.EncodeVolatile(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: seal volatile encode: %w", err)
+	}
+	block, err := aes.NewCipher(keys.key)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: seal volatile cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: seal volatile gcm: %w", err)
+	}
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("crypto: seal volatile nonce: %w", err)
+	}
+	sealed := gcm.Seal(nil, nonce[:], plain, nil)
+	out := make([]byte, 0, len(nonce)+len(sealed))
+	out = append(out, nonce[:]...)
+	out = append(out, sealed...)
+	return out, nil
+}
+
+// OpenVolatile opens one Kx-sealed volatile envelope per 10.5.2.1.2.
+//
+// It selects the Kx key by the expected source peer, opens the
+// nonce-prefixed ciphertext, and decodes the envelope. Source mismatch
+// or missing Kx sessions fail closed without installing keys.
+func (e *KeyExchange) OpenVolatile(sealed []byte, expectedSource [16]byte) (tokens.VolatileEnvelope, error) {
+	var out tokens.VolatileEnvelope
+	if len(sealed) < 12 {
+		return out, fmt.Errorf("crypto: open volatile truncated: %w", ErrNoKxSession)
+	}
+	e.mu.Lock()
+	keys, ok := e.kx[expectedSource]
+	e.mu.Unlock()
+	if !ok {
+		return out, fmt.Errorf("crypto: open volatile without kx for peer: %w", ErrNoKxSession)
+	}
+	var nonce [12]byte
+	copy(nonce[:], sealed[:12])
+	block, err := aes.NewCipher(keys.key)
+	if err != nil {
+		return out, fmt.Errorf("crypto: open volatile cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return out, fmt.Errorf("crypto: open volatile gcm: %w", err)
+	}
+	plain, err := gcm.Open(nil, nonce[:], sealed[12:], nil)
+	if err != nil {
+		return out, fmt.Errorf("crypto: open volatile: %w", err)
+	}
+	decoded, err := tokens.DecodeVolatile(plain)
+	if err != nil {
+		return out, fmt.Errorf("crypto: open volatile decode: %w", err)
+	}
+	if decoded.SourceGUID != expectedSource {
+		return out, fmt.Errorf("crypto: volatile source mismatch: %w", ErrDestinationMismatch)
+	}
+	return decoded, nil
+}
+
+// RolloverHoldSignal builds a hold-before-use signal when rollover pends.
+//
+// Per 9.5.1.9 the sender distributes the rollover signal on the volatile
+// channel and holds the new session until peer ack or
+// RolloverHoldTimeoutcry9. It reports held plus the signal envelope when
+// store.RolloverPendingcry9 is true; held false needs no hold. Missing
+// keys fail closed.
+func (e *KeyExchange) RolloverHoldSignal(source, destination [16]byte, keyID, revision uint32) (bool, tokens.VolatileEnvelope, error) {
+	pending, err := e.store.RolloverPendingcry9(source, keyID, revision)
+	if err != nil {
+		return false, tokens.VolatileEnvelope{}, err
+	}
+	if !pending {
+		return false, tokens.VolatileEnvelope{}, nil
+	}
+	signal, err := e.CreateRolloverSignalcry9(source, destination, keyID, revision)
+	if err != nil {
+		return false, tokens.VolatileEnvelope{}, err
+	}
+	return true, signal, nil
 }
 
 // CreateLocalTokens wraps one master record for the volatile channel.
 //
 // INV-5: the caller must have completed the handshake for destination.
-// The volatile channel itself uses KxKey material from the handshake
-// secret, so this path never precedes registerMatchedRemote.
+// Per 9.5.1.9 and 10.5.2.1.2 the wire distribution must seal via
+// SealVolatile with the Kx session; SealVolatile fails closed with
+// ErrNoKxSession instead of sending clear. This path never precedes
+// registerMatchedRemote.
 func (e *KeyExchange) CreateLocalTokens(source, destination [16]byte, keyID, revision uint32) (tokens.VolatileEnvelope, error) {
 	var out tokens.VolatileEnvelope
 

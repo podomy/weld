@@ -190,8 +190,20 @@ func gcmForKey(sessionKey []byte, kind uint32) (cipher.AEAD, error) {
 //
 // It allocates the next session plus suffix, derives the session key,
 // seals with the 16 byte header as additional data, and returns header
-// plus ciphertext. Missing keys fail closed with ErrUnknownKey.
+// plus ciphertext. Missing keys fail closed with ErrUnknownKey. It
+// delegates to EncodeWithOrigin with an empty origin for tolerance
+// compatibility; origin-bound callers must use EncodeWithOrigin per
+// 10.5.3.3.
 func (t *Transform) Encode(sender [16]byte, keyID, revision uint32, plaintext, aad []byte) ([]byte, []byte, error) {
+	return t.EncodeWithOrigin(sender, keyID, revision, plaintext, [16]byte{}, aad)
+}
+
+// EncodeWithOrigin encrypts one payload with the origin bound into AAD.
+//
+// The GCM additional data is origin plus header plus external AAD per
+// 10.5.3.3, so a ciphertext cut from one origin never verifies under
+// another. Empty origin reproduces the legacy header-only AAD.
+func (t *Transform) EncodeWithOrigin(sender [16]byte, keyID, revision uint32, plaintext []byte, origin [16]byte, aad []byte) ([]byte, []byte, error) {
 	master, err := t.store.Lookup(sender, keyID, revision)
 	if err != nil {
 		return nil, nil, err
@@ -223,7 +235,7 @@ func (t *Transform) Encode(sender [16]byte, keyID, revision uint32, plaintext, a
 
 	nonce := sessionNonce(session, suffix)
 
-	fullAAD := append(append([]byte(nil), headerBytes...), aad...)
+	fullAAD := append(append(append([]byte(nil), origin[:]...), headerBytes...), aad...)
 	ciphertext := gcm.Seal(nil, nonce[:], plaintext, fullAAD)
 
 	return headerBytes, ciphertext, nil
@@ -236,8 +248,18 @@ func (t *Transform) Encode(sender [16]byte, keyID, revision uint32, plaintext, a
 // Tampered tags fail inside AES-GCM Open. When the sender-key open fails
 // and receiver-specific material is stored, it retries once with the
 // receiver key per 7.3.20; both failures drop without plaintext and the
-// nonce claim releases because no plaintext was delivered.
+// nonce claim releases because no plaintext was delivered. It delegates
+// to DecodeWithOrigin with an empty origin; origin-bound callers must use
+// DecodeWithOrigin per 10.5.3.3.
 func (t *Transform) Decode(sender [16]byte, keyID, revision uint32, headerBytes, ciphertext, aad []byte) ([]byte, error) {
+	return t.DecodeWithOrigin(sender, keyID, revision, headerBytes, ciphertext, [16]byte{}, aad)
+}
+
+// DecodeWithOrigin decrypts one payload with the origin bound into AAD.
+//
+// The GCM additional data is origin plus header plus external AAD; a
+// ciphertext sealed under another origin fails closed in GCM Open.
+func (t *Transform) DecodeWithOrigin(sender [16]byte, keyID, revision uint32, headerBytes, ciphertext []byte, origin [16]byte, aad []byte) ([]byte, error) {
 	header, err := tokens.DecodeCryptoHeader(headerBytes)
 	if err != nil {
 		return nil, fmt.Errorf("crypto: decode header: %w", err)
@@ -273,7 +295,7 @@ func (t *Transform) Decode(sender [16]byte, keyID, revision uint32, headerBytes,
 	t.mu.Unlock()
 
 	nonce := sessionNonce(header.SessionID, suffix)
-	fullAAD := append(append([]byte(nil), headerBytes...), aad...)
+	fullAAD := append(append(append([]byte(nil), origin[:]...), headerBytes...), aad...)
 
 	plaintext, err := openWithKey(master.SenderKey, master.Salt, master.Kind, header.SessionID, nonce, fullAAD, ciphertext)
 	if err == nil {

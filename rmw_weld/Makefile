@@ -82,10 +82,13 @@ install-in-jazzy: build-in-jazzy
 # smoke-in-jazzy probes the installed shim with a tiny pub attempt.
 #
 # It expects the publish to succeed with a plain zero exit: the shim is
-# a working RMW now, not a refusal stub. A silent pass with no output
-# fails, a signal exit (crash) fails, and a hang past timeout fails.
+# a working RMW now, not a refusal stub. -w 0 skips the wait for a
+# matching subscription (stock ros2 topic pub --once waits for one and
+# would time out with no listener, even on Cyclone). A silent pass with
+# no output fails, a signal exit (crash) fails, and a hang past timeout
+# fails.
 smoke-in-jazzy: install-in-jazzy
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=$(SMOKE_DOMAIN) RMW_IMPLEMENTATION=rmw_weld LD_LIBRARY_PATH=$(JAZZY_LIBDIR):$$LD_LIBRARY_PATH timeout 30 ros2 topic pub $(SMOKE_TOPIC) std_msgs/msg/String "{data: smoke}" --once > /tmp/rmw_weld_smoke.log 2>&1; rc=$$?; cat /tmp/rmw_weld_smoke.log; if [ $$rc -eq 124 ]; then echo "smoke: rmw_weld probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "smoke: rmw_weld crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "smoke: rmw_weld pub exited non-zero, failing"; exit 1; fi; echo "smoke: rmw_weld pub ok"'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=$(SMOKE_DOMAIN) RMW_IMPLEMENTATION=rmw_weld LD_LIBRARY_PATH=$(JAZZY_LIBDIR):$$LD_LIBRARY_PATH timeout 30 ros2 topic pub -w 0 $(SMOKE_TOPIC) std_msgs/msg/String "{data: smoke}" --once > /tmp/rmw_weld_smoke.log 2>&1; rc=$$?; cat /tmp/rmw_weld_smoke.log; if [ $$rc -eq 124 ]; then echo "smoke: rmw_weld probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "smoke: rmw_weld crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "smoke: rmw_weld pub exited non-zero, failing"; exit 1; fi; echo "smoke: rmw_weld pub ok"'
 
 FFI_REAL_DIR ?= /tmp/weld_ffi_real
 FFI_REAL_SO ?= $(FFI_REAL_DIR)/libweld_ffi.so

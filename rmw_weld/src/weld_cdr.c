@@ -284,36 +284,6 @@ static const weld_members_t * top_table(
   return (const weld_members_t *)h->data;
 }
 
-// Count UTF-8 code points tolerantly by skipping continuation bytes.
-static size_t count_runes(const char * s, size_t n)
-{
-  size_t out = 0;
-  size_t i = 0;
-
-  for (i = 0; i < n; i++) {
-    unsigned char c = (unsigned char)s[i];
-    if ((c & 0xC0U) != 0x80U) {
-      out++;
-    }
-  }
-  return out;
-}
-
-// Count UTF-16 code points, folding each lead plus trail pair into one.
-static size_t count_utf16(const uint16_t * u, size_t n)
-{
-  size_t out = 0;
-  size_t i = 0;
-
-  for (i = 0; i < n; i++) {
-    if (u[i] >= 0xDC00U && u[i] <= 0xDFFFU) {
-      continue;
-    }
-    out++;
-  }
-  return out;
-}
-
 // Forward declaration for recursion through nested messages.
 static weld_cdr_status_t encode_body(
   const weld_members_t * m, const uint8_t * base, struct weld_writer * w);

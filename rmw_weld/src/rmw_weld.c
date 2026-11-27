@@ -233,6 +233,37 @@ extern int weld_ffi_sub_set_content_filter(
   long long handle, const char * expr, const char * params, int nparams)
   __attribute__((weak));
 
+// Matched-entity queries match the internal/rmwbridge/weldffi/matched.go
+// exports. They stay weak so counts fail loudly when the Go core is not
+// linked instead of crashing.
+extern int weld_ffi_pub_matched_subs(long long handle, int * out_n)
+  __attribute__((weak));
+extern int weld_ffi_sub_matched_pubs(long long handle, int * out_n)
+  __attribute__((weak));
+
+// Event deadline plus incompatibility wiring matches the
+// internal/rmwbridge/weldffi/events.go exports. Every symbol stays
+// weak so the paths fall back to local-only sources when an older Go
+// library is linked instead of crashing.
+extern int weld_ffi_sub_set_deadline(
+  long long handle, long long sec, long long nsec)
+  __attribute__((weak));
+extern int weld_ffi_pub_set_deadline(
+  long long handle, long long sec, long long nsec)
+  __attribute__((weak));
+extern int weld_ffi_sub_requested_deadline_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_pub_offered_deadline_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_sub_incompatible_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+extern int weld_ffi_pub_incompatible_total(
+  long long handle, unsigned long long * out)
+  __attribute__((weak));
+
 // Process-global FFI bridge handle.
 //
 // The bridge is created on the first rmw_init and joined with the
@@ -766,6 +797,7 @@ static bool weld_sub_wait_poll(struct weld_sub_data * sd)
   return true;
 }
 
+#ifndef WELD_HAVE_NAMES_AND_TYPES
 static rmw_ret_t weld_unimplemented(const char * what)
 {
   rmw_reset_error();
@@ -779,6 +811,7 @@ static rmw_ret_t weld_unimplemented(const char * what)
   }
   return RMW_RET_ERROR;
 }
+#endif
 
 const char * rmw_get_implementation_identifier(void)
 {
@@ -987,6 +1020,9 @@ struct weld_ep_snap;
 static size_t weld_incompat_scan(
   int new_kind, const rmw_qos_profile_t * new_qos, const char * topic,
   size_t domain);
+static size_t weld_matched_incompat_count(
+  int new_kind, const rmw_qos_profile_t * new_qos, const char * topic,
+  size_t domain);
 static rmw_ret_t weld_ep_snapshot(
   const char * name, int kind, size_t domain, bool use_domain,
   struct weld_ep_snap ** out_items, size_t * out_n);
@@ -1137,16 +1173,6 @@ static void weld_pub_drop_add(void)
     g_weld_pub_drops++;
   }
   (void)pthread_mutex_unlock(&g_weld_loan_mutex);
-}
-
-// Read the MESSAGE_LOST total for one side without consuming.
-static size_t weld_lost_total_for(bool is_pub)
-{
-  size_t total = 0;
-  (void)pthread_mutex_lock(&g_weld_loan_mutex);
-  total = is_pub ? g_weld_pub_drops : g_weld_sub_drops;
-  (void)pthread_mutex_unlock(&g_weld_loan_mutex);
-  return total;
 }
 
 // Fill take info with a local receive stamp plus delivered attribution.
@@ -5012,6 +5038,14 @@ rmw_client_t * rmw_create_client(
     free(cli);
     return NULL;
   }
+  // Report the IDL base best effort for RTPS endpoint declares, mirroring
+  // servers. A missing symbol keeps in-memory only.
+  if (weld_ffi_service_set_type != NULL) {
+    char base[512];
+    if (weld_service_idl_base(type_support, base, sizeof(base)) == 0) {
+      (void)weld_ffi_service_set_type(st->ffi_handle, base, "");
+    }
+  }
   cli->implementation_identifier = kImplementationIdentifier;
   cli->data = st;
   // service_name aliases the endpoint name; destroy frees it once
@@ -6110,11 +6144,14 @@ rmw_ret_t rmw_wait(
     }
   }
   {
-    // Enforce the wait set bound: more attached conditions than the
-    // set was created for fails loudly instead of polling them.
+    // Track the wait set bound: more attached conditions than the
+    // set was created for grows the bound instead of failing. rcl
+    // sizes the set at init but may add an interrupt guard or resize
+    // after creation, and Cyclone plus FastDDS accept the larger wait;
+    // failing here breaks stock ros2 CLI verbs.
     struct weld_wait_state * st = (struct weld_wait_state *)wait_set->data;
     size_t total = 0;
-    if (st != NULL && st->max_conditions > 0) {
+    if (st != NULL) {
       if (subscriptions != NULL) {
         total += subscriptions->subscriber_count;
       }
@@ -6131,7 +6168,7 @@ rmw_ret_t rmw_wait(
         total += events->event_count;
       }
       if (total > st->max_conditions) {
-        return weld_fail_invalid("rmw_weld: rmw_wait too many conditions");
+        st->max_conditions = total;
       }
     }
   }
@@ -8149,9 +8186,10 @@ static int weld_info_remote_qos(
   out->deadline.nsec = (uint64_t)deadline_nsec;
   if (liveliness == 0) {
     out->liveliness = RMW_QOS_POLICY_LIVELINESS_AUTOMATIC;
-  } else if (liveliness == 1) {
-    out->liveliness = RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE;
-  } else if (liveliness == 2) {
+  } else if (liveliness == 1 || liveliness == 2) {
+    // DDS 1.4 section 2.2.3.11 has automatic 0, manual by participant 1,
+    // and manual by topic 2. RMW has no participant kind and Jazzy
+    // deprecates MANUAL_BY_NODE, so both manual kinds report TOPIC.
     out->liveliness = RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC;
   } else {
     return -1;
@@ -9590,7 +9628,7 @@ rmw_ret_t rmw_take_dynamic_message_with_info(
       "rmw_weld: rmw_take_dynamic_message_with_info deserialize failed");
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info, seq, gid);
+  weld_fill_take_info(message_info, sd->handle, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }

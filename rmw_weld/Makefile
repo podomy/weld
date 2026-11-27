@@ -48,7 +48,7 @@ $(LIB): $(SRC)
 	$(CC) $(CFLAGS) -shared -o $@ $(SRC) $(LDLIBS)
 
 check:
-	$(CC) -std=$(CSTD) $(WARN) -fsyntax-only $(SRC) $(shell pkg-config --cflags rmw rcl rosidl_runtime_c rcutils 2>/dev/null)
+	$(CC) -std=$(CSTD) $(WARN) -fsyntax-only $(SRC) $(shell pkg-config --cflags rmw rcl rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c rcutils 2>/dev/null)
 
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/share/ament_index/resource_index/rmw_implementation
@@ -68,7 +68,7 @@ build-in-jazzy: go-ffi-shared
 	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc "source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread"
+	docker exec $(CONTAINER) bash -lc "source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) $$(pkg-config --cflags rmw rcl rcutils rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c 2>/dev/null) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread"
 
 # install-in-jazzy publishes the container build to a ROS-visible path.
 #

@@ -287,14 +287,19 @@ func verifyUDPChecksum(buf []byte, ext HeaderExtension, extOff int, drops *Count
 	return nil
 }
 
-// checkRtps1HeaderExtension validates every HeaderExtension in the
+// ValidateHeaderExtensionPlacement validates every HeaderExtension in the
 // datagram per DDSI-RTPS 2.5 8.3.7.3 on the UDP path. Each present
 // extension must be well-formed; the first must be at index 0 and any
 // later HeaderExtension drops loudly as mispositioned, even when
 // well-formed. Short bodies, malformed parameters, length mismatches,
 // and checksum mismatches drop loudly. A valid first extension is
 // accepted per 2.5 and stays as raw for the dispatcher.
-func checkRtps1HeaderExtension(buf []byte, subs []RawSubmessage, drops *Counter) error {
+//
+// Standalone datagram walks that do not go through DecodeMessage (such as
+// the SEDP submessage split) must call this with the full datagram plus
+// the walked submessages so mispositioned or checksum-invalid extensions
+// drop fail-closed instead of skipping as opaque bytes.
+func ValidateHeaderExtensionPlacement(buf []byte, subs []RawSubmessage, drops *Counter) error {
 	off := HeaderSize
 	for i := range subs {
 		if subs[i].ID != SubmessageHeaderExtension {
@@ -398,7 +403,7 @@ func DecodeMessage(buf []byte, drops *Counter) (Header, []RawSubmessage, error) 
 		subs = append(subs, sub)
 		off = next
 	}
-	err = checkRtps1HeaderExtension(buf, subs, drops)
+	err = ValidateHeaderExtensionPlacement(buf, subs, drops)
 	if err != nil {
 		return zero, nil, err
 	}

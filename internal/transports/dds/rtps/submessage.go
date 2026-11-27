@@ -703,14 +703,16 @@ func (t InfoTS) Encode(littleEndian bool) []byte {
 }
 
 // DecodeInfoTS parses an INFO_TS body. Invalidate accepts any body and
-// reports invalid, since no fields follow. A valid stamp needs 8 bytes;
-// trailing bytes are ignored for forward compatibility.
+// reports invalid, since no fields follow. A valid stamp needs exactly 8
+// bytes: short bodies and trailing bytes both drop, since the content is
+// fixed width and extra bytes indicate a malformed sender or a framing
+// error.
 func DecodeInfoTS(body []byte, flags uint8, drops *Counter) (InfoTS, error) {
 	var out InfoTS
 	if flags&InfoTSFlagInvalidate != 0 {
 		return out, nil
 	}
-	if len(body) < infoTSSize {
+	if len(body) != infoTSSize {
 		drops.RecordDrop()
 		return out, fmt.Errorf("rtps: info_ts need %d have %d (8.3.8.9)", infoTSSize, len(body))
 	}
@@ -723,8 +725,9 @@ func DecodeInfoTS(body []byte, flags uint8, drops *Counter) (InfoTS, error) {
 
 // InfoSrc is a decoded INFO_SRC submessage per DDSI-RTPS 2.5 8.3.8.10.
 // It carries the source protocol version plus the 2 byte vendor id.
-// The body is at least 5 bytes: reserved, major, minor, vendor[2].
-// Trailing bytes are ignored for forward compatibility. The minimal
+// The body is exactly 5 bytes: reserved, major, minor, vendor[2].
+// Short bodies, trailing bytes, nonzero reserved bytes, and non-2 major
+// versions drop fail-closed. The minimal
 // form carries no GUID prefix, so dispatch validates and logs without
 // overriding GUID identity.
 type InfoSrc struct {
@@ -765,14 +768,15 @@ func checkInfoSrcVersion(body []byte, drops *Counter) error {
 }
 
 // DecodeInfoSrc parses an INFO_SRC body per 8.3.8.10 minimal form.
-// Short bodies, nonzero reserved bytes, and non-2 major versions drop
-// loudly with a counter increment. Trailing bytes are ignored for
-// forward compatibility. Callers invalidate the rest of the message
+// The body must be exactly infoSrcSize bytes: short bodies and trailing
+// bytes both drop loudly with a counter increment, since the content is
+// fixed width. Nonzero reserved bytes and non-2 major versions drop
+// fail-closed. Callers invalidate the rest of the message
 // on error per 8.3.4.1 rule 6.
 func DecodeInfoSrc(body []byte, flags uint8, drops *Counter) (InfoSrc, error) {
 	var out InfoSrc
 	_ = flags
-	if len(body) < infoSrcSize {
+	if len(body) != infoSrcSize {
 		drops.RecordDrop()
 		return out, fmt.Errorf("rtps: info_src need %d have %d (8.3.8.10)", infoSrcSize, len(body))
 	}
@@ -938,10 +942,13 @@ func DecodeInfoReply(body []byte, flags uint8, drops *Counter) (InfoReply, error
 // IsKnownSubmessageID reports whether id has a typed decoder per
 // DDSI-RTPS 2.5 8.3.4. Known ids fail loudly on malformed bodies and
 // invalidate the rest of the message per 8.3.4.1 rule 6. Unknown ids
-// skip by length.
+// skip by length. SubmessageHeaderExtension (0x00) is known: its body
+// validates via DecodeHeaderExtension, so malformed extensions fail
+// instead of skipping as opaque bytes.
 func IsKnownSubmessageID(id uint8) bool {
 	switch id {
-	case SubmessagePad,
+	case SubmessageHeaderExtension,
+		SubmessagePad,
 		SubmessageAckNack,
 		SubmessageHeartbeat,
 		SubmessageGap,
@@ -961,7 +968,8 @@ func IsKnownSubmessageID(id uint8) bool {
 }
 
 // Heartbeat is a decoded HEARTBEAT submessage announcing writer sequence
-// bounds. Decode is tolerant and trailing bytes are ignored. There is no
+// bounds. The body must be exactly 28 bytes per 8.3.8.6; short and long
+// bodies drop. There is no
 // reliability engine in v1: heartbeats inform but never trigger repair.
 type Heartbeat struct {
 	// ReaderID names the destination entity.
@@ -1019,15 +1027,17 @@ func checkHeartbeatBounds(first, last int64, drops *Counter) error {
 	return nil
 }
 
-// DecodeHeartbeat parses a HEARTBEAT body, ignoring trailing bytes for
-// tolerance. Short bodies and signed invalid bounds per 8.3.8.6.3 drop
-// with a counter increment. An empty range with first equal to last plus
-// one is valid: CycloneDDS sends first last plus one when the writer
-// holds no new sample, so it parses without error and callers treat it
-// as a silent no-op.
+// DecodeHeartbeat parses a HEARTBEAT body per 8.3.8.6. The body must be
+// exactly 28 bytes: short bodies and trailing bytes both drop with a
+// counter increment, since the content is fixed width and extra bytes
+// indicate a malformed sender or a framing error. Signed invalid bounds
+// per 8.3.8.6.3 drop as well. An empty range with first equal to last
+// plus one is valid: CycloneDDS sends first last plus one when the
+// writer holds no new sample, so it parses without error and callers
+// treat it as a silent no-op.
 func DecodeHeartbeat(body []byte, flags uint8, drops *Counter) (Heartbeat, error) {
 	var out Heartbeat
-	if len(body) < heartbeatSize {
+	if len(body) != heartbeatSize {
 		drops.RecordDrop()
 		return out, fmt.Errorf("rtps: heartbeat need %d have %d (8.3.8.6)", heartbeatSize, len(body))
 	}
@@ -1577,13 +1587,18 @@ func EncodePad(length int) ([]byte, error) {
 }
 
 // Submessage is one decoded submessage. Exactly one of the typed pointers
-// is set for known kinds; Raw carries skipped content for PAD, ACKNACK,
-// and unknown ids, aliasing the owned raw body.
+// is set for known kinds, including the header extension; Raw carries
+// skipped content for PAD, ACKNACK, and unknown ids, aliasing the owned
+// raw body.
 type Submessage struct {
 	// ID selects the submessage kind.
 	ID uint8
 	// Flags carries the endianness bit plus kind specific bits.
 	Flags uint8
+	// HeaderExtension holds a decoded RTPS_HE submessage, nil otherwise.
+	// Checksum verification against the full datagram needs the frame;
+	// see ValidateHeaderExtensionPlacement.
+	HeaderExtension *HeaderExtension
 	// Data holds a decoded DATA submessage, nil otherwise.
 	Data *Data
 	// DataFrag holds a decoded DATA_FRAG submessage, nil otherwise.
@@ -1719,6 +1734,25 @@ func decodeInfoDstSubmessage(raw RawSubmessage, drops *Counter) (Submessage, err
 	return out, nil
 }
 
+// decodeHeaderExtensionSubmessage validates one RTPS_HE body with drop accounting per 8.3.7.3.
+//
+// A malformed extension body fails loudly so callers invalidate the rest
+// of the datagram per 8.3.4.1 rule 6. Body validity here covers flagged
+// field fit plus parameter shape; checksum verification against the full
+// datagram needs the frame and runs in ValidateHeaderExtensionPlacement,
+// which datagram walks must also call to enforce first-position.
+func decodeHeaderExtensionSubmessage(raw RawSubmessage, drops *Counter) (Submessage, error) {
+	out := Submessage{ID: raw.ID, Flags: raw.Flags}
+	var tmp TCPDropCounter
+	ext, err := DecodeHeaderExtension(raw.Body, raw.Flags, &tmp)
+	if err != nil {
+		drops.RecordDrop()
+		return Submessage{}, fmt.Errorf("rtps: submessage header extension: %w (8.3.7.3)", err)
+	}
+	out.HeaderExtension = &ext
+	return out, nil
+}
+
 // decodeInfoReplyIP4Submessage decodes one INFO_REPLY_IP4 body per 8.3.8.11.
 func decodeInfoReplyIP4Submessage(raw RawSubmessage, drops *Counter) (Submessage, error) {
 	out := Submessage{ID: raw.ID, Flags: raw.Flags}
@@ -1744,10 +1778,13 @@ func decodeInfoReplySubmessage(raw RawSubmessage, drops *Counter) (Submessage, e
 // DecodeSubmessage decodes one raw submessage by id per 8.3.4.1. PAD
 // content is skipped without validation. ACKNACK bodies are validated per
 // 8.3.5.5; valid receipts stay as Raw for the repair path while malformed
-// bodies fail. INFO_SRC bodies are validated per 8.3.8.10 minimal form.
-// INFO_DST bodies are validated per 8.3.8.13 with 0 or 12 byte widths.
+// bodies fail. INFO_SRC bodies are validated per 8.3.8.10 minimal form
+// with exact 5 byte width. INFO_DST bodies are validated per 8.3.8.13
+// with 0 or 12 byte widths.
 // INFO_REPLY_IP4 and INFO_REPLY bodies are validated per 8.3.8.11 with
-// fixed widths. NACK_FRAG and HEARTBEAT_FRAG decode to typed repair
+// fixed widths. RTPS_HE bodies are validated per 8.3.7.3; malformed
+// extensions fail instead of skipping as opaque bytes. NACK_FRAG and
+// HEARTBEAT_FRAG decode to typed repair
 // bounds.
 // Unknown ids are skipped by length and never fatal: Raw preserves the
 // bytes for forward compatible readers. A known but invalid submessage
@@ -1803,6 +1840,8 @@ func decodeInfoSubmessageKind(raw RawSubmessage, drops *Counter) (Submessage, bo
 // decodeControlSubmessageKind decodes control kinds plus PAD and unknown.
 func decodeControlSubmessageKind(raw RawSubmessage, drops *Counter) (Submessage, error) {
 	switch raw.ID {
+	case SubmessageHeaderExtension:
+		return decodeHeaderExtensionSubmessage(raw, drops)
 	case SubmessageHeartbeat:
 		return decodeHeartbeatSubmessage(raw, drops)
 	case SubmessageGap:

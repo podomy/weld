@@ -613,13 +613,19 @@ func equalTCPChecksum(a, b []byte) bool {
 
 // verifyTCPChecksum checks the extension checksum with its field zeroed.
 // The frame stays in sync, so a mismatch drops the message but keeps the
-// connection open for the next frame.
+// connection open for the next frame. Offsets bound-check against the
+// frame before any probe or frame slice so a crafted flagged length can
+// never panic.
 func verifyTCPChecksum(frame []byte, ext HeaderExtension, extOff int, drops *TCPDropCounter) error {
 	cksLen := checksumKindLen(ext.Checksum)
 	if cksLen <= 0 {
 		return fmt.Errorf("rtps: tcp extension checksum kind %d unknown (8.3.7.3)", int(ext.Checksum))
 	}
 	cksOff := extOff + SubmessageHeaderSize + extensionChecksumBodyOffset(ext)
+	if cksOff < 0 || cksOff+cksLen > len(frame) {
+		drops.dropf("tcp extension checksum overruns frame")
+		return fmt.Errorf("rtps: tcp extension checksum overruns %d (8.3.7.3)", len(frame))
+	}
 	probe := append([]byte(nil), frame...)
 	for i := range cksLen {
 		probe[cksOff+i] = 0

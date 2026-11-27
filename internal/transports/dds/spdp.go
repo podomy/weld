@@ -216,6 +216,12 @@ type LocalParticipant struct {
 	metaPort int
 	// defaultPort is the bound user-traffic unicast port, zero for legacy.
 	defaultPort int
+	// secureAllowed is the governance allow-list for secure announces, nil for tolerance mode.
+	secureAllowed []string
+	// secureCert is the local identity certificate for secure announces, nil for tolerance mode.
+	secureCert *x509.Certificate
+	// secureCASubject is the CA subject for the identity token, valid when secureCert is set.
+	secureCASubject string
 }
 
 // NewLocalParticipant creates a local participant identity.
@@ -373,6 +379,31 @@ func (p *LocalParticipant) SetSpdp2DomainTag(tag string) {
 	p.domainTag = tag
 }
 
+// SetSpdp2SecurityMaterial arms secure SPDP announces per DDS-SECURITY 7.4.
+//
+// Allowed must be the governance allow-list of algorithm names (for
+// example ECDSA+P256+SHA256 plus ECDHE-CEUM+P256); cert is the local
+// identity certificate and caSubject names its CA. When set, alive
+// announces negotiate via Spdp2NegotiatedSecureAlgos (fail-closed on
+// unnegotiated curves or allow-list misses), set the honest
+// Spdp2SecureParticipantMask, and emit PID 0x1001 plus 0x1002 identity
+// and permissions tokens carrying only the negotiated local algorithm
+// names, never mirrored peer input. When unset (nil cert), announces use
+// the tolerance baseline with byte-identical output. Goodbye packets are
+// unaffected. It is safe for concurrent use.
+func (p *LocalParticipant) SetSpdp2SecurityMaterial(allowed []string, cert *x509.Certificate, caSubject string) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.secureAllowed = append([]string(nil), allowed...)
+	p.secureCert = cert
+	p.secureCASubject = caSubject
+}
+
 // Spdp2ManualCount returns the current manual liveliness count.
 func (p *LocalParticipant) Spdp2ManualCount() uint32 {
 	p.mu.Lock()
@@ -431,6 +462,12 @@ type spdpAnnounce struct {
 	metaPort int
 	// defaultPort is the bound user-traffic unicast port, zero for legacy.
 	defaultPort int
+	// secureAllowed is the governance allow-list snapshot for this ticket.
+	secureAllowed []string
+	// secureCert is the local identity certificate snapshot, nil for tolerance mode.
+	secureCert *x509.Certificate
+	// secureCASubject is the CA subject snapshot for the identity token.
+	secureCASubject string
 }
 
 // send assigns the next sequence and transmits one packet.
@@ -484,15 +521,21 @@ func (p *LocalParticipant) nextPacket() (spdpAnnounce, error) {
 
 	p.seq++
 
-	return spdpAnnounce{seq: p.seq, guid: p.guid, domain: p.domain, lease: p.lease, manual: p.manual, domainTag: p.domainTag, metaPort: p.metaPort, defaultPort: p.defaultPort}, nil
+	return spdpAnnounce{seq: p.seq, guid: p.guid, domain: p.domain, lease: p.lease, manual: p.manual, domainTag: p.domainTag, metaPort: p.metaPort, defaultPort: p.defaultPort, secureAllowed: append([]string(nil), p.secureAllowed...), secureCert: p.secureCert, secureCASubject: p.secureCASubject}, nil
 }
 
 // marshalSpdp2TicketAlive builds one alive packet from a ticket.
 //
-// Baseline tickets with zero manual and empty tag use the exported
-// wrappers so goldens stay byte-identical. Tickets carrying manual or
-// tag use the detail builder.
+// Baseline tickets with zero manual, empty tag, and no security material
+// use the exported wrappers so goldens stay byte-identical. Tickets
+// carrying manual or tag use the detail builder. Tickets carrying
+// security material use the secure builder, which negotiates from the
+// governance allow-list plus the local certificate fail-closed and emits
+// the honest secure mask plus identity and permissions tokens.
 func marshalSpdp2TicketAlive(ticket spdpAnnounce) ([]byte, error) {
+	if ticket.secureCert != nil {
+		return marshalSpdp2SecureTicketAlive(ticket)
+	}
 	if ticket.manual == 0 && ticket.domainTag == "" {
 		if ticket.metaPort > 0 && ticket.defaultPort > 0 {
 			return MarshalAlivePacketWithPorts(ticket.guid, ticket.domain, ticket.seq, ticket.lease, ticket.metaPort, ticket.defaultPort)
@@ -527,6 +570,48 @@ func marshalSpdp2TicketAlive(ticket spdpAnnounce) ([]byte, error) {
 	}
 
 	return marshalSpdp2AliveWithDetail(ticket.guid, ticket.domain, ticket.seq, ticket.lease, metaPort, defaultPort, metaMCPort, defaultMCPort, ticket.manual, ticket.domainTag)
+}
+
+// marshalSpdp2SecureTicketAlive builds one secure alive packet from a ticket.
+//
+// It negotiates the announce algorithms from the ticket governance
+// allow-list plus the local certificate via Spdp2NegotiatedSecureAlgos
+// (fail-closed on unnegotiated curves or allow-list misses, never
+// mirroring peer input), resolves the ticket unicast ports with legacy
+// fallback like the baseline path, and emits the honest secure mask plus
+// PID 0x1001 and 0x1002 tokens with the manual count and domain tag.
+func marshalSpdp2SecureTicketAlive(ticket spdpAnnounce) ([]byte, error) {
+	dsignToken, kagreeToken, err := Spdp2NegotiatedSecureAlgos(ticket.secureAllowed, ticket.secureCert)
+	if err != nil {
+		return nil, err
+	}
+
+	metaPort := ticket.metaPort
+	defaultPort := ticket.defaultPort
+
+	metaMCPort, err := rtps.MetatrafficMulticastPort(ticket.domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	defaultMCPort, err := rtps.UsertrafficMulticastPort(ticket.domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+
+	if metaPort <= 0 || defaultPort <= 0 {
+		metaPort, err = rtps.MetatrafficUnicastPort(ticket.domain, 0)
+		if err != nil {
+			return nil, fmt.Errorf("dds: SPDP meta port: %w", errors.Join(err, ErrInvalidSPDP))
+		}
+
+		defaultPort, err = rtps.UsertrafficUnicastPort(ticket.domain, 0)
+		if err != nil {
+			return nil, fmt.Errorf("dds: SPDP default port: %w", errors.Join(err, ErrInvalidSPDP))
+		}
+	}
+
+	return marshalAliveSecureWithDetail(ticket.guid, ticket.domain, ticket.seq, ticket.lease, metaPort, defaultPort, metaMCPort, defaultMCPort, dsignToken, kagreeToken, ticket.secureCert, ticket.secureCASubject, ticket.manual, ticket.domainTag)
 }
 
 // marshalSpdp2AliveWithDetail builds an alive packet with manual and tag.
@@ -783,7 +868,10 @@ func MarshalAlivePacketWithPorts(guid GUID, domain uint32, seq uint64, lease tim
 // MarshalAlivePacketWithPorts with their actual ports instead, or peers
 // send metatraffic and user DATA to the wrong socket. Manual count is
 // zero because this package never asserts manual liveliness. Builtin QoS
-// is zero for the non secure baseline.
+// is zero for the non secure baseline. Tolerance path stays byte-identical:
+// secure announces must use MarshalAlivePacketSecure instead, which emits
+// identity plus permissions tokens with negotiated algorithms per 7.4.
+//
 // Unknown vendor PIDs such as 0x8003, 0x8007, 0x8019, and 0x800c are
 // tolerated on receive and survive an rtps round trip.
 func MarshalAlivePacket(guid GUID, domain uint32, seq uint64, lease time.Duration) ([]byte, error) {
@@ -899,6 +987,126 @@ func marshalAliveWithPorts(guid GUID, domain uint32, seq uint64, lease time.Dura
 		Payload:        encoded,
 	}
 
+	return frameSPDP(guid.Prefix, data)
+}
+
+// MarshalAlivePacketSecure builds an alive RTPS SPDP DATA packet with
+// DDS Security identity plus permissions tokens per 7.4 and 9.3.2.
+//
+// It negotiates the announce algorithms from the governance allow-list
+// plus the local certificate via Spdp2NegotiatedSecureAlgos (fail-closed
+// on unnegotiated curves or allow-list misses), sets the secure
+// participant mask via Spdp2SecureParticipantMask, and emits PID 0x1001
+// plus 0x1002 token params carrying the negotiated algorithm names. The
+// tolerance MarshalAlivePacket path stays byte-identical; this secure
+// path is only for suite-enabled announces.
+func MarshalAlivePacketSecure(guid GUID, domain uint32, seq uint64, lease time.Duration, allowed []string, cert *x509.Certificate, caSubject string) ([]byte, error) {
+	dsignToken, kagreeToken, err := Spdp2NegotiatedSecureAlgos(allowed, cert)
+	if err != nil {
+		return nil, err
+	}
+	metaPort, err := rtps.MetatrafficUnicastPort(domain, 0)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+	defaultPort, err := rtps.UsertrafficUnicastPort(domain, 0)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+	metaMCPort, err := rtps.MetatrafficMulticastPort(domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP meta multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+	defaultMCPort, err := rtps.UsertrafficMulticastPort(domain)
+	if err != nil {
+		return nil, fmt.Errorf("dds: SPDP default multicast port: %w", errors.Join(err, ErrInvalidSPDP))
+	}
+	return marshalAliveSecureWithPorts(guid, domain, seq, lease, metaPort, defaultPort, metaMCPort, defaultMCPort, dsignToken, kagreeToken, cert, caSubject)
+}
+
+// marshalAliveSecureWithPorts builds a secure alive packet with zero
+// manual count and no domain tag.
+func marshalAliveSecureWithPorts(guid GUID, domain uint32, seq uint64, lease time.Duration, metaPort, defaultPort, metaMCPort, defaultMCPort int, dsignToken, kagreeToken string, cert *x509.Certificate, caSubject string) ([]byte, error) {
+	return marshalAliveSecureWithDetail(guid, domain, seq, lease, metaPort, defaultPort, metaMCPort, defaultMCPort, dsignToken, kagreeToken, cert, caSubject, 0, "")
+}
+
+// marshalAliveSecureWithDetail builds a secure alive packet with tokens.
+//
+// The identity token carries the certificate subject, CA subject, and the
+// negotiated algorithm names; the permissions token is empty per spec.
+// Both encode via tokens.EncodeDataHolder into PID 0x1001 plus 0x1002.
+// The builtin set carries the honest Spdp2SecureParticipantMask and the
+// manual count plus optional domain tag ride alongside like the
+// non-secure detail builder.
+func marshalAliveSecureWithDetail(guid GUID, domain uint32, seq uint64, lease time.Duration, metaPort, defaultPort, metaMCPort, defaultMCPort int, dsignToken, kagreeToken string, cert *x509.Certificate, caSubject string, manual uint32, domainTag string) ([]byte, error) {
+	err := validatePacketHeader(guid, domain, seq)
+	if err != nil {
+		return nil, err
+	}
+	sec, nanos, err := durationToParts(lease)
+	if err != nil {
+		return nil, err
+	}
+	certSN := ""
+	if cert != nil {
+		certSN = cert.Subject.String()
+	}
+	identity, err := tokens.BuildIdentityToken(tokens.IdentityToken{
+		Class:    tokens.TokenIdentity,
+		CertSN:   certSN,
+		CertAlgo: dsignToken,
+		CaSN:     caSubject,
+		CaAlgo:   kagreeToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure announce identity token: %w", err)
+	}
+	identityRaw, err := tokens.EncodeDataHolder(identity)
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure announce identity encode: %w", err)
+	}
+	permissions := tokens.BuildPermissionsToken()
+	permissionsRaw, err := tokens.EncodeDataHolder(permissions)
+	if err != nil {
+		return nil, fmt.Errorf("dds: secure announce permissions encode: %w", err)
+	}
+	advertise := rtps.AdvertiseIPv4()
+	group := net.ParseIP(rtps.SPDPMulticastGroup)
+	domainRaw := domainRawBytes(domain)
+	var leaseRaw [8]byte
+	binary.LittleEndian.PutUint32(leaseRaw[0:4], sec)
+	binary.LittleEndian.PutUint32(leaseRaw[4:8], nanos)
+	var besRaw [4]byte
+	binary.LittleEndian.PutUint32(besRaw[:], Spdp2SecureParticipantMask())
+	var builtinQosRaw [4]byte
+	binary.LittleEndian.PutUint32(builtinQosRaw[:], 0)
+	var manualRaw [4]byte
+	binary.LittleEndian.PutUint32(manualRaw[:], manual)
+	userdata := []byte(spdpUserDataEnclave)
+	var userdataRaw []byte
+	userdataRaw = binary.LittleEndian.AppendUint32(userdataRaw, uint32(len(userdata))) //nolint:gosec // G115: enclave string is a short constant
+	userdataRaw = append(userdataRaw, userdata...)
+	for len(userdataRaw)%4 != 0 {
+		userdataRaw = append(userdataRaw, 0x00)
+	}
+	params := spdpAliveParams(guid, domainRaw, leaseRaw, besRaw, builtinQosRaw, manualRaw, userdataRaw, advertise, group, metaPort, defaultPort, metaMCPort, defaultMCPort)
+	if domainTag != "" {
+		params = append(params, rtps.Param{ID: spdp2PIDDomainTag, Value: spdp2EncodeDomainTag(domainTag)})
+	}
+	params = append(params,
+		rtps.Param{ID: PIDIdentityToken, Value: identityRaw},
+		rtps.Param{ID: PIDPermissionsToken, Value: permissionsRaw},
+	)
+	encoded, err := encodeSPDPParams(params)
+	if err != nil {
+		return nil, err
+	}
+	data := rtps.Data{
+		ReaderID:       rtps.EntityUnknown,
+		WriterID:       rtps.EntitySPDPWriter,
+		SequenceNumber: seq,
+		Payload:        encoded,
+	}
 	return frameSPDP(guid.Prefix, data)
 }
 
@@ -2379,12 +2587,11 @@ func (t *RemoteTable) HandlePacket(data []byte, now time.Time) error {
 //
 // It shares the walk with the SEDP helper and the backend demux through
 // rtps.ClassifyUnicastInfoDst so all three agree: absent, zero-length, or
-// all-zero INFO_DST processes normally, mismatch or short non-empty bodies
-// drop loudly with ErrInvalidSPDP. Undecodable datagrams classify as
-// absent and return nil so the caller flows to the normal decode path,
-// which counts the failure. Multicast ingress must never call this helper:
-// group sockets carry every sender, so per-sender identity has no meaning
-// there and enforcement would drop valid peers.
+// all-zero INFO_DST processes normally, mismatch drops loudly with
+// ErrInvalidSPDP, and short non-empty or undecodable INFO_DST bodies drop
+// loudly fail-closed with ErrInvalidSPDP. Multicast ingress must never
+// call this helper: group sockets carry every sender, so per-sender
+// identity has no meaning there and enforcement would drop valid peers.
 func checkSPDPInfoDstUnicast(data []byte, local GUIDPrefix) error {
 	var want [12]byte
 	copy(want[:], local[:])
@@ -2509,6 +2716,13 @@ func spdpManualDue(info ParticipantInfo, now time.Time) bool {
 // reinstall after sweep. Tombstones at or past expiry are dropped without
 // a generation bump so the map stays bounded. It returns the number of
 // removed entries.
+//
+// Sweep is table-only and self-contained: it takes only the table lock,
+// touches only table state, and is safe to call standalone or under the
+// backend joint lock without ordering concerns. Joint paths that also
+// touch backend store or route state live in backend-owned code and own
+// their lock order (backend mu then table mu); this helper never takes
+// the backend lock itself.
 func (t *RemoteTable) Sweep(now time.Time) int {
 	t.mu.Lock()
 
@@ -2634,7 +2848,13 @@ func compareInfo(a, b ParticipantInfo) int {
 // because there is no route to delete; the patch walk caps at
 // spdpMaxSubmessages (4096, matching rtps) with a loud leave-unchanged
 // drop; unicast INFO_DST enforcement lives in checkSPDPInfoDstUnicast
-// plus HandlePacketUnicast, which unicast ingress must call.
+// plus HandlePacketUnicast, which unicast ingress must call; secure
+// announces negotiate from the governance allow-list plus the local
+// certificate via Spdp2NegotiatedSecureAlgos and emit the honest secure
+// mask plus identity and permissions tokens only when security material
+// is armed, with the tolerance baseline staying byte-identical; table
+// Sweep is table-only and self-locked, safe standalone or under joint
+// locks.
 //
 // Done elsewhere: backend shouldDropUnicastForInfoDst plus
 // storeAnnouncementRoutes enforce the same unicast INFO_DST and

@@ -3038,7 +3038,7 @@ func TestSEDPProvisionalPromotesOnConfirmedUpsert(t *testing.T) {
 	provisional.TypeHash = "RIHS01_prov"
 	provisional.QoS = []byte{0x09}
 
-	err := local.ProvisionalInstall(provisional)
+	err := local.ProvisionalInstall(provisional, 1)
 	if err != nil {
 		t.Fatalf("provisional install: %v", err)
 	}
@@ -3109,7 +3109,7 @@ func TestSEDPConfirmedImmuneToProvisional(t *testing.T) {
 	stale.TypeHash = "RIHS01_stale"
 	stale.QoS = []byte{0x07, 0x08}
 
-	err = local.ProvisionalInstall(stale)
+	err = local.ProvisionalInstall(stale, 1)
 	if err != nil {
 		t.Fatalf("provisional install over confirmed: %v", err)
 	}
@@ -3148,7 +3148,7 @@ func TestSEDPProvisionalExpiryRemovesStale(t *testing.T) {
 	stale := mustSEDPWriter(t, peer, "/chatter", "RIHS01_abc")
 	stale.FirstSeen = now.Add(-sedpProvisionalTTL - time.Second)
 
-	err := local.ProvisionalInstall(stale)
+	err := local.ProvisionalInstall(stale, 1)
 	if err != nil {
 		t.Fatalf("provisional install stale: %v", err)
 	}
@@ -4609,7 +4609,7 @@ func TestSEDPProvisionalInstallSecurityRefusesWhenEnabled(t *testing.T) {
 	guarded := mustSEDPIndexWithPrefix(t, 0xA6)
 	guarded.SetSecuritySuite(sedpTestEnabledSuite(t))
 
-	if err := guarded.ProvisionalInstall(ep); err == nil {
+	if err := guarded.ProvisionalInstall(ep, 1); err == nil {
 		t.Fatalf("enabled suite installed provisional, want refuse")
 	}
 
@@ -4623,7 +4623,7 @@ func TestSEDPProvisionalInstallSecurityRefusesWhenEnabled(t *testing.T) {
 
 	plain := mustSEDPIndexWithPrefix(t, 0xA7)
 
-	if err := plain.ProvisionalInstall(ep); err != nil {
+	if err := plain.ProvisionalInstall(ep, 1); err != nil {
 		t.Fatalf("tolerance provisional install: %v", err)
 	}
 }

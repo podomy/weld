@@ -128,10 +128,13 @@ const (
 	sedpDATAReserved byte = 0x00
 	// sedpMaxSubmessages caps one datagram submessage walk for bounded work.
 	//
-	// Sixty four covers batched discovery (one DATA plus one HEARTBEAT per
-	// endpoint) with wide headroom while bounding unauthenticated walks;
-	// over-cap datagrams drop loudly before dispatch.
-	sedpMaxSubmessages = 64
+	// The bound matches rtps maxSubmessagesPerDatagram (4096) so the SEDP
+	// split walk and the rtps decode path agree; over-cap datagrams drop
+	// loudly before dispatch. The walk stays cheap (one header parse per
+	// entry with no allocation past collected DATA bodies), so the wider
+	// bound keeps batched discovery with headroom while still bounding
+	// unauthenticated work.
+	sedpMaxSubmessages = 4096
 	// sedpGapNoBoundCap caps a GAP advance with no heartbeat bound known.
 	//
 	// Sixty four is one user repair window: a writer that never announced
@@ -360,6 +363,12 @@ type SEDPEndpoint struct {
 	VolatileDurability bool
 	// DomainID is the domain the endpoint belongs to.
 	DomainID uint32
+	// DomainTag is the DDS domain tag the endpoint belongs to, empty for
+	// the default tag. The wire carries no tag today, so decoded endpoints
+	// always carry empty; UpsertRemote enforces exact equality with the
+	// index tag fail-closed per 8.5.5.1 (empty equals only empty, no
+	// wildcards).
+	DomainTag string
 	// BuiltinEndpointQos is the builtin endpoint QoS mask, zero when absent.
 	BuiltinEndpointQos uint32
 	// TypeObject holds the raw XTypes TypeObject bytes when present, nil otherwise.
@@ -419,15 +428,17 @@ type SEDPReceiver interface {
 // pendingEvict never bumps alone. Local declares do not affect the
 // generation. Use NewSEDPIndex. It is safe for concurrent use.
 type SEDPIndex struct {
-	mu         sync.Mutex
-	prefix     SEDPGUIDPrefix
-	domain     uint32
-	next       uint32
-	locals     map[SEDPGUID]SEDPEndpoint
-	remotes    map[SEDPGUID]SEDPEndpoint
-	generation uint64
-	onChange   func(uint64)
-	onRemove   func(SEDPGUID)
+	mu           sync.Mutex
+	prefix       SEDPGUIDPrefix
+	domain       uint32
+	domainTag    string
+	next         uint32
+	locals       map[SEDPGUID]SEDPEndpoint
+	remotes      map[SEDPGUID]SEDPEndpoint
+	remoteTopics map[SEDPTopic]struct{}
+	generation   uint64
+	onChange     func(uint64)
+	onRemove     func(SEDPGUID)
 	// lastSeq tracks the last SEDP DATA sequence per endpoint GUID for
 	// monotonic ingest gating. Stale or reordered samples are rejected
 	// without upserting. Zero never advances this map.
@@ -726,6 +737,34 @@ func (idx *SEDPIndex) stampDomain() uint32 {
 	defer idx.mu.Unlock()
 
 	return idx.domain
+}
+
+// SetSEDPDomainTag pins the local DDS domain tag for SEDP gating per 8.5.5.1.
+//
+// Empty selects the default domain tag. UpsertRemote and
+// ProvisionalInstall refuse endpoints whose DomainTag differs with an
+// exact match (empty equals only empty, no wildcards). The wire carries
+// no tag today so decoded endpoints stamp empty; API callers with an
+// explicit foreign tag are refused fail-closed. It is safe for
+// concurrent use.
+func (idx *SEDPIndex) SetSEDPDomainTag(tag string) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.domainTag = tag
+}
+
+// sedpCheckDomainTagLocked rejects foreign domain tags. Caller holds idx.mu.
+//
+// Empty tag means the default domain tag per 8.5.5.1 and matches only
+// empty: there are no wildcards, so a tagged local index refuses untagged
+// wire endpoints and vice versa.
+func (idx *SEDPIndex) sedpCheckDomainTagLocked(ep SEDPEndpoint) error {
+	if ep.DomainTag != idx.domainTag {
+		return fmt.Errorf("dds: sedp domain tag %q mismatches local %q: %w", ep.DomainTag, idx.domainTag, ErrSEDPInvalidDomain)
+	}
+
+	return nil
 }
 
 // DeclareWriter declares a local writer for a ROS topic.
@@ -1161,16 +1200,87 @@ func (idx *SEDPIndex) RemoteEndpoints() []SEDPEndpoint {
 	return sedpSnapshotEndpoints(idx.remotes)
 }
 
+// RemoteTopics returns a sorted copy of remotely announced topics.
+//
+// TopicBuiltinTopicData is advisory: it records which topics exist
+// without endpoint state, and matching still uses endpoints. Topic
+// installs never bump the endpoint generation and never fire onChange,
+// so a Topics-only datagram installs topics while leaving generation at
+// zero. It is safe for concurrent use.
+func (idx *SEDPIndex) RemoteTopics() []SEDPTopic {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	out := make([]SEDPTopic, 0, len(idx.remoteTopics))
+	for topic := range idx.remoteTopics {
+		out = append(out, topic)
+	}
+	slices.SortFunc(out, func(a, b SEDPTopic) int {
+		if a.DDSTopic != b.DDSTopic {
+			return strings.Compare(a.DDSTopic, b.DDSTopic)
+		}
+		if a.TypeDDS != b.TypeDDS {
+			return strings.Compare(a.TypeDDS, b.TypeDDS)
+		}
+		return strings.Compare(a.TypeIDL, b.TypeIDL)
+	})
+	return out
+}
+
+// installRemoteTopic records one remotely announced topic.
+func (idx *SEDPIndex) installRemoteTopic(topic SEDPTopic) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if idx.remoteTopics == nil {
+		idx.remoteTopics = make(map[SEDPTopic]struct{})
+	}
+	idx.remoteTopics[topic] = struct{}{}
+}
+
+// removeRemoteTopic drops one remotely announced topic when present.
+func (idx *SEDPIndex) removeRemoteTopic(topic SEDPTopic) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	delete(idx.remoteTopics, topic)
+}
+
 // UpsertRemote adds or replaces a remote endpoint by GUID.
 //
 // The input is always stored as confirmed: Provisional is cleared and
 // FirstSeen is reset because SEDP QoS, type, and hash are authoritative.
 // Promotion of a provisional placeholder therefore bumps generation.
+// The domain tag must exactly equal the index tag (empty equals only
+// empty, no wildcards) per 8.5.5.1 or the upsert refuses fail-closed.
 // Caller must validate the endpoint prefix against the RTPS header prefix
 // before calling: UpsertRemote installs any prefix it is given and never
 // checks header binding itself, so ingest paths enforce the binding and
-// direct callers must do the same.
+// direct callers must do the same. Prefer UpsertRemoteChecked, which
+// enforces the binding, for all new callers.
 func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
+	return idx.upsertRemote(ep)
+}
+
+// UpsertRemoteChecked adds or replaces a remote endpoint by GUID after
+// enforcing the RTPS header binding fail-closed.
+//
+// Prefix must equal the endpoint GUID prefix: a mismatch drops loudly
+// without installing, recording sequence, or bumping generation, so
+// spoofed endpoints never enter the index. All other semantics match
+// UpsertRemote. Ingest paths must call this instead of UpsertRemote.
+func (idx *SEDPIndex) UpsertRemoteChecked(prefix SEDPGUIDPrefix, ep SEDPEndpoint) error {
+	if ep.ID.Prefix != prefix {
+		sedpTracef("upsert prefix mismatch guid=%s header=%x", ep.ID.String(), prefix)
+		log.Printf("dds: sedp guid prefix mismatches header, dropping")
+		return fmt.Errorf("dds: sedp guid prefix mismatches header: %w", ErrSEDPInvalidDATA)
+	}
+
+	return idx.upsertRemote(ep)
+}
+
+// upsertRemote implements UpsertRemote plus UpsertRemoteChecked.
+func (idx *SEDPIndex) upsertRemote(ep SEDPEndpoint) error {
 	err := sedpValidateRemote(ep)
 	if err != nil {
 		sedpTracef("upsert reject guid=%s ros=%q dds=%q type=%q domain=%d err=%v", ep.ID.String(), ep.ROSTopic, ep.DDSTopic, ep.TypeDDS, ep.DomainID, err)
@@ -1193,6 +1303,16 @@ func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
 		return fmt.Errorf("dds: sedp upsert remote: %w", err)
 	}
 
+	// Fail-closed domain tag gate per 8.5.5.1: exact match, no wildcards.
+	// A refused re-announce neither cancels a scheduled dispose eviction
+	// nor installs nor bumps generation, matching the security gate.
+	if err := idx.sedpCheckDomainTagLocked(ep); err != nil {
+		idx.mu.Unlock()
+		sedpTracef("upsert tag refuse guid=%s ros=%q err=%v", ep.ID.String(), ep.ROSTopic, err)
+
+		return fmt.Errorf("dds: sedp upsert remote: %w", err)
+	}
+
 	// A re-announce proves liveness even when identical, so it cancels a
 	// scheduled dispose eviction before the duplicate short-circuit below.
 	delete(idx.pendingEvict, ep.ID.Prefix)
@@ -1203,6 +1323,13 @@ func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
 		sedpTracef("upsert skipped duplicate guid=%s ros=%q domain=%d", ep.ID.String(), ep.ROSTopic, ep.DomainID)
 
 		return nil
+	}
+
+	if idx.remotes == nil {
+		idx.remotes = make(map[SEDPGUID]SEDPEndpoint)
+	}
+	if !seen && len(idx.remotes) >= sedpAuxCap {
+		idx.sedpEvictOldestRemoteLocked()
 	}
 
 	installed := !seen
@@ -1225,6 +1352,49 @@ func (idx *SEDPIndex) UpsertRemote(ep SEDPEndpoint) error {
 	}
 
 	return nil
+}
+
+// sedpEvictOldestRemoteLocked drops one remote entry to hold the cap.
+//
+// Caller holds idx.mu and inserts a GUID not yet present. It prefers the
+// provisional placeholder with the earliest FirstSeen (placeholders carry
+// age while confirmed entries carry none), else drops one arbitrary
+// confirmed entry, always with a loud log so writer churn cannot grow
+// remotes without bound. It is a no-op when under cap.
+func (idx *SEDPIndex) sedpEvictOldestRemoteLocked() {
+	var (
+		oldest SEDPGUID
+		have   bool
+		best   time.Time
+	)
+
+	for id, ep := range idx.remotes {
+		if !ep.Provisional {
+			continue
+		}
+		if !have || ep.FirstSeen.Before(best) {
+			oldest = id
+			best = ep.FirstSeen
+			have = true
+		}
+	}
+
+	if !have {
+		for id := range idx.remotes {
+			oldest = id
+			have = true
+
+			break
+		}
+	}
+
+	if !have {
+		return
+	}
+
+	delete(idx.remotes, oldest)
+	delete(idx.lastSeq, oldest)
+	log.Printf("dds: sedp remotes table full evict guid=%s", oldest.String())
 }
 
 // RemoveRemote deletes a remote endpoint by GUID.
@@ -1367,17 +1537,24 @@ func (idx *SEDPIndex) ExpirePendingEvictions(now time.Time) int {
 
 // ProvisionalInstall installs a datapath fast-path placeholder by GUID.
 //
-// The record is stored with Provisional true and FirstSeen set to now
+// Seq is the DATA sequence that observed the endpoint and gates the
+// install like the confirmed path: zero sequences reject loudly without
+// installing (mirroring SPDP and the ingest seq-zero reject), and
+// sequences at or below the per-endpoint high reject as stale with
+// ErrSEDPStale so an old retransmit cannot clobber newer state. The
+// record is stored with Provisional true and FirstSeen set to now
 // when the caller leaves it zero. A confirmed record is never
 // overwritten: install over a non-provisional entry is a no-op without
 // bumping generation. Install over a provisional entry preserves the
 // original FirstSeen so the TTL stays bounded from first sight, and is
 // a no-op when all other fields already match. Otherwise it stores the
-// placeholder, bumps generation, and fires the change hook.
-func (idx *SEDPIndex) ProvisionalInstall(ep SEDPEndpoint) error {
-	err := sedpValidateRemote(ep)
+// placeholder, bumps generation, and fires the change hook. The domain
+// tag must exactly equal the index tag per 8.5.5.1. Inserts at the
+// remotes cap evict one entry loudly like the confirmed path.
+func (idx *SEDPIndex) ProvisionalInstall(ep SEDPEndpoint, seq uint64) error {
+	err := checkProvisionalArgs(ep, seq)
 	if err != nil {
-		return fmt.Errorf("dds: sedp provisional install: %w", err)
+		return err
 	}
 
 	ep.Provisional = true
@@ -1386,49 +1563,107 @@ func (idx *SEDPIndex) ProvisionalInstall(ep SEDPEndpoint) error {
 	}
 
 	idx.mu.Lock()
+	hook, gen, stored, err := idx.provisionalInstallLocked(ep, seq)
+	idx.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if stored && hook != nil {
+		hook(gen)
+	}
 
+	return nil
+}
+
+// checkProvisionalArgs validates the endpoint plus DATA sequence before locking.
+func checkProvisionalArgs(ep SEDPEndpoint, seq uint64) error {
+	err := sedpValidateRemote(ep)
+	if err != nil {
+		return fmt.Errorf("dds: sedp provisional install: %w", err)
+	}
+
+	if seq == 0 {
+		return fmt.Errorf("dds: sedp provisional sequence must be non-zero: %w", ErrSEDPInvalidDATA)
+	}
+
+	return nil
+}
+
+// provisionalInstallLocked gates and stores one placeholder. Caller holds
+// idx.mu. It reports whether the placeholder stored plus the hook and
+// generation to fire outside the lock when it did.
+func (idx *SEDPIndex) provisionalInstallLocked(ep SEDPEndpoint, seq uint64) (func(uint64), uint64, bool, error) {
 	// Fail-closed fast-path gate: an enabled suite refuses the placeholder
 	// before it enters the index, so nothing installs and nothing bumps
 	// generation. A nil or disabled suite skips the check with
 	// byte-identical behavior.
 	if err := idx.sedpCheckRemoteSecurityLocked(ep); err != nil {
-		idx.mu.Unlock()
+		return nil, 0, false, fmt.Errorf("dds: sedp provisional install: %w", err)
+	}
 
-		return fmt.Errorf("dds: sedp provisional install: %w", err)
+	// Fail-closed domain tag gate per 8.5.5.1: exact match, no wildcards.
+	if err := idx.sedpCheckDomainTagLocked(ep); err != nil {
+		return nil, 0, false, fmt.Errorf("dds: sedp provisional install: %w", err)
+	}
+
+	// DATA sequence gate mirroring the confirmed path: stale or reordered
+	// samples never install and never advance the high.
+	if last, seen := idx.lastSeq[ep.ID]; seen && seq <= last {
+		return nil, 0, false, fmt.Errorf("dds: sedp provisional stale seq=%d last=%d: %w", seq, last, ErrSEDPStale)
 	}
 
 	existing, seen := idx.remotes[ep.ID]
 	if seen && !existing.Provisional {
-		idx.mu.Unlock()
-
-		return nil
+		return nil, 0, false, nil
 	}
 
 	if seen {
-		candidate := sedpCloneEndpoint(ep)
-		candidate.FirstSeen = existing.FirstSeen
-		if sedpEndpointsEqual(existing, candidate) {
-			idx.mu.Unlock()
-
-			return nil
+		unchanged, merged := provisionalMerge(existing, ep)
+		if unchanged {
+			return nil, 0, false, nil
 		}
-
-		ep.FirstSeen = existing.FirstSeen
+		ep = merged
 	}
+
+	provisionalStoreLocked(idx, ep, seen, seq)
+
+	return idx.onChange, idx.generation, true, nil
+}
+
+// provisionalMerge preserves the original FirstSeen and reports whether
+// the stored placeholder already matches.
+func provisionalMerge(existing, candidate SEDPEndpoint) (bool, SEDPEndpoint) {
+	merged := sedpCloneEndpoint(candidate)
+	merged.FirstSeen = existing.FirstSeen
+	if sedpEndpointsEqual(existing, merged) {
+		return true, merged
+	}
+	candidate.FirstSeen = existing.FirstSeen
+
+	return false, candidate
+}
+
+// provisionalStoreLocked stores one gated placeholder and bumps generation.
+// Caller holds idx.mu; seen reports whether the GUID was already present.
+func provisionalStoreLocked(idx *SEDPIndex, ep SEDPEndpoint, seen bool, seq uint64) {
+	if idx.remotes == nil {
+		idx.remotes = make(map[SEDPGUID]SEDPEndpoint)
+	}
+	if !seen && len(idx.remotes) >= sedpAuxCap {
+		idx.sedpEvictOldestRemoteLocked()
+	}
+
+	// A provisional install proves liveness like a confirmed re-announce.
+	delete(idx.pendingEvict, ep.ID.Prefix)
 
 	idx.remotes[ep.ID] = sedpCloneEndpoint(ep)
-	idx.generation++
-
-	gen := idx.generation
-	hook := idx.onChange
-
-	idx.mu.Unlock()
-
-	if hook != nil {
-		hook(gen)
+	if idx.lastSeq == nil {
+		idx.lastSeq = make(map[SEDPGUID]uint64)
 	}
-
-	return nil
+	if last, tracked := idx.lastSeq[ep.ID]; !tracked || seq > last {
+		idx.lastSeq[ep.ID] = seq
+	}
+	idx.generation++
 }
 
 // ExpireProvisional removes provisional entries older than sedpProvisionalTTL.
@@ -1499,7 +1734,12 @@ func (idx *SEDPIndex) ExpireProvisional(now time.Time) int {
 // Sweep removes expired provisional entries and bumps generation once when any expire.
 //
 // It is an alias for ExpireProvisional kept for symmetry with the SPDP
-// remote table sweep. Confirmed entries never expire here.
+// remote table sweep. Confirmed entries never expire here. Sweep is
+// table-only and self-contained: it takes only the index lock, touches
+// only index state, and is safe to call standalone or under the backend
+// joint lock without ordering concerns. Joint paths that also touch
+// backend store or route state live in backend-owned code and own their
+// lock order; this helper never takes the backend lock itself.
 func (idx *SEDPIndex) Sweep(now time.Time) int {
 	return idx.ExpireProvisional(now)
 }
@@ -1695,16 +1935,50 @@ func sedpHeaderPrefix(data []byte) (SEDPGUIDPrefix, error) {
 	return prefix, nil
 }
 
+// sedpValidateHeaderExtension enforces RTPS_HE placement per 8.3.7.3.
+//
+// It splits every submessage in the datagram and validates the header
+// extension layout through rtps.ValidateHeaderExtensionPlacement: a
+// malformed extension body, a checksum mismatch, or an extension in any
+// position but first drops fail-closed. Standalone walks must call this
+// before dispatch because sedpSplitSubmessage alone skips unknown ids by
+// length and would otherwise ignore a mispositioned extension.
+func sedpValidateHeaderExtension(data []byte) error {
+	err := sedpValidateRTPSHeader(data)
+	if err != nil {
+		return err
+	}
+	off := sedpRTPSHeaderLen
+	seen := 0
+	var raws []rtps.RawSubmessage
+	for off < len(data) {
+		seen++
+		if seen > sedpMaxSubmessages {
+			return fmt.Errorf("dds: sedp parse submessages above %d: %w", sedpMaxSubmessages, ErrSEDPInvalidDATA)
+		}
+		id, body, flags, next, serr := sedpSplitSubmessage(data, off)
+		if serr != nil {
+			return serr
+		}
+		raws = append(raws, rtps.RawSubmessage{ID: id, Flags: flags, Body: body})
+		off = next
+	}
+	var drops rtps.Counter
+	if err := rtps.ValidateHeaderExtensionPlacement(data, raws, &drops); err != nil {
+		return fmt.Errorf("dds: sedp header extension: %w", errors.Join(err, ErrSEDPInvalidDATA))
+	}
+	return nil
+}
+
 // sedpCheckInfoDstUnicast enforces INFO_DST on unicast ingress.
 //
 // It shares the walk with the SPDP helper and the backend demux through
 // rtps.ClassifyUnicastInfoDst so all three agree: absent, zero-length, or
-// all-zero INFO_DST processes normally, mismatch or short non-empty bodies
-// drop loudly with ErrSEDPInfoDst. Undecodable datagrams classify as
-// absent and return nil so the caller flows to the normal decode path,
-// which counts the failure. Multicast ingress must never call this
-// helper: group sockets carry every sender, so per-sender identity has no
-// meaning there and enforcement would drop valid peers.
+// all-zero INFO_DST processes normally, mismatch drops loudly with
+// ErrSEDPInfoDst, and short non-empty or undecodable INFO_DST bodies drop
+// loudly fail-closed with ErrSEDPInfoDst. Multicast ingress must never
+// call this helper: group sockets carry every sender, so per-sender
+// identity has no meaning there and enforcement would drop valid peers.
 func sedpCheckInfoDstUnicast(data []byte, local SEDPGUIDPrefix) error {
 	var want [12]byte
 	copy(want[:], local[:])
@@ -1864,11 +2138,17 @@ func sedpHeartbeatWriterOf(body []byte) (SEDPEntityID, bool) {
 
 // scanSedpControl walks one datagram for want submessages.
 // It validates each sub via knownInvalidSubmessage; a known invalid drops
-// the rest per 8.3.4.1 rule 6. For each matching want sub it calls handle;
+// the rest per 8.3.4.1 rule 6. RTPS_HE placement validates first per
+// 8.3.7.3: a malformed or mispositioned extension drops the whole walk
+// before any handle runs. For each matching want sub it calls handle;
 // when handle reports true the scan stops. Split failures stop the scan.
 func scanSedpControl(data []byte, want byte, handle func(body []byte, flags byte) bool) {
 	err := sedpValidateRTPSHeader(data)
 	if err != nil {
+		return
+	}
+	if err := sedpValidateHeaderExtension(data); err != nil {
+		log.Printf("dds: sedp scan header extension invalid, dropping: %v", err)
 		return
 	}
 	off := sedpRTPSHeaderLen
@@ -1979,14 +2259,10 @@ func (idx *SEDPIndex) ingestSample(data []byte) error {
 	}
 	idx.noteSedpHeartbeats(data, prefix)
 	idx.applySedpGapsFromDatagram(data, prefix)
+	idx.noteRemoteTopics(data)
 	bodies, flags, err := sedpFindAllEndpointDATA(data)
 	if err != nil {
-		sedpTracef("ingest parse reject len=%d err=%v", len(data), err)
-		if errors.Is(err, ErrSEDPInvalidDATA) && (sedpIsSEDPControl(data) || sedpHasTopicsDATA(data)) {
-			sedpTracef("ingest control skip len=%d", len(data))
-			return nil
-		}
-		return fmt.Errorf("dds: sedp listen parse: %w", err)
+		return ingestFindError(data, err)
 	}
 
 	var firstErr error
@@ -2008,6 +2284,58 @@ func (idx *SEDPIndex) ingestSample(data []byte) error {
 		}
 	}
 	return ingestOutcomeError(installed, stale, firstErr)
+}
+
+// noteRemoteTopics installs remotely announced Topics DATA best-effort.
+//
+// A spec peer announcing TopicBuiltinTopicData sends no endpoint DATA,
+// which is a known builtin, not poison: each decodable topic installs
+// into the remote topic set without touching endpoints, sequence gates,
+// or the endpoint generation. Topics DATA from the 0x000002c2 writer
+// never installs an endpoint: endpoint decode rejects the Topics writer
+// and topic bodies never reach the endpoint path. Key-flagged or
+// unregister samples remove the topic when present. Malformed entries
+// skip with a trace so one poison entry never drops endpoint DATA in a
+// mixed datagram; the endpoint path still reports its own errors.
+func (idx *SEDPIndex) noteRemoteTopics(data []byte) {
+	bodies, flags, err := sedpFindAllTopicsDATA(data)
+	if err != nil {
+		return
+	}
+	for i := range bodies {
+		topic, derr := sedpDecodeTopicsBody(bodies[i], flags[i])
+		if derr != nil {
+			sedpTracef("topics note skip index=%d/%d err=%v", i, len(bodies), derr)
+			continue
+		}
+		if flags[i]&sedpFlagKeyPresent != 0 || sedpIsUnregister(bodies[i], flags[i]) {
+			sedpTracef("topics note remove dds=%q typeDDS=%q", topic.DDSTopic, topic.TypeDDS)
+			idx.removeRemoteTopic(topic)
+			continue
+		}
+		sedpTracef("topics note install dds=%q typeDDS=%q", topic.DDSTopic, topic.TypeDDS)
+		idx.installRemoteTopic(topic)
+	}
+}
+
+// ingestFindError maps an endpoint walk failure to a loud or quiet result.
+//
+// An RTPS_HE violation is never a quiet control skip: the heartbeat, gap,
+// and topic walks already dropped the datagram fail-closed above, so it
+// reports loudly instead of masking the attack as a benign control
+// sample. Control-only and Topics-only datagrams skip quietly; anything
+// else reports loudly.
+func ingestFindError(data []byte, err error) error {
+	sedpTracef("ingest parse reject len=%d err=%v", len(data), err)
+	if herr := sedpValidateHeaderExtension(data); herr != nil {
+		return fmt.Errorf("dds: sedp listen parse: %w", herr)
+	}
+	if errors.Is(err, ErrSEDPInvalidDATA) && (sedpIsSEDPControl(data) || sedpHasTopicsDATA(data)) {
+		sedpTracef("ingest control skip len=%d", len(data))
+		return nil
+	}
+
+	return fmt.Errorf("dds: sedp listen parse: %w", err)
 }
 
 // ingestOutcomeError maps an ingest tally to its result.
@@ -2106,7 +2434,7 @@ func (idx *SEDPIndex) ingestOneEndpoint(header SEDPGUIDPrefix, body []byte, flag
 
 		return false, true, nil
 	}
-	err = idx.UpsertRemote(ep)
+	err = idx.UpsertRemoteChecked(header, ep)
 	if err != nil {
 		sedpTracef("ingest upsert reject guid=%s err=%v", ep.ID.String(), err)
 		return false, false, err
@@ -2391,13 +2719,9 @@ func sedpTopicsSlicesEqual(a, b []SEDPTopic) bool {
 //
 // It mirrors sedpAnnounceSnapshot for the Topics builtin writer so spec
 // peers learn TopicBuiltinTopicData alongside endpoint DATA. A snapshot
-// with zero topics sends nothing.
-//
-// TODO(backend-owner): announceWithRoutes, announceTick, and
-// announceInitial in backend.go still send endpoint-only snapshots via
-// sedpAnnounceSnapshot. Wire TopicsSnapshot plus
-// sedpAnnounceTopicsSnapshot there so backend-driven announces carry
-// TopicBuiltinTopicData too.
+// with zero topics sends nothing. Backend-driven announces in backend.go
+// (announceWithRoutes, announceTick, announceInitial) carry topics via
+// this helper per 8.5.4.
 func sedpAnnounceTopicsSnapshot(ctx context.Context, s SEDPSender, prefix SEDPGUIDPrefix, topics []SEDPTopic) error {
 	for _, topic := range topics {
 		select {
@@ -3381,11 +3705,17 @@ func sedpFindAllEndpointDATA(data []byte) ([][]byte, []byte, error) {
 //
 // The submessage walk caps at sedpMaxSubmessages before dispatch; over-cap
 // datagrams drop loudly instead of trusting an unbounded header chain.
+// RTPS_HE placement validates first per 8.3.7.3 so a malformed or
+// mispositioned extension drops fail-closed instead of walking past it.
 // what names the builtin for the empty error, such as endpoint or topics.
 func sedpFindAllBuiltinDATA(data []byte, match func(SEDPEntityID) bool, what string) ([][]byte, []byte, error) {
 	err := sedpValidateRTPSHeader(data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dds: sedp parse header: %w", err)
+	}
+
+	if err := sedpValidateHeaderExtension(data); err != nil {
+		return nil, nil, err
 	}
 
 	off := sedpRTPSHeaderLen
@@ -4567,6 +4897,10 @@ func sedpEndpointsTypeEqual(a, b SEDPEndpoint) bool {
 		return false
 	}
 
+	if a.DomainTag != b.DomainTag {
+		return false
+	}
+
 	return a.DomainID == b.DomainID
 }
 
@@ -4716,27 +5050,42 @@ func sedpSortEndpoints(eps []SEDPEndpoint) {
 // INTEGRATION state for SEDP discovery hardening.
 //
 // Done in this file: endpoint GUID binds to the RTPS header prefix with a
-// loud drop on mismatch, so spoofed endpoints never install; replay gates
+// loud drop on mismatch, so spoofed endpoints never install; UpsertRemote
+// documents the trust requirement while UpsertRemoteChecked enforces the
+// binding fail-closed and ingest uses the checked form; replay gates
 // on the per-endpoint DATA sequence after successful upsert, with the
 // sequence recorded only when the endpoint installs and never before
-// validation; seq 0 never advances lastSeq; the parameter list caps at
-// sedpMaxParams entries before full decode via a header pre-walk, with NUL
-// termination checks as before; the datagram submessage walk caps at
-// sedpMaxSubmessages (64) before dispatch with a loud drop on over-cap;
-// HEARTBEAT Count tracks per builtin writer with replay ignore (Count at
-// or below last with no new LastSequence draws no work) and Count==0
-// handled as single processing per LastSequence without a NACK storm,
-// documented on sedpHeartbeatNote; GAP decodes the full skipped list and
-// applies it in order via sedpApplyGapList, clamped to the known heartbeat
-// bound plus one and capped at current high plus sedpGapNoBoundCap (64,
-// one repair window) when no bound is known; unicast INFO_DST enforcement
-// lives in sedpCheckInfoDstUnicast, which unicast ingress must call.
+// validation; provisional installs gate on the DATA sequence (zero and
+// stale reject) with the same remotes cap; seq 0 never advances lastSeq;
+// domain tags enforce exact equality per 8.5.5.1 (empty equals only
+// empty, no wildcards) at upsert and provisional install; remote topics
+// install from the Topics writer into a separate advisory set that never
+// installs endpoints nor bumps the endpoint generation; the parameter
+// list caps at sedpMaxParams entries before full decode via a header
+// pre-walk, with NUL termination checks as before; the datagram submessage
+// walk caps at sedpMaxSubmessages (4096, matching rtps) before dispatch
+// with a loud drop on over-cap; RTPS_HE bodies validate as known typed
+// submessages and placement validates first per 8.3.7.3 (malformed or
+// mispositioned extensions drop fail-closed) in both the builtin DATA
+// walk and the control scan; HEARTBEAT Count tracks per builtin writer
+// with replay ignore (Count at or below last with no new LastSequence
+// draws no work) and Count==0 handled as single processing per
+// LastSequence without a NACK storm, documented on sedpHeartbeatNote;
+// GAP decodes the full skipped list and applies it in order via
+// sedpApplyGapList, clamped to the known heartbeat bound plus one and
+// capped at current high plus sedpGapNoBoundCap (64, one repair window)
+// when no bound is known; unicast INFO_DST enforcement lives in
+// sedpCheckInfoDstUnicast, which unicast callers must call (multicast
+// never calls it).
 //
 // Done elsewhere: backend shouldDropUnicastForInfoDst enforces the same
 // unicast INFO_DST on the live socket path; backend noteSedpHeartbeatBound
 // plus applySedpGaps mirror the writer bound and full gap list for ACK
-// decisions; rtps DecodeMessage caps submessages at 4096 before dispatch
-// and DecodeGap bounds the trailing set.
+// decisions; backend sedpBuiltinWriter routes the Topics (0x02) plus
+// publications (0x03) plus subscriptions (0x04) writers to the SEDP queue
+// and excludes all three from the user data path; rtps DecodeMessage caps
+// submessages at 4096 before dispatch and DecodeGap bounds the trailing
+// set.
 //
 // Explicitly open and unenforced: multicast ingress never calls the
 // INFO_DST helper because group sockets carry every sender and have no

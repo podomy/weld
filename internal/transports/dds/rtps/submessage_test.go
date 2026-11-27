@@ -328,9 +328,9 @@ func TestHeartbeat(t *testing.T) {
 	}
 
 	var drops rtps.Counter
-	back, err := rtps.DecodeHeartbeat(append(got, 0xFF, 0xFF), beat.Flags(true, true, false), &drops)
+	back, err := rtps.DecodeHeartbeat(got, beat.Flags(true, true, false), &drops)
 	if err != nil {
-		t.Fatalf("decode with trailing: %v", err)
+		t.Fatalf("decode: %v", err)
 	}
 	if back != beat {
 		t.Fatalf("round trip = %+v, want %+v", back, beat)
@@ -344,6 +344,30 @@ func TestHeartbeat(t *testing.T) {
 	}
 	if _, err := rtps.DecodeHeartbeat(got[:27], 0x01, &drops); err == nil {
 		t.Fatalf("short heartbeat succeeded, want error")
+	}
+	if _, err := rtps.DecodeHeartbeat(append(got, 0xFF, 0xFF), 0x01, &drops); err == nil {
+		t.Fatalf("trailing heartbeat succeeded, want error")
+	}
+	if drops.Count() != 2 {
+		t.Fatalf("drops = %d, want 2", drops.Count())
+	}
+}
+
+// TestHeartbeatTrailingExact pins the fixed 28 byte width per 8.3.8.6.
+func TestHeartbeatTrailingExact(t *testing.T) {
+	t.Parallel()
+
+	beat := rtps.Heartbeat{
+		ReaderID:      rtps.EntityUnknown,
+		WriterID:      rtps.EntitySPDPWriter,
+		FirstSequence: 1,
+		LastSequence:  5,
+		Count:         9,
+	}
+	got := beat.Encode(true)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeHeartbeat(append(got, 0x00), 0x01, &drops); err == nil {
+		t.Fatalf("trailing heartbeat succeeded, want error")
 	}
 	if drops.Count() != 1 {
 		t.Fatalf("drops = %d, want 1", drops.Count())
@@ -536,19 +560,20 @@ func TestUnknownSubmessageSkipSweep(t *testing.T) {
 	t.Parallel()
 
 	known := map[uint8]bool{
-		rtps.SubmessagePad:           true,
-		rtps.SubmessageAckNack:       true,
-		rtps.SubmessageHeartbeat:     true,
-		rtps.SubmessageGap:           true,
-		rtps.SubmessageInfoTS:        true,
-		rtps.SubmessageInfoSrc:       true,
-		rtps.SubmessageInfoReplyIP4:  true,
-		rtps.SubmessageInfoDst:       true,
-		rtps.SubmessageInfoReply:     true,
-		rtps.SubmessageData:          true,
-		rtps.SubmessageDataFrag:      true,
-		rtps.SubmessageNackFrag:      true,
-		rtps.SubmessageHeartbeatFrag: true,
+		rtps.SubmessageHeaderExtension: true,
+		rtps.SubmessagePad:             true,
+		rtps.SubmessageAckNack:         true,
+		rtps.SubmessageHeartbeat:       true,
+		rtps.SubmessageGap:             true,
+		rtps.SubmessageInfoTS:          true,
+		rtps.SubmessageInfoSrc:         true,
+		rtps.SubmessageInfoReplyIP4:    true,
+		rtps.SubmessageInfoDst:         true,
+		rtps.SubmessageInfoReply:       true,
+		rtps.SubmessageData:            true,
+		rtps.SubmessageDataFrag:        true,
+		rtps.SubmessageNackFrag:        true,
+		rtps.SubmessageHeartbeatFrag:   true,
 	}
 	for id := range 256 {
 		raw := rtps.RawSubmessage{ID: uint8(id), Flags: 0x01, Body: []byte{0x01, 0x02, 0x03, 0x04}}
@@ -1025,19 +1050,39 @@ func TestInfoSrcInvalid(t *testing.T) {
 	}
 }
 
-// TestInfoSrcTrailingIgnored pins forward compatible trailing bytes.
-func TestInfoSrcTrailingIgnored(t *testing.T) {
+// TestInfoTSExactSize pins the fixed 8 byte valid width per 8.3.8.9.
+func TestInfoTSExactSize(t *testing.T) {
+	t.Parallel()
+
+	stamp := rtps.InfoTS{Valid: true, Seconds: 1, Fraction: 2}
+	body := append(stamp.Encode(true), 0x00)
+	var drops rtps.Counter
+	if _, err := rtps.DecodeInfoTS(body, stamp.Flags(true), &drops); err == nil {
+		t.Fatalf("trailing info_ts succeeded, want error")
+	}
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+}
+
+// TestInfoSrcExactSize pins the fixed 5 byte width per 8.3.8.10.
+func TestInfoSrcExactSize(t *testing.T) {
 	t.Parallel()
 
 	src := rtps.InfoSrc{Major: 2, Minor: 1, Vendor: [2]byte{0x01, 0x01}}
 	body := append(src.Encode(), 0xFF, 0xFF)
 	var drops rtps.Counter
-	back, err := rtps.DecodeInfoSrc(body, 0x01, &drops)
-	if err != nil {
-		t.Fatalf("decode trailing: %v", err)
+	if _, err := rtps.DecodeInfoSrc(body, 0x01, &drops); err == nil {
+		t.Fatalf("trailing info_src succeeded, want error")
 	}
-	if back != src {
-		t.Fatalf("trailing = %+v, want %+v", back, src)
+	if drops.Count() != 1 {
+		t.Fatalf("drops = %d, want 1", drops.Count())
+	}
+	if _, err := rtps.DecodeInfoSrc(src.Encode()[:4], 0x01, &drops); err == nil {
+		t.Fatalf("short info_src succeeded, want error")
+	}
+	if drops.Count() != 2 {
+		t.Fatalf("drops = %d, want 2", drops.Count())
 	}
 }
 
@@ -1070,6 +1115,7 @@ func TestIsKnownSubmessageID(t *testing.T) {
 	t.Parallel()
 
 	known := []uint8{
+		rtps.SubmessageHeaderExtension,
 		rtps.SubmessagePad,
 		rtps.SubmessageAckNack,
 		rtps.SubmessageHeartbeat,
@@ -1788,5 +1834,179 @@ func TestInfoSrcVendorFull(t *testing.T) {
 	}
 	if back.Vendor != src.Vendor {
 		t.Fatalf("vendor = % X, want AB CD", back.Vendor)
+	}
+}
+
+// splitTestDatagram walks one framed datagram into raw submessages for
+// placement tests, mirroring the wire header layout.
+func splitTestDatagram(t *testing.T, msg []byte) []rtps.RawSubmessage {
+	t.Helper()
+
+	if len(msg) < 20 {
+		t.Fatalf("datagram len = %d, want at least 20", len(msg))
+	}
+	var out []rtps.RawSubmessage
+	off := 20
+	for off < len(msg) {
+		if len(msg)-off < 4 {
+			t.Fatalf("submessage header truncated at %d", off)
+		}
+		id := msg[off]
+		flags := msg[off+1]
+		var ln int
+		if flags&0x01 != 0 {
+			ln = int(binary.LittleEndian.Uint16(msg[off+2 : off+4]))
+		} else {
+			ln = int(binary.BigEndian.Uint16(msg[off+2 : off+4]))
+		}
+		if off+4+ln > len(msg) {
+			t.Fatalf("submessage %#02x overruns datagram", id)
+		}
+		body := append([]byte(nil), msg[off+4:off+4+ln]...)
+		out = append(out, rtps.RawSubmessage{ID: id, Flags: flags, Body: body})
+		off += 4 + ln
+	}
+	return out
+}
+
+// TestDecodeSubmessageHeaderExtension pins typed HE dispatch per 8.3.7.3.
+func TestDecodeSubmessageHeaderExtension(t *testing.T) {
+	t.Parallel()
+
+	if !rtps.IsKnownSubmessageID(rtps.SubmessageHeaderExtension) {
+		t.Fatalf("HE %#02x not known, want known per 8.3.4", rtps.SubmessageHeaderExtension)
+	}
+	framed, err := rtps.EncodeHeaderExtension(rtps.HeaderExtension{LittleEndian: true})
+	if err != nil {
+		t.Fatalf("encode HE: %v", err)
+	}
+	raw := rtps.RawSubmessage{ID: rtps.SubmessageHeaderExtension, Flags: 0x01, Body: framed[4:]}
+	var drops rtps.Counter
+	got, err := rtps.DecodeSubmessage(raw, &drops)
+	if err != nil {
+		t.Fatalf("dispatch valid HE: %v", err)
+	}
+	if got.HeaderExtension == nil {
+		t.Fatalf("header extension missing after typed decode")
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+
+	// Malformed HE fails so callers invalidate the rest per 8.3.4.1 rule 6.
+	bad := rtps.RawSubmessage{ID: rtps.SubmessageHeaderExtension, Flags: 0x03, Body: []byte{0x01}}
+	var badDrops rtps.Counter
+	if _, err := rtps.DecodeSubmessage(bad, &badDrops); err == nil {
+		t.Fatalf("malformed HE succeeded, want error")
+	}
+	if badDrops.Count() != 1 {
+		t.Fatalf("bad drops = %d, want 1", badDrops.Count())
+	}
+
+	// Caller walk breaks on the known-invalid HE instead of continuing to
+	// the trailing DATA.
+	trailing, err := testData().Submessage(true)
+	if err != nil {
+		t.Fatalf("data submessage: %v", err)
+	}
+	walk := []rtps.RawSubmessage{bad, trailing}
+	broke := false
+	for _, r := range walk {
+		if _, err := rtps.DecodeSubmessage(r, &badDrops); err != nil {
+			broke = true
+			break
+		}
+	}
+	if !broke {
+		t.Fatalf("walk continued past malformed HE, want rule-6 break")
+	}
+}
+
+// TestValidateHeaderExtensionPlacement pins first-position plus checksum per 8.3.7.3.
+func TestValidateHeaderExtensionPlacement(t *testing.T) {
+	t.Parallel()
+
+	hdr := rtps.DefaultHeader(testPrefix())
+	ext := rtps.HeaderExtension{LittleEndian: true, Checksum: rtps.TCPChecksumCRC32}
+	msg, err := rtps.EncodeTCPMessage(hdr, &ext, checksumTestSubs())
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	raws := splitTestDatagram(t, msg)
+	var drops rtps.Counter
+	if err := rtps.ValidateHeaderExtensionPlacement(msg, raws, &drops); err != nil {
+		t.Fatalf("valid first HE: %v", err)
+	}
+	if drops.Count() != 0 {
+		t.Fatalf("drops = %d, want 0", drops.Count())
+	}
+}
+
+// TestValidateHeaderExtensionChecksum pins checksum fail-closed per 8.3.7.3.
+func TestValidateHeaderExtensionChecksum(t *testing.T) {
+	t.Parallel()
+
+	hdr := rtps.DefaultHeader(testPrefix())
+	ext := rtps.HeaderExtension{LittleEndian: true, Checksum: rtps.TCPChecksumCRC32}
+	msg, err := rtps.EncodeTCPMessage(hdr, &ext, checksumTestSubs())
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	raws := splitTestDatagram(t, msg)
+
+	bad := append([]byte(nil), msg...)
+	bad[len(bad)-1] ^= 0xFF
+	var tamperDrops rtps.Counter
+	if err := rtps.ValidateHeaderExtensionPlacement(bad, raws, &tamperDrops); err == nil {
+		t.Fatalf("tampered checksum succeeded, want error")
+	}
+	if tamperDrops.Count() != 1 {
+		t.Fatalf("tamper drops = %d, want 1", tamperDrops.Count())
+	}
+}
+
+// TestValidateHeaderExtensionMispositioned pins not-first fail-closed per 8.3.7.3.
+func TestValidateHeaderExtensionMispositioned(t *testing.T) {
+	t.Parallel()
+
+	hdr := rtps.DefaultHeader(testPrefix())
+	// Well-formed HE in a later position drops as mispositioned.
+	empty, err := rtps.EncodeHeaderExtension(rtps.HeaderExtension{LittleEndian: true})
+	if err != nil {
+		t.Fatalf("encode empty HE: %v", err)
+	}
+	stamp := rtps.InfoTS{Valid: true, Seconds: 1, Fraction: 2}
+	misplaced := []rtps.RawSubmessage{
+		{ID: rtps.SubmessageInfoTS, Flags: stamp.Flags(true), Body: stamp.Encode(true)},
+		{ID: rtps.SubmessageHeaderExtension, Flags: 0x01, Body: empty[4:]},
+	}
+	var wire []byte
+	raw := hdr.Encode()
+	wire = append(wire, raw[:]...)
+	for _, s := range misplaced {
+		f, err := rtps.WrapSubmessage(s.ID, s.Flags, s.Body)
+		if err != nil {
+			t.Fatalf("wrap: %v", err)
+		}
+		wire = append(wire, f...)
+	}
+	var misDrops rtps.Counter
+	if err := rtps.ValidateHeaderExtensionPlacement(wire, misplaced, &misDrops); err == nil {
+		t.Fatalf("mispositioned HE succeeded, want error")
+	}
+	if misDrops.Count() != 1 {
+		t.Fatalf("misplaced drops = %d, want 1", misDrops.Count())
+	}
+
+	// Malformed HE body drops fail-closed.
+	malformed := []rtps.RawSubmessage{
+		{ID: rtps.SubmessageHeaderExtension, Flags: 0x03, Body: []byte{0x01}},
+	}
+	var malDrops rtps.Counter
+	if err := rtps.ValidateHeaderExtensionPlacement(wire, malformed, &malDrops); err == nil {
+		t.Fatalf("malformed HE succeeded, want error")
+	}
+	if malDrops.Count() != 1 {
+		t.Fatalf("malformed drops = %d, want 1", malDrops.Count())
 	}
 }

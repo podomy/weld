@@ -316,6 +316,7 @@ func TestForwardQoSFramingGolden(t *testing.T) {
 		"1b000c00" + "00000000ffffff7fffffffff" +
 		"21000c00" + "000000000000000000000000" +
 		"27000800" + "0000000000000000" +
+		"11000400" + "00000000" +
 		"01000000"
 
 	if got != want {

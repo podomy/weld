@@ -140,35 +140,91 @@ var ackRtps1Mu sync.Mutex
 // ackRtps1Last tracks last applied ACK Count per reader.
 var ackRtps1Last = make(map[ackRtps1Key]int32)
 
-// shouldRtps1SkipAck reports whether an ACK Count replays the last applied.
+// shouldSkipReplayCount records one monotonic reader count and reports replay.
+//
 // Zero counts never suppress. New counts record and bound the table by
-// maxTrackedWriters with loud eviction after unlock.
-func shouldRtps1SkipAck(backend *Backend, reader WriterGUID, writer rtps.EntityID, count int32) bool {
+// maxTrackedWriters; eviction picks one entry matching evictBackend and
+// reports it for loud logging after unlock. It is the shared core of the
+// ACKNACK and NACKFRAG duplicate suppressors so the two paths stay
+// identical without duplicating the table discipline.
+func shouldSkipReplayCount[K comparable](mu *sync.Mutex, table map[K]int32, key K, count int32, evictBackend func(K) bool) (bool, *K) {
 	if count == 0 {
-		return false
+		return false, nil
 	}
-	ackRtps1Mu.Lock()
-	last, seen := ackRtps1Last[ackRtps1Key{backend: backend, reader: reader, writer: writer}]
+	mu.Lock()
+	last, seen := table[key]
 	if seen && count <= last {
-		ackRtps1Mu.Unlock()
-		return true
+		mu.Unlock()
+		return true, nil
 	}
-	ackRtps1Last[ackRtps1Key{backend: backend, reader: reader, writer: writer}] = count
-	var evicted ackRtps1Key
+	table[key] = count
+	var evicted K
 	haveEvicted := false
-	if len(ackRtps1Last) > maxTrackedWriters {
-		for k := range ackRtps1Last {
-			if k.backend == backend {
+	if len(table) > maxTrackedWriters {
+		for k := range table {
+			if evictBackend(k) {
 				evicted = k
 				haveEvicted = true
-				delete(ackRtps1Last, k)
+				delete(table, k)
 				break
 			}
 		}
 	}
-	ackRtps1Mu.Unlock()
+	mu.Unlock()
 	if haveEvicted {
+		return false, &evicted
+	}
+	return false, nil
+}
+
+// shouldRtps1SkipAck reports whether an ACK Count replays the last applied.
+// Zero counts never suppress. New counts record and bound the table by
+// maxTrackedWriters with loud eviction after unlock.
+func shouldRtps1SkipAck(backend *Backend, reader WriterGUID, writer rtps.EntityID, count int32) bool {
+	skip, evicted := shouldSkipReplayCount(&ackRtps1Mu, ackRtps1Last, ackRtps1Key{backend: backend, reader: reader, writer: writer}, count,
+		func(k ackRtps1Key) bool { return k.backend == backend })
+	if skip {
+		return true
+	}
+	if evicted != nil {
 		log.Printf("dds: ack table full evict reader=%x writer=%x", evicted.reader, evicted.writer)
+	}
+	return false
+}
+
+// nackFragRtps1Key identifies one NACKFRAG source for duplicate suppression.
+//
+// It mirrors ackRtps1Key (backend plus reader plus writer): the NACKFRAG
+// reader count is per-reader monotonic like ACKNACK, so the same count
+// replayed for any fragment set of the same writer suppresses. The
+// fragment sequence rides inside the request but does not join the key:
+// a replayed count for a different seq is still a replay, while a newer
+// count for any seq passes.
+type nackFragRtps1Key struct {
+	backend *Backend
+	reader  WriterGUID
+	writer  rtps.EntityID
+}
+
+// nackFragRtps1Mu guards nackFragRtps1Last.
+var nackFragRtps1Mu sync.Mutex
+
+// nackFragRtps1Last tracks last applied NACKFRAG Count per reader.
+var nackFragRtps1Last = make(map[nackFragRtps1Key]int32)
+
+// shouldRtps1SkipNackFrag reports whether a NACKFRAG Count replays the last applied.
+//
+// Zero counts never suppress. New counts record and bound the table by
+// maxTrackedWriters with loud eviction after unlock, mirroring
+// shouldRtps1SkipAck via the shared shouldSkipReplayCount helper.
+func shouldRtps1SkipNackFrag(backend *Backend, reader WriterGUID, writer rtps.EntityID, count int32) bool {
+	skip, evicted := shouldSkipReplayCount(&nackFragRtps1Mu, nackFragRtps1Last, nackFragRtps1Key{backend: backend, reader: reader, writer: writer}, count,
+		func(k nackFragRtps1Key) bool { return k.backend == backend })
+	if skip {
+		return true
+	}
+	if evicted != nil {
+		log.Printf("dds: nackfrag table full evict reader=%x writer=%x", evicted.reader, evicted.writer)
 	}
 	return false
 }
@@ -2890,8 +2946,9 @@ func (b *Backend) handleUserAck(
 // fragment repair, reporting whether the submessage was user control.
 // Malformed bodies count loudly; a non-user writer returns false so the
 // submessage can fall through to the DATA path like other non-user
-// control.
-func (b *Backend) handleUserNackFragRaw(sub rtps.RawSubmessage) bool {
+// control. Duplicate Counts per reader skip quietly as replays, mirroring
+// handleUserAck.
+func (b *Backend) handleUserNackFragRaw(header rtps.Header, sub rtps.RawSubmessage) bool {
 	rawReq, err := decodeUserNackFrag(
 		sub.Body,
 		sub.Flags,
@@ -2908,6 +2965,13 @@ func (b *Backend) handleUserNackFragRaw(sub rtps.RawSubmessage) bool {
 
 	if !isUserWriterEntity(rawReq.writer) {
 		return false
+	}
+
+	var reader WriterGUID
+	copy(reader[:12], header.Prefix[:])
+	copy(reader[12:16], rawReq.reader[:])
+	if shouldRtps1SkipNackFrag(b, reader, rawReq.writer, rawReq.count) {
+		return true
 	}
 
 	b.handleUserNackFrag(rawReq)
@@ -3043,7 +3107,7 @@ func (b *Backend) handleUserControl(
 
 		return true
 	case rtps.SubmessageNackFrag:
-		return b.handleUserNackFragRaw(sub)
+		return b.handleUserNackFragRaw(header, sub)
 	case rtps.SubmessageHeartbeat:
 		var drops rtps.Counter
 

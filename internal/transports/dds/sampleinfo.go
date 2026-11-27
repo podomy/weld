@@ -255,7 +255,9 @@ func (r *DataReceiver) readerStateFor() *readerState {
 // sample. Arrival never flips view: the info snapshots the live view and
 // only a delivered take or collect flips it on access, so a filtered or
 // dropped take leaves the instance unviewed. Rebirth on arrival resets
-// view to new with the matching generation increment. Generations come
+// view to new with NO generation increment: counters already incremented
+// on the transition INTO disposed/no-writers per DDS 1.4 section
+// 2.2.2.5.1, so revival only flips state. Generations come
 // from the instance counters. The returned info carries the pre-take
 // state while storage is marked read, so take-plus-info pairing is
 // atomic under one lock with no separate lookup.
@@ -271,7 +273,9 @@ func (r *DataReceiver) observeData(topic, typeIDL string, guid WriterGUID, seq u
 // exceeded; best-effort evicts oldest-first. It reports resource exhaustion
 // joining ErrResourceExhausted. New instances admit against MaxInstances
 // before creation per DDS 1.4 section 2.2.3.19; exhaustion fails closed
-// without creating the instance.
+// without creating the instance. A reliable keep-all block after creation
+// removes a newly auto-created empty instance so a blocked write leaves no
+// leak: MaxInstances plus a blocked write installs nothing.
 func (st *readerState) observeData(topic, typeIDL string, guid WriterGUID, seq uint64, payload []byte, at time.Time) (SampleInfo, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -280,7 +284,8 @@ func (st *readerState) observeData(topic, typeIDL string, guid WriterGUID, seq u
 
 	st.purgeLife5NotAliveLocked(at.UnixNano())
 
-	if !st.instanceExistsLocked(topic, typeIDL, guid, payload) {
+	existed := st.instanceExistsLocked(topic, typeIDL, guid, payload)
+	if !existed {
 		if err := st.admitLife5InstanceLocked(); err != nil {
 			st.violations++
 			return empty, err
@@ -290,12 +295,6 @@ func (st *readerState) observeData(topic, typeIDL string, guid WriterGUID, seq u
 	rec := st.instanceForLocked(topic, typeIDL, guid, payload)
 
 	if rec.state != InstanceStateAlive {
-		if rec.state == InstanceStateDisposed {
-			rec.disposedCount++
-		}
-		if rec.state == InstanceStateNoWriters {
-			rec.noWritersCount++
-		}
 		rec.state = InstanceStateAlive
 		rec.view = ViewStateNew
 		rec.notAliveAtLife5 = 0
@@ -303,6 +302,9 @@ func (st *readerState) observeData(topic, typeIDL string, guid WriterGUID, seq u
 
 	if st.blockingLife5ExceededLocked(rec.handle) {
 		st.violations++
+		if !existed {
+			st.deleteEmptyInstanceLocked(rec.handle)
+		}
 
 		return empty, fmt.Errorf("dds: reliable keep-all resource exhausted: %w", ErrResourceExhausted)
 	}
@@ -347,6 +349,31 @@ func (st *readerState) observeData(topic, typeIDL string, guid WriterGUID, seq u
 	rec.lastSeq = seq
 
 	return info, nil
+}
+
+// deleteEmptyInstanceLocked removes a newly created instance with no samples.
+//
+// It runs on a reliable keep-all block after auto-creation so a blocked
+// write leaves no empty instance behind. Only instances with no retained
+// history and no queued controls delete; live instances with samples stay.
+// The caller must hold st.mu.
+func (st *readerState) deleteEmptyInstanceLocked(handle [16]byte) {
+	for _, entry := range st.history {
+		if entry.sample.Info.InstanceHandle == handle {
+			return
+		}
+	}
+	for _, control := range st.controls {
+		if control.Info.InstanceHandle == handle {
+			return
+		}
+	}
+	delete(st.instances, handle)
+	for slot, h := range st.keyIndex {
+		if h == handle {
+			delete(st.keyIndex, slot)
+		}
+	}
 }
 
 // assignRanksLocked fills per-collection ranks per DDS 1.4 section 2.2.2.5.1.6.
@@ -776,9 +803,7 @@ func (st *readerState) blockingLife5ExceededLocked(handle [16]byte) bool {
 // waiting for the next read or take. Only instances with no retained
 // history samples purge; controls for purged handles drop with the
 // instance. It returns the purged handle count for loud accounting.
-// TODO backend agent - drive SweepAgedInstances from the sweepLoop owner on
-// a timer (for example once per second with receiverNow) instead of only on
-// observe/collect paths; see purgeLife5NotAliveLocked for the lazy path.
+// Wired from Backend.sweepOnce plus advertiseWriterHistory on a timer.
 func (st *readerState) SweepAgedInstances(nowNanos int64) int {
 	purged := 0
 	for handle, rec := range st.instances {

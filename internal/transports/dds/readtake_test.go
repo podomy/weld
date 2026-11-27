@@ -562,8 +562,10 @@ func TestLife5ControlOldGenerationKeepsNew(t *testing.T) {
 	st := recv.readerStateFor()
 	st.mu.Lock()
 	rec := st.instances[handle]
+	// Post-transition control carries 1; bump the live record to 2 so the
+	// queued control reads as the old generation per DDS 1.4 2.2.2.5.1.6.
 	rec.state = InstanceStateAlive
-	rec.disposedCount = 1
+	rec.disposedCount = 2
 	rec.view = ViewStateNew
 	st.mu.Unlock()
 
@@ -572,8 +574,8 @@ func TestLife5ControlOldGenerationKeepsNew(t *testing.T) {
 		t.Fatalf("take old-gen control: %v", err)
 	}
 
-	if control.Info.DisposedGenerationCount != 0 {
-		t.Fatalf("control disposed count = %d, want 0 old generation", control.Info.DisposedGenerationCount)
+	if control.Info.DisposedGenerationCount != 1 {
+		t.Fatalf("control disposed count = %d, want 1 old generation", control.Info.DisposedGenerationCount)
 	}
 
 	st.mu.Lock()

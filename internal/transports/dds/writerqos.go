@@ -48,6 +48,9 @@ const (
 	writerQoSPIDPresentation uint16 = 0x0021
 	// writerQoSPIDLatencyBudget carries the latency budget duration.
 	writerQoSPIDLatencyBudget uint16 = 0x0027
+	// writerQoSPIDOwnership carries the ownership kind (SHARED 0, EXCLUSIVE 1)
+	// per DDS 1.4 section 2.2.3.9 and DDSI-RTPS Table 9.13 PID_OWNERSHIP 0x0011.
+	writerQoSPIDOwnership uint16 = 0x0011
 )
 
 // Writer QoS wire kind values.
@@ -74,6 +77,10 @@ const (
 	writerQoSLivelinessManualByParticipant uint32 = 1
 	// writerQoSLivelinessManualByTopic is the DDS manual by topic kind.
 	writerQoSLivelinessManualByTopic uint32 = 2
+	// writerQoSOwnershipShared is the DDS SHARED ownership kind.
+	writerQoSOwnershipShared uint32 = 0
+	// writerQoSOwnershipExclusive is the DDS EXCLUSIVE ownership kind.
+	writerQoSOwnershipExclusive uint32 = 1
 )
 
 // Writer QoS duration bounds for the DDS Duration_t range.
@@ -257,6 +264,10 @@ type WireQoS struct {
 	PresentationOrdered uint32
 	// LatencyBudget is the maximum acceptable delay per DDS 1.4 section 2.2.3.8.
 	LatencyBudget WireDuration
+	// OwnershipKind is shared 0 or exclusive 1 per DDS 1.4 section 2.2.3.9.
+	// Forward announces it; reverse fails closed on unknown kinds so a
+	// SHARED versus EXCLUSIVE mismatch never matches silently.
+	OwnershipKind uint32
 }
 
 // WireQoSRefusal is the typed loud refusal for an untranslatable setting.
@@ -445,6 +456,24 @@ func forwardLivelinessKind(topic, publisher, subscriber string, l core.Livelines
 	}
 }
 
+// forwardOwnershipKind maps ownership to the wire kind.
+//
+// SHARED 0 and EXCLUSIVE 1 announce per DDS 1.4 section 2.2.3.9; the zero
+// value (SHARED) is the DDS default so omitted profiles stay concrete.
+// Unresolved markers refuse loudly instead of downgrading silently.
+func forwardOwnershipKind(topic, publisher, subscriber string, o core.Ownershipqos4Policy) (uint32, error) {
+	switch o { //nolint:exhaustive // default refuses unresolved markers with a typed error
+	case core.Ownershipqos4Shared:
+		return writerQoSOwnershipShared, nil
+	case core.Ownershipqos4Exclusive:
+		return writerQoSOwnershipExclusive, nil
+	default:
+		err := refuseWriterQoSError(topic, publisher, subscriber, core.Policyqos4Ownership,
+			"ownership %v needs resolution before forward translation", o)
+		return 0, err
+	}
+}
+
 // forwardPresentation maps presentation to wire scope plus flags.
 //
 // Access scope instance 0, topic 1, or group 2 announces directly per DDS 1.4
@@ -577,6 +606,13 @@ func ForwardQoS(topic, publisher, subscriber string, p core.QoSProfile) (WireQoS
 	out.Lifespan = lifespan
 	out.LeaseDuration = lease
 
+	ownershipKind, err := forwardOwnershipKind(topic, publisher, subscriber, p.Ownershipqos4)
+	if err != nil {
+		return WireQoS{}, err
+	}
+
+	out.OwnershipKind = ownershipKind
+
 	return out, nil
 }
 
@@ -628,6 +664,11 @@ func (q WireQoS) encodePresentation() []byte {
 // encodeLatencyBudget renders the latency budget PID value: duration only.
 func (q WireQoS) encodeLatencyBudget() []byte {
 	return q.LatencyBudget.encode()
+}
+
+// encodeOwnership renders the ownership PID value: kind only.
+func (q WireQoS) encodeOwnership() []byte {
+	return binary.LittleEndian.AppendUint32(nil, q.OwnershipKind)
 }
 
 // decodePresentation parses one 12 byte presentation value.
@@ -701,7 +742,21 @@ func (q WireQoS) Validate() error {
 	if err := q.validateWireLiveliness(); err != nil {
 		return err
 	}
-	return q.validateWirePresentation()
+	if err := q.validateWirePresentation(); err != nil {
+		return err
+	}
+	return q.validateWireOwnership()
+}
+
+// validateWireOwnership checks ownership kind announcability.
+//
+// Only SHARED 0 and EXCLUSIVE 1 announce per DDS 1.4 section 2.2.3.9;
+// unknown kinds refuse fail-closed so a mismatch never matches silently.
+func (q WireQoS) validateWireOwnership() error {
+	if q.OwnershipKind == writerQoSOwnershipShared || q.OwnershipKind == writerQoSOwnershipExclusive {
+		return nil
+	}
+	return refuseParseError(core.Policyqos4Ownership, "ownership kind %d is not announcable", q.OwnershipKind)
 }
 
 // validateWireDurability checks durability kind announcability.
@@ -784,19 +839,20 @@ func (q WireQoS) ValidatedParams() ([]rtps.Param, error) {
 		{ID: writerQoSPIDLiveliness, Value: q.encodeLiveliness()},
 		{ID: writerQoSPIDPresentation, Value: q.encodePresentation()},
 		{ID: writerQoSPIDLatencyBudget, Value: q.encodeLatencyBudget()},
+		{ID: writerQoSPIDOwnership, Value: q.encodeOwnership()},
 	}, nil
 }
 
 // Params renders q as SEDP inline QoS params in canonical order.
 //
 // Order is reliability, history, durability, then deadline, lifespan,
-// liveliness, presentation, and latency budget: the first three keep their
+// liveliness, presentation, latency budget, and ownership: the first three keep their
 // existing SerializeSEDPDATA relative order and the new PIDs append after,
 // so a future announce call site can splice this list in without reordering
 // the old bytes. SEDP announce wiring lives in sedp.go (NOT owned here):
-// TODO backend agent - splice ValidatedParams/Params into SerializeSEDPDATA
-// and decode PID 0x0021/0x0027 in sedpEndpointFields via the
-// DecodePresentation/DecodeLatencyBudget helpers below.
+// TODO sedp owner - splice ValidatedParams/Params into SerializeSEDPDATA
+// and decode PID 0x0021/0x0027/0x0011 in sedpEndpointFields via the
+// DecodePresentation/DecodeLatencyBudget/DecodeOwnership helpers below.
 // validates before encoding and panics loudly on invalid input because a
 // manually constructed invalid WireQoS is a programmer error; production
 // ForwardQoS output always validates. Never call Params with
@@ -863,7 +919,7 @@ func parseWireHistory(byID map[uint16][]byte) (uint32, uint32, error) {
 	return binary.LittleEndian.Uint32(raw[:4]), binary.LittleEndian.Uint32(raw[4:8]), nil
 }
 
-// parseWireOptionalDurations decodes optional deadline, lifespan, liveliness, presentation, and latency budget.
+// parseWireOptionalDurations decodes optional deadline, lifespan, liveliness, presentation, latency budget, and ownership.
 func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 	if err := parseWireDeadline(byID, out); err != nil {
 		return err
@@ -877,7 +933,10 @@ func parseWireOptionalDurations(byID map[uint16][]byte, out *WireQoS) error {
 	if err := parseWirePresentation(byID, out); err != nil {
 		return err
 	}
-	return parseWireLatencyBudget(byID, out)
+	if err := parseWireLatencyBudget(byID, out); err != nil {
+		return err
+	}
+	return parseWireOwnership(byID, out)
 }
 
 // parseWireDeadline decodes optional deadline duration.
@@ -953,6 +1012,63 @@ func parseWireLatencyBudget(byID map[uint16][]byte, out *WireQoS) error {
 		return err
 	}
 	out.LatencyBudget = budget
+	return nil
+}
+
+// parseWireOwnership decodes the optional ownership kind.
+//
+// Absent ownership defaults to SHARED 0 per DDS 1.4 section 2.2.3.9 (the
+// DDS default); present values must be 4 bytes. Malformed lengths refuse
+// loudly fail-closed so a truncated kind never matches silently.
+func parseWireOwnership(byID map[uint16][]byte, out *WireQoS) error {
+	raw, seen := byID[writerQoSPIDOwnership]
+	if !seen {
+		out.OwnershipKind = writerQoSOwnershipShared
+		return nil
+	}
+	if len(raw) != 4 {
+		return refuseParseError(core.Policyqos4Ownership, "ownership length %d, want 4", len(raw))
+	}
+	out.OwnershipKind = binary.LittleEndian.Uint32(raw)
+	return nil
+}
+
+// DecodeOwnership parses one ownership PID value for SEDP wiring.
+//
+// It exists here so sedp.go (NOT owned) can wire PID 0x0011 without
+// touching this file: TODO sedp owner - call DecodeOwnership in
+// sedpEndpointFields for PID 0x0011 and carry the kind on SEDPEndpoint,
+// defaulting absent to SHARED 0 per DDS 1.4 section 2.2.3.9.
+func DecodeOwnership(raw []byte) (uint32, error) {
+	if len(raw) != 4 {
+		return 0, refuseParseError(core.Policyqos4Ownership, "ownership length %d, want 4", len(raw))
+	}
+	return binary.LittleEndian.Uint32(raw), nil
+}
+
+// EncodeOwnership renders one ownership PID value for SEDP announce.
+func EncodeOwnership(kind uint32) []byte {
+	return binary.LittleEndian.AppendUint32(nil, kind)
+}
+
+// CheckOwnershipWireCompatible reports whether two wire ownership kinds match.
+//
+// SHARED versus EXCLUSIVE mismatch is incompatible fail-closed per DDS 1.4
+// section 2.2.3.9.2; unknown kinds refuse loudly. SEDP callers (sedp.go NOT
+// owned) should call this after DecodeOwnership on both endpoints when the
+// full CheckWireCompatibility path is unavailable:
+// TODO sedp owner - call CheckOwnershipWireCompatible in the SEDP match
+// path (near SEDPEndpointsMatch) for the ownership RxO check.
+func CheckOwnershipWireCompatible(offered, requested uint32) error {
+	if offered != writerQoSOwnershipShared && offered != writerQoSOwnershipExclusive {
+		return refuseReverseError(core.Policyqos4Ownership, "ownership kind %d is unknown", offered)
+	}
+	if requested != writerQoSOwnershipShared && requested != writerQoSOwnershipExclusive {
+		return refuseReverseError(core.Policyqos4Ownership, "ownership kind %d is unknown", requested)
+	}
+	if offered != requested {
+		return refuseReverseError(core.Policyqos4Ownership, "offered ownership %d does not match requested %d", offered, requested)
+	}
 	return nil
 }
 
@@ -1046,6 +1162,7 @@ func ParseWireQoS(params []rtps.Param) (WireQoS, error) {
 	out.PresentationCoherent = 0
 	out.PresentationOrdered = 0
 	out.LatencyBudget = WireDuration{}
+	out.OwnershipKind = writerQoSOwnershipShared
 
 	err = parseWireOptionalDurations(byID, &out)
 	if err != nil {
@@ -1248,6 +1365,22 @@ func reversePresentation(q WireQoS) (core.PresentationQosPolicy, WriterPolicyKin
 	return out, "", nil
 }
 
+// reverseOwnership maps wire ownership kind to core ownership.
+//
+// Only SHARED 0 and EXCLUSIVE 1 map per DDS 1.4 section 2.2.3.9; unknown
+// kinds refuse loudly fail-closed so a SHARED versus EXCLUSIVE mismatch
+// never matches silently via the zero value.
+func reverseOwnership(q WireQoS) (core.Ownershipqos4Policy, WriterPolicyKind, error) {
+	switch q.OwnershipKind {
+	case writerQoSOwnershipShared:
+		return core.Ownershipqos4Shared, "", nil
+	case writerQoSOwnershipExclusive:
+		return core.Ownershipqos4Exclusive, "", nil
+	default:
+		return core.Ownershipqos4Policy(0), core.Policyqos4Ownership, refuseReverseError(core.Policyqos4Ownership, "ownership kind %d is unknown", q.OwnershipKind)
+	}
+}
+
 // reverseLifeDurations maps wire deadline, lifespan, and lease to core durations.
 func reverseLifeDurations(q WireQoS) (core.Duration, core.Duration, core.Duration, WriterPolicyKind, error) {
 	deadline, err := reverseWireDuration(q.Deadline, core.PolicyDeadline)
@@ -1325,13 +1458,21 @@ func reverseWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
 
 	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
 
+	ownership, policy, err := reverseOwnership(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Ownershipqos4 = ownership
+
 	return out, "", nil
 }
 
 // ReverseQoS translates a wire QoS back to a core profile for matching.
 //
 // All durability, liveliness, presentation, and latency kinds map directly
-// per DDS 1.4 sections 2.2.3.4, 2.2.3.11, 2.2.3.6, and 2.2.3.8. Unknown
+// per DDS 1.4 sections 2.2.3.4, 2.2.3.11, 2.2.3.6, and 2.2.3.8, plus
+// ownership SHARED/EXCLUSIVE per 2.2.3.9. Unknown
 // history, reliability, durability, liveliness, and presentation values
 // refuse loudly with the policy kind named. Durations convert with infinite
 // mapping. The avoidance flag is never carried on the wire and returns
@@ -1348,9 +1489,10 @@ func ReverseQoS(q WireQoS) (core.QoSProfile, error) {
 // reverseRxOWithPolicy translates only RxO-relevant wire fields back for matching.
 //
 // It reverses reliability, durability, deadline, liveliness, lease,
-// presentation, and latency budget and delegates to core.CheckCompatibility,
+// presentation, latency budget, and ownership and delegates to core.CheckCompatibility,
 // so the verdict reuses the exact matcher semantics for those policies:
-// translated offers match identically to facade offers. History, depth,
+// translated offers match identically to facade offers, and a SHARED versus
+// EXCLUSIVE mismatch fails closed per DDS 1.4 section 2.2.3.9.2. History, depth,
 // lifespan, and the avoidance flag never affect the verdict, matching the
 // documented contract and core semantics. Non-RxO translation failures are
 // ignored; RxO failures yield a refusing policy for the loud incompatible
@@ -1408,13 +1550,20 @@ func reverseRxOWithPolicy(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) 
 
 	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
 
+	ownership, policy, err := reverseOwnership(q)
+	if err != nil {
+		return core.QoSProfile{}, policy, err
+	}
+
+	out.Ownershipqos4 = ownership
+
 	return out, "", nil
 }
 
 // CheckWireCompatibility applies the core RxO rules to translated wire values.
 //
 // It reverses RxO-relevant fields (reliability, durability, deadline,
-// liveliness, lease, presentation, latency budget) back to core profiles
+// liveliness, lease, presentation, latency budget, ownership) back to core profiles
 // and delegates to core.CheckCompatibility, so the verdict reuses the exact
 // matcher semantics: translated offers match identically to facade offers.
 // History, depth, lifespan, and the avoidance flag never affect the result,
@@ -1510,67 +1659,11 @@ func CheckWireCompatibilityWithDurabilityService(offered, requested WireQoS, off
 // reverseRxOLenient translates RxO wire fields with transient and persistent
 // durability mapped instead of refused.
 //
-// All durability, liveliness, presentation, and latency kinds map exactly
-// like reverseRxOWithPolicy; this lenient form is kept for the caps-aware
-// compatibility path so durability-service enforces per DDS 1.4 section
-// 2.2.3.5. It now delegates to the shared reverse helpers.
+// All durability, liveliness, presentation, latency, and ownership kinds map
+// exactly like reverseRxOWithPolicy; this lenient form is kept for the
+// caps-aware compatibility path so durability-service enforces per DDS 1.4
+// section 2.2.3.5. It delegates to reverseRxOWithPolicy since strict reverse
+// already maps all four durability kinds.
 func reverseRxOLenient(q WireQoS) (core.QoSProfile, WriterPolicyKind, error) {
-	var out core.QoSProfile
-
-	reliability, policy, err := reverseReliability(q)
-	if err != nil {
-		return core.QoSProfile{}, policy, err
-	}
-
-	out.Reliability = reliability
-
-	switch q.DurabilityKind {
-	case sedpDurabilityVolatile:
-		out.Durability = core.DurabilityVolatile
-	case sedpDurabilityTransientLocal:
-		out.Durability = core.DurabilityTransientLocal
-	case writerQoSDurabilityTransient:
-		out.Durability = core.Durabilityqos4Transient
-	case writerQoSDurabilityPersistent:
-		out.Durability = core.Durabilityqos4Persistent
-	default:
-		return core.QoSProfile{}, core.PolicyDurability, refuseReverseError(core.PolicyDurability, "durability kind %d is unknown", q.DurabilityKind)
-	}
-
-	liveliness, policy, err := reverseLiveliness(q)
-	if err != nil {
-		return core.QoSProfile{}, policy, err
-	}
-
-	out.Liveliness = liveliness
-
-	deadline, err := reverseWireDuration(q.Deadline, core.PolicyDeadline)
-	if err != nil {
-		return core.QoSProfile{}, core.PolicyDeadline, err
-	}
-
-	out.Deadline = deadline
-
-	lease, err := reverseWireDuration(q.LeaseDuration, core.PolicyLeaseDuration)
-	if err != nil {
-		return core.QoSProfile{}, core.PolicyLeaseDuration, err
-	}
-
-	out.LeaseDuration = lease
-
-	presentation, policy, err := reversePresentation(q)
-	if err != nil {
-		return core.QoSProfile{}, policy, err
-	}
-
-	out.Presentation = presentation
-
-	latency, err := reverseWireDuration(q.LatencyBudget, core.PolicyLatencyBudget)
-	if err != nil {
-		return core.QoSProfile{}, core.PolicyLatencyBudget, err
-	}
-
-	out.LatencyBudget = core.LatencyBudgetQosPolicy{Duration: latency}
-
-	return out, "", nil
+	return reverseRxOWithPolicy(q)
 }

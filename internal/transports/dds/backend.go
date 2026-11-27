@@ -334,6 +334,14 @@ type Backend struct {
 	// rtpsSeqByWriter is the next RTPS DATA sequence per writer GUID.
 	rtpsSeqByWriter map[WriterGUID]uint64
 	// routes maps remote prefix to unicast ports from SPDP.
+	//
+	// Per-prefix sharing is intentional, not a violation: routes are unicast
+	// ports per participant and partitions share participants by design, so
+	// the same prefix correctly serves every partition on that participant.
+	// Isolation lives one layer up in partitionRouteKeys plus demux/take
+	// gates keyed by PartitionRouteKeyForEndpoint, never in this table.
+	// Scoping routes by partition would duplicate one participant's ports per
+	// partition and break wire compat with peers that announce no partition.
 	routes map[GUIDPrefix][]int
 	// spdpCh carries demultiplexed SPDP bytes.
 	spdpCh chan []byte
@@ -711,16 +719,15 @@ func (b *Backend) sweepLoop(ctx context.Context) {
 // sweepOnce expires one round of SEDP provisional plus pending evictions.
 //
 // It snapshots the index and clock without holding locks across the SEDP
-// index lock, then runs both sweeps. A nil index is a no-op.
+// index lock, then runs both sweeps. Reader autopurge also sweeps here via
+// SweepAgedInstances so silent not-alive instances purge without waiting
+// for the next read or take. A nil index still sweeps reader instances.
 func (b *Backend) sweepOnce() {
 	b.mu.RLock()
 	sedpIdx := b.sedp
 	clock := b.clock
+	receiver := b.receiver
 	b.mu.RUnlock()
-
-	if sedpIdx == nil {
-		return
-	}
 
 	var now time.Time
 	if clock != nil {
@@ -729,8 +736,13 @@ func (b *Backend) sweepOnce() {
 		now = time.Now()
 	}
 
-	sedpIdx.ExpireProvisional(now)
-	sedpIdx.ExpirePendingEvictions(now)
+	if sedpIdx != nil {
+		sedpIdx.ExpireProvisional(now)
+		sedpIdx.ExpirePendingEvictions(now)
+	}
+	if receiver != nil {
+		receiver.SweepAgedInstances(now.UnixNano())
+	}
 }
 
 // userHeartbeatLoop advertises retained writer history until context ends.
@@ -835,6 +847,12 @@ func (b *Backend) advertiseWriterHistory(ctx context.Context) {
 	b.sweepExpiredRoutes(snap.now)
 	snap.idx.ExpireProvisional(snap.now)
 	snap.idx.ExpirePendingEvictions(snap.now)
+	b.mu.RLock()
+	receiver := b.receiver
+	b.mu.RUnlock()
+	if receiver != nil {
+		receiver.SweepAgedInstances(snap.now.UnixNano())
+	}
 
 	remotes := snap.idx.RemoteEndpoints()
 	for _, ep := range snap.idx.LocalEndpoints() {
@@ -1306,10 +1324,21 @@ type spdpSender struct {
 }
 
 // Send transmits one SPDP payload over multicast and unicast bootstrap.
+//
+// Per 10.5.3.1, protected discovery denies plain SPDP fail-closed via
+// checkDiscoveryEgressAllowed; keyed SPDP wrap is an interface request,
+// so denial is the honest posture and tolerance stays byte-identical.
 func (s *spdpSender) Send(ctx context.Context, data []byte) error {
 	err := ctx.Err()
 	if err != nil {
 		return fmt.Errorf("dds: spdp send context: %w", err)
+	}
+
+	s.backend.mu.RLock()
+	domain := s.backend.domainID
+	s.backend.mu.RUnlock()
+	if err := s.backend.checkDiscoveryEgressAllowed(domain); err != nil {
+		return err
 	}
 
 	sender, uni, domain := s.backend.snapshotSPDPSend()
@@ -1631,6 +1660,16 @@ func (b *Backend) authorizeRemoteParticipant(ann Announcement) error {
 	if suite == nil || !suite.Enabled() {
 		return nil
 	}
+	if err := ddssecurity.ValidateDiscoveryTokens(ann.Security.IdentityTokenPresent, ann.Security.PermissionsTokenPresent); err != nil {
+		return fmt.Errorf("dds: spdp admission token presence for %x: %w", ann.GUID.Prefix, err)
+	}
+	// TODO(sec-contents): call ddssecurity.ValidateDiscoveryTokenContents
+	// once security.go ExtractSecurityInfo retains parsed DataHolders for
+	// PID 0x1001/0x1002. Current SecurityInfo carries only presence bools,
+	// so malformed token bytes fail closed here via CheckRemoteParticipant
+	// governance denial; identity-only content without permissions already
+	// denies above. Foreign site: security.go ExtractSecurityInfo plus
+	// spdp.go announcementSecurityFields to thread holders through.
 	if !ann.Security.IdentityTokenPresent {
 		return fmt.Errorf("dds: spdp admission without identity token for %x: %w", ann.GUID.Prefix, ErrSecuredTransformUnavailable)
 	}
@@ -1753,10 +1792,21 @@ type sedpSender struct {
 }
 
 // SendSEDP sends one serialized DATA sample to all discovered peers.
+//
+// Per 10.5.3.1, protected discovery denies plain SEDP fail-closed via
+// checkDiscoveryEgressAllowed; keyed SEDP wrap is an interface request
+// (no session keys on this path), so denial is the honest posture.
 func (s *sedpSender) SendSEDP(ctx context.Context, data []byte) error {
 	err := ctx.Err()
 	if err != nil {
 		return fmt.Errorf("dds: sedp send context: %w", err)
+	}
+
+	s.backend.mu.RLock()
+	domain := s.backend.domainID
+	s.backend.mu.RUnlock()
+	if err := s.backend.checkDiscoveryEgressAllowed(domain); err != nil {
+		return err
 	}
 
 	ports, uni := s.backend.snapshotRoutesAndUnicast()
@@ -2138,11 +2188,18 @@ func (b *Backend) buildDataMessage(
 // It mirrors the trailing heartbeat that buildDataMessage appends after
 // DATA so reliable readers complete samples instead of waiting for a
 // heartbeat that never comes. First and Last both name seq: the heartbeat
-// advertises exactly the sample just sent as available.
+// advertises exactly the sample just sent as available. Per 10.5.3.1,
+// protected liveliness denies plain heartbeat fail-closed via
+// checkHeartbeatEgressAllowed instead of leaking liveliness.
 func (b *Backend) buildHeartbeatMessage(guid WriterGUID, seq uint64) ([]byte, error) {
 	b.mu.RLock()
 	local := b.local
+	domain := b.domainID
 	b.mu.RUnlock()
+
+	if err := b.checkHeartbeatEgressAllowed(domain); err != nil {
+		return nil, err
+	}
 
 	if local == nil {
 		return nil, fmt.Errorf("dds: send heartbeat without transport: %w", ErrDataPathNotWired)
@@ -3219,20 +3276,22 @@ func (b *Backend) sortedRoutesSnapshot() []int {
 
 // announceWithRoutes re-announces locals when locals or routes change.
 //
-// It snapshots locals plus sorted routes, sends the initial locals when a
-// route exists, then polls every sedpAnnouncePollInterval and re-sends when
-// either snapshot differs. It also resends every second with fresh DATA
-// sequences and HEARTBEATs so reliable peers that dropped the first sample
-// still match. Route tracking matters because sedpSender drops announcements
-// while no SPDP route exists: endpoints declared before discovery would
-// otherwise never reach late peers. Sends run outside the index lock.
-// Skipping sends while routes are empty preserves per-writer SEDP DATA
-// sequence continuity: SerializeSEDPDATA consumes one sequence per
-// sample from the writer stream, and CycloneDDS holds seq 2 until seq 1
-// arrives, so a seq 1 dropped for no route would stall matching until
-// expiry. Resend timing uses the backend clock so fake-clock tests control
-// it; the poll ticker itself keeps wall-clock intentionally because it paces
-// sends, not leases.
+// It snapshots locals plus topics plus sorted routes, sends the initial
+// locals plus topics when a route exists, then polls every
+// sedpAnnouncePollInterval and re-sends when any snapshot differs. It
+// also resends every second with fresh DATA sequences and HEARTBEATs so
+// reliable peers that dropped the first sample still match. Route
+// tracking matters because sedpSender drops announcements while no SPDP
+// route exists: endpoints declared before discovery would otherwise never
+// reach late peers. Sends run outside the index lock. Skipping sends
+// while routes are empty preserves per-writer SEDP DATA sequence
+// continuity: SerializeSEDPDATA consumes one sequence per sample from the
+// writer stream, and CycloneDDS holds seq 2 until seq 1 arrives, so a
+// seq 1 dropped for no route would stall matching until expiry. Resend
+// timing uses the backend clock so fake-clock tests control it; the poll
+// ticker itself keeps wall-clock intentionally because it paces sends,
+// not leases. TopicsSnapshot rides along per 8.5.4 so TopicBuiltinTopicData
+// reaches spec peers.
 func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error {
 	if idx == nil {
 		return fmt.Errorf("dds: sedp announce nil index: %w", ErrSEDPInvalidEndpoint)
@@ -3250,9 +3309,10 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 	sender := &sedpSender{backend: b}
 
 	lastLocals := idx.LocalEndpoints()
+	lastTopics := idx.TopicsSnapshot()
 	lastRoutes := b.sortedRoutesSnapshot()
 
-	err = b.announceInitial(ctx, sender, lastLocals, lastRoutes)
+	err = b.announceInitial(ctx, sender, idx, lastLocals, lastTopics, lastRoutes)
 	if err != nil {
 		return err
 	}
@@ -3268,7 +3328,7 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 			return ctx.Err() //nolint:wrapcheck // cancel semantics require unwrapped ctx.Err
 		case <-ticker.C:
 			var err error
-			lastLocals, lastRoutes, lastSend, err = b.announceTick(ctx, sender, idx, lastLocals, lastRoutes, lastSend)
+			lastLocals, lastTopics, lastRoutes, lastSend, err = b.announceTick(ctx, sender, idx, lastLocals, lastTopics, lastRoutes, lastSend)
 			if err != nil {
 				return err
 			}
@@ -3276,8 +3336,8 @@ func (b *Backend) announceWithRoutes(ctx context.Context, idx *SEDPIndex) error 
 	}
 }
 
-// announceInitial sends one snapshot when routes exist, tolerating no-route races.
-func (b *Backend) announceInitial(ctx context.Context, sender *sedpSender, locals []SEDPEndpoint, routes []int) error {
+// announceInitial sends one endpoint plus topics snapshot when routes exist, tolerating no-route races.
+func (b *Backend) announceInitial(ctx context.Context, sender SEDPSender, idx *SEDPIndex, locals []SEDPEndpoint, topics []SEDPTopic, routes []int) error {
 	if len(routes) == 0 {
 		return nil
 	}
@@ -3286,33 +3346,47 @@ func (b *Backend) announceInitial(ctx context.Context, sender *sedpSender, local
 	if err != nil && !errors.Is(err, ErrNoRoute) {
 		return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
 	}
+	if idx != nil && len(topics) != 0 {
+		if terr := sedpAnnounceTopicsSnapshot(ctx, sender, idx.snapshotPrefix(), topics); terr != nil && !errors.Is(terr, ErrNoRoute) {
+			return sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce topics snapshot: %w", terr))
+		}
+	}
 
 	return nil
 }
 
-// announceTick checks routes and announces when endpoints or routes change.
+// announceTick checks routes and announces when endpoints, topics, or routes change.
 //
 // Resend timing uses the backend clock via backendNow so fake-clock tests
 // control it; the caller passes lastSend from the same source.
-func (b *Backend) announceTick(ctx context.Context, sender *sedpSender, idx *SEDPIndex, lastLocals []SEDPEndpoint, lastRoutes []int, lastSend time.Time) ([]SEDPEndpoint, []int, time.Time, error) {
+func (b *Backend) announceTick(ctx context.Context, sender SEDPSender, idx *SEDPIndex, lastLocals []SEDPEndpoint, lastTopics []SEDPTopic, lastRoutes []int, lastSend time.Time) ([]SEDPEndpoint, []SEDPTopic, []int, time.Time, error) {
 	currentLocals := idx.LocalEndpoints()
+	currentTopics := idx.TopicsSnapshot()
 	currentRoutes := b.sortedRoutesSnapshot()
 	if len(currentRoutes) == 0 {
-		return currentLocals, currentRoutes, lastSend, nil
+		return currentLocals, currentTopics, currentRoutes, lastSend, nil
 	}
 	now := b.backendNow()
-	if sedpShouldSkipResendAt(lastLocals, currentLocals, lastRoutes, currentRoutes, lastSend, now) {
-		return lastLocals, lastRoutes, lastSend, nil
+	if sedpShouldSkipResendAt(lastLocals, currentLocals, lastRoutes, currentRoutes, lastSend, now) && sedpTopicsSlicesEqual(lastTopics, currentTopics) {
+		return lastLocals, lastTopics, lastRoutes, lastSend, nil
 	}
 	err := sedpAnnounceSnapshot(ctx, sender, currentLocals)
 	if err != nil {
 		if errors.Is(err, ErrNoRoute) {
-			return currentLocals, currentRoutes, lastSend, nil
+			return currentLocals, currentTopics, currentRoutes, lastSend, nil
 		}
 
-		return lastLocals, lastRoutes, lastSend, sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
+		return lastLocals, lastTopics, lastRoutes, lastSend, sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce snapshot: %w", err))
 	}
-	return currentLocals, currentRoutes, now, nil
+	if len(currentTopics) != 0 {
+		if terr := sedpAnnounceTopicsSnapshot(ctx, sender, idx.snapshotPrefix(), currentTopics); terr != nil {
+			if errors.Is(terr, ErrNoRoute) {
+				return currentLocals, currentTopics, currentRoutes, lastSend, nil
+			}
+			return lastLocals, lastTopics, lastRoutes, lastSend, sedpMapLoopError(ctx, fmt.Errorf("dds: sedp announce topics snapshot: %w", terr))
+		}
+	}
+	return currentLocals, currentTopics, currentRoutes, now, nil
 }
 
 // sedpShouldSkipResendAt reports whether the periodic resend can be skipped at now.
@@ -3585,9 +3659,11 @@ func knownInvalidSubmessage(sub rtps.RawSubmessage) bool {
 // It decodes via rtps.DecodeInfoSrc and reports handled for a valid
 // minimal-form INFO_SRC to skip, or invalid for a malformed INFO_SRC so
 // the caller drops the rest of the datagram per 8.3.4.1 rule 6
-// (fail-closed). The minimal 4 byte form carries version plus vendor
+// (fail-closed). The minimal 5 byte form carries version plus vendor
 // only and no GUID prefix, so attribution stays with the RTPS header
-// prefix; see attributionPrefixForDispatch. There is no identity
+// prefix; see attributionPrefixForDispatch. Verified against rtps.InfoSrc:
+// the struct holds Major/Minor/Vendor only with no prefix bytes, so there
+// is no identity to thread on this form. There is no identity
 // override to thread on this form.
 func handleInfoSrc(sub rtps.RawSubmessage) (handled bool, invalid bool) {
 	if sub.ID != rtps.SubmessageInfoSrc {
@@ -3603,10 +3679,13 @@ func handleInfoSrc(sub rtps.RawSubmessage) (handled bool, invalid bool) {
 
 // attributionPrefixForDispatch returns the attribution prefix for one datagram.
 //
-// INFO_SRC on the minimal 4 byte form carries no GUID identity, so the
-// RTPS header prefix remains the attribution source after handleInfoSrc
-// validation. Malformed INFO_SRC never reaches here: the caller drops
-// the rest fail-closed on invalid. When a future full-form INFO_SRC
+// INFO_SRC on the minimal 5 byte form (reserved plus major plus minor plus
+// vendor[2] per DDSI-RTPS 2.5 section 8.3.8.10, see rtps.InfoSrc) carries no
+// GUID identity, so the RTPS header prefix remains the attribution source
+// after handleInfoSrc validation. Verified: rtps.InfoSrc has only
+// Major/Minor/Vendor fields with no prefix bytes, and DecodeInfoSrc accepts
+// only that minimal form. Malformed INFO_SRC never reaches here: the caller
+// drops the rest fail-closed on invalid. When a future full-form INFO_SRC
 // carries a validated GUID prefix, demux must thread that identity as the
 // routing key instead of the header; this helper stays the single
 // attribution point so that override lands in one place. Minimal wiring
@@ -4152,9 +4231,11 @@ func (b *Backend) enqueueUserDataSub(ctx context.Context, header rtps.Header, su
 // It mirrors handleUserControl decoders in reliability.go (owned by the
 // reliability agent) without touching that file: ACKNACK uses
 // decodeUserAckNack, NACKFRAG uses decodeUserNackFrag, HEARTBEAT and GAP
-// use rtps decoders. DecodeSubmessage in preHandleUserSub already covers
-// the common malformed shapes, but the reliability decoders enforce
-// stricter bounds (for example ack bits caps), so an invalid control
+// use rtps decoders, and DATA_FRAG uses rtps.DecodeDataFrag so a malformed
+// fragment drops the rest fail-closed per 8.3.4.1 rule 6 instead of
+// continuing to a trailing DATA. DecodeSubmessage in preHandleUserSub
+// already covers the common malformed shapes, but the reliability decoders
+// enforce stricter bounds (for example ack bits caps), so an invalid control
 // that passes the generic decode still fails closed here per 8.3.4.1
 // rule 6. Unknown ids never fail.
 func invalidUserControl(sub rtps.RawSubmessage) bool {
@@ -4173,6 +4254,9 @@ func invalidUserControl(sub rtps.RawSubmessage) bool {
 		var drops rtps.Counter
 		_, err := rtps.DecodeGap(sub.Body, sub.Flags, &drops)
 		return err != nil
+	case rtps.SubmessageDataFrag:
+		_, err := rtps.DecodeDataFrag(sub.Body, sub.Flags, nil)
+		return err != nil
 	default:
 		return false
 	}
@@ -4189,7 +4273,9 @@ func invalidUserControl(sub rtps.RawSubmessage) bool {
 // decodeDataOnce and the result is shared with enqueueData so the same sub
 // is not decoded twice. A known invalid submessage drops the rest of the
 // datagram per 8.3.4.1 rule 6. SEC triples (SEC_PREFIX plus body plus
-// SEC_POSTFIX per 9.5.3) open with origin-bound AAD via
+// SEC_POSTFIX per 9.5.3) authenticate the sender per 9.4.2.4 before any
+// trial-open: unauthenticated senders drop the rest fail-closed without
+// decrypt side effects, then open with origin-bound AAD via
 // openSecureTripleWithOrigin; failures drop the rest fail-closed.
 func (b *Backend) enqueueUserSubs(
 	ctx context.Context,
@@ -4204,6 +4290,11 @@ func (b *Backend) enqueueUserSubs(
 		}
 		sub := subs[i]
 		if b.isSecTripleAt(subs, i) {
+			if !b.authenticateSender(header) {
+				b.bumpDemuxError()
+				sampleDropLog("dds: demux unauthenticated sender drops secure triple rest")
+				break
+			}
 			inner, consumed, ok := b.openSecTripleAt(header, subs, i)
 			if !ok {
 				b.bumpDemuxError()
@@ -5777,11 +5868,32 @@ func secureKindForDataProtection(dataProt string, keyLen int) (uint32, error) {
 	return 0, fmt.Errorf("dds: secure egress key need 16 or 32 have %d: %w", keyLen, ErrSecuredTransformUnavailable)
 }
 
+// lookupEgressMasterExact returns the exact master record for origin plus key id plus revision.
+//
+// Exact matches win per 9.5.3: callers with negotiated key state pass the
+// wire key id plus revision and get that record or fail closed. It never
+// sweeps across key ids.
+func (b *Backend) lookupEgressMasterExact(origin [16]byte, keyID, revision uint32) (crypto.MasterRecord, error) {
+	b.mu.RLock()
+	store := b.cryptoStore
+	b.mu.RUnlock()
+	if store == nil {
+		return crypto.MasterRecord{}, fmt.Errorf("dds: secure egress without store: %w", ErrSecuredTransformUnavailable)
+	}
+	rec, err := store.Lookup(origin, keyID, revision)
+	if err != nil {
+		return crypto.MasterRecord{}, fmt.Errorf("dds: secure egress unknown key %d revision %d: %w", keyID, revision, err)
+	}
+	return rec, nil
+}
+
 // lookupEgressMaster finds one master record for origin across key ids.
 //
-// It tries key ids 1 through 4 at their latest revisions, returning
-// the first hit. Missing keys fail closed with ErrSecuredTransformUnavailable
-// so callers deny plain instead of sending.
+// Single-key stores resolve to the latest revision of that key. Stores
+// holding keys under more than one key id fail closed as ambiguous instead
+// of first-hit sweeping: egress must select the negotiated key id via
+// lookupEgressMasterExact. Missing keys fail closed with
+// ErrSecuredTransformUnavailable so callers deny plain instead of sending.
 func (b *Backend) lookupEgressMaster(origin [16]byte) (crypto.MasterRecord, uint32, uint32, error) {
 	b.mu.RLock()
 	store := b.cryptoStore
@@ -5789,6 +5901,9 @@ func (b *Backend) lookupEgressMaster(origin [16]byte) (crypto.MasterRecord, uint
 	if store == nil {
 		return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress without store: %w", ErrSecuredTransformUnavailable)
 	}
+	var found crypto.MasterRecord
+	var foundKeyID, foundRev uint32
+	hits := 0
 	for _, keyID := range []uint32{1, 2, 3, 4} {
 		rev, ok := store.LatestRevision(origin, keyID)
 		if !ok {
@@ -5798,18 +5913,58 @@ func (b *Backend) lookupEgressMaster(origin [16]byte) (crypto.MasterRecord, uint
 		if err != nil {
 			continue
 		}
-		return rec, keyID, rev, nil
+		hits++
+		if hits == 1 {
+			found, foundKeyID, foundRev = rec, keyID, rev
+		}
 	}
-	return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress without session keys: %w", ErrSecuredTransformUnavailable)
+	if hits == 0 {
+		return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress without session keys: %w", ErrSecuredTransformUnavailable)
+	}
+	if hits > 1 {
+		return crypto.MasterRecord{}, 0, 0, fmt.Errorf("dds: secure egress ambiguous keys, select exact key id: %w", ErrSecuredTransformUnavailable)
+	}
+	return found, foundKeyID, foundRev, nil
+}
+
+// noteRolloverHold observes hold-before-use per 9.5.1.9.
+//
+// When the session bound is reached the sender must distribute the
+// rollover signal on the volatile channel and hold the new session until
+// peer ack or RolloverHoldTimeoutcry9. The volatile distribution lives
+// with the handshake manager in security/auth (foreign); here we build
+// the signal envelope so the hold is observable and fail closed on
+// signal errors instead of encoding under an unannounced session.
+//
+//nolint:nilerr // missing keys report no hold here; AllocateSuffix fails closed next
+func noteRolloverHold(store *crypto.KeyStore, origin [16]byte, keyID, rev uint32) error {
+	if store == nil {
+		return nil
+	}
+	pending, err := store.RolloverPendingcry9(origin, keyID, rev)
+	if err != nil || !pending {
+		return nil
+	}
+	exch, err := crypto.NewKeyExchange(store, func([16]byte) bool { return true })
+	if err != nil {
+		return fmt.Errorf("dds: secure egress rollover exchange: %w", err)
+	}
+	held, _, err := exch.RolloverHoldSignal(origin, origin, keyID, rev)
+	if err != nil {
+		return fmt.Errorf("dds: secure egress rollover signal: %w", err)
+	}
+	_ = held
+	return nil
 }
 
 // sealSecureEgress seals one inner framed submessage with origin-bound AAD.
 //
 // It maps governance data protection to a wire kind, resolves the
-// master record for origin, allocates a fresh session plus suffix,
-// derives the session key, and seals via sealFramedWithOrigin per
-// 10.5.3.3. Tolerance mode (nil or disabled suite) reports
-// not-required; protected topics without keys deny fail-closed.
+// master record for origin, observes rollover hold, allocates a fresh
+// session plus suffix, derives the session key, and seals via
+// sealFramedWithOrigin per 10.5.3.3. Tolerance mode (nil or disabled
+// suite) reports not-required; protected topics without keys deny
+// fail-closed.
 func (b *Backend) sealSecureEgress(topic string, domain uint32, origin [16]byte, inner []byte) ([]byte, error) {
 	b.mu.RLock()
 	suite := b.secSuite
@@ -5827,6 +5982,9 @@ func (b *Backend) sealSecureEgress(topic string, domain uint32, origin [16]byte,
 	}
 	rec, keyID, rev, err := b.lookupEgressMaster(origin)
 	if err != nil {
+		return nil, err
+	}
+	if err := noteRolloverHold(store, origin, keyID, rev); err != nil {
 		return nil, err
 	}
 	kind, err := secureKindForDataProtection(cfg.DataProtection, len(rec.SenderKey))
@@ -5865,10 +6023,12 @@ func sealFramedWithOrigin(kind, transformID, session uint32, suffix uint64, sess
 // openSecureTripleWithOrigin opens one SEC triple with origin-bound AAD.
 //
 // It mirrors sealSecureEgress: lookup resolves the master key and salt
-// for the transform id and session, derives the session key, and
-// opens with originAAD per 10.5.3.3. Prefix-only triples open only
-// in secUnwrapTriple, so cross-verify fails closed. Missing keys
-// deny fail-closed.
+// for the wire transform id across all stored revisions for that key id,
+// trying each revision until GCM/GMAC verifies per 9.5.3 and 10.5.3.3.
+// The first cryptographic success wins (exact revision match); all
+// failures deny fail-closed. Prefix-only triples open only in
+// secUnwrapTriple, so cross-verify fails closed. Missing keys deny
+// fail-closed.
 func (b *Backend) openSecureTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw []byte, origin [16]byte) ([]byte, error) {
 	b.mu.RLock()
 	store := b.cryptoStore
@@ -5876,18 +6036,40 @@ func (b *Backend) openSecureTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw []by
 	if store == nil {
 		return nil, fmt.Errorf("dds: secure ingress without store: %w", ErrSecuredTransformUnavailable)
 	}
-	lookup := func(transformID, session uint32) ([]byte, []byte, error) {
-		rev, ok := store.LatestRevision(origin, transformID)
-		if !ok {
-			return nil, nil, fmt.Errorf("dds: secure ingress unknown key %d: %w", transformID, ErrSecuredTransformUnavailable)
-		}
-		rec, err := store.Lookup(origin, transformID, rev)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dds: secure ingress lookup: %w", err)
-		}
-		return rec.SenderKey, rec.Salt, nil
+	prefixBody, err := secSubmessageBody(prefixRaw)
+	if err != nil {
+		return nil, err
 	}
-	return secUnwrapTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw, origin, lookup)
+	prefix, err := secParsePrefix(prefixBody)
+	if err != nil {
+		return nil, err
+	}
+	latest, ok := store.LatestRevision(origin, prefix.transformID)
+	if !ok {
+		return nil, fmt.Errorf("dds: secure ingress unknown key %d: %w", prefix.transformID, ErrSecuredTransformUnavailable)
+	}
+	var lastErr error
+	for rev := uint32(1); rev <= latest; rev++ {
+		rec, err := store.Lookup(origin, prefix.transformID, rev)
+		if err != nil {
+			continue
+		}
+		lookup := func(transformID, session uint32) ([]byte, []byte, error) {
+			if transformID != prefix.transformID {
+				return nil, nil, fmt.Errorf("dds: secure ingress key mismatch: %w", ErrSecuredTransformUnavailable)
+			}
+			return rec.SenderKey, rec.Salt, nil
+		}
+		opened, err := secUnwrapTripleWithOrigin(prefixRaw, bodyRaw, postfixRaw, origin, lookup)
+		if err == nil {
+			return opened, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("dds: secure ingress unknown key %d: %w", prefix.transformID, ErrSecuredTransformUnavailable)
+	}
+	return nil, lastErr
 }
 
 // dispatchPublish declares the writer and sends through the selected path.

@@ -1880,8 +1880,10 @@ func TestProvisionalConfirmCleanupAndTTL(t *testing.T) {
 }
 
 // TestTakeNotesOfferedDeadlineMiss wires the writer-side deadline monitor.
-// A take past the deadline must count both the requested and offered misses
-// with one listener notification.
+// A take past the deadline notes once as requested with one listener
+// notification: the take reject path counts the reader side only, while the
+// offered side counts separately on delivery via CheckOfferedDeadline, so
+// one miss never double-counts both monitors.
 func TestTakeNotesOfferedDeadlineMiss(t *testing.T) {
 	t.Parallel()
 
@@ -1908,8 +1910,8 @@ func TestTakeNotesOfferedDeadlineMiss(t *testing.T) {
 		t.Fatalf("requested = %+v, want total 1", requested)
 	}
 	offered := recv.OfferedDeadlineMissedStatus()
-	if offered.TotalCount != 1 {
-		t.Fatalf("offered = %+v, want total 1", offered)
+	if offered.TotalCount != 0 {
+		t.Fatalf("offered = %+v, want total 0 (reject notes requested only)", offered)
 	}
 	if notified != 1 {
 		t.Fatalf("deadline notifications = %d, want 1", notified)

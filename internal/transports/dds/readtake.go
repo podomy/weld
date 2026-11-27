@@ -407,9 +407,11 @@ func (r *DataReceiver) TakeNext(maxSamples int, sampleMask SampleStateKind, view
 // collectAndNotifyLife5 collects matching samples, notifies once per delivery,
 // and reports ErrNoSample when empty.
 func (r *DataReceiver) collectAndNotifyLife5(sampleMask SampleStateKind, viewMask ViewStateKind, instanceMask InstanceStateKind, maxSamples int, take bool, op string) ([]SampledMessage, error) {
+	nowNanos := r.receiverNow()().UnixNano()
+	r.sweepAllLifespans(nowNanos)
 	st := r.readerStateFor()
 	st.mu.Lock()
-	st.purgeLife5NotAliveLocked(r.receiverNow()().UnixNano())
+	st.purgeLife5NotAliveLocked(nowNanos)
 
 	out := st.collectMatching(sampleMask, viewMask, instanceMask, nil, maxSamples, take)
 	if len(out) == 0 {
@@ -664,8 +666,10 @@ func (r *DataReceiver) queryCollectLife5(c *QueryCondition, maxSamples int, take
 	}
 
 	st := r.readerStateFor()
+	nowNanos := r.receiverNow()().UnixNano()
+	r.sweepAllLifespans(nowNanos)
 	st.mu.Lock()
-	st.purgeLife5NotAliveLocked(r.receiverNow()().UnixNano())
+	st.purgeLife5NotAliveLocked(nowNanos)
 
 	out := st.collectMatching(c.SampleMask, c.ViewMask, c.InstanceMask, c.matches, maxSamples, take)
 	if len(out) == 0 {

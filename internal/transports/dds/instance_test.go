@@ -231,8 +231,10 @@ func TestInstanceUnregisterSurfacesNoWriters(t *testing.T) {
 		t.Fatalf("control state = %v, want no_writers", control.Info.InstanceState)
 	}
 
-	if control.Info.NoWritersGenerationCount != 0 {
-		t.Fatalf("no-writers count = %d, want 0 pre-transition", control.Info.NoWritersGenerationCount)
+	// DDS 1.4 2.2.2.5.1 counts transitions INTO not-alive: the unregister
+	// control carries the post-transition count 1, not the pre-transition 0.
+	if control.Info.NoWritersGenerationCount != 1 {
+		t.Fatalf("no-writers count = %d, want 1 post-transition", control.Info.NoWritersGenerationCount)
 	}
 }
 
@@ -357,14 +359,17 @@ func TestLife5DisposeTwiceSnapshotsZero(t *testing.T) {
 		t.Fatalf("second dispose: %v", err)
 	}
 
+	// Post-transition pinning per DDS 1.4 2.2.2.5.1: the first dispose
+	// increments to 1 and carries 1; the repeat while already disposed adds
+	// no new transition so it also carries 1.
 	for i := range 2 {
 		control, err := recv.TakeControlSample()
 		if err != nil {
 			t.Fatalf("take control %d: %v", i, err)
 		}
 
-		if control.Info.DisposedGenerationCount != 0 {
-			t.Fatalf("control %d disposed count = %d, want 0 pre-transition", i, control.Info.DisposedGenerationCount)
+		if control.Info.DisposedGenerationCount != 1 {
+			t.Fatalf("control %d disposed count = %d, want 1 post-transition", i, control.Info.DisposedGenerationCount)
 		}
 	}
 }
@@ -456,15 +461,17 @@ func TestLife5DataRebirthIncrementsNoWriters(t *testing.T) {
 	}
 }
 
-// TestLife5ExplicitReviveDisposed checks register revival bumps disposed.
+// TestLife5ExplicitReviveDisposed checks register revival keeps post-transition count.
 func TestLife5ExplicitReviveDisposed(t *testing.T) {
 	t.Parallel()
 
 	sampleKeyedDesc(t)
 	control := mustRevivalControl(t, sampleLife5ExtractedKey(t, 15), true)
 
-	if control.Info.DisposedGenerationCount != 1 {
-		t.Fatalf("revival disposed count = %d, want 1", control.Info.DisposedGenerationCount)
+	// Post-transition per DDS 1.4 2.2.2.5.1: first dispose carries 1,
+	// revival keeps 1, second dispose increments to 2 and carries 2.
+	if control.Info.DisposedGenerationCount != 2 {
+		t.Fatalf("revival disposed count = %d, want 2", control.Info.DisposedGenerationCount)
 	}
 }
 
@@ -633,8 +640,9 @@ func TestInstanceGenerationCountsDisposed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("take first control: %v", err)
 	}
-	if first.Info.DisposedGenerationCount != 0 || first.Info.NoWritersGenerationCount != 0 {
-		t.Fatalf("pre-transition control = %d %d, want 0 0", first.Info.DisposedGenerationCount, first.Info.NoWritersGenerationCount)
+	// Post-transition per DDS 1.4 2.2.2.5.1: the dispose control carries 1.
+	if first.Info.DisposedGenerationCount != 1 || first.Info.NoWritersGenerationCount != 0 {
+		t.Fatalf("post-transition control = %d %d, want 1 0", first.Info.DisposedGenerationCount, first.Info.NoWritersGenerationCount)
 	}
 
 	if _, err := recv.RegisterInstance("/gen", "sample_test__msg__Keyed", key); err != nil {
@@ -647,8 +655,8 @@ func TestInstanceGenerationCountsDisposed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("take second control: %v", err)
 	}
-	if second.Info.DisposedGenerationCount != 1 {
-		t.Fatalf("revived dispose control = %d, want 1", second.Info.DisposedGenerationCount)
+	if second.Info.DisposedGenerationCount != 2 {
+		t.Fatalf("revived dispose control = %d, want 2", second.Info.DisposedGenerationCount)
 	}
 }
 

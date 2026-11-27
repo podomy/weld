@@ -195,7 +195,9 @@ func (st *readerState) implicitInstanceLocked(topic, typeIDL string) *instanceRe
 // handle from a payload when no registration is needed.
 // Re-registering a live instance is idempotent; re-registering a disposed
 // or unregistered instance revives it to alive with view reset to new.
-// Generation counts increment on the revival per DDS 1.4 section 2.2.2.5.1.
+// Generation counts do NOT increment on revival: they already incremented
+// on the transition INTO disposed/no-writers per DDS 1.4 section 2.2.2.5.1,
+// so revival only flips state with the counters unchanged.
 // Unkeyed topics need no registration: use the implicit handle from
 // LookupInstance with an empty key.
 func (r *DataReceiver) RegisterInstance(topic, typeIDL string, key []byte) ([16]byte, error) {
@@ -263,21 +265,17 @@ func (st *readerState) admitLife5InstanceLocked() error {
 
 // reviveLife5InstanceLocked revives a not-alive instance to alive.
 //
-// Generation counts increment on the not-alive to alive revival per DDS 1.4
-// section 2.2.2.5.1 (disposed count for disposed revivals, no-writers count
-// for no-writers revivals): revive only resets view to new with the
-// autopurge stamp cleared. Live instances stay untouched. The caller
-// must hold st.mu.
+// DDS 1.4 section 2.2.2.5.1 defines disposed_generation_count as "the
+// number of times the instance has become disposed" and
+// no_writers_generation_count as "the number of times the instance has
+// become no-writers": both count transitions INTO the not-alive state, so
+// the control sample for the dispose/unregister carries the
+// post-transition counts. Revival therefore only resets view to new with
+// the autopurge stamp cleared and never touches the counters. Live
+// instances stay untouched. The caller must hold st.mu.
 func reviveLife5InstanceLocked(rec *instanceRecord) {
 	if rec.state == InstanceStateAlive {
 		return
-	}
-
-	if rec.state == InstanceStateDisposed {
-		rec.disposedCount++
-	}
-	if rec.state == InstanceStateNoWriters {
-		rec.noWritersCount++
 	}
 
 	rec.state = InstanceStateAlive
@@ -352,14 +350,17 @@ func (r *DataReceiver) InstanceStateOf(handle [16]byte) (InstanceStateKind, bool
 // DisposeInstance marks one instance disposed and enqueues its control sample.
 //
 // The control sample carries the instance topic and type with no payload
-// and valid_data false. Generation counts increment on the not-alive to
-// alive revival per DDS 1.4 section 2.2.2.5.1, so the control snapshot
-// carries the pre-transition counts. Repeated dispose while already
-// disposed is idempotent for state but still enqueues one sample per call
-// so every dispose edge is observable. Exclusive instances fail closed
-// without a writer: use DisposeInstanceByWriter when ownership is
+// and valid_data false. Generation counts increment ON the transition INTO
+// the not-alive state per DDS 1.4 section 2.2.2.5.1 ("disposed_generation_count:
+// number of times the instance has become disposed"), so the control
+// snapshot carries the post-transition counts. Repeated dispose while
+// already disposed is idempotent for counts but still enqueues one sample
+// per call so every dispose edge is observable. Exclusive instances fail
+// closed without a writer: use DisposeInstanceByWriter when ownership is
 // exclusive, since the legacy handle-only path cannot prove ownership and
 // refuses with ErrOwnershipRefused rather than misrouting a dispose.
+// Stamps use the receiver clock (not wall clock) so fake clocks pin
+// control times in tests.
 func (r *DataReceiver) DisposeInstance(handle [16]byte) error {
 	st := r.readerStateFor()
 	st.mu.Lock()
@@ -374,12 +375,16 @@ func (r *DataReceiver) DisposeInstance(handle [16]byte) error {
 		return fmt.Errorf("dds: dispose instance %x exclusive owner check: %w", handle, ErrOwnershipRefused)
 	}
 
+	now := r.receiverNow()()
+	if rec.state != InstanceStateDisposed {
+		rec.disposedCount++
+	}
 	rec.state = InstanceStateDisposed
-	rec.notAliveAtLife5 = r.receiverNow()().UnixNano()
+	rec.notAliveAtLife5 = now.UnixNano()
 	st.enqueueControlLocked(rec, transports.IncomingMessage{
 		TopicName: rec.topic,
 		TypeName:  rec.typeIDL,
-	})
+	}, now)
 
 	return nil
 }
@@ -389,7 +394,8 @@ func (r *DataReceiver) DisposeInstance(handle [16]byte) error {
 // Exclusive instances admit only the arbitrated owner; mismatched kinds,
 // ineligible owners, and non-owners fail closed with ErrOwnershipRefused per
 // DDS 1.4 sections 2.2.2.5.1.3 and 2.2.3.9. Shared and unconfigured instances
-// admit any writer.
+// admit any writer. Counts increment on the transition INTO disposed per
+// DDS 1.4 section 2.2.2.5.1; stamps use the receiver clock.
 func (r *DataReceiver) DisposeInstanceByWriter(handle [16]byte, writer WriterGUID) error {
 	st := r.readerStateFor()
 	st.mu.Lock()
@@ -404,12 +410,16 @@ func (r *DataReceiver) DisposeInstanceByWriter(handle [16]byte, writer WriterGUI
 		return fmt.Errorf("dds: dispose instance %x exclusive owner check: %w", handle, ErrOwnershipRefused)
 	}
 
+	now := r.receiverNow()()
+	if rec.state != InstanceStateDisposed {
+		rec.disposedCount++
+	}
 	rec.state = InstanceStateDisposed
-	rec.notAliveAtLife5 = r.receiverNow()().UnixNano()
+	rec.notAliveAtLife5 = now.UnixNano()
 	st.enqueueControlLocked(rec, transports.IncomingMessage{
 		TopicName: rec.topic,
 		TypeName:  rec.typeIDL,
-	})
+	}, now)
 
 	return nil
 }
@@ -475,10 +485,12 @@ func (r *DataReceiver) SetAutodisposeUnregisteredInstances(enabled bool) {
 // disposed, unless autodispose is enabled via
 // SetAutodisposeUnregisteredInstances, in which case the transition lands
 // in disposed per DDS 1.4 section 2.2.3.23.3. Generation counts increment on
-// the not-alive to alive revival, so the control snapshot carries the
-// pre-transition counts. Exclusive instances fail closed without a writer
+// the transition INTO the not-alive state per DDS 1.4 section 2.2.2.5.1
+// (disposed count for autodisposed transitions, no-writers count
+// otherwise), so the control snapshot carries the post-transition counts.
+// Exclusive instances fail closed without a writer
 // like DisposeInstance: use UnregisterInstanceByWriter when ownership is
-// exclusive.
+// exclusive. Stamps use the receiver clock.
 func (r *DataReceiver) UnregisterInstance(handle [16]byte) error {
 	st := r.readerStateFor()
 	st.mu.Lock()
@@ -493,16 +505,23 @@ func (r *DataReceiver) UnregisterInstance(handle [16]byte) error {
 		return fmt.Errorf("dds: unregister instance %x exclusive owner check: %w", handle, ErrOwnershipRefused)
 	}
 
+	now := r.receiverNow()()
 	if st.autodisposeLife5 {
+		if rec.state != InstanceStateDisposed {
+			rec.disposedCount++
+		}
 		rec.state = InstanceStateDisposed
 	} else {
+		if rec.state != InstanceStateNoWriters {
+			rec.noWritersCount++
+		}
 		rec.state = InstanceStateNoWriters
 	}
-	rec.notAliveAtLife5 = r.receiverNow()().UnixNano()
+	rec.notAliveAtLife5 = now.UnixNano()
 	st.enqueueControlLocked(rec, transports.IncomingMessage{
 		TopicName: rec.topic,
 		TypeName:  rec.typeIDL,
-	})
+	}, now)
 
 	return nil
 }
@@ -511,6 +530,8 @@ func (r *DataReceiver) UnregisterInstance(handle [16]byte) error {
 //
 // Ownership gating matches DisposeInstanceByWriter. When autodispose is
 // enabled the transition lands in disposed per DDS 1.4 section 2.2.3.23.3.
+// Counts increment on the transition INTO the not-alive state; stamps use
+// the receiver clock.
 func (r *DataReceiver) UnregisterInstanceByWriter(handle [16]byte, writer WriterGUID) error {
 	st := r.readerStateFor()
 	st.mu.Lock()
@@ -525,16 +546,23 @@ func (r *DataReceiver) UnregisterInstanceByWriter(handle [16]byte, writer Writer
 		return fmt.Errorf("dds: unregister instance %x exclusive owner check: %w", handle, ErrOwnershipRefused)
 	}
 
+	now := r.receiverNow()()
 	if st.autodisposeLife5 {
+		if rec.state != InstanceStateDisposed {
+			rec.disposedCount++
+		}
 		rec.state = InstanceStateDisposed
 	} else {
+		if rec.state != InstanceStateNoWriters {
+			rec.noWritersCount++
+		}
 		rec.state = InstanceStateNoWriters
 	}
-	rec.notAliveAtLife5 = r.receiverNow()().UnixNano()
+	rec.notAliveAtLife5 = now.UnixNano()
 	st.enqueueControlLocked(rec, transports.IncomingMessage{
 		TopicName: rec.topic,
 		TypeName:  rec.typeIDL,
-	})
+	}, now)
 
 	return nil
 }
@@ -543,12 +571,14 @@ func (r *DataReceiver) UnregisterInstanceByWriter(handle [16]byte, writer Writer
 //
 // The caller must hold st.mu. The sample carries no payload with
 // valid_data false per DDS 1.4 section 2.2.2.5.8. View and generation
-// counts snapshot the instance before the transition: counts increment on
-// revival, so a dispose or unregister control carries the counts as of the
-// transition; reading the control later flips view to not new. Ranks stay
-// zero here; collectMatching fills per-collection ranks per section
-// 2.2.2.5.1.6.
-func (st *readerState) enqueueControlLocked(rec *instanceRecord, msg transports.IncomingMessage) {
+// counts snapshot the instance AFTER the transition: counts increment on
+// the transition INTO disposed/no-writers per 2.2.2.5.1, so a dispose or
+// unregister control carries the post-transition counts; reading the
+// control later flips view to not new. The stamp uses the receiver clock
+// passed by dispose/unregister (not wall clock) so fake clocks pin expiry.
+// Ranks stay zero here; collectMatching fills per-collection ranks per
+// section 2.2.2.5.1.6.
+func (st *readerState) enqueueControlLocked(rec *instanceRecord, msg transports.IncomingMessage, now time.Time) {
 	st.seq++
 
 	info := SampleInfo{
@@ -556,8 +586,8 @@ func (st *readerState) enqueueControlLocked(rec *instanceRecord, msg transports.
 		ViewState:                rec.view,
 		InstanceState:            rec.state,
 		ValidData:                false,
-		SourceTimestamp:          time.Now(),
-		ReceptionTimestamp:       time.Now(),
+		SourceTimestamp:          now,
+		ReceptionTimestamp:       now,
 		InstanceHandle:           rec.handle,
 		DisposedGenerationCount:  rec.disposedCount,
 		NoWritersGenerationCount: rec.noWritersCount,

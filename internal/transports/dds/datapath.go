@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"sync"
 	"time"
@@ -1357,6 +1358,10 @@ func (r *DataReceiver) takeDecoded(
 		return empty, emptyInfo, r.countTakeHookReject(rej)
 	}
 
+	// Sweep expired lifespan samples before serving history so retained
+	// then-expired samples never serve per DDS 1.4 section 2.2.3.16.
+	r.sweepLifespanForTopic(rosTopic, r.receiverNow()().UnixNano())
+
 	snap := r.snapshotTakeHooks(rosTopic, decoded.guid)
 	r.feedOwnershipStatus(decoded.guid, snap, r.receiverNow()().UnixNano())
 
@@ -1536,20 +1541,15 @@ func (r *DataReceiver) CheckWriterLiveliness(guid WriterGUID) bool {
 
 // CheckOfferedDeadline polls the topic deadline tracker and notes a writer-side miss.
 //
-// It polls the writer-side offered tracker, separate from the requested
+// It polls the writer-side offered tracker only, separate from the requested
 // tracker used by snapshotTakeHooks plus CheckRequestedDeadline, so the two
-// sides never share watermarks. When no offered tracker exists it falls back
-// to the shared deadlines entry for compat with callers that only set the
-// requested side; SetDeadlineTrackerForTopic installs separate instances on
-// both sides. A missing tracker reports no alert.
+// sides never share watermarks. No fallback to the requested side: offered
+// uses the offered tracker installed via SetOfferedDeadlineTrackerForTopic,
+// and a missing offered tracker reports no alert. A missing tracker reports no alert.
 func (r *DataReceiver) CheckOfferedDeadline(topic string, now int64) (core.DeadlineAlert, bool) {
 	r.mu.RLock()
 	tracker := r.offeredDeadlines[topic]
-	fallback := r.deadlines[topic]
 	r.mu.RUnlock()
-	if tracker == nil {
-		tracker = fallback
-	}
 	if tracker == nil {
 		return core.DeadlineAlert{}, false
 	}
@@ -1616,6 +1616,93 @@ func (r *DataReceiver) lifespanExpiredForTake(topic string, sourceNanos, nowNano
 		return false
 	}
 	return ExpiredByLifespan(nowNanos, sourceNanos, lifespan)
+}
+
+// sweepLifespanForTopic removes history samples expired under the topic
+// lifespan per DDS 1.4 section 2.2.3.16 before serving.
+//
+// It calls SweepLifespan in durability.go so the take and read paths share
+// the single expiry predicate. Only samples for the named topic sweep;
+// other topics stay untouched to preserve ordering. It returns the expired
+// count for loud accounting via st.violations.
+func (r *DataReceiver) sweepLifespanForTopic(topic string, nowNanos int64) int {
+	lifespan, ok := r.lifespanForTopic(topic)
+	if !ok {
+		return 0
+	}
+	st := r.readerStateFor()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.sweepLifespanLocked(topic, nowNanos, lifespan)
+}
+
+// sweepLifespanLocked filters history through SweepLifespan for one topic.
+//
+// The caller must hold st.mu. Source time is the sample source timestamp
+// when known else reception, matching deliverableLife5Take. Expired samples
+// drop from history with violations counting each for dashboards.
+func (st *readerState) sweepLifespanLocked(topic string, nowNanos int64, lifespan core.Duration) int {
+	var topicSamples []*storedSample
+	for _, entry := range st.history {
+		if entry.sample.Msg.TopicName == topic {
+			topicSamples = append(topicSamples, entry)
+		}
+	}
+	if len(topicSamples) == 0 {
+		return 0
+	}
+	kept, expired := SweepLifespan(nowNanos, lifespan, topicSamples, func(s *storedSample) int64 {
+		if !s.sample.Info.SourceTimestamp.IsZero() {
+			return s.sample.Info.SourceTimestamp.UnixNano()
+		}
+		return s.sample.Info.ReceptionTimestamp.UnixNano()
+	})
+	if expired == 0 {
+		return 0
+	}
+	keepSet := make(map[*storedSample]struct{}, len(kept))
+	for _, e := range kept {
+		keepSet[e] = struct{}{}
+	}
+	retained := st.history[:0]
+	for _, entry := range st.history {
+		if entry.sample.Msg.TopicName != topic {
+			retained = append(retained, entry)
+			continue
+		}
+		if _, ok := keepSet[entry]; ok {
+			retained = append(retained, entry)
+			continue
+		}
+		st.violations++
+	}
+	for i := len(retained); i < len(st.history); i++ {
+		st.history[i] = nil
+	}
+	st.history = retained
+	return expired
+}
+
+// sweepAllLifespans removes expired history across all lifespans.
+//
+// It snapshots the lifespan table without holding the receiver lock across
+// the state lock, then sweeps each topic in one state critical section via
+// SweepLifespan. Read/take-next paths call it before serving so
+// retained-then-expired samples never serve.
+func (r *DataReceiver) sweepAllLifespans(nowNanos int64) {
+	r.mu.RLock()
+	lifespans := make(map[string]core.Duration, len(r.lifespans))
+	maps.Copy(lifespans, r.lifespans)
+	r.mu.RUnlock()
+	if len(lifespans) == 0 {
+		return
+	}
+	st := r.readerStateFor()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for topic, lifespan := range lifespans {
+		st.sweepLifespanLocked(topic, nowNanos, lifespan)
+	}
 }
 
 // SetSecureProvisionalGate closes or opens the provisional fast-path.
@@ -1765,7 +1852,10 @@ func (r *DataReceiver) partitionGateReject(guid WriterGUID, rosTopic string) *ta
 
 // noteTakeReject notes deadline and liveliness statuses for one take-path drop.
 //
-// Reader-side expired-writer drops update only change counters via
+// Deadline drops note once as requested (reader-side) so one miss counts
+// once: the offered side is polled separately on delivery via
+// CheckOfferedDeadline, never doubled on a reject. Reader-side
+// expired-writer drops update only change counters via
 // NoteWriterAlive; the writer-side LIVELINESS_LOST count stays for writers.
 func (r *DataReceiver) noteTakeReject(topic, typeIDL string, guid WriterGUID, payload []byte, rej *takeHookReject) {
 	if rej == nil {
@@ -1775,7 +1865,6 @@ func (r *DataReceiver) noteTakeReject(topic, typeIDL string, guid WriterGUID, pa
 	if errors.Is(rej.err, ErrDeadlineMissed) {
 		handle := r.instanceHandleForDrop(topic, typeIDL, guid, payload)
 		r.NoteRequestedDeadlineMissed(handle)
-		r.NoteOfferedDeadlineMissed(handle)
 		r.NotifyDeadline(topic)
 	}
 
@@ -1872,6 +1961,7 @@ func (r *DataReceiver) tryPlainFallbacks(ctx context.Context, guid WriterGUID, s
 	if rej := r.partitionGateReject(guid, msg.TopicName); rej != nil {
 		return empty, emptyInfo, rej, false
 	}
+	r.sweepLifespanForTopic(msg.TopicName, r.receiverNow()().UnixNano())
 	snap := r.snapshotTakeHooks(msg.TopicName, guid)
 	now := r.receiverNow()().UnixNano()
 	r.feedOwnershipStatus(guid, snap, now)

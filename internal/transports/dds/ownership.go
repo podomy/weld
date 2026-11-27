@@ -77,6 +77,13 @@ var ErrOwnershipRefused = errors.New("dds: ownership refused")
 // join this sentinel so callers can distinguish exhaustion from arbitration.
 // It chains ErrOwnershipRefused so refusals pre-dating the split still match
 // errors.Is with either sentinel; new code should match ErrResourceExhausted.
+// Time-filter versus deadline consistency errors (checkLife5DeadlineConsistent,
+// SetTimeBasedFilter) deliberately keep chaining ErrOwnershipRefused rather
+// than splitting to a new sentinel: pre-split callers match
+// errors.Is(err, ErrOwnershipRefused) for every config refusal, and a split
+// would silently break those contracts. Keeping the chain preserves
+// backward compat while ErrResourceExhausted stays the preferred match for
+// resource cases.
 // TODO backend agent - remap datapath resource errors to ErrResourceExhausted
 // where datapath currently matches ErrOwnershipRefused.
 var ErrResourceExhausted = fmt.Errorf("%w: resource exhausted", ErrOwnershipRefused)

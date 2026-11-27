@@ -1167,6 +1167,28 @@ func (b *Backend) capSedpHeartbeatLocked(except WriterGUID) (WriterGUID, bool) {
 	return WriterGUID{}, false
 }
 
+// isRemoteDataDuplicate reports whether one outer seq was already recorded
+// for a remote writer. It mirrors tracker.observe without recording, so
+// repair resends of already seen samples skip the data queue instead of
+// filling it with duplicates the take path must drain. Unseen writers
+// report false. It self-locks with RLock and is safe for concurrent use.
+func (b *Backend) isRemoteDataDuplicate(guid WriterGUID, seq uint64) bool {
+	if seq == 0 {
+		return true
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	tracker, ok := b.remoteTrack[guid]
+	if !ok || tracker == nil {
+		return false
+	}
+	if seq <= tracker.contig {
+		return true
+	}
+	_, seen := tracker.seen[seq]
+	return seen
+}
+
 // noteRemoteData records one outer seq per remote writer for NACK base.
 //
 // It tracks contiguity, not highest seen, so the ACK base names the
@@ -2802,6 +2824,10 @@ func (b *Backend) sendSelectiveHeartbeatAck(remote WriterGUID, beat rtps.Heartbe
 		}
 
 		b.bumpDemuxError()
+		if errors.Is(err, ErrRepairBackpressure) {
+			sampleDropLog("dds: demux ack queue: %v", err)
+			return
+		}
 		log.Printf("dds: demux ack queue: %v", err)
 	}
 }
@@ -2870,7 +2896,7 @@ func (b *Backend) sendPromptNack(
 		}
 		if errors.Is(err, ErrRepairBackpressure) {
 			b.bumpDemuxError()
-			log.Printf("dds: demux prompt ack queue full: %v", err)
+			sampleDropLog("dds: demux prompt ack queue full: %v", err)
 			return
 		}
 
@@ -2938,6 +2964,10 @@ func (b *Backend) handleUserAck(
 			return
 		}
 		b.bumpDemuxError()
+		if errors.Is(err, ErrRepairBackpressure) {
+			sampleDropLog("dds: demux repair: %v", err)
+			return
+		}
 		log.Printf("dds: demux repair: %v", err)
 	}
 }
@@ -3005,6 +3035,10 @@ func (b *Backend) handleUserNackFrag(
 			return
 		}
 		b.bumpDemuxError()
+		if errors.Is(err, ErrRepairBackpressure) {
+			sampleDropLog("dds: demux frag repair: %v", err)
+			return
+		}
 		log.Printf("dds: demux frag repair: %v", err)
 	}
 }
@@ -3070,6 +3104,22 @@ func (b *Backend) handleUserGap(
 	b.applyRemoteGaps(remote, gap.SkippedSequences())
 }
 
+// dropSelfUserControl reports whether one user control submessage is our
+// own multicast loopback. Self-sent control drops like self DATA:
+// answering our own heartbeats with ACKs and our own ACKs with repairs
+// is a self-storm with no peer. It never panics.
+func (b *Backend) dropSelfUserControl(header rtps.Header) bool {
+	b.mu.RLock()
+	local := b.local
+	b.mu.RUnlock()
+	if local == nil || attributionPrefixForDispatch(header) != local.GUID().Prefix {
+		return false
+	}
+	b.bumpDemuxError()
+	sampleDropLog("dds: demux self user control loopback dropped")
+	return true
+}
+
 // handleUserControl processes user control subs before DATA queueing. It handles ACKNACK with repair,
 // NACKFRAG with fragment repair, HEARTBEAT with ACK, GAP with skip, and
 // DATA_FRAG with reassembly to dataCh. It returns true when sub
@@ -3083,6 +3133,9 @@ func (b *Backend) handleUserControl(
 	sub rtps.RawSubmessage,
 	dataCh chan dataItem,
 ) bool {
+	if b.dropSelfUserControl(header) {
+		return true
+	}
 	switch sub.ID {
 	case rtps.SubmessageAckNack:
 		rawReq, err := decodeUserAckNack(

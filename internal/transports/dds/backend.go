@@ -3850,13 +3850,13 @@ func (b *Backend) sendSedpAck(ctx context.Context, sender GUIDPrefix, ack rtps.R
 	ports := b.snapshotRoutePorts(sender)
 	if len(ports) == 0 {
 		b.bumpDemuxError()
-		log.Printf("dds: demux sedp ack without route for %x", sender)
+		sampleDropLog("dds: demux sedp ack without route for %x", sender)
 		return
 	}
 	uni := b.snapshotUnicast()
 	if uni == nil {
 		b.bumpDemuxError()
-		log.Printf("dds: demux sedp ack without transport")
+		sampleDropLog("dds: demux sedp ack without transport")
 		return
 	}
 	b.mu.RLock()
@@ -4734,6 +4734,12 @@ func (b *Backend) enqueueDataWithDecoded(
 		return
 	}
 
+	if b.isRemoteDataDuplicate(guid, dataDecoded.SequenceNumber) {
+		sampleDropLog("dds: demux data duplicate guid=%x seq=%d", guid, dataDecoded.SequenceNumber)
+
+		return
+	}
+
 	payload := append([]byte(nil), dataDecoded.Payload...)
 
 	queued := enqueueBestEffort(ctx, dataCh, dataItem{guid: guid, seq: dataDecoded.SequenceNumber, payload: payload})
@@ -5177,6 +5183,24 @@ func (b *Backend) hasStrictRemoteReaderwir10(topic, typeName, typeHash string) b
 	}
 
 	return false
+}
+
+// LocalEndpoints returns a sorted copy of local SEDP endpoints.
+//
+// It mirrors RemoteEndpoints: callers decide topic versus service use
+// by Kind. A nil SEDP index reports nil so callers before JoinDiscovery
+// see an empty view without a nil panic. It self-locks with RLock
+// through the SEDP snapshot and is safe for concurrent use.
+func (b *Backend) LocalEndpoints() []SEDPEndpoint {
+	b.mu.RLock()
+	sedpIdx := b.sedp
+	b.mu.RUnlock()
+
+	if sedpIdx == nil {
+		return nil
+	}
+
+	return sedpIdx.LocalEndpoints()
 }
 
 // RemoteEndpoints returns a sorted copy of remote SEDP endpoints.

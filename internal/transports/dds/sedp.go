@@ -725,6 +725,9 @@ func (idx *SEDPIndex) sedpCheckLocalSecurityLocked(ep SEDPEndpoint) error {
 
 // Generation returns the current remote mutation generation.
 func (idx *SEDPIndex) Generation() uint64 {
+	if idx == nil {
+		return 0
+	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -733,6 +736,9 @@ func (idx *SEDPIndex) Generation() uint64 {
 
 // stampDomain returns the index domain for ListenLoop stamping.
 func (idx *SEDPIndex) stampDomain() uint32 {
+	if idx == nil {
+		return 0
+	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -1186,6 +1192,9 @@ func sedpSnapshotEndpoints(src map[SEDPGUID]SEDPEndpoint) []SEDPEndpoint {
 
 // LocalEndpoints returns a sorted copy of local endpoints.
 func (idx *SEDPIndex) LocalEndpoints() []SEDPEndpoint {
+	if idx == nil {
+		return nil
+	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -1194,6 +1203,9 @@ func (idx *SEDPIndex) LocalEndpoints() []SEDPEndpoint {
 
 // RemoteEndpoints returns a sorted copy of remote endpoints.
 func (idx *SEDPIndex) RemoteEndpoints() []SEDPEndpoint {
+	if idx == nil {
+		return nil
+	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -1208,6 +1220,9 @@ func (idx *SEDPIndex) RemoteEndpoints() []SEDPEndpoint {
 // so a Topics-only datagram installs topics while leaving generation at
 // zero. It is safe for concurrent use.
 func (idx *SEDPIndex) RemoteTopics() []SEDPTopic {
+	if idx == nil {
+		return nil
+	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 

@@ -85,12 +85,12 @@ func weldGraphNodes(bridgeID int64) ([]weldGraphNode, bool) {
 
 // weldGraphType prefers the IDL type and demangles the DDS type on fallback.
 //
-// The graph reports IDL names, so a demangleable DDS type converts and
-// anything else stays empty. Local topics with no known type stay empty
-// so the name still lists. It never panics.
+// The graph reports ROS slash names (std_msgs/msg/String), so IDL
+// (std_msgs__msg__String) converts with __ to /. Local topics with no
+// known type stay empty so the name still lists. It never panics.
 func weldGraphType(idl, ddsName string) string {
 	if idl != "" {
-		return idl
+		return weldIDLToSlash(idl)
 	}
 	if ddsName == "" {
 		return ""
@@ -99,22 +99,35 @@ func weldGraphType(idl, ddsName string) string {
 	if err != nil {
 		return ""
 	}
-	return demangled
+	return weldIDLToSlash(demangled)
+}
+
+// weldIDLToSlash converts IDL (std_msgs__msg__String) to ROS slash
+// form (std_msgs/msg/String). Unknown shapes pass through unchanged.
+func weldIDLToSlash(idl string) string {
+	if idl == "" {
+		return ""
+	}
+	if !strings.Contains(idl, "__") {
+		return idl
+	}
+	return strings.ReplaceAll(idl, "__", "/")
 }
 
 // weldGraphServiceBase strips the request or response suffix to the base type.
 //
 // Service endpoints announce the directional IDL name such as
 // example_interfaces__srv__AddTwoInts_Request while the graph reports
-// the base service type. Unknown shapes pass through unchanged.
+// the base service type in slash form. Unknown shapes pass through
+// unchanged.
 func weldGraphServiceBase(t string) string {
 	if base, ok := strings.CutSuffix(t, "_Request"); ok {
-		return base
+		return weldIDLToSlash(base)
 	}
 	if base, ok := strings.CutSuffix(t, "_Response"); ok {
-		return base
+		return weldIDLToSlash(base)
 	}
-	return t
+	return weldIDLToSlash(t)
 }
 
 // weldGraphFlattenPairs sorts a name to types map into flat pairs.
@@ -250,6 +263,28 @@ func weldGraphWriteCount(bridge C.longlong, label *C.char, out *C.longlong, coun
 	return C.int(weldCodeOK)
 }
 
+// weldGraphTypeOverlay returns per-topic slash types from the bridge
+// publisher plus subscription type reports for one bridge. Topics or
+// type names still unknown contribute nothing. It never panics.
+func weldGraphTypeOverlay(bridgeID int64) map[string][]string {
+	overlay := make(map[string][]string)
+	weldMu.Lock()
+	defer weldMu.Unlock()
+	for _, pt := range weldPubTypes {
+		if pt.bridgeID != bridgeID || pt.topic == "" || pt.typeName == "" {
+			continue
+		}
+		overlay[pt.topic] = append(overlay[pt.topic], weldIDLToSlash(pt.typeName))
+	}
+	for _, st := range weldSubTypes {
+		if st.bridgeID != bridgeID || st.topic == "" || st.typeName == "" {
+			continue
+		}
+		overlay[st.topic] = append(overlay[st.topic], weldIDLToSlash(st.typeName))
+	}
+	return overlay
+}
+
 // weldGraphTopics returns sorted (topic, type) pairs for a bridge.
 //
 // Local topics come from the bridge registries plus publisher type
@@ -263,19 +298,15 @@ func weldGraphTopics(bridgeID int64) ([]weldGraphPair, bool) {
 		return nil, false
 	}
 	local := b.TopicNamesAndTypes()
-	weldMu.Lock()
-	overlay := make(map[string][]string)
-	for _, pt := range weldPubTypes {
-		if pt.bridgeID != bridgeID || pt.topic == "" || pt.typeName == "" {
-			continue
-		}
-		overlay[pt.topic] = append(overlay[pt.topic], pt.typeName)
-	}
-	weldMu.Unlock()
+	overlay := weldGraphTypeOverlay(bridgeID)
 	backend := weldGraphBackend(bridgeID)
 	byTopic := make(map[string]map[string]struct{})
 	for _, info := range local {
-		weldGraphAddTypes(byTopic, info.Name, info.Types)
+		slashed := make([]string, 0, len(info.Types))
+		for _, t := range info.Types {
+			slashed = append(slashed, weldIDLToSlash(t))
+		}
+		weldGraphAddTypes(byTopic, info.Name, slashed)
 	}
 	for topic, types := range overlay {
 		weldGraphAddTypes(byTopic, topic, types)
@@ -290,9 +321,9 @@ func weldGraphTopics(bridgeID int64) ([]weldGraphPair, bool) {
 //
 // Local services come from the bridge registry; remote services come
 // from the backend view with request or reply kind, normalized to the
-// base service type. Services with no known type contribute one pair
-// with an empty type. It reports false for an unknown bridge. It never
-// panics.
+// base service type in slash form. Services with no known type
+// contribute one pair with an empty type. It reports false for an
+// unknown bridge. It never panics.
 func weldGraphServices(bridgeID int64) ([]weldGraphPair, bool) {
 	b := weldGraphBridge(bridgeID)
 	if b == nil {
@@ -305,7 +336,11 @@ func weldGraphServices(bridgeID int64) ([]weldGraphPair, bool) {
 		if info.Name == "" {
 			continue
 		}
-		weldGraphAddTypes(byService, info.Name, info.Types)
+		slashed := make([]string, 0, len(info.Types))
+		for _, t := range info.Types {
+			slashed = append(slashed, weldIDLToSlash(weldGraphServiceBase(t)))
+		}
+		weldGraphAddTypes(byService, info.Name, slashed)
 	}
 	if backend == nil {
 		return weldGraphFlattenPairs(byService), true

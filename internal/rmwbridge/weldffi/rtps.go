@@ -252,8 +252,11 @@ func weldSetSubType(key int64, tn, th string) (int64, string, bool) {
 // weldWriteWireType reads a type pair, stores it, and refreshes the reader.
 //
 // Save records the type for the handle and returns bridge plus topic; it
-// reports false for an unknown handle. It never panics.
-func weldWriteWireType(handle C.longlong, typeName, typeHash *C.char, save func(int64, string, string) (int64, string, bool)) C.int {
+// reports false for an unknown handle. When refresh is true it declares
+// the backend reader for subscriptions. Publishers must not declare
+// readers: a pub declaring a reader makes `ros2 topic info` see a
+// spurious subscriber and hides the missing writer. It never panics.
+func weldWriteWireType(handle C.longlong, typeName, typeHash *C.char, save func(int64, string, string) (int64, string, bool), refresh bool) C.int {
 	key := int64(handle)
 	if key <= 0 {
 		return C.int(weldCodeErrHandle)
@@ -266,7 +269,9 @@ func weldWriteWireType(handle C.longlong, typeName, typeHash *C.char, save func(
 	if !ok {
 		return C.int(weldCodeErrHandle)
 	}
-	weldRefreshRTPSReader(bridgeID, topic)
+	if refresh {
+		weldRefreshRTPSReader(bridgeID, topic)
+	}
 	return C.int(weldCodeOK)
 }
 
@@ -307,10 +312,11 @@ func weldRefreshRTPSReader(bridgeID int64, topic string) {
 // weldPublishRTPS mirrors one FFI publish to the wire best effort.
 //
 // The in-memory publish already succeeded; this leg only adds ROS peer
-// visibility. It skips fast when the bridge has no live backend or no
-// discovered peer for the topic, so local-only setups pay one map lookup
-// plus one reader scan. All transport errors end here and the FFI return
-// code always reflects the in-memory leg. It never panics.
+// visibility. It always attempts PublishBytes so the SEDP writer is
+// announced even with no remote reader yet: discovery needs the writer
+// announce before any reader appears, and PublishBytes announces the
+// writer synchronously before checking for matching readers. DATA to no
+// readers fails with ErrNoRoute and is ignored here. It never panics.
 func weldPublishRTPS(pubHandle int64, payload []byte) {
 	weldMu.Lock()
 	entry, ok := weldPubs[pubHandle]
@@ -323,9 +329,6 @@ func weldPublishRTPS(pubHandle int64, payload []byte) {
 	topic := entry.pub.Topic
 	weldMu.Unlock()
 	if backend == nil {
-		return
-	}
-	if !backend.HasRemoteEndpoint(topic) {
 		return
 	}
 	msg := transports.OutgoingMessage{
@@ -429,9 +432,10 @@ func weldTakeRTPS(bridgeID int64, topic string) ([]byte, bool) {
 // is the RIHS01 hash; both are NUL terminated C strings and either may be
 // empty to clear. The C layer calls this after weld_ffi_pub_create from
 // its introspection handle because the create signature stays frozen.
-// Stored info feeds PublishBytes addressing plus reader declares for same
-// bridge subscriptions on the topic. It returns 0 on success, -1 for NULL
-// pointers, and -2 for an unknown publisher handle. It never panics.
+// Stored info feeds PublishBytes addressing. It does not declare a
+// backend reader: publishers are writers only. It returns 0 on success,
+// -1 for NULL pointers, and -2 for an unknown publisher handle. It never
+// panics.
 //
 //export weld_ffi_pub_set_type
 func weld_ffi_pub_set_type(handle C.longlong, typeName *C.char, typeHash *C.char) (rc C.int) {
@@ -441,7 +445,7 @@ func weld_ffi_pub_set_type(handle C.longlong, typeName *C.char, typeHash *C.char
 			rc = C.int(weldCodeErrInternal)
 		}
 	}()
-	return weldWriteWireType(handle, typeName, typeHash, weldSetPubType)
+	return weldWriteWireType(handle, typeName, typeHash, weldSetPubType, false)
 }
 
 // weld_ffi_sub_set_type stores wire type info for a subscription.
@@ -462,5 +466,5 @@ func weld_ffi_sub_set_type(handle C.longlong, typeName *C.char, typeHash *C.char
 			rc = C.int(weldCodeErrInternal)
 		}
 	}()
-	return weldWriteWireType(handle, typeName, typeHash, weldSetSubType)
+	return weldWriteWireType(handle, typeName, typeHash, weldSetSubType, true)
 }

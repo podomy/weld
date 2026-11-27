@@ -19,11 +19,8 @@
 // never counts and malformed counts once as incompatible. Remote QoS
 // reads expose the parsed RxO wire offer for info-by-topic queries.
 //
-// Local SEDP endpoints are read through the same-process backend struct
-// with the reflect pattern from netflow.go because the backend offers no
-// public locals accessor. Every field access is type-checked and the
-// endpoint copy runs under no backend lock beyond the callee's own, so
-// layout drift fails closed instead of fabricating endpoints.
+// Local SEDP endpoints are read through the backend public accessor.
+// It never panics.
 package main
 
 /*
@@ -32,10 +29,7 @@ package main
 import "C"
 
 import (
-	"reflect"
-	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/podomy/weld/internal/transports/dds"
 )
@@ -226,18 +220,11 @@ func weldDropEventExtrasLocked(bridgeID int64) {
 	}
 }
 
-// weldSEDPIndexType is the expected type of the backend sedp field.
-var weldSEDPIndexType = reflect.TypeFor[*dds.SEDPIndex]()
-
-// weldBackendMuType mirrors the backend read lock for locals snapshots.
-var weldBackendMuType = reflect.TypeFor[sync.RWMutex]() //nolint:gochecknoglobals // shared with netflow pattern
-
 // weldLocalEndpoints returns the local SEDP endpoints for a bridge.
 //
-// It reads the same-process backend sedp field with the netflow reflect
-// pattern because the backend offers no public locals accessor. A
-// missing bridge, missing backend, or layout drift reports false so
-// callers fall back to malformed-only incompat counting. It never panics.
+// It uses the backend public accessor, so no reflect or unsafe is
+// needed. A missing bridge or missing backend reports false so callers
+// fall back to malformed-only incompat counting. It never panics.
 func weldLocalEndpoints(bridgeID int64) ([]dds.SEDPEndpoint, bool) {
 	weldMu.Lock()
 	backend := weldRTPS[bridgeID]
@@ -249,15 +236,7 @@ func weldLocalEndpoints(bridgeID int64) ([]dds.SEDPEndpoint, bool) {
 	if backend == nil {
 		return nil, false
 	}
-	v := reflect.ValueOf(backend).Elem().FieldByName("sedp")
-	if !v.IsValid() || v.Type() != weldSEDPIndexType {
-		return nil, false
-	}
-	idx := (*dds.SEDPIndex)(unsafe.Pointer(v.UnsafeAddr()))
-	if idx == nil {
-		return nil, false
-	}
-	return idx.LocalEndpoints(), true
+	return backend.LocalEndpoints(), true
 }
 
 // weldIdentityMatches reports whether non-QoS identity matches.

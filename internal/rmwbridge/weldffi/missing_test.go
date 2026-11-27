@@ -570,6 +570,13 @@ func declareNetflowPair(t *testing.T, bhA, bhB int64) (int64, int64) {
 	pubB, code := weldGoPubCreate(bhB, "n", "/weld_netflow_probe")
 	requireWeldCode(t, code, 0, "pub_create B")
 	requireWeldCode(t, weldGoPubSetType(pubB, "std_msgs__msg__String", ""), 0, "set_type B")
+	// Publishers are writers only and no longer declare a spurious
+	// reader, so declare an explicit reader on B for the reader-role
+	// check. The handle leaks until bridge free, which is fine for the
+	// test lifetime.
+	subB, code := weldGoSubCreate(bhB, "n", "/weld_netflow_probe")
+	requireWeldCode(t, code, 0, "sub_create B")
+	requireWeldCode(t, weldGoSubSetDynamicType(subB, "std_msgs/msg/String", ""), 0, "set_dynamic B")
 	return subA, pubB
 }
 
@@ -650,8 +657,19 @@ func checkNetflowRemoteDiscovery(t *testing.T) {
 	}()
 	peerPort, n := waitNetflowWriterPeer(t, bhA, bhB, pubB)
 	checkNetflowEntries(t, bhA, 0, n, peerPort, "writer")
-	nReaders, code := weldGoNetflowRemoteCount(bhA, "/weld_netflow_probe", 1)
-	requireWeldCode(t, code, 0, "netflow_remote_count reader role code")
+	// Readers announce via the periodic SEDP loop, not on publish,
+	// so poll until the explicit B reader converges.
+	deadline := time.Now().Add(10 * time.Second)
+	var nReaders int64
+	var rcode int32
+	for {
+		nReaders, rcode = weldGoNetflowRemoteCount(bhA, "/weld_netflow_probe", 1)
+		requireWeldCode(t, rcode, 0, "netflow_remote_count reader role code")
+		if nReaders > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if nReaders <= 0 {
 		t.Fatalf("netflow_remote_count reader peers = %d, want at least 1", nReaders)
 	}

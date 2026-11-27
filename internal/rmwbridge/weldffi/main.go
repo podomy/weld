@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/podomy/weld/internal/rmwbridge"
+	"github.com/podomy/weld/internal/transports"
 )
 
 // Return codes for the C ABI layer.
@@ -640,12 +641,16 @@ func weld_ffi_join(handle C.longlong, participant *C.char, domain C.int) (rc C.i
 	if !ok {
 		return C.int(weldCodeErrHandle)
 	}
-	info := rmwbridge.DiscoveryInfo{ParticipantName: name, DomainID: uint32(domain)}
-	err := b.JoinDiscovery(context.Background(), info)
+	resolved, err := transports.ResolveDomainID(uint32(domain))
 	if err != nil {
 		return C.int(weldCodeErrInternal)
 	}
-	weldAttachRTPS(key, name, uint32(domain))
+	info := rmwbridge.DiscoveryInfo{ParticipantName: name, DomainID: resolved}
+	err = b.JoinDiscovery(context.Background(), info)
+	if err != nil {
+		return C.int(weldCodeErrInternal)
+	}
+	weldAttachRTPS(key, name, resolved)
 	return C.int(weldCodeOK)
 }
 
@@ -702,7 +707,9 @@ func weld_ffi_pub_create(bridgeHandle C.longlong, nodeName *C.char, topic *C.cha
 
 // weld_ffi_pub_destroy closes a publisher and releases its handle.
 //
-// It returns 0 on success and -2 for an unknown handle. It never panics.
+// It is idempotent: destroying an already destroyed or collected handle
+// returns success so shutdown ordering (bridge free before endpoint
+// destroy) does not surface as a loud error. It never panics.
 //
 //export weld_ffi_pub_destroy
 func weld_ffi_pub_destroy(handle C.longlong) (rc C.int) {
@@ -720,7 +727,7 @@ func weld_ffi_pub_destroy(handle C.longlong) (rc C.int) {
 	e, ok := weldPubs[key]
 	if !ok {
 		weldMu.Unlock()
-		return C.int(weldCodeErrHandle)
+		return C.int(weldCodeOK)
 	}
 	delete(weldPubs, key)
 	delete(weldPubTypes, key)
@@ -825,7 +832,9 @@ func weld_ffi_sub_create(bridgeHandle C.longlong, nodeName *C.char, topic *C.cha
 
 // weld_ffi_sub_destroy closes a subscription and releases its handle.
 //
-// It returns 0 on success and -2 for an unknown handle. It never panics.
+// It is idempotent: destroying an already destroyed or collected handle
+// returns success so shutdown ordering does not surface as an error.
+// It never panics.
 //
 //export weld_ffi_sub_destroy
 func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
@@ -843,7 +852,7 @@ func weld_ffi_sub_destroy(handle C.longlong) (rc C.int) {
 	e, ok := weldSubs[key]
 	if !ok {
 		weldMu.Unlock()
-		return C.int(weldCodeErrHandle)
+		return C.int(weldCodeOK)
 	}
 	delete(weldSubs, key)
 	delete(weldSubPending, key)
@@ -1133,7 +1142,9 @@ func weld_ffi_service_create(bridgeHandle C.longlong, name *C.char, outHandle *C
 
 // weld_ffi_service_destroy unregisters a service and releases its handle.
 //
-// It returns 0 on success and -2 for an unknown handle. It never panics.
+// It is idempotent: destroying an already destroyed or collected handle
+// returns success so shutdown ordering does not surface as an error.
+// It never panics.
 //
 //export weld_ffi_service_destroy
 func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
@@ -1151,7 +1162,7 @@ func weld_ffi_service_destroy(handle C.longlong) (rc C.int) {
 	e, ok := weldServices[key]
 	if !ok {
 		weldMu.Unlock()
-		return C.int(weldCodeErrHandle)
+		return C.int(weldCodeOK)
 	}
 	bkey := e.bridgeID
 	delete(weldServices, key)

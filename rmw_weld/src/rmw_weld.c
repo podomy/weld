@@ -152,6 +152,15 @@ extern int weld_ffi_sub_destroy(long long handle);
 extern int weld_ffi_sub_take_poll(
   long long handle, char * buf, int buflen, int * out_n);
 
+// Publisher GID authority from the Go core (weld_ffi_pub_get_gid).
+//
+// The bridge counter assigns the 16 byte writer identity shared with the
+// take-info side channel, so rmw_compare_gids_equal holds in-process.
+// Weak so an older Go library degrades to an error instead of crashing;
+// synthesis is never used because it would diverge from take GIDs.
+extern int weld_ffi_pub_get_gid(
+  long long handle, char * gid_buf, int gid_len) __attribute__((weak));
+
 // In-process loan handoff for zero-copy delivery (see the loan family).
 //
 // loan_addr carries the opaque C message pointer and members_addr carries
@@ -177,6 +186,14 @@ extern int weld_ffi_loan_take_poll(
 extern int weld_ffi_sub_take_info(
   long long handle, unsigned long long * out_seq, char * gid_buf, int gid_len)
   __attribute__((weak));
+
+// Publisher send stamp side channel (weld_ffi_sub_take_source).
+//
+// OutNs receives unix nanos captured at publish time, or zero when the
+// leg carried none (wire takes). Callers fall back to local receive
+// time on zero. Weak for the same old-library reason as take_info.
+extern int weld_ffi_sub_take_source(
+  long long handle, unsigned long long * out_ns) __attribute__((weak));
 
 // Optional type annotation for graph interop.
 //
@@ -540,6 +557,31 @@ static int weld_take_info(
     return -1;
   }
   *seq_out = seq;
+  return 0;
+}
+
+// Read the publisher send stamp for the last delivered sample.
+//
+// Returns 0 with the unix nanos on success, or -1 with zero when the
+// side channel is missing, fails, or carried none (wire takes). A zero
+// stamp means the caller falls back to local receive time.
+static int weld_take_source(long long handle, unsigned long long * ns_out)
+{
+  unsigned long long ns = 0;
+  int rc = 0;
+  if (ns_out == NULL) {
+    return -1;
+  }
+  *ns_out = 0;
+  if (weld_ffi_sub_take_source == NULL) {
+    return -1;
+  }
+  rc = weld_ffi_sub_take_source(handle, &ns);
+  if (rc != 0 || ns == 0) {
+    *ns_out = 0;
+    return -1;
+  }
+  *ns_out = ns;
   return 0;
 }
 
@@ -994,7 +1036,15 @@ static struct weld_loan_entry * g_weld_pub_loans = NULL;
 
 static struct weld_loan_entry * g_weld_sub_loans = NULL;
 
-static size_t g_weld_decode_drops = 0;
+// MESSAGE_LOST drop counters split by side (DDS 1.4 section 2.2.4: lost
+// counts are per-reader; publisher losses are separate publish failures).
+// Sub drops count consumed but undecodable wire samples on the take
+// paths. Pub drops count publish-side encode or send failures that lost
+// a sample before delivery. Sharing one counter misattributes sub
+// losses to pubs, so takes and waits select by slot side.
+static size_t g_weld_sub_drops = 0;
+
+static size_t g_weld_pub_drops = 0;
 
 // Add one outstanding loan to the list. Returns 0, or -1 on bad argument
 // or alloc failure.
@@ -1073,33 +1123,64 @@ static void weld_loan_restore_pub(
 static void weld_drop_add(void)
 {
   (void)pthread_mutex_lock(&g_weld_loan_mutex);
-  if (g_weld_decode_drops < SIZE_MAX) {
-    g_weld_decode_drops++;
+  if (g_weld_sub_drops < SIZE_MAX) {
+    g_weld_sub_drops++;
   }
   (void)pthread_mutex_unlock(&g_weld_loan_mutex);
 }
 
+// Record one publish-side lost sample for MESSAGE_LOST.
+static void weld_pub_drop_add(void)
+{
+  (void)pthread_mutex_lock(&g_weld_loan_mutex);
+  if (g_weld_pub_drops < SIZE_MAX) {
+    g_weld_pub_drops++;
+  }
+  (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+}
+
+// Read the MESSAGE_LOST total for one side without consuming.
+static size_t weld_lost_total_for(bool is_pub)
+{
+  size_t total = 0;
+  (void)pthread_mutex_lock(&g_weld_loan_mutex);
+  total = is_pub ? g_weld_pub_drops : g_weld_sub_drops;
+  (void)pthread_mutex_unlock(&g_weld_loan_mutex);
+  return total;
+}
+
 // Fill take info with a local receive stamp plus delivered attribution.
 //
-// The source stamp reports the local receive time (never 0) while the
-// sequence is the per-subscription receive count from the Go core with
-// intra-process equal to network because the bridge is a single
-// transport. A zero sequence means the core predates attribution and
-// both sequences stay unsupported. The GID is the publishing writer
-// identity, or zeroed when the take carried none (wire takes, old
-// core, or a NULL gid).
+// The source stamp prefers the publisher-side send stamp from the Go
+// core when available (in-process takes carry the publish-time unix
+// nanos); wire takes carry none, so the source falls back to the local
+// receive time with the documented divergence. The received stamp is
+// always the local receive time (never 0). The sequence is the
+// per-subscription receive count with intra-process equal to network
+// because the bridge is a single transport. A zero sequence means the
+// core predates attribution and both sequences stay unsupported. The
+// GID is the publishing writer identity, or zeroed when the take
+// carried none (wire takes, old core, or a NULL gid).
 static void weld_fill_take_info(
-  rmw_message_info_t * message_info, unsigned long long seq,
-  const uint8_t gid[16])
+  rmw_message_info_t * message_info, long long handle,
+  unsigned long long seq, const uint8_t gid[16])
 {
   struct timespec now;
   uint64_t now_ns = 0;
+  unsigned long long source_ns = 0;
   if (message_info == NULL) {
     return;
   }
   (void)clock_gettime(CLOCK_REALTIME, &now);
   now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-  message_info->source_timestamp = (rmw_time_point_value_t)now_ns;
+  if (handle != 0) {
+    (void)weld_take_source(handle, &source_ns);
+  }
+  if (source_ns != 0) {
+    message_info->source_timestamp = (rmw_time_point_value_t)source_ns;
+  } else {
+    message_info->source_timestamp = (rmw_time_point_value_t)now_ns;
+  }
   message_info->received_timestamp = (rmw_time_point_value_t)now_ns;
   if (seq == 0 || seq > (unsigned long long)INT64_MAX) {
     message_info->publication_sequence_number =
@@ -1138,8 +1219,12 @@ static void weld_fill_take_info(
 // same buffer pointer enqueued by publish with no encode, decode, or
 // payload copy; the fallback pulls one wire sample (wait stash first via
 // weld_take_wire) plus decodes it into a fresh buffer, which copies.
-// Decode failures count as dropped samples for MESSAGE_LOST. On success
-// seq_out plus gid_out carry the delivered attribution when non-NULL.
+// The loan fast path discards its wire duplicate without consuming the
+// wait stash: wait parks one sample for the next regular take, so the
+// duplicate is polled directly and the stash stays intact for a later
+// wait to take_loaned delivery. Decode failures count as dropped samples
+// for MESSAGE_LOST. On success seq_out plus gid_out carry the delivered
+// attribution when non-NULL.
 static int weld_take_loaned_wire(
   const rmw_subscription_t * subscription, void ** message_out,
   unsigned long long * seq_out, uint8_t gid_out[16])
@@ -1172,8 +1257,6 @@ static int weld_take_loaned_wire(
         (const rosidl_typesupport_introspection_c__MessageMembers *)
         (uintptr_t)members_addr;
       void * loan_buf = (void *)(uintptr_t)loan_addr;
-      uint8_t * dup = NULL;
-      size_t dup_len = 0;
       if (weld_loan_add(&g_weld_sub_loans, subscription, loan_buf,
         loan_members) != 0)
       {
@@ -1183,8 +1266,17 @@ static int weld_take_loaned_wire(
         RCUTILS_SET_ERROR_MSG("rmw_weld: loaned take no memory");
         return -1;
       }
-      if (weld_take_wire(sd, &dup, &dup_len, NULL, NULL) == 0) {
-        free(dup);
+      // Discard the wire duplicate without touching the wait stash so a
+      // wait-parked sample survives for the next regular take. The stash
+      // stays executor-thread owned and is never consumed here.
+      {
+        uint8_t * dup_direct = NULL;
+        size_t dup_direct_len = 0;
+        if (weld_poll_payload(
+          sd->handle, &dup_direct, &dup_direct_len, NULL, NULL) == 0)
+        {
+          free(dup_direct);
+        }
       }
       if (seq_out != NULL || gid_out != NULL) {
         uint8_t gid[16];
@@ -1262,8 +1354,8 @@ static int weld_take_loaned_wire(
 // on-event callbacks. Guarded by g_weld_loan_mutex with the loan lists.
 // Each slot binds one rmw_event_t to its endpoint at init: handle is the
 // FFI pub or sub handle, endpoint points at the live weld_pub_data or
-// weld_sub_data, and is_pub selects the side. Message lost stays global
-// with no endpoint. Baselines mirror the take path so wait peeks without
+// weld_sub_data, and is_pub selects the side. Message lost tracks
+// per-side totals selected by is_pub. Baselines mirror the take path so wait peeks without
 // consuming: lost, alive, not-alive, deadline, wire incompat, and local
 // incompat totals last reported. Callback fires on take when new data
 // exists; wait wakes for polling without firing.
@@ -1499,7 +1591,8 @@ static bool weld_event_bound_ready(const rmw_event_t * handle)
     }
     switch (slot->event_type) {
       case RMW_EVENT_MESSAGE_LOST:
-        ready = g_weld_decode_drops > slot->lost_reported;
+        ready = (slot->is_pub ? g_weld_pub_drops : g_weld_sub_drops) >
+          slot->lost_reported;
         break;
       case RMW_EVENT_LIVELINESS_CHANGED:
         if (weld_event_matched_current(slot, &matched) == 0) {
@@ -3255,18 +3348,21 @@ rmw_ret_t rmw_publish(
       RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_publish encode failed");
     }
     free(wire);
+    weld_pub_drop_add();
     return RMW_RET_ERROR;
   }
   if (wire_len > (size_t)INT_MAX) {
     free(wire);
     rmw_reset_error();
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_publish payload too large");
+    weld_pub_drop_add();
     return RMW_RET_ERROR;
   }
   rc = weld_ffi_pub_publish(
     pd->handle, (const char *)wire, (int)wire_len);
   free(wire);
   if (rc != 0) {
+    weld_pub_drop_add();
     return weld_fail_ffi("rmw_weld: rmw_publish backend failed", rc);
   }
   return RMW_RET_OK;
@@ -3614,9 +3710,10 @@ rmw_ret_t rmw_take_with_info(
   rmw_message_info_t * message_info, rmw_subscription_allocation_t * allocation)
 {
   // Same poll plus decode path as rmw_take, with source info filled from
-  // local metadata through weld_fill_take_info. The source stamp reports
-  // the local receive time while the sequence plus GID ride the take
-  // info side channel.
+  // local metadata through weld_fill_take_info. The source stamp prefers
+  // the publisher-side send stamp when the in-process leg carried one
+  // and falls back to local receive time for wire takes, while the
+  // sequence plus GID ride the take info side channel.
   struct weld_sub_data * sd = NULL;
   const rosidl_typesupport_introspection_c__MessageMembers * members = NULL;
   uint8_t * wire = NULL;
@@ -3672,7 +3769,7 @@ rmw_ret_t rmw_take_with_info(
     }
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info, seq, gid);
+  weld_fill_take_info(message_info, sd->handle, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }
@@ -3794,6 +3891,20 @@ extern int weld_ffi_service_send_rtps(
 extern int weld_ffi_service_take_reply(
   long long handle, long long seq, const char * guid, const char * idl_base,
   char * resp_buf, int resp_buf_len, int * out_n) __attribute__((weak));
+// RTPS server leg matches the weldffi serve_rtps exports: serve_rtps
+// dequeues one wire request with its client guid plus seq, respond_rtps
+// publishes the matching reply, and has_request_rtps peeks without
+// consuming. Weak for the same old-library reason; a NULL address keeps
+// the server leg in-memory only instead of crashing.
+extern int weld_ffi_service_serve_rtps(
+  long long handle, const char * idl_base, char * req_buf, int req_buf_len,
+  int * out_n, long long * out_seq, char * out_guid) __attribute__((weak));
+extern int weld_ffi_service_respond_rtps(
+  long long handle, const char * guid, long long seq, const char * idl_base,
+  const char * resp, int resp_len) __attribute__((weak));
+extern int weld_ffi_service_has_request_rtps(
+  long long handle, const char * idl_base, int * out_n)
+  __attribute__((weak));
 // Matched-entity queries match the internal/rmwbridge/weldffi/matched.go
 // exports. They stay weak so counts fail loudly when the Go core is not
 // linked instead of crashing. Counts sum local same-bridge endpoints
@@ -3885,7 +3996,11 @@ enum
 // arrived as an 8 byte sequence echo with no encoded bytes.
 // pending_local parallels pending: a true slot means the take sent
 // while a local server existed, so the take waits on the same leg the
-// send used instead of re-deciding after a topology change.
+// send used instead of re-deciding after a topology change. For
+// services, a false pending_local slot arrived via the RTPS wire leg
+// and carries its client guid in pending_guid for the matching
+// respond_rtps; a true slot arrived via the in-memory rendezvous and
+// answers through respond.
 // n_pending never exceeds WELD_RPC_PENDING_MAX.
 struct weld_rpc_state
 {
@@ -3899,6 +4014,7 @@ struct weld_rpc_state
   // distinguishing endpoint incarnations that reuse an address.
   uint64_t guid_salt;
   int64_t pending[WELD_RPC_PENDING_MAX];
+  uint8_t pending_guid[WELD_RPC_PENDING_MAX][8];
   size_t n_pending;
   size_t domain;
   rmw_event_callback_t on_new_callback;
@@ -3945,7 +4061,8 @@ static int64_t weld_seq_read(const char in[8])
 
 // Drop one sequence id from the pending set. The caller holds the
 // endpoint mutex. Missing ids are ignored so double removal is safe.
-// The echo flag and the leg flag parallel the id and drop with it.
+// The echo flag, the leg flag, and the client guid parallel the id and
+// drop with it.
 static void weld_rpc_remove_locked(struct weld_rpc_state * st, int64_t seq)
 {
   for (size_t i = 0; i < st->n_pending; i++) {
@@ -3955,6 +4072,9 @@ static void weld_rpc_remove_locked(struct weld_rpc_state * st, int64_t seq)
         (void)memmove(
           &st->pending[i], &st->pending[i + 1],
           tail * sizeof(st->pending[0]));
+        (void)memmove(
+          &st->pending_guid[i], &st->pending_guid[i + 1],
+          tail * sizeof(st->pending_guid[0]));
         (void)memmove(
           &st->pending_is_echo[i], &st->pending_is_echo[i + 1],
           tail * sizeof(st->pending_is_echo[0]));
@@ -4414,11 +4534,14 @@ rmw_ret_t rmw_take_request(
   void * ros_request, bool * taken)
 {
   // Bridge: a pending weld_ffi_service_serve_nb dequeues one Go Service
-  // request from the in-memory rendezvous or the RTPS request topic and
-  // reports its sequence id. CDR payloads decode through the
-  // introspection request members; a leftover 8 byte sequence echo from
-  // the old in-memory path keeps working by mapping only the header
-  // while ros_request stays untouched.
+  // request from the in-memory rendezvous and reports its sequence id;
+  // when the in-memory queue is empty the RTPS request topic is polled
+  // via weld_ffi_service_serve_rtps so cross-process clients are served.
+  // CDR payloads decode through the introspection request members; a
+  // leftover 8 byte sequence echo from the old in-memory path keeps
+  // working by mapping only the header while ros_request stays untouched.
+  // In-memory takes record pending_local true, RTPS takes record false
+  // with the client guid for the matching respond_rtps.
   if (service == NULL || request_header == NULL || ros_request == NULL ||
     taken == NULL)
   {
@@ -4454,6 +4577,10 @@ rmw_ret_t rmw_take_request(
   }
   int out_n = 0;
   long long seq = 0;
+  bool from_rtps = false;
+  bool inmem_empty = false;
+  uint8_t rtps_guid[8];
+  (void)memset(rtps_guid, 0, sizeof(rtps_guid));
   for (;;) {
     int rc = 0;
     if (cap > (size_t)INT_MAX) {
@@ -4462,9 +4589,11 @@ rmw_ret_t rmw_take_request(
     rc = weld_ffi_service_serve_nb(
       handle, (char *)buf, (int)cap, &out_n, &seq);
     if (rc == 1) {
-      free(buf);
-      *taken = false;
-      return RMW_RET_OK;
+      // In-memory empty: fall through to the RTPS wire leg so
+      // cross-process clients are dequeued and answered. A missing
+      // RTPS symbol keeps the server in-memory only.
+      inmem_empty = true;
+      break;
     }
     if (rc == -4) {
       uint8_t * next = NULL;
@@ -4494,6 +4623,70 @@ rmw_ret_t rmw_take_request(
     }
     break;
   }
+  if (inmem_empty) {
+    // No in-memory request was queued: try the RTPS wire leg. Empty
+    // samples (zero bytes with rc 0) stay on the in-memory path above.
+    char base[512];
+    if (weld_ffi_service_serve_rtps == NULL) {
+      free(buf);
+      *taken = false;
+      return RMW_RET_OK;
+    }
+    if (weld_service_idl_base(st->type_support, base, sizeof(base)) != 0) {
+      free(buf);
+      return weld_fail_invalid(
+        "rmw_weld: rmw_take_request type support has no service name");
+    }
+    for (;;) {
+      int rc = 0;
+      long long rseq = 0;
+      uint8_t guid[8];
+      if (cap > (size_t)INT_MAX) {
+        cap = (size_t)INT_MAX;
+      }
+      (void)memset(guid, 0, sizeof(guid));
+      rc = weld_ffi_service_serve_rtps(
+        handle, base, (char *)buf, (int)cap, &out_n, &rseq, (char *)guid);
+      if (rc == 1) {
+        free(buf);
+        *taken = false;
+        return RMW_RET_OK;
+      }
+      if (rc == -4) {
+        uint8_t * next = NULL;
+        if (cap >= cap_max) {
+          free(buf);
+          rmw_reset_error();
+          RCUTILS_SET_ERROR_MSG(
+            "rmw_weld: rmw_take_request payload too large");
+          return RMW_RET_ERROR;
+        }
+        cap *= 2;
+        if (cap > cap_max) {
+          cap = cap_max;
+        }
+        next = (uint8_t *)realloc(buf, cap);
+        if (next == NULL) {
+          free(buf);
+          rmw_reset_error();
+          RCUTILS_SET_ERROR_MSG(
+            "rmw_weld: rmw_take_request out of memory");
+          return RMW_RET_BAD_ALLOC;
+        }
+        buf = next;
+        continue;
+      }
+      if (rc != 0) {
+        free(buf);
+        return weld_fail_error(
+          "rmw_weld: rmw_take_request rtps serve failed");
+      }
+      seq = rseq;
+      (void)memcpy(rtps_guid, guid, sizeof(rtps_guid));
+      from_rtps = true;
+      break;
+    }
+  }
   if (out_n < 0) {
     free(buf);
     return weld_fail_error("rmw_weld: rmw_take_request bad length");
@@ -4510,23 +4703,45 @@ rmw_ret_t rmw_take_request(
       return weld_fail_error("rmw_weld: rmw_take_request too many pending");
     }
     st->pending[st->n_pending] = (int64_t)seq;
+    if (from_rtps) {
+      (void)memcpy(st->pending_guid[st->n_pending], rtps_guid, 8);
+    } else {
+      (void)memset(st->pending_guid[st->n_pending], 0, 8);
+    }
     st->pending_is_echo[st->n_pending] = false;
-    st->pending_local[st->n_pending] = true;
+    st->pending_local[st->n_pending] = !from_rtps;
     st->n_pending++;
     (void)pthread_mutex_unlock(&st->mutex);
     request_header->source_timestamp = 0;
     request_header->received_timestamp = 0;
-    (void)memset(
-      request_header->request_id.writer_guid, 0,
-      sizeof(request_header->request_id.writer_guid));
+    if (from_rtps) {
+      if (sizeof(request_header->request_id.writer_guid) >= 8) {
+        (void)memcpy(
+          request_header->request_id.writer_guid, rtps_guid, 8);
+        if (sizeof(request_header->request_id.writer_guid) > 8) {
+          (void)memset(
+            request_header->request_id.writer_guid + 8, 0,
+            sizeof(request_header->request_id.writer_guid) - 8);
+        }
+      } else {
+        (void)memset(
+          request_header->request_id.writer_guid, 0,
+          sizeof(request_header->request_id.writer_guid));
+      }
+    } else {
+      (void)memset(
+        request_header->request_id.writer_guid, 0,
+        sizeof(request_header->request_id.writer_guid));
+    }
     request_header->request_id.sequence_number = (int64_t)seq;
     *taken = true;
     free(buf);
     return RMW_RET_OK;
   }
   // Old in-memory echo: exactly 8 bytes with no CDR header. Only the
-  // header sequence travels; ros_request stays untouched.
-  if (out_n == 8 && buf[0] != 0x00) {
+  // header sequence travels; ros_request stays untouched. Echoes only
+  // arrive via the in-memory leg, never RTPS.
+  if (!from_rtps && out_n == 8 && buf[0] != 0x00) {
     (void)pthread_mutex_lock(&st->mutex);
     if (st->n_pending >= WELD_RPC_PENDING_MAX) {
       (void)pthread_mutex_unlock(&st->mutex);
@@ -4534,6 +4749,7 @@ rmw_ret_t rmw_take_request(
       return weld_fail_error("rmw_weld: rmw_take_request too many pending");
     }
     st->pending[st->n_pending] = (int64_t)seq;
+    (void)memset(st->pending_guid[st->n_pending], 0, 8);
     st->pending_is_echo[st->n_pending] = true;
     st->pending_local[st->n_pending] = true;
     st->n_pending++;
@@ -4583,17 +4799,22 @@ rmw_ret_t rmw_send_response(
   }
   int64_t seq = request_header->sequence_number;
   bool want_echo = false;
+  bool want_local = true;
+  uint8_t want_guid[8];
   long long handle = 0;
-  // Peek the echo flag first: encoding needs no shared state, so it
-  // runs without the mutex. The answer below re-verifies pending under
-  // one lock hold, so a racing second responder finds the id gone and
-  // fails instead of answering twice.
+  (void)memset(want_guid, 0, sizeof(want_guid));
+  // Peek the echo plus leg flags first: encoding needs no shared state,
+  // so it runs without the mutex. The answer below re-verifies pending
+  // under one lock hold, so a racing second responder finds the id gone
+  // and fails instead of answering twice.
   (void)pthread_mutex_lock(&st->mutex);
   {
     bool found = false;
     for (size_t i = 0; i < st->n_pending; i++) {
       if (st->pending[i] == seq) {
         want_echo = st->pending_is_echo[i];
+        want_local = st->pending_local[i];
+        (void)memcpy(want_guid, st->pending_guid[i], 8);
         found = true;
         break;
       }
@@ -4663,15 +4884,50 @@ rmw_ret_t rmw_send_response(
       }
       return weld_fail_invalid("rmw_weld: rmw_send_response unknown sequence");
     }
-    int rc = weld_ffi_service_respond(
-      handle, (long long)seq, (const char *)wire, (int)wire_len);
-    if (!want_echo) {
-      free(wire);
-      wire = NULL;
-    }
-    if (rc != 0) {
-      (void)pthread_mutex_unlock(&st->mutex);
-      return weld_fail_error("rmw_weld: rmw_send_response respond failed");
+    if (want_local) {
+      int rc = weld_ffi_service_respond(
+        handle, (long long)seq, (const char *)wire, (int)wire_len);
+      if (!want_echo) {
+        free(wire);
+        wire = NULL;
+      }
+      if (rc != 0) {
+        (void)pthread_mutex_unlock(&st->mutex);
+        return weld_fail_error("rmw_weld: rmw_send_response respond failed");
+      }
+    } else {
+      char base[512];
+      int rc = 0;
+      if (weld_ffi_service_respond_rtps == NULL) {
+        (void)pthread_mutex_unlock(&st->mutex);
+        if (!want_echo) {
+          free(wire);
+        }
+        return weld_fail_unsupported(
+          "rmw_weld: rmw_send_response rtps respond not linked yet");
+      }
+      if (weld_service_idl_base(
+        st->type_support, base, sizeof(base)) != 0)
+      {
+        (void)pthread_mutex_unlock(&st->mutex);
+        if (!want_echo) {
+          free(wire);
+        }
+        return weld_fail_invalid(
+          "rmw_weld: rmw_send_response type support has no service name");
+      }
+      rc = weld_ffi_service_respond_rtps(
+        handle, (const char *)want_guid, (long long)seq, base,
+        (const char *)wire, (int)wire_len);
+      if (!want_echo) {
+        free(wire);
+        wire = NULL;
+      }
+      if (rc != 0) {
+        (void)pthread_mutex_unlock(&st->mutex);
+        return weld_fail_error(
+          "rmw_weld: rmw_send_response rtps respond failed");
+      }
     }
     weld_rpc_remove_locked(st, seq);
   }
@@ -5284,17 +5540,30 @@ static bool weld_svc_wait_probe(struct weld_rpc_state * st)
 {
   long long handle = 0;
   int n = 0;
-  if (st == NULL || weld_ffi_service_has_request == NULL) {
+  if (st == NULL) {
     return false;
   }
   handle = weld_rpc_handle(st);
   if (handle == 0) {
     return false;
   }
-  if (weld_ffi_service_has_request(handle, &n) != 0) {
-    return false;
+  if (weld_ffi_service_has_request != NULL) {
+    if (weld_ffi_service_has_request(handle, &n) == 0 && n > 0) {
+      return true;
+    }
   }
-  return n > 0;
+  // RTPS wire leg: a missing symbol keeps the server in-memory only.
+  if (weld_ffi_service_has_request_rtps != NULL && st->type_support != NULL) {
+    char base[512];
+    if (weld_service_idl_base(st->type_support, base, sizeof(base)) == 0) {
+      if (weld_ffi_service_has_request_rtps(handle, base, &n) == 0 &&
+        n > 0)
+      {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // Probe one client for a matching reply without consuming.
@@ -6125,13 +6394,16 @@ rmw_ret_t rmw_destroy_waitset(rmw_wait_set_t * wait_set)
 
 rmw_ret_t rmw_get_gid_for_publisher(const rmw_publisher_t * publisher, rmw_gid_t * gid)
 {
-  // Bridge: 16 byte writer identity with domain in the first 4 bytes
-  // little endian and the FFI publisher handle in the next 8 bytes,
-  // mirroring dds WriterGUID width. Unique within one domain.
+  // Bridge counter authority: the 16 byte writer identity comes from the
+  // Go bridge (domain in the first 4 bytes, counter in the next 8),
+  // the same authority backing the take-info side channel, so
+  // rmw_compare_gids_equal holds in-process between publisher GIDs and
+  // take GIDs. Wire takes with no writer identity keep the zero-GID
+  // documented fallback. Synthesis is never used.
   const struct weld_pub_data * pd = NULL;
-  uint64_t handle_u = 0;
-  uint32_t domain_u = 0;
-  size_t i = 0;
+  uint8_t raw[16];
+  size_t copy_len = 0;
+  int rc = 0;
   if (publisher == NULL || gid == NULL) {
     return weld_fail_invalid("rmw_weld: rmw_get_gid_for_publisher null argument");
   }
@@ -6144,21 +6416,22 @@ rmw_ret_t rmw_get_gid_for_publisher(const rmw_publisher_t * publisher, rmw_gid_t
     RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_get_gid_for_publisher no data");
     return RMW_RET_ERROR;
   }
-  if (pd->domain > (size_t)UINT32_MAX) {
+  if (weld_ffi_pub_get_gid == NULL) {
     rmw_reset_error();
-    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_get_gid_for_publisher domain range");
+    RCUTILS_SET_ERROR_MSG("rmw_weld: rmw_get_gid_for_publisher FFI not linked");
     return RMW_RET_ERROR;
   }
-  domain_u = (uint32_t)pd->domain;
-  handle_u = (uint64_t)pd->handle;
-  (void)memset(gid->data, 0, sizeof(gid->data));
-  gid->data[0] = (uint8_t)(domain_u & 0xFFU);
-  gid->data[1] = (uint8_t)((domain_u >> 8) & 0xFFU);
-  gid->data[2] = (uint8_t)((domain_u >> 16) & 0xFFU);
-  gid->data[3] = (uint8_t)((domain_u >> 24) & 0xFFU);
-  for (i = 0; i < 8; i++) {
-    gid->data[4 + i] = (uint8_t)((handle_u >> (8 * i)) & 0xFFU);
+  (void)memset(raw, 0, sizeof(raw));
+  rc = weld_ffi_pub_get_gid(pd->handle, (char *)raw, 16);
+  if (rc != 0) {
+    return weld_fail_ffi("rmw_weld: rmw_get_gid_for_publisher backend failed", rc);
   }
+  (void)memset(gid->data, 0, sizeof(gid->data));
+  copy_len = sizeof(raw);
+  if (copy_len > sizeof(gid->data)) {
+    copy_len = sizeof(gid->data);
+  }
+  (void)memcpy(gid->data, raw, copy_len);
   gid->implementation_identifier = kImplementationIdentifier;
   return RMW_RET_OK;
 }
@@ -6168,7 +6441,9 @@ rmw_ret_t rmw_publisher_count_matched_subscriptions(
 {
   // Bridge: Publisher.CountMatchedSubscriptions counts live subscriptions
   // in the same per-domain pubs plus subs registry on the same topic.
-  // Closed subscriptions are excluded. No Go mapping exists yet.
+  // Closed subscriptions are excluded. Local endpoints filter by QoS
+  // compatibility (WARNING excluded); remote endpoints keep passthrough
+  // because remote QoS may be unknown, documented here fail-closed.
   if (publisher == NULL || subscription_count == NULL) {
     return weld_fail_invalid(
       "rmw_weld: rmw_publisher_count_matched_subscriptions null argument");
@@ -6195,7 +6470,18 @@ rmw_ret_t rmw_publisher_count_matched_subscriptions(
       return weld_fail_error(
         "rmw_weld: rmw_publisher_count_matched_subscriptions backend failed");
     }
-    *subscription_count = (size_t)n;
+    {
+      size_t incompat = 0;
+      if (pd->topic != NULL) {
+        incompat = weld_matched_incompat_count(
+          WELD_EP_PUB, &pd->qos, pd->topic, pd->domain);
+      }
+      if ((size_t)n > incompat) {
+        *subscription_count = (size_t)n - incompat;
+      } else {
+        *subscription_count = 0;
+      }
+    }
   }
   return RMW_RET_OK;
 }
@@ -6205,7 +6491,8 @@ rmw_ret_t rmw_subscription_count_matched_publishers(
 {
   // Bridge: Subscription.CountMatchedPublishers counts live publishers in
   // the same per-domain registry on the same topic. Closed publishers are
-  // excluded. No Go mapping exists yet.
+  // excluded. Local endpoints filter by QoS compatibility (WARNING
+  // excluded); remotes keep passthrough where QoS is unknown.
   if (subscription == NULL || publisher_count == NULL) {
     return weld_fail_invalid(
       "rmw_weld: rmw_subscription_count_matched_publishers null argument");
@@ -6232,7 +6519,18 @@ rmw_ret_t rmw_subscription_count_matched_publishers(
       return weld_fail_error(
         "rmw_weld: rmw_subscription_count_matched_publishers backend failed");
     }
-    *publisher_count = (size_t)n;
+    {
+      size_t incompat = 0;
+      if (sd->topic != NULL) {
+        incompat = weld_matched_incompat_count(
+          WELD_EP_SUB, &sd->qos, sd->topic, sd->domain);
+      }
+      if ((size_t)n > incompat) {
+        *publisher_count = (size_t)n - incompat;
+      } else {
+        *publisher_count = 0;
+      }
+    }
   }
   return RMW_RET_OK;
 }
@@ -6423,10 +6721,13 @@ rmw_ret_t rmw_client_response_subscription_get_actual_qos(
 
 // QoS scope: this shim stores passthrough QoS and never contacts the
 // Go core, so compatibility is decided locally on every policy:
-// reliability, durability, deadline, liveliness (plus lease duration),
-// history, and depth. Any difference reports WARNING with the differing
-// policies named in reason; the transport is best effort in memory, so
-// no mismatch is ever a hard error.
+// reliability, durability, deadline, lifespan, liveliness (plus lease
+// duration), history, and depth. Any difference reports WARNING with
+// the differing policies named in reason; the transport is best effort
+// in memory, so no mismatch is ever a hard error. Lifespan is local
+// per DDS 1.4 section 2.2.3 (data disposed when lifespan expires) and
+// never blocks matching, hence WARNING not ERROR, mirroring the other
+// policies here.
 // Append one policy label to a comma separated mismatch list.
 // Caps the write position so a truncated snprintf never pushes the next
 // write past the buffer. Always marks the comparison mismatched.
@@ -6474,6 +6775,11 @@ rmw_ret_t rmw_qos_profile_check_compatible(
       publisher_profile.deadline.nsec != subscription_profile.deadline.nsec)
     {
       weld_qos_flag(details, sizeof(details), &pos, &mismatch, "deadline");
+    }
+    if (publisher_profile.lifespan.sec != subscription_profile.lifespan.sec ||
+      publisher_profile.lifespan.nsec != subscription_profile.lifespan.nsec)
+    {
+      weld_qos_flag(details, sizeof(details), &pos, &mismatch, "lifespan");
     }
     if (publisher_profile.liveliness != subscription_profile.liveliness ||
       publisher_profile.liveliness_lease_duration.sec !=
@@ -6944,7 +7250,7 @@ rmw_ret_t rmw_take_sequence(
       return RMW_RET_ERROR;
     }
     info = &message_info_sequence->data[n];
-    weld_fill_take_info(info, seq, gid);
+    weld_fill_take_info(info, sd->handle, seq, gid);
     n++;
   }
   *taken = n;
@@ -7014,7 +7320,7 @@ rmw_ret_t rmw_take_serialized_message_with_info(
   }
   free(wire);
   serialized_message->buffer_length = wire_len;
-  weld_fill_take_info(message_info, seq, gid);
+  weld_fill_take_info(message_info, sd->handle, seq, gid);
   *taken = true;
   return RMW_RET_OK;
 }
@@ -7435,6 +7741,60 @@ static size_t weld_incompat_scan(
     }
     (void)pthread_mutex_unlock(&g_weld_ep_mutex);
   }
+  return mismatched;
+}
+
+// Count QoS-incompatible local opposite endpoints without mutating.
+//
+// Snapshots opposite-kind endpoints on the same topic plus domain and
+// runs rmw_qos_profile_check_compatible for each pair. WARNING counts as
+// incompatible and is excluded from matched counts; OK counts as
+// matched. Check errors never count (fail-closed passthrough) so a probe
+// failure does not shrink the matched set. Remote endpoints keep
+// passthrough: unknown remote QoS counts as matched, documented at the
+// call sites.
+static size_t weld_matched_incompat_count(
+  int new_kind, const rmw_qos_profile_t * new_qos, const char * topic,
+  size_t domain)
+{
+  struct weld_ep_snap * snaps = NULL;
+  size_t n_snaps = 0;
+  size_t mismatched = 0;
+  size_t i = 0;
+  int opp_kind = WELD_EP_SUB;
+  if (new_qos == NULL || topic == NULL) {
+    return 0;
+  }
+  if (new_kind == WELD_EP_PUB) {
+    opp_kind = WELD_EP_SUB;
+  } else if (new_kind == WELD_EP_SUB) {
+    opp_kind = WELD_EP_PUB;
+  } else {
+    return 0;
+  }
+  if (weld_ep_snapshot(topic, opp_kind, domain, true, &snaps, &n_snaps) !=
+    RMW_RET_OK)
+  {
+    return 0;
+  }
+  for (i = 0; i < n_snaps; i++) {
+    rmw_qos_compatibility_type_t compat = RMW_QOS_COMPATIBILITY_OK;
+    rmw_ret_t rc = RMW_RET_OK;
+    if (new_kind == WELD_EP_PUB) {
+      rc = rmw_qos_profile_check_compatible(
+        *new_qos, snaps[i].qos, &compat, NULL, 0);
+    } else {
+      rc = rmw_qos_profile_check_compatible(
+        snaps[i].qos, *new_qos, &compat, NULL, 0);
+    }
+    if (rc != RMW_RET_OK) {
+      continue;
+    }
+    if (compat != RMW_QOS_COMPATIBILITY_OK) {
+      mismatched++;
+    }
+  }
+  weld_ep_snapshot_fini(snaps, n_snaps);
   return mismatched;
 }
 
@@ -8281,7 +8641,12 @@ rmw_ret_t rmw_take_loaned_message_with_info(
   if (empty != 0) {
     return RMW_RET_ERROR;
   }
-  weld_fill_take_info(message_info, seq, gid);
+  {
+    struct weld_sub_data * fill_sd =
+      (struct weld_sub_data *)subscription->data;
+    long long fill_handle = fill_sd != NULL ? fill_sd->handle : 0;
+    weld_fill_take_info(message_info, fill_handle, seq, gid);
+  }
   *loaned_message = buf;
   *taken = true;
   return RMW_RET_OK;
@@ -8433,8 +8798,9 @@ rmw_ret_t rmw_client_set_on_new_response_callback(
 
 // Events: every RMW event type is backed by a live source.
 //
-// MESSAGE_LOST counts decode drops in the take paths (see
-// g_weld_decode_drops). LIVELINESS_CHANGED reports matched-publisher
+// MESSAGE_LOST counts per-side drops: sub takes count decode drops
+// (see g_weld_sub_drops) while pubs count publish-side encode or send
+// losses (see g_weld_pub_drops). LIVELINESS_CHANGED reports matched-publisher
 // edges for subscriptions and LIVELINESS_LOST reports matched-subscriber
 // drops for publishers, both via the existing matched FFI which sums
 // local same-bridge endpoints with remote SEDP peers. Deadline misses
@@ -8484,7 +8850,8 @@ static void weld_event_snapshot_locked(struct weld_event_slot * slot)
   }
   switch (slot->event_type) {
     case RMW_EVENT_MESSAGE_LOST:
-      slot->lost_reported = g_weld_decode_drops;
+      slot->lost_reported = slot->is_pub ? g_weld_pub_drops :
+        g_weld_sub_drops;
       break;
     case RMW_EVENT_LIVELINESS_CHANGED:
       if (weld_event_matched_current(slot, &matched) == 0) {
@@ -8589,9 +8956,9 @@ rmw_ret_t rmw_take_event(
       size_t last = 0;
       size_t change = 0;
       (void)pthread_mutex_lock(&g_weld_loan_mutex);
-      total = g_weld_decode_drops;
       slot = weld_event_slot_locked(event_handle);
       if (slot != NULL) {
+        total = slot->is_pub ? g_weld_pub_drops : g_weld_sub_drops;
         last = slot->lost_reported;
         slot->lost_reported = total;
         cb = slot->callback;
@@ -8620,6 +8987,8 @@ rmw_ret_t rmw_take_event(
         (rmw_liveliness_changed_status_t *)event_info;
       long long matched = 0;
       long long last = 0;
+      long long not_alive = 0;
+      long long not_last = 0;
       int rc = -1;
       (void)pthread_mutex_lock(&g_weld_loan_mutex);
       {
@@ -8636,7 +9005,17 @@ rmw_ret_t rmw_take_event(
           rc = weld_event_matched_current(slot, &matched);
           if (rc == 0) {
             last = slot->alive_reported;
+            not_last = slot->not_alive_reported;
+            not_alive = not_last;
+            // Drops count as not-alive transitions fail-closed: without
+            // per-writer lease tracking, an unmatch (dispose or close)
+            // moves alive to not-alive. Lease expiry without unmatch
+            // stays untracked, documented above.
+            if (matched < last) {
+              not_alive = not_last + (last - matched);
+            }
             slot->alive_reported = matched;
+            slot->not_alive_reported = not_alive;
             cb = slot->callback;
             user_data = slot->user_data;
           }
@@ -8651,7 +9030,8 @@ rmw_ret_t rmw_take_event(
       }
       status->alive_count = weld_event_clamp32(
         matched < 0 ? 0 : (unsigned long long)matched);
-      status->not_alive_count = 0;
+      status->not_alive_count = weld_event_clamp32(
+        not_alive < 0 ? 0 : (unsigned long long)not_alive);
       status->alive_count_change = weld_event_clamp32(
         matched >= last ? (unsigned long long)(matched - last) : 0);
       if (matched < last) {
@@ -8659,7 +9039,9 @@ rmw_ret_t rmw_take_event(
         status->alive_count_change = (int32_t)-weld_event_clamp32(
           (unsigned long long)drop);
       }
-      status->not_alive_count_change = 0;
+      status->not_alive_count_change = weld_event_clamp32(
+        not_alive >= not_last ?
+        (unsigned long long)(not_alive - not_last) : 0);
       *taken = matched != last;
       fire = *taken && cb != NULL;
       if (fire) {
@@ -9641,15 +10023,18 @@ rmw_ret_t rmw_subscription_get_network_flow_endpoints(
 // Feature query: only dynamic message takes are real. The take
 // dynamic paths move the wire sample into caller bound dynamic data
 // through the runtime deserializer when it is linked, which Jazzy and
-// newer name RMW_MIDDLEWARE_CAN_TAKE_DYNAMIC_MESSAGE (value 3).
-// Sequence numbers stay unsupported (both MESSAGE_INFO values stay
-// false) and no discovery population exists (TYPE_DISCOVERY stays
-// false). Humble predates dynamic takes entirely and stays false for
-// every value.
+// newer name RMW_MIDDLEWARE_CAN_TAKE_DYNAMIC_MESSAGE. Sequence numbers
+// stay unsupported (both MESSAGE_INFO values stay false) and no
+// discovery population exists (TYPE_DISCOVERY stays false). Humble
+// predates dynamic takes entirely and stays false for every value.
 bool rmw_feature_supported(rmw_feature_t feature)
 {
 #if defined(__has_include) && __has_include("rmw/dynamic_message_type_support.h")
+#if defined(RMW_MIDDLEWARE_CAN_TAKE_DYNAMIC_MESSAGE)
+  return feature == RMW_MIDDLEWARE_CAN_TAKE_DYNAMIC_MESSAGE;
+#else
   return feature == (rmw_feature_t)3;
+#endif
 #else
   (void)feature;
   return false;

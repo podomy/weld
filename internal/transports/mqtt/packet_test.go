@@ -461,6 +461,21 @@ func TestDisconnectVersions(t *testing.T) {
 	}
 }
 
+// TestPingReqFraming pins PINGREQ encoding on both versions.
+//
+// PINGREQ carries no version-dependent fields: one fixed two-byte
+// packet serves keepalive for 3.1.1 and v5, decoded as PINGRESP on the
+// wire. MQTT-3.12.1-1 requires the 0xC0 header with zero remaining
+// length.
+func TestPingReqFraming(t *testing.T) {
+	t.Parallel()
+
+	got := EncodePingReq()
+	if len(got) != 2 || got[0] != packetPingReq<<4 || got[1] != 0x00 {
+		t.Fatalf("pingreq = %v, want [0xc0 0x00]", got)
+	}
+}
+
 // TestPublishVersionReject checks unknown versions fail loudly.
 func TestPublishVersionReject(t *testing.T) {
 	t.Parallel()

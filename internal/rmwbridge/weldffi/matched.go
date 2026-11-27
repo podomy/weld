@@ -9,6 +9,8 @@ package main
 import "C"
 
 import (
+	"unsafe"
+
 	"github.com/podomy/weld/internal/transports/dds"
 )
 
@@ -162,6 +164,45 @@ func weld_ffi_sub_matched_pubs(handle C.longlong, outN *C.int) (rc C.int) {
 		}
 	}()
 	return weldWriteMatchedTotal(handle, outN, weldMatchedSubTotal)
+}
+
+// weld_ffi_pub_get_gid copies the bridge-assigned publisher GID.
+//
+// The GID is the 16 byte writer identity assigned at creation from the
+// bridge counter with the domain in the first 4 bytes, mirroring
+// dds.WriterGUID width. It is the same authority backing the take-info
+// side channel, so rmw_compare_gids_equal holds in-process between the
+// publisher GID and the take GID. It returns 0 on success, -1 for NULL
+// or short buffers, and -2 for an unknown handle. It never panics.
+//
+//export weld_ffi_pub_get_gid
+func weld_ffi_pub_get_gid(handle C.longlong, gidBuf *C.char, gidLen C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(weldCodeErrInternal)
+		}
+	}()
+	key := int64(handle)
+	if key <= 0 {
+		return C.int(weldCodeErrHandle)
+	}
+	if gidBuf == nil {
+		return C.int(weldCodeErrNull)
+	}
+	if int(gidLen) < 16 {
+		return C.int(weldCodeErrShort)
+	}
+	weldMu.Lock()
+	e, ok := weldPubs[key]
+	weldMu.Unlock()
+	if !ok {
+		return C.int(weldCodeErrHandle)
+	}
+	gid := e.pub.GID()
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(gidBuf)), int(gidLen))
+	copy(dst, gid[:])
+	return C.int(weldCodeOK)
 }
 
 // weld_ffi_service_remote_available reports remote service endpoints.

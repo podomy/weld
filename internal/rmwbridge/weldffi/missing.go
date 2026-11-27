@@ -93,6 +93,13 @@ type weldRTPSWaiter struct {
 	guid     [8]byte
 }
 
+// weldServeRTPSReq holds one dequeued RTPS request for serve_rtps.
+type weldServeRTPSReq struct {
+	payload []byte
+	guid    [8]byte
+	seq     uint64
+}
+
 // Split-leg and annotation state. Guarded by weldMu like the rest of
 // the handle registry. Backend calls never run under weldMu.
 var (
@@ -108,6 +115,8 @@ var (
 	weldSplitRTPS = make(map[weldSvcReplyKey]weldRTPSWaiter)
 	// weldSplitRTPSStash holds consumed RTPS replies that did not fit.
 	weldSplitRTPSStash = make(map[weldSvcReplyKey][]byte)
+	// weldServeRTPSStash holds dequeued RTPS requests that did not fit.
+	weldServeRTPSStash = make(map[int64][]weldServeRTPSReq)
 )
 
 // weldNormalizeDynamicType converts a slash type name to IDL form.
@@ -392,6 +401,7 @@ func weldForgetSplitKey(rkey weldSvcReplyKey) {
 // The caller must hold weldMu.
 func weldDropSvcExtrasLocked(key int64) {
 	delete(weldSvcTypes, key)
+	delete(weldServeRTPSStash, key)
 	for _, rkey := range weldSvcKeysLocked(key) {
 		weldForgetSplitKey(rkey)
 	}
@@ -421,6 +431,16 @@ func weldDropBridgeExtrasLocked(bridgeID int64) {
 	}
 	for _, rkey := range weldSplitKeysForBridgeLocked(bridgeID) {
 		weldForgetSplitKey(rkey)
+	}
+	for id, e := range weldServices {
+		if e.bridgeID == bridgeID {
+			delete(weldServeRTPSStash, id)
+		}
+	}
+	for id := range weldServeRTPSStash {
+		if _, ok := weldServices[id]; !ok {
+			delete(weldServeRTPSStash, id)
+		}
 	}
 	weldDropEventExtrasLocked(bridgeID)
 }
@@ -578,10 +598,10 @@ func weld_ffi_service_set_type(handle C.longlong, typeName *C.char, typeHash *C.
 // weld_ffi_service_has_request counts requests servable by serve_nb.
 //
 // The count sums the in-memory rendezvous depth with dequeued requests
-// stashed for short-buffer retry. RTPS requests are excluded: serve_nb
-// stays in-memory only, so the count matches what the next serve_nb
-// can dequeue. It returns 0 on success, -1 for a NULL out pointer, and
-// -2 for an unknown handle. It never panics.
+// stashed for short-buffer retry. RTPS requests are excluded here and
+// counted by weld_ffi_service_has_request_rtps, so this count matches
+// what the next serve_nb can dequeue. It returns 0 on success, -1 for
+// a NULL out pointer, and -2 for an unknown handle. It never panics.
 //
 //export weld_ffi_service_has_request
 func weld_ffi_service_has_request(handle C.longlong, outN *C.int) (rc C.int) {
@@ -1245,6 +1265,429 @@ func weldDeliverSplitRTPSOrStash(rkey weldSvcReplyKey, respBuf *C.char, respBufL
 	return C.int(weldCodeOK)
 }
 
+// weldDeclareServiceServer declares the RTPS server endpoints for one service.
+//
+// The request reader carries take requests back to serve_rtps and the
+// reply writer carries respond_rtps publishes; both declares are
+// idempotent. It never panics.
+func weldDeclareServiceServer(ctx context.Context, backend *dds.Backend, service, idlBase, typeHash string) error {
+	err := backend.SubscribeService(ctx, service, idlBase, dds.ServiceRoleServer, typeHash)
+	if err != nil {
+		return fmt.Errorf("weld: declare service server subscribe: %w", err)
+	}
+	err = backend.DeclareServiceWriter(ctx, service, idlBase, dds.ServiceRoleServer, typeHash)
+	if err != nil {
+		return fmt.Errorf("weld: declare service server writer: %w", err)
+	}
+	return nil
+}
+
+// weldServeRTPSLoad returns the service name plus backend for serve_rtps.
+//
+// It validates the handle and reads the stored IDL base plus type hash.
+// It never panics.
+func weldServeRTPSLoad(key int64) (int64, string, string, string, *dds.Backend, C.int) {
+	weldMu.Lock()
+	defer weldMu.Unlock()
+	e, ok := weldLoadSvcLocked(key)
+	if !ok {
+		return 0, "", "", "", nil, C.int(weldCodeErrHandle)
+	}
+	typeHash := ""
+	base := ""
+	if stored, reported := weldSvcTypes[key]; reported {
+		typeHash = stored.typeHash
+		base = stored.typeName
+	}
+	return e.bridgeID, e.name, base, typeHash, weldRTPS[e.bridgeID], C.int(weldCodeOK)
+}
+
+// weldServeRTPSPoll polls the wire once for one request and stashes the rest.
+//
+// A match for the service returns its payload plus guid plus seq. Anything
+// else parks in the bridge overflow for its own consumer. Transport errors
+// report err so the caller can tell a quiet wire from a broken one. It
+// never panics.
+func weldServeRTPSPoll(ctx context.Context, backend *dds.Backend, bridgeID int64, service string) ([]byte, [8]byte, uint64, bool, error) {
+	msg, err := backend.TakeBytes(ctx)
+	if err != nil {
+		return nil, [8]byte{}, 0, false, fmt.Errorf("weld: poll rtps request: %w", err)
+	}
+	if msg.TopicName != "" && msg.TopicName != service {
+		weldStashRTPSOverflow(bridgeID, msg)
+		return nil, [8]byte{}, 0, false, nil
+	}
+	var metrics types.Metrics
+	inner, guid, seq, _, umErr := dds.UnmarshalServiceRequest(msg.Payload, &metrics)
+	if umErr != nil {
+		// Malformed service packets park for no one; drop and continue.
+		return nil, [8]byte{}, 0, false, nil //nolint:nilerr // malformed drops are not errors
+	}
+	return append([]byte(nil), inner...), guid, seq, true, nil
+}
+
+// weldServeRTPSDequeue returns one stashed request when present.
+func weldServeRTPSDequeue(key int64, reqBuf *C.char, reqBufLen C.int, outN *C.int, outSeq *C.longlong, outGuid *C.char) ([]byte, [8]byte, uint64, bool, C.int) {
+	var empty [8]byte
+	weldMu.Lock()
+	stashed := weldServeRTPSStash[key]
+	haveStash := len(stashed) > 0
+	var first weldServeRTPSReq
+	if haveStash {
+		first = stashed[0]
+		weldServeRTPSStash[key] = stashed[1:]
+		if len(weldServeRTPSStash[key]) == 0 {
+			delete(weldServeRTPSStash, key)
+		}
+	}
+	weldMu.Unlock()
+	if !haveStash {
+		return nil, empty, 0, false, C.int(weldCodeOK)
+	}
+	if len(first.payload) > int(reqBufLen) {
+		weldMu.Lock()
+		weldServeRTPSStash[key] = append([]weldServeRTPSReq{first}, weldServeRTPSStash[key]...)
+		weldMu.Unlock()
+		return nil, empty, 0, false, C.int(weldCodeErrShort)
+	}
+	if code := weldCopyToC(reqBuf, reqBufLen, first.payload); code != C.int(weldCodeOK) {
+		weldMu.Lock()
+		weldServeRTPSStash[key] = append([]weldServeRTPSReq{first}, weldServeRTPSStash[key]...)
+		weldMu.Unlock()
+		return nil, empty, 0, false, code
+	}
+	if outGuid != nil {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(outGuid)), 8)
+		copy(dst, first.guid[:])
+	}
+	*outN = C.int(len(first.payload))
+	*outSeq = C.longlong(first.seq)
+	return first.payload, first.guid, first.seq, true, C.int(weldCodeOK)
+}
+
+// weldCheckServeRTPSArgs validates serve_rtps arguments in one place.
+//
+// It returns the parsed handle plus base. It never panics.
+func weldCheckServeRTPSArgs(handle C.longlong, idlBase *C.char, reqBuf *C.char, reqBufLen C.int, outN *C.int, outSeq *C.longlong, outGuid *C.char) (int64, string, C.int) {
+	key := int64(handle)
+	if key <= 0 {
+		return 0, "", C.int(weldCodeErrHandle)
+	}
+	if outN == nil || outSeq == nil || outGuid == nil || idlBase == nil {
+		return 0, "", C.int(weldCodeErrNull)
+	}
+	if reqBufLen < 0 {
+		return 0, "", C.int(weldCodeErrNull)
+	}
+	if reqBufLen > 0 && reqBuf == nil {
+		return 0, "", C.int(weldCodeErrNull)
+	}
+	base, code := weldReadCString(idlBase)
+	if code != C.int(weldCodeOK) {
+		return 0, "", code
+	}
+	if base == "" {
+		return 0, "", C.int(weldCodeErrInternal)
+	}
+	return key, base, C.int(weldCodeOK)
+}
+
+// weld_ffi_service_serve_rtps dequeues one RTPS request without blocking long.
+//
+// The server endpoints declare first so peers see the server before DATA.
+// The overflow stash is scanned before the wire so has_request peeks stay
+// consumable here; wire samples for other services park back in the
+// overflow. An oversized match parks in the short stash and reports -4
+// without consuming. Expiry reports 1 with 0 in outN so the C layer keeps
+// polling. Unknown handles report -2. It never panics.
+//
+//export weld_ffi_service_serve_rtps
+func weld_ffi_service_serve_rtps(handle C.longlong, idlBase *C.char, reqBuf *C.char, reqBufLen C.int, outN *C.int, outSeq *C.longlong, outGuid *C.char) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(weldCodeErrInternal)
+		}
+	}()
+	key, base, code := weldCheckServeRTPSArgs(handle, idlBase, reqBuf, reqBufLen, outN, outSeq, outGuid)
+	if code != C.int(weldCodeOK) {
+		return code
+	}
+	if _, _, _, done, code := weldServeRTPSDequeue(key, reqBuf, reqBufLen, outN, outSeq, outGuid); done || code != C.int(weldCodeOK) {
+		return code
+	}
+	bridgeID, service, _, typeHash, backend, bcode := weldServeRTPSLoad(key)
+	if bcode != C.int(weldCodeOK) {
+		return bcode
+	}
+	// Replay overflow first so has_request peeks stay consumable and
+	// mock transports without a backend still dequeue.
+	if resp, found := weldTakeOverflowServiceRequest(bridgeID, service); found {
+		return weldDeliverServeRTPS(key, reqBuf, reqBufLen, outN, outSeq, outGuid, resp.payload, resp.guid, resp.seq)
+	}
+	if backend == nil {
+		*outN = C.int(0)
+		*outSeq = C.longlong(0)
+		return C.int(weldCodeErrInternal)
+	}
+	if code := weldDeclareServeAndPoll(key, backend, bridgeID, service, base, typeHash, reqBuf, reqBufLen, outN, outSeq, outGuid); code != C.int(weldCodeEmpty) {
+		return code
+	}
+	*outN = C.int(0)
+	*outSeq = C.longlong(0)
+	return C.int(weldCodeEmpty)
+}
+
+func weldDeclareServeAndPoll(key int64, backend *dds.Backend, bridgeID int64, service, base, typeHash string, reqBuf *C.char, reqBufLen C.int, outN *C.int, outSeq *C.longlong, outGuid *C.char) C.int {
+	declareCtx, declareCancel := context.WithTimeout(context.Background(), weldRTPSSubscribeTimeout)
+	err := weldDeclareServiceServer(declareCtx, backend, service, base, typeHash)
+	declareCancel()
+	if err != nil {
+		return C.int(weldCodeErrInternal)
+	}
+	deadline := time.Now().Add(weldSplitPollBound)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		payload, guid, seq, matched, perr := weldServeRTPSPoll(ctx, backend, bridgeID, service)
+		cancel()
+		if matched {
+			return weldDeliverServeRTPS(key, reqBuf, reqBufLen, outN, outSeq, outGuid, payload, guid, seq)
+		}
+		if perr != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			return C.int(weldCodeErrInternal)
+		}
+	}
+	return C.int(weldCodeEmpty)
+}
+
+// weldTakeOverflowServiceRequest pops one stashed wire request for a service.
+func weldTakeOverflowServiceRequest(bridgeID int64, service string) (weldServeRTPSReq, bool) {
+	weldMu.Lock()
+	defer weldMu.Unlock()
+	queue := weldRTPSOverflow[bridgeID]
+	for i, msg := range queue {
+		if msg.TopicName != "" && msg.TopicName != service {
+			continue
+		}
+		var metrics types.Metrics
+		inner, guid, seq, _, err := dds.UnmarshalServiceRequest(msg.Payload, &metrics)
+		if err != nil {
+			continue
+		}
+		queue = append(queue[:i], queue[i+1:]...)
+		if len(queue) == 0 {
+			delete(weldRTPSOverflow, bridgeID)
+		} else {
+			weldRTPSOverflow[bridgeID] = queue
+		}
+		return weldServeRTPSReq{payload: append([]byte(nil), inner...), guid: guid, seq: seq}, true
+	}
+	return weldServeRTPSReq{}, false
+}
+
+// weldDeliverServeRTPS copies one RTPS request or parks it when short.
+func weldDeliverServeRTPS(key int64, reqBuf *C.char, reqBufLen C.int, outN *C.int, outSeq *C.longlong, outGuid *C.char, payload []byte, guid [8]byte, seq uint64) C.int {
+	if len(payload) > int(reqBufLen) {
+		weldMu.Lock()
+		weldServeRTPSStash[key] = append([]weldServeRTPSReq{{payload: payload, guid: guid, seq: seq}}, weldServeRTPSStash[key]...)
+		weldMu.Unlock()
+		return C.int(weldCodeErrShort)
+	}
+	if code := weldCopyToC(reqBuf, reqBufLen, payload); code != C.int(weldCodeOK) {
+		weldMu.Lock()
+		weldServeRTPSStash[key] = append([]weldServeRTPSReq{{payload: payload, guid: guid, seq: seq}}, weldServeRTPSStash[key]...)
+		weldMu.Unlock()
+		return code
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(outGuid)), 8)
+	copy(dst, guid[:])
+	*outN = C.int(len(payload))
+	*outSeq = C.longlong(seq)
+	return C.int(weldCodeOK)
+}
+
+// weldCheckRespondRTPSArgs validates respond_rtps arguments in one place.
+//
+// It returns the parsed handle, guid, sequence, base, and payload.
+// It never panics.
+func weldCheckRespondRTPSArgs(handle C.longlong, guid *C.char, seq C.longlong, idlBase *C.char, resp *C.char, respLen C.int) (int64, [8]byte, int64, string, []byte, C.int) {
+	var empty [8]byte
+	key := int64(handle)
+	if key <= 0 {
+		return 0, empty, 0, "", nil, C.int(weldCodeErrHandle)
+	}
+	sid, code := weldCheckSeq(seq)
+	if code != C.int(weldCodeOK) {
+		return 0, empty, 0, "", nil, code
+	}
+	guidBytes, code := weldReadGuid(guid)
+	if code != C.int(weldCodeOK) {
+		return 0, empty, 0, "", nil, code
+	}
+	base, code := weldReadCString(idlBase)
+	if code != C.int(weldCodeOK) {
+		return 0, empty, 0, "", nil, code
+	}
+	if base == "" {
+		return 0, empty, 0, "", nil, C.int(weldCodeErrInternal)
+	}
+	payload, code := weldReadBytes(resp, respLen)
+	if code != C.int(weldCodeOK) {
+		return 0, empty, 0, "", nil, code
+	}
+	return key, guidBytes, sid, base, payload, C.int(weldCodeOK)
+}
+
+func weldPublishRespondRTPS(backend *dds.Backend, service, base, typeHash string, payload []byte, guid [8]byte, sid int64) C.int {
+	wire, err := dds.MarshalServiceReply(payload, guid, uint64(sid), true)
+	if err != nil {
+		return C.int(weldCodeErrInternal)
+	}
+	declareCtx, declareCancel := context.WithTimeout(context.Background(), weldRTPSSubscribeTimeout)
+	err = weldDeclareServiceServer(declareCtx, backend, service, base, typeHash)
+	declareCancel()
+	if err != nil {
+		return C.int(weldCodeErrInternal)
+	}
+	publishCtx, publishCancel := context.WithTimeout(context.Background(), weldRTPSPublishTimeout)
+	defer publishCancel()
+	err = backend.PublishService(publishCtx, service, base, dds.ServiceRoleServer, wire, typeHash)
+	if err != nil {
+		return C.int(weldCodeErrInternal)
+	}
+	return C.int(weldCodeOK)
+}
+
+// weld_ffi_service_respond_rtps publishes one RTPS reply.
+//
+// guid plus seq must match a request previously returned by
+// weld_ffi_service_serve_rtps for the same handle. It declares the server
+// endpoints and publishes through the server role. It returns 0 on
+// success, -1 for NULL pointers, -2 for unknown handles, and -3 for
+// publish failures. It never panics.
+//
+//export weld_ffi_service_respond_rtps
+func weld_ffi_service_respond_rtps(handle C.longlong, guid *C.char, seq C.longlong, idlBase *C.char, resp *C.char, respLen C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(weldCodeErrInternal)
+		}
+	}()
+	key, guidBytes, sid, base, payload, code := weldCheckRespondRTPSArgs(handle, guid, seq, idlBase, resp, respLen)
+	if code != C.int(weldCodeOK) {
+		return code
+	}
+	_, service, _, typeHash, backend, bcode := weldServeRTPSLoad(key)
+	if bcode != C.int(weldCodeOK) {
+		return bcode
+	}
+	if backend == nil {
+		return C.int(weldCodeErrInternal)
+	}
+	return weldPublishRespondRTPS(backend, service, base, typeHash, payload, guidBytes, sid)
+}
+
+// weldCheckHasRequestRTPSArgs validates has_request_rtps arguments.
+//
+// It returns the parsed handle plus base. It never panics.
+func weldCheckHasRequestRTPSArgs(handle C.longlong, idlBase *C.char, outN *C.int) (int64, string, C.int) {
+	key := int64(handle)
+	if key <= 0 {
+		return 0, "", C.int(weldCodeErrHandle)
+	}
+	if outN == nil || idlBase == nil {
+		return 0, "", C.int(weldCodeErrNull)
+	}
+	base, code := weldReadCString(idlBase)
+	if code != C.int(weldCodeOK) {
+		return 0, "", code
+	}
+	if base == "" {
+		return 0, "", C.int(weldCodeErrInternal)
+	}
+	return key, base, C.int(weldCodeOK)
+}
+
+// weld_ffi_service_has_request_rtps counts RTPS requests servable by serve_rtps.
+//
+// The short stash plus the wire overflow report ready without consuming.
+// Otherwise one short wire poll runs; a match parks in the serve stash
+// for the consuming serve so C state never loses it. It returns 0 on
+// success with the count in outN, -1 for NULL pointers, and -2 for
+// unknown handles. It never panics.
+//
+//export weld_ffi_service_has_request_rtps
+func weld_ffi_service_has_request_rtps(handle C.longlong, idlBase *C.char, outN *C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(weldCodeErrInternal)
+		}
+	}()
+	key, _, code := weldCheckHasRequestRTPSArgs(handle, idlBase, outN)
+	if code != C.int(weldCodeOK) {
+		return code
+	}
+	weldMu.Lock()
+	n := len(weldServeRTPSStash[key])
+	weldMu.Unlock()
+	if n > 0 {
+		*outN = C.int(n)
+		return C.int(weldCodeOK)
+	}
+	bridgeID, service, _, _, backend, bcode := weldServeRTPSLoad(key)
+	if bcode != C.int(weldCodeOK) {
+		return bcode
+	}
+	if _, found := weldPeekOverflowServiceRequest(bridgeID, service); found {
+		*outN = C.int(1)
+		return C.int(weldCodeOK)
+	}
+	if backend == nil {
+		*outN = C.int(0)
+		return C.int(weldCodeOK)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), weldPollBound)
+	defer cancel()
+	payload, guid, seq, matched, err := weldServeRTPSPoll(ctx, backend, bridgeID, service)
+	if err != nil || !matched {
+		*outN = C.int(0)
+		return C.int(weldCodeOK)
+	}
+	weldMu.Lock()
+	weldServeRTPSStash[key] = append(weldServeRTPSStash[key], weldServeRTPSReq{payload: payload, guid: guid, seq: seq})
+	n = len(weldServeRTPSStash[key])
+	weldMu.Unlock()
+	*outN = C.int(n)
+	return C.int(weldCodeOK)
+}
+
+// weldPeekOverflowServiceRequest reports a stashed wire request for a service.
+func weldPeekOverflowServiceRequest(bridgeID int64, service string) (weldServeRTPSReq, bool) {
+	weldMu.Lock()
+	defer weldMu.Unlock()
+	for _, msg := range weldRTPSOverflow[bridgeID] {
+		if msg.TopicName != "" && msg.TopicName != service {
+			continue
+		}
+		var metrics types.Metrics
+		inner, guid, seq, _, err := dds.UnmarshalServiceRequest(msg.Payload, &metrics)
+		if err != nil {
+			continue
+		}
+		return weldServeRTPSReq{payload: append([]byte(nil), inner...), guid: guid, seq: seq}, true
+	}
+	return weldServeRTPSReq{}, false
+}
+
 // weld_ffi_sub_set_content_filter records one content filter for a subscription.
 //
 // The expression plus parameters compile through dds.CompileContentFilter
@@ -1252,7 +1695,8 @@ func weldDeliverSplitRTPSOrStash(rkey weldSvcReplyKey, respBuf *C.char, respBufL
 // nothing. A compiled filter attaches to the backend reader when the
 // backend is attached and the subscription type is known; attach or
 // declare failures stay best effort like the reader declare path, and
-// in-memory takes bypass the filter for lack of a type descriptor. It
+// in-memory takes filter through weldFilterMatchesInMemory with the
+// same compiled filter. It
 // returns 0 on success, -1 for NULL pointers, and -2 for an unknown
 // handle. It never panics.
 //
@@ -1306,12 +1750,72 @@ func weld_ffi_sub_set_content_filter(handle C.longlong, expr *C.char, params *C.
 	return weldAttachContentFilter(backend, topic, typeName, typeHash, compiled.Expression())
 }
 
+// weldFilterMatchesInMemory reports whether one in-memory payload passes the filter.
+//
+// It uses the same compiled ContentFilter as the wire path. A missing
+// filter passes. Unknown subscription types or unregistered descriptors
+// pass fail-open with documentation so typeless takes keep working;
+// wire takes still filter through the backend once the type is known.
+// Eval errors drop fail-closed. It never panics.
+func weldFilterMatchesInMemoryLocked(key int64, payload []byte) bool {
+	// Caller must hold weldMu.
+	entry, hasFilter := weldSubFilters[key]
+	st, hasType := weldSubTypes[key]
+	return weldFilterMatchesWith(entry, hasFilter, st, hasType, payload)
+}
+
+func weldFilterMatchesWith(entry weldSubFilter, hasFilter bool, st weldSubType, hasType bool, payload []byte) bool {
+	if !hasFilter || entry.filter == nil {
+		return true
+	}
+	if !hasType || st.typeName == "" {
+		return true
+	}
+	ns, name := splitIDLType(st.typeName)
+	if ns == "" || name == "" {
+		return true
+	}
+	desc, err := types.LookupMessageMembers(ns, name)
+	if err != nil || desc == nil {
+		return true
+	}
+	matched, err := entry.filter.Evaluate(payload, desc)
+	if err != nil {
+		return false
+	}
+	return matched
+}
+
+func weldFilterMatchesInMemory(key int64, payload []byte) bool {
+	weldMu.Lock()
+	entry, hasFilter := weldSubFilters[key]
+	st, hasType := weldSubTypes[key]
+	weldMu.Unlock()
+	return weldFilterMatchesWith(entry, hasFilter, st, hasType, payload)
+}
+
+// splitIDLType splits an IDL name into namespace plus base.
+func splitIDLType(idl string) (string, string) {
+	idx := -1
+	for i := len(idl) - 2; i >= 0; i-- {
+		if idl[i] == '_' && idl[i+1] == '_' {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 || idx+2 >= len(idl) {
+		return "", ""
+	}
+	return idl[:idx], idl[idx+2:]
+}
+
 // weldAttachContentFilter attaches a compiled filter to the backend reader.
 //
 // A missing backend or an unknown subscription type skips the attach:
-// the filter stays recorded for get_content_filter while delivery
-// continues unfiltered, mirroring the best-effort reader declare path.
-// Attach failures report internal. It never panics.
+// the filter stays recorded for get_content_filter while in-memory
+// takes filter through weldFilterMatchesInMemory and wire takes filter
+// through the backend once the type is known. Attach failures report
+// internal. It never panics.
 func weldAttachContentFilter(backend *dds.Backend, topic, typeName, typeHash, bound string) C.int {
 	if backend == nil || typeName == "" {
 		return C.int(weldCodeOK)

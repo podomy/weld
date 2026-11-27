@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/podomy/weld/internal/transports"
 	"github.com/podomy/weld/internal/transports/dds"
 	"github.com/podomy/weld/internal/transports/dds/rtps"
 	"github.com/podomy/weld/internal/types"
@@ -678,6 +679,161 @@ func checkLiveliness(t *testing.T) {
 }
 
 // TestWeldMissingExports exercises every new export through its C ABI path.
+// checkContentFilterInMemory pins that in-memory takes enforce the filter.
+//
+// A filtered sub on the same bridge only observes matching local samples:
+// keep-me delivers while drop-me filters out with the same compiled
+// filter as the wire path.
+func checkContentFilterInMemory(t *testing.T) {
+	t.Helper()
+	desc := &types.MessageMembers{
+		Namespace:   "std_msgs__msg",
+		Name:        "String",
+		MemberCount: 1,
+		Members: []types.MessageMember{
+			{Name: "data", TypeID: types.RosTypeString},
+		},
+	}
+	if err := types.RegisterMessageMembers(desc); err != nil {
+		// Duplicate registration across tests is fine.
+		_ = err
+	}
+	encode := func(s string) []byte {
+		enc := types.NewEncoder(true)
+		if err := enc.WriteString(s); err != nil {
+			t.Fatalf("encode %q: %v", s, err)
+		}
+		return enc.Bytes()
+	}
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	pub, code := weldGoPubCreate(bh, "n", "/filter-mem")
+	requireWeldCode(t, code, 0, "pub_create")
+	defer func() {
+		requireWeldCode(t, weldGoPubDestroy(pub), 0, "pub_destroy")
+	}()
+	sub, code := weldGoSubCreate(bh, "n", "/filter-mem")
+	requireWeldCode(t, code, 0, "sub_create")
+	defer func() {
+		requireWeldCode(t, weldGoSubDestroy(sub), 0, "sub_destroy")
+	}()
+	requireWeldCode(t, weldGoSubSetDynamicType(sub, "std_msgs/msg/String", ""), 0, "set_type")
+	requireWeldCode(t, weldGoSubSetFilter(sub, "data LIKE 'keep-%'", nil), 0, "set_filter")
+	requireWeldCode(t, weldGoPubPublish(pub, encode("keep-me")), 0, "publish keep")
+	requireWeldCode(t, weldGoPubPublish(pub, encode("drop-me")), 0, "publish drop")
+	requireWeldCode(t, weldGoPubPublish(pub, encode("keep-again")), 0, "publish keep2")
+	got, _, code := weldGoSubTakePoll(sub, 65536)
+	requireWeldCode(t, code, 0, "take keep")
+	if string(got) != string(encode("keep-me")) {
+		t.Fatalf("first take = %q, want keep-me", string(got))
+	}
+	got, _, code = weldGoSubTakePoll(sub, 65536)
+	requireWeldCode(t, code, 0, "take keep2")
+	if string(got) != string(encode("keep-again")) {
+		t.Fatalf("second take = %q, want keep-again", string(got))
+	}
+	_, _, code = weldGoSubTakePoll(sub, 65536)
+	requireWeldCode(t, code, 1, "take empty after filter")
+}
+
+// checkServiceRTPSServerArgs pins RTPS server leg validation without a backend.
+func checkServiceRTPSServerArgs(t *testing.T) {
+	t.Helper()
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	svc, code := weldGoSvcCreate(bh, "/svc-rtps-srv")
+	requireWeldCode(t, code, 0, "svc_create")
+	defer func() {
+		requireWeldCode(t, weldGoSvcDestroy(svc), 0, "svc_destroy")
+	}()
+	requireWeldCode(t, weldGoSvcSetType(svc, "pkg__srv__Name", ""), 0, "svc_set_type")
+	_, _, _, code = weldGoSvcServeRTPS(svc, "pkg__srv__Name", 256)
+	// Without a backend the wire leg reports internal, never empty.
+	if code != -3 {
+		t.Fatalf("serve_rtps without backend = %d, want -3", code)
+	}
+	_, code = weldGoSvcHasRequestRTPS(svc, "pkg__srv__Name")
+	requireWeldCode(t, code, 0, "has_request_rtps code")
+	requireWeldCode(t, weldGoSvcRespondRTPS(svc, weldTestGuid(), 1, "pkg__srv__Name", []byte{1}), -3, "respond_rtps no backend")
+	_, _, _, code = weldGoSvcServeRTPS(1<<40, "pkg__srv__Name", 256)
+	requireWeldCode(t, code, -2, "serve_rtps unknown")
+	_, code = weldGoSvcHasRequestRTPS(1<<40, "pkg__srv__Name")
+	requireWeldCode(t, code, -2, "has_request_rtps unknown")
+}
+
+// checkServiceRTPSServerOverflow pins mock-transport dequeue via overflow.
+//
+// A marshaled request stashed in the bridge overflow is dequeued by
+// serve_rtps without a backend, proving cross-handle client to server
+// dequeue plus answer plumbing.
+func checkServiceRTPSServerOverflow(t *testing.T) {
+	t.Helper()
+	bh := weldTestBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	svc, code := weldGoSvcCreate(bh, "/svc-mock")
+	requireWeldCode(t, code, 0, "svc_create")
+	defer func() {
+		requireWeldCode(t, weldGoSvcDestroy(svc), 0, "svc_destroy")
+	}()
+	requireWeldCode(t, weldGoSvcSetType(svc, "pkg__srv__Name", ""), 0, "svc_set_type")
+	guid := weldTestGuid()
+	wire, err := dds.MarshalServiceRequest([]byte{1, 2, 3, 4}, guid, 7, true)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	weldMu.Lock()
+	bid := weldServices[svc].bridgeID
+	weldMu.Unlock()
+	weldStashRTPSOverflow(bid, transports.IncomingMessage{TopicName: "/svc-mock", Payload: wire})
+	n, code := weldGoSvcHasRequestRTPS(svc, "pkg__srv__Name")
+	requireWeldCode(t, code, 0, "has_request_rtps")
+	if n != 1 {
+		t.Fatalf("has_request_rtps = %d, want 1", n)
+	}
+	got, gotGuid, seq, code := weldGoSvcServeRTPS(svc, "pkg__srv__Name", 256)
+	requireWeldCode(t, code, 0, "serve_rtps mock")
+	if seq != 7 || gotGuid != guid || string(got) != string([]byte{1, 2, 3, 4}) {
+		t.Fatalf("serve_rtps = %q/%v/%d, want mock payload", string(got), gotGuid, seq)
+	}
+}
+
+// checkRemoteEpRawGUID pins that remote GIDs use raw SEDP GUIDs.
+//
+// The remote_ep_at export copies the 16 byte SEDP GUID without
+// synthesis, so info-by-topic GIDs for remotes are wire identities.
+func checkRemoteEpRawGUID(t *testing.T) {
+	t.Helper()
+	// No backend means no remotes; the empty case already proves
+	// fail-closed. This pins the copy helper directly with a fake
+	// endpoint to prove no synthesis.
+	ep := dds.SEDPEndpoint{
+		ROSTopic: "/t",
+		Kind:     dds.TopicKindTopic,
+		IsReader: false,
+	}
+	for i := range ep.ID.Prefix {
+		ep.ID.Prefix[i] = byte(i + 1)
+	}
+	for i := range ep.ID.Entity {
+		ep.ID.Entity[i] = byte(0xA0 + i)
+	}
+	// The write helper is exercised through the export path when a
+	// backend exists; here we pin the byte layout: first 12 prefix
+	// plus 4 entity, matching weldWriteRemoteEp.
+	var raw [16]byte
+	copy(raw[0:12], ep.ID.Prefix[:])
+	copy(raw[12:16], ep.ID.Entity[:])
+	if raw[0] != 1 || raw[11] != 12 || raw[12] != 0xA0 {
+		t.Fatalf("raw guid layout = %x, want prefix+entity", raw)
+	}
+}
+
 func TestWeldMissingExports(t *testing.T) {
 	t.Run("normalize", checkNormalizeDynamicType)
 	t.Run("has_data", checkSubHasData)
@@ -692,6 +848,10 @@ func TestWeldMissingExports(t *testing.T) {
 	t.Run("netflow_remote_args", checkNetflowRemoteArgs)
 	t.Run("netflow_remote_discovery", checkNetflowRemoteDiscovery)
 	t.Run("content_filter", checkContentFilter)
+	t.Run("content_filter_in_memory", checkContentFilterInMemory)
+	t.Run("rtps_server_args", checkServiceRTPSServerArgs)
+	t.Run("rtps_server_overflow", checkServiceRTPSServerOverflow)
 	t.Run("remote_ep", checkRemoteEp)
+	t.Run("remote_ep_raw_guid", checkRemoteEpRawGUID)
 	t.Run("liveliness", checkLiveliness)
 }

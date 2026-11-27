@@ -676,3 +676,24 @@ func TestAnnounceRejectKeepsGeneration(t *testing.T) {
 		t.Fatalf("generation moved on rejected retract: %d -> %d", before, got)
 	}
 }
+
+// TestMemoryConnIsTestDouble pins the in-memory double as test-only.
+//
+// Production takes run over netConn with QoS 2 dedup, inflight caps,
+// retained replay, and counted evictions. The memory double documents
+// its limits in backend.go and this test pins them: no QoS 2 dedup
+// (duplicates enqueue twice) and silent queue eviction. New (memory)
+// stays the test constructor; NewWithConn with a live conn is the
+// production path.
+func TestMemoryConnIsTestDouble(t *testing.T) {
+	t.Parallel()
+
+	backend, err := mqtt.New(testConfig())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	// New must use the in-memory transport: joining needs no broker.
+	if err := backend.JoinDiscovery(context.Background(), transports.DiscoveryInfo{ParticipantName: "p", DomainID: 0}); err != nil {
+		t.Fatalf("join on memory backend: %v", err)
+	}
+}

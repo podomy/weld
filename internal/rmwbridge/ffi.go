@@ -65,21 +65,25 @@ type ffiSvcReplyKey struct {
 //
 // The payload keeps the dequeued bytes while gid plus seq keep the
 // attribution assigned at dequeue, so a larger-buffer retry delivers the
-// same sequence instead of incrementing twice for one sample.
+// same sequence instead of incrementing twice for one sample. SourceNs
+// carries the publisher-side send stamp for the retry.
 type ffiStashedTake struct {
-	payload []byte
-	gid     [16]byte
-	seq     uint64
+	payload  []byte
+	gid      [16]byte
+	seq      uint64
+	sourceNs int64
 }
 
 // ffiTakeInfo is the attribution of the most recent delivered take.
 //
 // Seq is the per-subscription receive sequence starting at 1. GID is the
-// publishing writer identity. Intra-process and network sequences are
-// equal because the bridge is a single transport.
+// publishing writer identity. SourceNs is the publisher-side send stamp,
+// or zero when the leg carried none. Intra-process and network sequences
+// are equal because the bridge is a single transport.
 type ffiTakeInfo struct {
-	gid [16]byte
-	seq uint64
+	gid      [16]byte
+	seq      uint64
+	sourceNs int64
 }
 
 // ffiStashedReq holds a dequeued request that did not fit the serve buffer.
@@ -572,6 +576,42 @@ func weld_ffi_pub_publish(handle C.longlong, data *C.char, dataLen C.int) (rc C.
 	return C.int(ffiOK)
 }
 
+// weld_ffi_pub_get_gid copies the bridge-assigned publisher GID.
+//
+// The GID is the 16 byte writer identity from the bridge counter with the
+// domain in the first 4 bytes. It is the same authority backing the
+// take-info side channel, so rmw_compare_gids_equal holds in-process.
+// It returns 0 on success, -1 for NULL or short buffers, and -2 for an
+// unknown handle. It never panics.
+func weld_ffi_pub_get_gid(handle C.longlong, gidBuf *C.char, gidLen C.int) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(ffiErrInternal)
+		}
+	}()
+	key := int64(handle)
+	if key <= 0 {
+		return C.int(ffiErrHandle)
+	}
+	if gidBuf == nil {
+		return C.int(ffiErrNull)
+	}
+	if int(gidLen) < 16 {
+		return C.int(ffiErrShort)
+	}
+	ffiMu.Lock()
+	e, ok := ffiPubs[key]
+	ffiMu.Unlock()
+	if !ok {
+		return C.int(ffiErrHandle)
+	}
+	gid := e.pub.GID()
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(gidBuf)), int(gidLen))
+	copy(dst, gid[:])
+	return C.int(ffiOK)
+}
+
 // weld_ffi_sub_create creates a subscription on a bridge and writes its handle.
 //
 // nodeName names the owning node and is created on first use, then reused
@@ -667,11 +707,11 @@ func ffiBeginTakePoll(key int64, outBuf *C.char, outBufLen C.int, outN *C.int) (
 			return nil, true, code
 		}
 		delete(ffiSubPending, key)
-		ffiSubLastInfo[key] = ffiTakeInfo{gid: stashed.gid, seq: stashed.seq}
+		ffiSubLastInfo[key] = ffiTakeInfo{gid: stashed.gid, seq: stashed.seq, sourceNs: stashed.sourceNs}
 		n := len(stashed.payload)
 		sub := e.sub
 		ffiMu.Unlock()
-		sub.ReplayTakeInfo(stashed.gid, stashed.seq)
+		sub.ReplayTakeInfoWithSource(stashed.gid, stashed.seq, stashed.sourceNs)
 		*outN = C.int(n)
 		return nil, true, C.int(ffiOK)
 	}
@@ -700,25 +740,36 @@ func ffiCheckSubUsable(sub *Subscription) C.int {
 // ffiStashTakePending stores an oversized payload for retry.
 //
 // The gid plus seq keep the dequeue-time attribution so the retry
-// delivers the same sequence instead of incrementing twice.
+// delivers the same sequence instead of incrementing twice. The source
+// stamp replays with the sample.
 func ffiStashTakePending(key int64, sample deliveredSample, seq uint64) {
 	cp := append([]byte(nil), sample.payload...)
 	ffiMu.Lock()
 	_, still := ffiSubs[key]
 	if still {
-		ffiSubPending[key] = ffiStashedTake{payload: cp, gid: sample.gid, seq: seq}
+		ffiSubPending[key] = ffiStashedTake{payload: cp, gid: sample.gid, seq: seq, sourceNs: sample.sourceNs}
 	}
 	ffiMu.Unlock()
 }
 
 // ffiRecordTakeInfo stores the attribution of a fresh delivered take.
-func ffiRecordTakeInfo(key int64, gid [16]byte, seq uint64) {
+func ffiRecordTakeInfo(key int64, gid [16]byte, seq uint64, sourceNs int64) {
 	ffiMu.Lock()
 	_, still := ffiSubs[key]
 	if still {
-		ffiSubLastInfo[key] = ffiTakeInfo{gid: gid, seq: seq}
+		ffiSubLastInfo[key] = ffiTakeInfo{gid: gid, seq: seq, sourceNs: sourceNs}
 	}
 	ffiMu.Unlock()
+}
+
+// ffiRecordSource updates the source stamp of the last take without moving seq.
+func ffiRecordSource(key int64, sourceNs int64) {
+	ffiMu.Lock()
+	defer ffiMu.Unlock()
+	if info, ok := ffiSubLastInfo[key]; ok {
+		info.sourceNs = sourceNs
+		ffiSubLastInfo[key] = info
+	}
 }
 
 // weld_ffi_sub_take_poll takes one message without blocking.
@@ -763,7 +814,7 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 		*outN = C.int(0)
 		return C.int(ffiEmpty)
 	}
-	seq := sub.noteDeliveredLocked(sample.gid)
+	seq := sub.noteDeliveredLocked(sample.gid, sample.sourceNs)
 	if len(sample.payload) > int(outBufLen) {
 		ffiStashTakePending(key, sample, seq)
 		return C.int(ffiErrShort)
@@ -772,7 +823,7 @@ func weld_ffi_sub_take_poll(handle C.longlong, outBuf *C.char, outBufLen C.int, 
 	if code != C.int(ffiOK) {
 		return code
 	}
-	ffiRecordTakeInfo(key, sample.gid, seq)
+	ffiRecordTakeInfo(key, sample.gid, seq, sample.sourceNs)
 	*outN = C.int(len(sample.payload))
 	return C.int(ffiOK)
 }
@@ -817,6 +868,41 @@ func weld_ffi_sub_take_info(handle C.longlong, outSeq *C.ulonglong, gidBuf *C.ch
 	*outSeq = C.ulonglong(info.seq)
 	dst := unsafe.Slice((*byte)(unsafe.Pointer(gidBuf)), int(gidLen))
 	copy(dst, gid[:])
+	return C.int(ffiOK)
+}
+
+// weld_ffi_sub_take_source reports the publisher send stamp of the last take.
+//
+// OutNs receives unix nanos captured at publish time, or zero when the
+// leg carried none (wire takes). Callers fall back to local receive time
+// on zero. It returns 0 on success, -1 for NULL, and -2 for unknown
+// handles or takes. It never panics.
+func weld_ffi_sub_take_source(handle C.longlong, outNs *C.ulonglong) (rc C.int) {
+	defer func() {
+		r := recover()
+		if r != nil {
+			rc = C.int(ffiErrInternal)
+		}
+	}()
+	key := int64(handle)
+	if key <= 0 {
+		return C.int(ffiErrHandle)
+	}
+	if outNs == nil {
+		return C.int(ffiErrNull)
+	}
+	ffiMu.Lock()
+	info, ok := ffiSubLastInfo[key]
+	if !ok {
+		_, still := ffiSubs[key]
+		ffiMu.Unlock()
+		if !still {
+			return C.int(ffiErrHandle)
+		}
+		return C.int(ffiErrHandle)
+	}
+	ffiMu.Unlock()
+	*outNs = C.ulonglong(info.sourceNs)
 	return C.int(ffiOK)
 }
 
@@ -1462,6 +1548,38 @@ func ffiGoSubTakeInfo(handle int64) ([16]byte, uint64, int32) {
 	var gid [16]byte
 	copy(gid[:], C.GoBytes(owned, 16))
 	return gid, uint64(seq), int32(ffiOK)
+}
+
+// ffiGoPubGetGID copies the bridge-assigned publisher GID.
+func ffiGoPubGetGID(handle int64) ([16]byte, int32) {
+	var empty [16]byte
+	owned := C.malloc(C.size_t(16))
+	if owned == nil {
+		return empty, int32(ffiErrInternal)
+	}
+	defer C.free(owned)
+	rc := weld_ffi_pub_get_gid(C.longlong(handle), (*C.char)(owned), C.int(16))
+	if rc != C.int(ffiOK) {
+		return empty, int32(rc)
+	}
+	var gid [16]byte
+	copy(gid[:], C.GoBytes(owned, 16))
+	return gid, int32(ffiOK)
+}
+
+// ffiGoSubTakeSource reports the publisher send stamp of the last take.
+func ffiGoSubTakeSource(handle int64) (uint64, int32) {
+	owned := C.malloc(C.size_t(8))
+	if owned == nil {
+		return 0, int32(ffiErrInternal)
+	}
+	defer C.free(owned)
+	var ns C.ulonglong
+	rc := weld_ffi_sub_take_source(C.longlong(handle), &ns)
+	if rc != C.int(ffiOK) {
+		return 0, int32(rc)
+	}
+	return uint64(ns), int32(ffiOK)
 }
 
 // ffiGoServiceCreate registers a service through weld_ffi_service_create.

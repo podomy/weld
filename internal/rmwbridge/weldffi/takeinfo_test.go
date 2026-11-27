@@ -113,6 +113,28 @@ func checkWeldTakeInfoEndToEnd(t *testing.T) {
 	requireWeldCode(t, weldGoPubDestroy(pub), 0, "pub_destroy")
 }
 
+// checkWeldTakeSourcePinsPublisherStamp pins source stamp after take.
+func checkWeldTakeSourcePinsPublisherStamp(t *testing.T) {
+	t.Helper()
+	bh, pub, sub := weldTakeInfoBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	requireWeldCode(t, weldGoPubPublish(pub, []byte("ping")), 0, "publish")
+	data, _, code := weldGoSubTakePoll(sub, 256)
+	requireWeldCode(t, code, 0, "take_poll")
+	if string(data) != "ping" {
+		t.Fatalf("take = %q, want ping", string(data))
+	}
+	ns, code := weldGoSubTakeSource(sub)
+	requireWeldCode(t, code, 0, "take_source")
+	if ns == 0 {
+		t.Fatalf("source stamp is zero, want publisher time")
+	}
+	requireWeldCode(t, weldGoSubDestroy(sub), 0, "sub_destroy")
+	requireWeldCode(t, weldGoPubDestroy(pub), 0, "pub_destroy")
+}
+
 // checkWeldTakeInfoNoTake pins the side channel with no delivered take.
 func checkWeldTakeInfoNoTake(t *testing.T) {
 	t.Helper()
@@ -131,10 +153,36 @@ func checkWeldTakeInfoNoTake(t *testing.T) {
 	requireWeldCode(t, icode, -2, "take_info unknown handle")
 }
 
+// checkWeldPubGIDPinsTakeGID pins pub GID equals take GID in-process.
+//
+// The publisher GID export and the take-info side channel share the
+// bridge counter authority, so rmw_compare_gids_equal holds between
+// rmw_get_gid_for_publisher and the take GID.
+func checkWeldPubGIDPinsTakeGID(t *testing.T) {
+	t.Helper()
+	bh, pub, sub := weldTakeInfoBridge(t)
+	defer func() {
+		requireWeldCode(t, weldGoBridgeFree(bh), 0, "bridge_free")
+	}()
+	pubGID, code := weldGoPubGetGID(pub)
+	requireWeldCode(t, code, 0, "pub_get_gid")
+	if pubGID == ([16]byte{}) {
+		t.Fatalf("pub GID is zero, want writer identity")
+	}
+	requireWeldCode(t, weldGoPubPublish(pub, []byte("ping")), 0, "publish")
+	checkWeldTakeInfo(t, sub, "ping", 1, pubGID)
+	_, code = weldGoPubGetGID(1 << 40)
+	requireWeldCode(t, code, -2, "pub_get_gid unknown")
+	requireWeldCode(t, weldGoSubDestroy(sub), 0, "sub_destroy")
+	requireWeldCode(t, weldGoPubDestroy(pub), 0, "pub_destroy")
+}
+
 // TestWeldTakeInfo exercises the take-info side channel.
 func TestWeldTakeInfo(t *testing.T) {
 	t.Run("sequence", checkWeldTakeInfoSequence)
 	t.Run("stash_retry", checkWeldTakeInfoStashRetry)
 	t.Run("end_to_end_gid", checkWeldTakeInfoEndToEnd)
 	t.Run("no_take", checkWeldTakeInfoNoTake)
+	t.Run("source_stamp", checkWeldTakeSourcePinsPublisherStamp)
+	t.Run("pub_gid_pins_take_gid", checkWeldPubGIDPinsTakeGID)
 }

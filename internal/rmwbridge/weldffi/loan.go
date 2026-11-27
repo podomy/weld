@@ -95,7 +95,7 @@ func weld_ffi_loan_take_poll(handle C.longlong, loanAddrOut *C.ulonglong, member
 	}
 	*loanAddrOut = C.ulonglong(ptr)
 	*membersAddrOut = C.ulonglong(members)
-	weldRecordSubTakeInfo(key, gid, seq)
+	weldRecordSubTakeInfo(key, gid, seq, e.sub.LastSourceTimestamp())
 	weldNoteSubDelivery(key)
 	return C.int(weldCodeOK)
 }

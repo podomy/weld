@@ -329,6 +329,78 @@ func weldGoSvcRespond(handle, seq int64, resp []byte) int32 {
 	return int32(rc)
 }
 
+// weldGoSvcServeRTPS dequeues one RTPS request through the export.
+func weldGoSvcServeRTPS(handle int64, base string, capacity int) ([]byte, [8]byte, int64, int32) {
+	var empty [8]byte
+	if capacity < 0 {
+		capacity = 0
+	}
+	cb := C.CString(base)
+	if cb == nil {
+		return nil, empty, 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(cb))
+	var ptr *C.char
+	var owned unsafe.Pointer
+	if capacity > 0 {
+		owned = C.malloc(C.size_t(capacity))
+		if owned == nil {
+			return nil, empty, 0, int32(weldCodeErrInternal)
+		}
+		defer C.free(owned)
+		ptr = (*C.char)(owned)
+	}
+	var n C.int
+	var seq C.longlong
+	gidOwned := C.malloc(C.size_t(8))
+	if gidOwned == nil {
+		return nil, empty, 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(gidOwned)
+	rc := weld_ffi_service_serve_rtps(C.longlong(handle), cb, ptr, C.int(capacity), &n, &seq, (*C.char)(gidOwned))
+	if rc == C.int(weldCodeEmpty) {
+		return nil, empty, 0, int32(weldCodeEmpty)
+	}
+	if rc != C.int(weldCodeOK) {
+		return nil, empty, 0, int32(rc)
+	}
+	var guid [8]byte
+	copy(guid[:], C.GoBytes(gidOwned, 8))
+	if int(n) == 0 {
+		return []byte{}, guid, int64(seq), int32(weldCodeOK)
+	}
+	out := C.GoBytes(owned, n)
+	return out, guid, int64(seq), int32(weldCodeOK)
+}
+
+// weldGoSvcRespondRTPS replies through the RTPS leg.
+func weldGoSvcRespondRTPS(handle int64, guid [8]byte, seq int64, base string, resp []byte) int32 {
+	g := guid
+	cb := C.CString(base)
+	if cb == nil {
+		return int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(cb))
+	var ptr *C.char
+	if len(resp) > 0 {
+		ptr = (*C.char)(unsafe.Pointer(&resp[0]))
+	}
+	rc := weld_ffi_service_respond_rtps(C.longlong(handle), (*C.char)(unsafe.Pointer(&g[0])), C.longlong(seq), cb, ptr, C.int(len(resp)))
+	return int32(rc)
+}
+
+// weldGoSvcHasRequestRTPS counts RTPS requests through the export.
+func weldGoSvcHasRequestRTPS(handle int64, base string) (int32, int32) {
+	cb := C.CString(base)
+	if cb == nil {
+		return 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(unsafe.Pointer(cb))
+	var n C.int
+	rc := weld_ffi_service_has_request_rtps(C.longlong(handle), cb, &n)
+	return int32(n), int32(rc)
+}
+
 // weldGoSubSetFilter records one content filter through the export.
 func weldGoSubSetFilter(handle int64, expr string, params []string) int32 {
 	ce := C.CString(expr)
@@ -446,6 +518,21 @@ func weldGoSubTakePoll(handle int64, capacity int) ([]byte, int32, int32) {
 	return out, int32(n), int32(weldCodeOK)
 }
 
+// weldGoSubTakeSource reports the publisher send stamp of the last take.
+func weldGoSubTakeSource(handle int64) (uint64, int32) {
+	owned := C.malloc(C.size_t(8))
+	if owned == nil {
+		return 0, int32(weldCodeErrInternal)
+	}
+	defer C.free(owned)
+	var ns C.ulonglong
+	rc := weld_ffi_sub_take_source(C.longlong(handle), &ns)
+	if rc != C.int(weldCodeOK) {
+		return 0, int32(rc)
+	}
+	return uint64(ns), int32(weldCodeOK)
+}
+
 // weldGoSubTakeInfo reports the last take attribution for a subscription.
 //
 // It returns the 16 byte writer GID, the per-subscription receive
@@ -466,6 +553,25 @@ func weldGoSubTakeInfo(handle int64) ([16]byte, uint64, int32) {
 	var gid [16]byte
 	copy(gid[:], C.GoBytes(owned, 16))
 	return gid, uint64(seq), int32(weldCodeOK)
+}
+
+// weldGoPubGetGID copies the bridge-assigned publisher GID through the export.
+//
+// It returns the 16 byte writer GID and the export code.
+func weldGoPubGetGID(handle int64) ([16]byte, int32) {
+	var empty [16]byte
+	owned := C.malloc(C.size_t(16))
+	if owned == nil {
+		return empty, int32(weldCodeErrInternal)
+	}
+	defer C.free(owned)
+	rc := weld_ffi_pub_get_gid(C.longlong(handle), (*C.char)(owned), C.int(16))
+	if rc != C.int(weldCodeOK) {
+		return empty, int32(rc)
+	}
+	var gid [16]byte
+	copy(gid[:], C.GoBytes(owned, 16))
+	return gid, int32(weldCodeOK)
 }
 
 // weldGoNetflowLocal reports the local socket address through the export.

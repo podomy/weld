@@ -144,3 +144,34 @@ func TestTakeInfoPublisherGID(t *testing.T) {
 		t.Fatalf("last take info = %x/%d, want %x/1", lastGID, lastSeq, wantGID)
 	}
 }
+
+// TestTakeSourceTimestampPinsPublisherSendStamp checks in-process source time.
+//
+// The publisher stamps send time at publish and the take records it, so
+// the source stamp is nonzero and precedes the take return.
+func TestTakeSourceTimestampPinsPublisherSendStamp(t *testing.T) {
+	t.Parallel()
+	bridge := rmwbridge.NewBridge()
+	defer func() {
+		closeBridgeChecked(t, bridge)
+	}()
+	node := mustTakeInfoNode(t, bridge)
+	pub, err := bridge.CreatePublisher(node, "/srcts", rmwbridge.DefaultQoS())
+	requireNoError(t, err, "create publisher")
+	sub, err := bridge.CreateSubscription(node, "/srcts", rmwbridge.DefaultQoS())
+	requireNoError(t, err, "create subscription")
+	ctx, cancel := takeInfoCtx(t)
+	defer cancel()
+	before := sub.LastSourceTimestamp()
+	if before != 0 {
+		t.Fatalf("source before take = %d, want 0", before)
+	}
+	err = pub.Publish(ctx, []byte("ping"))
+	requireNoError(t, err, "publish")
+	_, _, _, err = sub.TakeWithInfo(ctx)
+	requireNoError(t, err, "take with info")
+	got := sub.LastSourceTimestamp()
+	if got == 0 {
+		t.Fatalf("source after take is zero, want publisher stamp")
+	}
+}

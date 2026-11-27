@@ -419,3 +419,18 @@ func TestFFITakeInfoNoTake(t *testing.T) {
 	code = ffiGoBridgeFree(bh)
 	requireFFICodeZero(t, code, "bridge_free")
 }
+
+// TestFFIPubGIDPinsTakeGID pins pub GID equals take GID in-process.
+func TestFFIPubGIDPinsTakeGID(t *testing.T) {
+	bh := ffiTestBridge(t)
+	pubH, subH := createFFIPubSub(t, bh)
+	wantGID, code := ffiGoPubGetGID(pubH)
+	requireFFICodeZero(t, code, "pub_get_gid")
+	if wantGID == ([16]byte{}) {
+		t.Fatalf("pub GID is zero")
+	}
+	code = ffiGoPubPublish(pubH, []byte("ping"))
+	requireFFICodeZero(t, code, "publish")
+	checkFFITakeInfo(t, subH, "ping", 1, wantGID)
+	destroyFFIPubSub(t, bh, pubH, subH)
+}

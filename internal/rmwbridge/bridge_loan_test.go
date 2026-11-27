@@ -67,6 +67,39 @@ func TestBridgeLoanSharesHandle(t *testing.T) {
 	}
 }
 
+// TestBridgeLoanPreservesWireSample pins that loan takes preserve wire samples.
+//
+// Publishing a wire copy plus a loan queues both legs; taking the loan
+// must not drop the wire sample, so a later Take still delivers it.
+func TestBridgeLoanPreservesWireSample(t *testing.T) {
+	t.Parallel()
+	bridge := rmwbridge.NewBridge()
+	defer func() {
+		closeBridgeChecked(t, bridge)
+	}()
+	node := mustDomainNode(t, bridge, 0, "loan-preserve")
+	pub, sub := mustLoanEndpoints(t, bridge, node)
+	ctx, cancel := loanCtx(t)
+	defer cancel()
+	err := pub.Publish(ctx, []byte("wire"))
+	requireNoError(t, err, "publish wire")
+	queued, err := pub.PublishLoan(0x1111, 0x2222)
+	requireNoError(t, err, "publish loan")
+	if !queued {
+		t.Fatalf("publish loan queued = false, want true")
+	}
+	_, _, _, seq, ok, err := sub.TakeLoan()
+	requireNoError(t, err, "take loan")
+	if !ok || seq != 1 {
+		t.Fatalf("take loan ok/seq = %v/%d, want true/1", ok, seq)
+	}
+	got, err := sub.Take(ctx)
+	requireNoError(t, err, "take wire after loan")
+	if string(got) != "wire" {
+		t.Fatalf("wire after loan = %q, want wire", string(got))
+	}
+}
+
 // TestBridgeLoanLargePayloadWireStillCopies pins the wire path still copies.
 func TestBridgeLoanLargePayloadWireStillCopies(t *testing.T) {
 	t.Parallel()

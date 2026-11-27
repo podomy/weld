@@ -234,9 +234,14 @@ type Publisher struct {
 //
 // Payload is the copied sample bytes. GID is the publishing writer
 // identity captured at publish time, mirroring dds.WriterGUID width.
+// SourceNs is the publisher-side send stamp in unix nanos captured at
+// publish time per RMW source_timestamp semantics (DDS 1.4 section
+// 2.2.5.5.8); zero means the stamp is unknown and receivers fall back
+// to local receive time.
 type deliveredSample struct {
-	payload []byte
-	gid     [16]byte
+	payload  []byte
+	gid      [16]byte
+	sourceNs int64
 }
 
 // loanSlot is one queued in-process loan carrying opaque C handles.
@@ -246,11 +251,13 @@ type deliveredSample struct {
 // fini plus free on return. The bridge never dereferences either and
 // never copies payload bytes; only the 16 bytes of handles move, so the
 // in-process path is zero-copy. GID is the publishing writer identity
-// captured at publish time for the take-info side channel.
+// captured at publish time for the take-info side channel. SourceNs is
+// the publisher-side send stamp carried with the loan.
 type loanSlot struct {
-	ptr     uint64
-	members uint64
-	gid     [16]byte
+	ptr      uint64
+	members  uint64
+	gid      [16]byte
+	sourceNs int64
 }
 
 // loanQueueDepth bounds each per-topic in-process loan queue.
@@ -287,6 +294,9 @@ type Subscription struct {
 	recvSeq uint64
 	// lastGID is the writer identity of the most recent delivered take.
 	lastGID [16]byte
+	// lastSourceNs is the publisher-side send stamp of the most recent
+	// delivered take, or zero when the leg carried none (wire takes).
+	lastSourceNs int64
 }
 
 // ServiceRequest is one pending call from client to server.
@@ -940,7 +950,7 @@ func (p *Publisher) Publish(ctx context.Context, payload []byte) error {
 	}
 	bridge.mu.Unlock()
 	data := append([]byte(nil), payload...)
-	sample := deliveredSample{payload: data, gid: gid}
+	sample := deliveredSample{payload: data, gid: gid, sourceNs: time.Now().UnixNano()}
 	for _, sub := range targets {
 		sub.mu.Lock()
 		closed := sub.closed
@@ -985,6 +995,7 @@ func (s *Subscription) Take(ctx context.Context) ([]byte, error) {
 // every delivered take, including Takes that discard the attribution.
 // Intra-process and network sequence numbers are equal here because the
 // bridge is a single transport: callers report the same value for both.
+// The publisher-side send stamp is recorded for LastSourceTimestamp.
 // It backs the rmw_take_with_info attribution path.
 func (s *Subscription) TakeWithInfo(ctx context.Context) ([]byte, [16]byte, uint64, error) {
 	var empty [16]byte
@@ -1009,7 +1020,7 @@ func (s *Subscription) TakeWithInfo(ctx context.Context) ([]byte, [16]byte, uint
 		return nil, empty, 0, fmt.Errorf("rmwbridge: subscription take: %w", context.Canceled)
 	case sample := <-s.ch:
 		out := append([]byte(nil), sample.payload...)
-		seq := s.noteDeliveredLocked(sample.gid)
+		seq := s.noteDeliveredLocked(sample.gid, sample.sourceNs)
 		return out, sample.gid, seq, nil
 	}
 }
@@ -1017,13 +1028,15 @@ func (s *Subscription) TakeWithInfo(ctx context.Context) ([]byte, [16]byte, uint
 // noteDeliveredLocked records one delivery and returns its sequence.
 //
 // The caller must not hold s.mu. The GID is the writer identity of the
-// delivered sample. The sequence increments on every call, so stashed
-// retries must not call it twice for one sample.
-func (s *Subscription) noteDeliveredLocked(gid [16]byte) uint64 {
+// delivered sample and sourceNs is its publisher-side send stamp. The
+// sequence increments on every call, so stashed retries must not call
+// it twice for one sample.
+func (s *Subscription) noteDeliveredLocked(gid [16]byte, sourceNs int64) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recvSeq++
 	s.lastGID = gid
+	s.lastSourceNs = sourceNs
 	return s.recvSeq
 }
 
@@ -1032,7 +1045,8 @@ func (s *Subscription) noteDeliveredLocked(gid [16]byte) uint64 {
 // A short-buffer retry dequeued once already: its sequence was assigned
 // at dequeue, so redelivery replays the same gid plus seq. When seq
 // advances past the counter (no interleaving in practice) the counter
-// follows it to keep the stream contiguous. It never blocks.
+// follows it to keep the stream contiguous. The source stamp replays
+// with the sample. It never blocks.
 func (s *Subscription) ReplayTakeInfo(gid [16]byte, seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1042,14 +1056,38 @@ func (s *Subscription) ReplayTakeInfo(gid [16]byte, seq uint64) {
 	s.lastGID = gid
 }
 
+// ReplayTakeInfoWithSource replays a stashed retry with its send stamp.
+//
+// It mirrors ReplayTakeInfo and additionally restores the publisher-side
+// send stamp carried at dequeue. It never blocks.
+func (s *Subscription) ReplayTakeInfoWithSource(gid [16]byte, seq uint64, sourceNs int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq > s.recvSeq {
+		s.recvSeq = seq
+	}
+	s.lastGID = gid
+	s.lastSourceNs = sourceNs
+}
+
 // NoteExternalDelivery records one wire delivery from outside the queue.
 //
 // Wire takes bypass the subscription channel, so this assigns them the
 // next per-subscription receive sequence and records the writer identity
 // for the take-info side channel. A zero GID means the wire leg carried
-// no writer identity. It returns the assigned sequence.
+// no writer identity. Wire legs carry no publisher send stamp, so the
+// source stamp is zero and receivers fall back to local receive time.
+// It returns the assigned sequence.
 func (s *Subscription) NoteExternalDelivery(gid [16]byte) uint64 {
-	return s.noteDeliveredLocked(gid)
+	return s.noteDeliveredLocked(gid, 0)
+}
+
+// NoteExternalDeliveryWithSource records one wire delivery with a send stamp.
+//
+// It mirrors NoteExternalDelivery for future wire legs that carry a
+// publisher send stamp. It returns the assigned sequence.
+func (s *Subscription) NoteExternalDeliveryWithSource(gid [16]byte, sourceNs int64) uint64 {
+	return s.noteDeliveredLocked(gid, sourceNs)
 }
 
 // LastTakeInfo returns the attribution of the most recent delivered take.
@@ -1061,6 +1099,17 @@ func (s *Subscription) LastTakeInfo() ([16]byte, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastGID, s.recvSeq
+}
+
+// LastSourceTimestamp returns the publisher-side send stamp of the last take.
+//
+// It reports unix nanos captured at publish time, or zero when the leg
+// carried none (wire takes). Callers fall back to local receive time
+// on zero. It never blocks.
+func (s *Subscription) LastSourceTimestamp() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSourceNs
 }
 
 // PublishLoan enqueues one in-process loan handle without copying.
@@ -1120,7 +1169,7 @@ func (p *Publisher) PublishLoan(ptr uint64, members uint64) (bool, error) {
 	if len(queued) >= loanQueueDepth {
 		return false, nil
 	}
-	bridge.loans[key] = append(queued, loanSlot{ptr: ptr, members: members, gid: gid})
+	bridge.loans[key] = append(queued, loanSlot{ptr: ptr, members: members, gid: gid, sourceNs: time.Now().UnixNano()})
 	return true, nil
 }
 
@@ -1166,7 +1215,7 @@ func (s *Subscription) TakeLoan() (ptr uint64, members uint64, gid [16]byte, seq
 	}
 	bridge.loanTransfers++
 	bridge.mu.Unlock()
-	seq = s.noteDeliveredLocked(slot.gid)
+	seq = s.noteDeliveredLocked(slot.gid, slot.sourceNs)
 	return slot.ptr, slot.members, slot.gid, seq, true, nil
 }
 

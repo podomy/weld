@@ -19,7 +19,19 @@ RUN apt-get update -qq \
 COPY --from=gobuilder /out/libweld_ffi.so /opt/ros/jazzy/lib/libweld_ffi.so
 
 # rmw_weld shim sources (build context is the repo root).
-COPY rmw_weld/src/rmw_weld.c /tmp/rmw_weld_src/rmw_weld.c
+COPY rmw_weld/src/common.c /tmp/rmw_weld_src/common.c
+COPY rmw_weld/src/init.c /tmp/rmw_weld_src/init.c
+COPY rmw_weld/src/node.c /tmp/rmw_weld_src/node.c
+COPY rmw_weld/src/publish.c /tmp/rmw_weld_src/publish.c
+COPY rmw_weld/src/subscription.c /tmp/rmw_weld_src/subscription.c
+COPY rmw_weld/src/loan.c /tmp/rmw_weld_src/loan.c
+COPY rmw_weld/src/service.c /tmp/rmw_weld_src/service.c
+COPY rmw_weld/src/waitset.c /tmp/rmw_weld_src/waitset.c
+COPY rmw_weld/src/graph.c /tmp/rmw_weld_src/graph.c
+COPY rmw_weld/src/event.c /tmp/rmw_weld_src/event.c
+COPY rmw_weld/src/qos.c /tmp/rmw_weld_src/qos.c
+COPY rmw_weld/src/cft_dynamic.c /tmp/rmw_weld_src/cft_dynamic.c
+COPY rmw_weld/src/weld_private.h /tmp/rmw_weld_src/weld_private.h
 COPY rmw_weld/src/weld_cdr.c /tmp/rmw_weld_src/weld_cdr.c
 COPY rmw_weld/src/weld_cdr.h /tmp/rmw_weld_src/weld_cdr.h
 
@@ -29,7 +41,10 @@ COPY rmw_weld/src/weld_cdr.h /tmp/rmw_weld_src/weld_cdr.h
 RUN . /opt/ros/jazzy/setup.sh \
     && gcc -std=c17 -fPIC -shared -Wall -Wextra -Wpedantic \
         -o /opt/ros/jazzy/lib/librmw_weld.so \
-        /tmp/rmw_weld_src/rmw_weld.c /tmp/rmw_weld_src/weld_cdr.c \
+        /tmp/rmw_weld_src/common.c /tmp/rmw_weld_src/init.c /tmp/rmw_weld_src/node.c /tmp/rmw_weld_src/publish.c \
+        /tmp/rmw_weld_src/subscription.c /tmp/rmw_weld_src/loan.c /tmp/rmw_weld_src/service.c /tmp/rmw_weld_src/waitset.c \
+        /tmp/rmw_weld_src/graph.c /tmp/rmw_weld_src/event.c /tmp/rmw_weld_src/qos.c /tmp/rmw_weld_src/cft_dynamic.c \
+        /tmp/rmw_weld_src/weld_cdr.c \
         -I/tmp/rmw_weld_src -I/opt/ros/jazzy/include \
         $(for d in /opt/ros/jazzy/include/*/; do case "$d" in */dds/|*/idl/) continue;; *) printf -- "-I%s " "$d";; esac; done) \
         -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils \

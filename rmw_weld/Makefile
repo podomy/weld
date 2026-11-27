@@ -15,7 +15,13 @@
 CC ?= cc
 CSTD ?= c17
 WARN ?= -Wall -Wextra -Wpedantic
-SRC ?= src/rmw_weld.c
+# Every shim translation unit plus the private header they share.
+# weld_private.h travels with the sources; there is no rmw_weld.c left.
+SHIM_TUS ?= common.c init.c node.c publish.c subscription.c loan.c \
+  service.c waitset.c graph.c event.c qos.c cft_dynamic.c
+SHIM_HDR ?= weld_private.h
+SHIM_SRCS ?= $(addprefix src/,$(SHIM_TUS)) src/weld_cdr.c
+SHIM_FILES ?= $(SHIM_TUS) $(SHIM_HDR) weld_cdr.c weld_cdr.h
 LIB ?= librmw_weld.so
 PREFIX ?= /opt/weld
 
@@ -44,11 +50,11 @@ LDLIBS ?= $(shell pkg-config --libs rmw rcl rosidl_runtime_c rcutils 2>/dev/null
 
 all: $(LIB)
 
-$(LIB): $(SRC)
-	$(CC) $(CFLAGS) -shared -o $@ $(SRC) $(LDLIBS)
+$(LIB): $(SHIM_SRCS) src/$(SHIM_HDR)
+	$(CC) $(CFLAGS) -shared -o $@ $(SHIM_SRCS) $(LDLIBS)
 
 check:
-	$(CC) -std=$(CSTD) $(WARN) -fsyntax-only $(SRC) $(shell pkg-config --cflags rmw rcl rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c rcutils 2>/dev/null)
+	$(CC) -std=$(CSTD) $(WARN) -fsyntax-only $(SHIM_SRCS) $(shell pkg-config --cflags rmw rcl rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c rcutils 2>/dev/null)
 
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/share/ament_index/resource_index/rmw_implementation
@@ -57,18 +63,16 @@ install: all
 
 # build-in-jazzy compiles the shim inside the running Jazzy peer.
 #
-# It copies both C sources into the container, then runs gcc with the
-# same header and library set the linktest-in-jazzy probe uses: the
-# monolith needs weld_cdr.c plus rosidl_typesupport introspection libs.
+# It copies every TU plus both headers into the container, then runs gcc
+# with the same header and library set the linktest-in-jazzy probe uses:
+# the shim needs weld_cdr.c plus rosidl_typesupport introspection libs.
 # Output lands at JAZZY_SO inside the container.
 build-in-jazzy: go-ffi-shared
 	docker exec $(CONTAINER) mkdir -p $(JAZZY_SRC_DIR)
-	docker cp $(SRC) $(CONTAINER):$(JAZZY_SRC_DIR)/rmw_weld.c
-	docker cp $(CURDIR)/src/weld_cdr.c $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.c
-	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
+	for f in $(SHIM_FILES); do docker cp $(CURDIR)/src/$$f $(CONTAINER):$(JAZZY_SRC_DIR)/$$f || exit 1; done
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) -I/opt/ros/jazzy/include $$(for d in /opt/ros/jazzy/include/*/; do case "$$d" in */dds/|*/idl/) continue;; *) printf -- "-I%s " "$$d";; esac; done) $$(pkg-config --cflags rmw rcl rcutils rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c 2>/dev/null) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(addprefix $(JAZZY_SRC_DIR)/,$(SHIM_TUS)) $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) -I/opt/ros/jazzy/include $$(for d in /opt/ros/jazzy/include/*/; do case "$$d" in */dds/|*/idl/) continue;; *) printf -- "-I%s " "$$d";; esac; done) $$(pkg-config --cflags rmw rcl rcutils rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c 2>/dev/null) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread'
 
 # install-in-jazzy publishes the container build to a ROS-visible path.
 #
@@ -99,7 +103,7 @@ JAZZY_LINKTEST_BIN ?= /tmp/weld_linktest
 # linktest-in-jazzy links the shim against the real Go FFI inside ros-jazzy.
 #
 # It copies libweld_ffi.so plus libweld_ffi.h from the host c-shared
-# build (see go-ffi-shared) plus linktest.c plus rmw_weld.c plus weld_cdr.c
+# build (see go-ffi-shared) plus linktest.c plus the shim TUs plus weld_cdr.c
 # into the Jazzy peer, links with gcc -std=c17 against the ROS libs plus
 # -lweld_ffi with rpath and LD_LIBRARY_PATH covering both the staged dir
 # and the stock ROS lib dir, and runs the probe under timeout 60.
@@ -108,12 +112,10 @@ JAZZY_LINKTEST_BIN ?= /tmp/weld_linktest
 linktest-in-jazzy: go-ffi-shared
 	docker exec $(CONTAINER) mkdir -p $(JAZZY_SRC_DIR)
 	docker cp $(CURDIR)/$(LINKTEST_SRC) $(CONTAINER):$(JAZZY_SRC_DIR)/linktest.c
-	docker cp $(CURDIR)/src/rmw_weld.c $(CONTAINER):$(JAZZY_SRC_DIR)/rmw_weld.c
-	docker cp $(CURDIR)/src/weld_cdr.c $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.c
-	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
+	for f in $(SHIM_FILES); do docker cp $(CURDIR)/src/$$f $(CONTAINER):$(JAZZY_SRC_DIR)/$$f || exit 1; done
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "linktest: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_LINKTEST_BIN) $(JAZZY_SRC_DIR)/linktest.c $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_LINKTEST_BIN) > /tmp/weld_linktest.log 2>&1; rc=$$?; cat /tmp/weld_linktest.log; if [ $$rc -eq 124 ]; then echo "linktest: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "linktest: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "linktest: probe exited $$rc, failing"; exit 1; fi; grep -E "^version=.+" /tmp/weld_linktest.log && grep -E "^identifier=rmw_weld$$" /tmp/weld_linktest.log && grep -E "^ffi=REAL$$" /tmp/weld_linktest.log && grep -E "^PASS publish$$" /tmp/weld_linktest.log && grep -E "^PASS take payload=hello$$" /tmp/weld_linktest.log && grep -E "^PASS qos compatible OK$$" /tmp/weld_linktest.log && grep -E "^PASS weld_linktest_real$$" /tmp/weld_linktest.log'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "linktest: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_LINKTEST_BIN) $(JAZZY_SRC_DIR)/linktest.c $(addprefix $(JAZZY_SRC_DIR)/,$(SHIM_TUS)) $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_LINKTEST_BIN) > /tmp/weld_linktest.log 2>&1; rc=$$?; cat /tmp/weld_linktest.log; if [ $$rc -eq 124 ]; then echo "linktest: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "linktest: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "linktest: probe exited $$rc, failing"; exit 1; fi; grep -E "^version=.+" /tmp/weld_linktest.log && grep -E "^identifier=rmw_weld$$" /tmp/weld_linktest.log && grep -E "^ffi=REAL$$" /tmp/weld_linktest.log && grep -E "^PASS publish$$" /tmp/weld_linktest.log && grep -E "^PASS take payload=hello$$" /tmp/weld_linktest.log && grep -E "^PASS qos compatible OK$$" /tmp/weld_linktest.log && grep -E "^PASS weld_linktest_real$$" /tmp/weld_linktest.log'
 
 # go-ffi-shared builds the real Go FFI shared library on the host.
 #
@@ -136,7 +138,7 @@ INTEROP_TOPIC ?= /weld_interop
 
 # interop-in-jazzy proves live RTPS exchange with a real ROS peer.
 #
-# It links interop_test.c plus rmw_weld.c plus weld_cdr.c against the real
+# It links interop_test.c plus the shim TUs plus weld_cdr.c against the real
 # Go shared lib inside ros-jazzy, then runs the probe under timeout 60.
 # Direction one checks rmw pub reaches ros echo on INTEROP_TOPIC in
 # INTEROP_DOMAIN. Direction two checks ros pub reaches rmw sub. Any
@@ -144,12 +146,10 @@ INTEROP_TOPIC ?= /weld_interop
 interop-in-jazzy: go-ffi-shared
 	docker exec $(CONTAINER) mkdir -p $(JAZZY_SRC_DIR)
 	docker cp $(CURDIR)/$(INTEROP_SRC) $(CONTAINER):$(JAZZY_SRC_DIR)/interop_test.c
-	docker cp $(CURDIR)/src/rmw_weld.c $(CONTAINER):$(JAZZY_SRC_DIR)/rmw_weld.c
-	docker cp $(CURDIR)/src/weld_cdr.c $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.c
-	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
+	for f in $(SHIM_FILES); do docker cp $(CURDIR)/src/$$f $(CONTAINER):$(JAZZY_SRC_DIR)/$$f || exit 1; done
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "interop: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_INTEROP_BIN) $(JAZZY_SRC_DIR)/interop_test.c $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_INTEROP_BIN) > /tmp/weld_interop.log 2>&1; rc=$$?; cat /tmp/weld_interop.log; if [ $$rc -eq 124 ]; then echo "interop: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "interop: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "interop: probe exited $$rc, failing"; exit 1; fi; grep -E "^PASS weld_to_ros$$" /tmp/weld_interop.log && grep -E "^PASS ros_to_weld payload=hello$$" /tmp/weld_interop.log && grep -E "^PASS weld_interop_real$$" /tmp/weld_interop.log'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "interop: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_INTEROP_BIN) $(JAZZY_SRC_DIR)/interop_test.c $(addprefix $(JAZZY_SRC_DIR)/,$(SHIM_TUS)) $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_INTEROP_BIN) > /tmp/weld_interop.log 2>&1; rc=$$?; cat /tmp/weld_interop.log; if [ $$rc -eq 124 ]; then echo "interop: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "interop: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "interop: probe exited $$rc, failing"; exit 1; fi; grep -E "^PASS weld_to_ros$$" /tmp/weld_interop.log && grep -E "^PASS ros_to_weld payload=hello$$" /tmp/weld_interop.log && grep -E "^PASS weld_interop_real$$" /tmp/weld_interop.log'
 
 SVCWAIT_SRC ?= svcwait_test.c
 JAZZY_SVCWAIT_BIN ?= /tmp/weld_svcwait
@@ -160,7 +160,7 @@ JAZZY_SVCWAIT_BIN ?= /tmp/weld_svcwait
 # through the real Go FFI inside ros-jazzy.
 #
 # It copies libweld_ffi.so plus libweld_ffi.h from the host c-shared
-# build (see go-ffi-shared) plus svcwait_test.c plus rmw_weld.c plus
+# build (see go-ffi-shared) plus svcwait_test.c plus the shim TUs plus
 # weld_cdr.c into the Jazzy peer, links with gcc -std=c17 against the
 # ROS libs plus -lweld_ffi with rpath and LD_LIBRARY_PATH covering both
 # the staged dir and the stock ROS lib dir, and runs the probe under
@@ -176,9 +176,7 @@ JAZZY_SVCWAIT_BIN ?= /tmp/weld_svcwait
 svcwait-in-jazzy: go-ffi-shared
 	docker exec $(CONTAINER) mkdir -p $(JAZZY_SRC_DIR)
 	docker cp $(CURDIR)/$(SVCWAIT_SRC) $(CONTAINER):$(JAZZY_SRC_DIR)/svcwait_test.c
-	docker cp $(CURDIR)/src/rmw_weld.c $(CONTAINER):$(JAZZY_SRC_DIR)/rmw_weld.c
-	docker cp $(CURDIR)/src/weld_cdr.c $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.c
-	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
+	for f in $(SHIM_FILES); do docker cp $(CURDIR)/src/$$f $(CONTAINER):$(JAZZY_SRC_DIR)/$$f || exit 1; done
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "svcwait: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_SVCWAIT_BIN) $(JAZZY_SRC_DIR)/svcwait_test.c $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -lstd_srvs__rosidl_generator_c -lstd_srvs__rosidl_typesupport_c -lstd_srvs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_SVCWAIT_BIN) > /tmp/weld_svcwait.log 2>&1; rc=$$?; cat /tmp/weld_svcwait.log; if [ $$rc -eq 124 ]; then echo "svcwait: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "svcwait: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "svcwait: probe exited $$rc, failing"; exit 1; fi; grep -E "^version=.+" /tmp/weld_svcwait.log && grep -E "^identifier=rmw_weld$$" /tmp/weld_svcwait.log && grep -E "^ffi=REAL$$" /tmp/weld_svcwait.log && grep -E "^PASS svc payload match seq=" /tmp/weld_svcwait.log && grep -E "^PASS wait triggered OK$$" /tmp/weld_svcwait.log && grep -E "^PASS wait timeout$$" /tmp/weld_svcwait.log && grep -E "^PASS weld_svcwait_real$$" /tmp/weld_svcwait.log'
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && echo "svcwait: linking against REAL Go shared lib" && gcc -std=$(CSTD) $(WARN) -o $(JAZZY_SVCWAIT_BIN) $(JAZZY_SRC_DIR)/svcwait_test.c $(addprefix $(JAZZY_SRC_DIR)/,$(SHIM_TUS)) $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) $$(for d in /opt/ros/jazzy/include/*; do printf -- "-I%s " "$$d"; done) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw_implementation -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -lstd_msgs__rosidl_generator_c -lstd_msgs__rosidl_typesupport_c -lstd_msgs__rosidl_typesupport_introspection_c -lstd_srvs__rosidl_generator_c -lstd_srvs__rosidl_typesupport_c -lstd_srvs__rosidl_typesupport_introspection_c -pthread -Wl,-rpath,$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib && LD_LIBRARY_PATH=$(JAZZY_SRC_DIR):/opt/ros/jazzy/lib:$$LD_LIBRARY_PATH timeout 60 $(JAZZY_SVCWAIT_BIN) > /tmp/weld_svcwait.log 2>&1; rc=$$?; cat /tmp/weld_svcwait.log; if [ $$rc -eq 124 ]; then echo "svcwait: probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "svcwait: probe crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "svcwait: probe exited $$rc, failing"; exit 1; fi; grep -E "^version=.+" /tmp/weld_svcwait.log && grep -E "^identifier=rmw_weld$$" /tmp/weld_svcwait.log && grep -E "^ffi=REAL$$" /tmp/weld_svcwait.log && grep -E "^PASS svc payload match seq=" /tmp/weld_svcwait.log && grep -E "^PASS wait triggered OK$$" /tmp/weld_svcwait.log && grep -E "^PASS wait timeout$$" /tmp/weld_svcwait.log && grep -E "^PASS weld_svcwait_real$$" /tmp/weld_svcwait.log'

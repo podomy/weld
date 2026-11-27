@@ -74,27 +74,40 @@ func checkMapxt6aWrapperKeys(t *testing.T) {
 	}
 }
 
-// TestMapxt6aSortedKeys pins strictly increasing key order checks.
+// TestMapxt6aSortedKeys pins strictly increasing numeric key order checks.
+//
+// Numeric order is canonical per 7.2.3.2.2.1 rules 14 to 16: LE and BE agree
+// on value order, unlike byte-lexicographic order which is endian-dependent
+// for multi-byte keys. The deprecated byte helper is deleted.
 func TestMapxt6aSortedKeys(t *testing.T) {
-	err := CheckSortedxt6aMapKeys(nil)
+	err := CheckSortedxt6aMapKeysNumeric(RosTypeUint8, nil, true)
 	if err != nil {
 		t.Fatalf("empty keys rejected: %v", err)
 	}
-	err = CheckSortedxt6aMapKeys([][]byte{{0x01}})
+	err = CheckSortedxt6aMapKeysNumeric(RosTypeUint8, [][]byte{{0x01}}, true)
 	if err != nil {
 		t.Fatalf("single key rejected: %v", err)
 	}
-	err = CheckSortedxt6aMapKeys([][]byte{{0x01}, {0x02}, {0x03}})
+	err = CheckSortedxt6aMapKeysNumeric(RosTypeUint8, [][]byte{{0x01}, {0x02}, {0x03}}, true)
 	if err != nil {
 		t.Fatalf("sorted keys rejected: %v", err)
 	}
-	err = CheckSortedxt6aMapKeys([][]byte{{0x02}, {0x01}})
+	err = CheckSortedxt6aMapKeysNumeric(RosTypeUint8, [][]byte{{0x02}, {0x01}}, true)
 	if err == nil {
 		t.Fatal("unsorted keys accepted, want rejection")
 	}
-	err = CheckSortedxt6aMapKeys([][]byte{{0x01}, {0x01}})
+	err = CheckSortedxt6aMapKeysNumeric(RosTypeUint8, [][]byte{{0x01}, {0x01}}, true)
 	if err == nil {
 		t.Fatal("duplicate keys accepted, want rejection")
+	}
+	// LE and BE agree on numeric order for multi-byte keys.
+	leKeys := [][]byte{{0x01, 0x00, 0x00, 0x00}, {0x02, 0x00, 0x00, 0x00}}
+	beKeys := [][]byte{{0x00, 0x00, 0x00, 0x01}, {0x00, 0x00, 0x00, 0x02}}
+	if err := CheckSortedxt6aMapKeysNumeric(RosTypeInt32, leKeys, true); err != nil {
+		t.Fatalf("le numeric order rejected: %v", err)
+	}
+	if err := CheckSortedxt6aMapKeysNumeric(RosTypeInt32, beKeys, false); err != nil {
+		t.Fatalf("be numeric order rejected: %v", err)
 	}
 }
 

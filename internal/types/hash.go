@@ -408,12 +408,29 @@ func ComputeEquivalenceHash(seqBytes []byte) EquivalenceHash {
 
 // ComputeWireEquivalenceHash builds the TypeObjectSeq CDR then hashes it.
 //
-// objects holds DHEADER framed TypeObjects from MarshalTypeObject.
-// littleEndian selects the sequence count byte order. The returned hash
-// pins the wire form; the model Equivalencext6aHash over canonical JSON
+// The hash is canonical per 7.3.3.10: each object is re-encoded
+// little-endian and the sequence count is little-endian, regardless of the
+// littleEndian hint. The hint is retained for compatibility but ignored so
+// LE and BE wires hash identically. objects holds DHEADER framed
+// TypeObjects from MarshalTypeObject in either endian; they are
+// canonicalized via Unmarshal plus LE remarshal. The returned hash pins the
+// canonical wire form; the model Equivalencext6aHash over canonical JSON
 // is kept for indexing and differs.
 func ComputeWireEquivalenceHash(objects [][]byte, littleEndian bool) (EquivalenceHash, error) {
-	seq, err := MarshalTypeObjectSeqCDR(objects, littleEndian)
+	_ = littleEndian
+	canonical := make([][]byte, 0, len(objects))
+	for i := range objects {
+		obj, err := UnmarshalTypeObject(objects[i], true)
+		if err != nil {
+			return EquivalenceHash{}, fmt.Errorf("types: wire equivalence hash canonicalize %d: %w", i, err)
+		}
+		raw, err := MarshalTypeObject(obj, true)
+		if err != nil {
+			return EquivalenceHash{}, fmt.Errorf("types: wire equivalence hash remarshal %d: %w", i, err)
+		}
+		canonical = append(canonical, raw)
+	}
+	seq, err := MarshalTypeObjectSeqCDR(canonical, true)
 	if err != nil {
 		return EquivalenceHash{}, fmt.Errorf("types: wire equivalence hash: %w", err)
 	}

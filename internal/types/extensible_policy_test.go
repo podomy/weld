@@ -123,6 +123,373 @@ func TestExtensiblePolicy(t *testing.T) {
 	t.Run("sequence", checkTrySequence)
 	for _, le := range []bool{true, false} {
 		checkAppendableBound(t, le)
+		checkFramedPerKind(t, le)
+		checkTryConstructRealPaths(t, le)
+	}
+}
+
+// checkFramedPerKind pins final/plain, appendable/delimited, mutable/PL outer framing.
+func checkFramedPerKind(t *testing.T, le bool) {
+	t.Helper()
+	checkFramedFinal(t, le)
+	checkFramedAppendableV2(t, le)
+	checkFramedAppendableV1(t, le)
+	checkFramedMutableV2(t, le)
+	checkFramedMutableV1(t, le)
+	checkFramedBound(t, le)
+}
+
+// checkFramedFinal pins final plain framing.
+//
+//nolint:dupl // framing helpers share wire shape by design; splitting would obscure per-kind pins
+func checkFramedFinal(t *testing.T, le bool) {
+	t.Helper()
+	fin := NewEncoderWithExtVersioned(ExtFinal, XCDRVersion2, le)
+	err := fin.WriteStructFramed(ExtFinal, XCDRVersion2, func() error {
+		fin.WriteUint32(0x01020304)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v final framed write failed: %v", le, err)
+	}
+	wireFin := fin.Bytes()
+	decFin, err := NewDecoder(wireFin)
+	if err != nil {
+		t.Fatalf("le=%v final decode failed: %v", le, err)
+	}
+	err = decFin.ReadStructFramed(ExtFinal, XCDRVersion2, 0, func(size uint32) error {
+		if size != 0 {
+			t.Fatalf("le=%v final size %d want 0", le, size)
+		}
+		v, err := decFin.ReadUint32()
+		if err != nil {
+			return err
+		}
+		if v != 0x01020304 {
+			t.Fatalf("le=%v final body %#x", le, v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v final framed read failed: %v", le, err)
+	}
+}
+
+// checkFramedAppendableV2 pins appendable delimited framing.
+//
+//nolint:dupl // framing helpers share wire shape by design; splitting would obscure per-kind pins
+func checkFramedAppendableV2(t *testing.T, le bool) {
+	t.Helper()
+	app := NewEncoderWithExtVersioned(ExtAppendable, XCDRVersion2, le)
+	err := app.WriteStructFramed(ExtAppendable, XCDRVersion2, func() error {
+		app.WriteUint32(0x0A0B0C0D)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v appendable write failed: %v", le, err)
+	}
+	wireApp := app.Bytes()
+	decApp, err := NewDecoder(wireApp)
+	if err != nil {
+		t.Fatalf("le=%v appendable decode failed: %v", le, err)
+	}
+	err = decApp.ReadStructFramed(ExtAppendable, XCDRVersion2, 0, func(size uint32) error {
+		if size != 4 {
+			t.Fatalf("le=%v appendable size %d want 4", le, size)
+		}
+		v, err := decApp.ReadUint32()
+		if err != nil {
+			return err
+		}
+		if v != 0x0A0B0C0D {
+			t.Fatalf("le=%v appendable body %#x", le, v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v appendable framed read failed: %v", le, err)
+	}
+}
+
+// checkFramedAppendableV1 pins V1 appendable plain framing.
+func checkFramedAppendableV1(t *testing.T, le bool) {
+	t.Helper()
+	appV1 := NewEncoderWithExtVersioned(ExtAppendable, XCDRVersion1, le)
+	err := appV1.WriteStructFramed(ExtAppendable, XCDRVersion1, func() error {
+		appV1.WriteUint32(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v appendable V1 write failed: %v", le, err)
+	}
+	wireAppV1 := appV1.Bytes()
+	decAppV1, err := NewDecoder(wireAppV1)
+	if err != nil {
+		t.Fatalf("le=%v appendable V1 decode failed: %v", le, err)
+	}
+	err = decAppV1.ReadStructFramed(ExtAppendable, XCDRVersion1, 0, func(size uint32) error {
+		if size != 0 {
+			t.Fatalf("le=%v appendable V1 size %d want 0", le, size)
+		}
+		if _, err := decAppV1.ReadUint32(); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v appendable V1 read failed: %v", le, err)
+	}
+}
+
+// checkFramedMutableV2 pins mutable PL framing.
+func checkFramedMutableV2(t *testing.T, le bool) {
+	t.Helper()
+	mut := NewEncoderWithExtVersioned(ExtMutable, XCDRVersion2, le)
+	err := mut.WriteStructFramed(ExtMutable, XCDRVersion2, func() error {
+		if err := mut.WriteEMHeader(1, false, 4); err != nil {
+			return err
+		}
+		mut.WriteUint32(0xDEADBEEF)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v mutable write failed: %v", le, err)
+	}
+	wireMut := mut.Bytes()
+	decMut, err := NewDecoder(wireMut)
+	if err != nil {
+		t.Fatalf("le=%v mutable decode failed: %v", le, err)
+	}
+	err = decMut.ReadStructFramed(ExtMutable, XCDRVersion2, 0, func(size uint32) error {
+		hdr, err := decMut.ReadEMHeader()
+		if err != nil {
+			return err
+		}
+		if hdr.MemberID != 1 {
+			t.Fatalf("le=%v mutable member %d", le, hdr.MemberID)
+		}
+		v, err := decMut.ReadUint32()
+		if err != nil {
+			return err
+		}
+		if v != 0xDEADBEEF {
+			t.Fatalf("le=%v mutable body %#x", le, v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v mutable framed read failed: %v", le, err)
+	}
+}
+
+// checkFramedMutableV1 pins V1 mutable PID framing.
+func checkFramedMutableV1(t *testing.T, le bool) {
+	t.Helper()
+	mutV1 := NewEncoderWithExtVersioned(ExtMutable, XCDRVersion1, le)
+	err := mutV1.WriteStructFramed(ExtMutable, XCDRVersion1, func() error {
+		if err := mutV1.WritePIDMember(1, false, []byte{0xAA}); err != nil {
+			return err
+		}
+		return mutV1.WritePIDListEnd()
+	})
+	if err != nil {
+		t.Fatalf("le=%v mutable V1 write failed: %v", le, err)
+	}
+	wireMutV1 := mutV1.Bytes()
+	decMutV1, err := NewDecoder(wireMutV1)
+	if err != nil {
+		t.Fatalf("le=%v mutable V1 decode failed: %v", le, err)
+	}
+	err = decMutV1.ReadStructFramed(ExtMutable, XCDRVersion1, 0, func(size uint32) error {
+		known := map[uint32]bool{1: true}
+		hdr, done, err := decMutV1.SkipPIDMemberContent(known)
+		if err != nil {
+			return err
+		}
+		if done || hdr.memberID != 1 {
+			t.Fatalf("le=%v mutable V1 member %+v done %v", le, hdr, done)
+		}
+		if err := decMutV1.SkipBytes(uint64(hdr.size)); err != nil {
+			return err
+		}
+		_, done, err = decMutV1.SkipPIDMemberContent(known)
+		if err != nil || !done {
+			t.Fatalf("le=%v mutable V1 sentinel missing", le)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v mutable V1 read failed: %v", le, err)
+	}
+}
+
+// checkFramedBound pins appendable bound enforcement.
+func checkFramedBound(t *testing.T, le bool) {
+	t.Helper()
+	boundEnc := NewEncoderWithExtVersioned(ExtAppendable, XCDRVersion2, le)
+	err := boundEnc.WriteStructFramed(ExtAppendable, XCDRVersion2, func() error {
+		boundEnc.WriteUint32(1)
+		boundEnc.WriteUint32(2)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v bound enc failed: %v", le, err)
+	}
+	decBound, err := NewDecoder(boundEnc.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v bound decode failed: %v", le, err)
+	}
+	if err := decBound.ReadStructFramed(ExtAppendable, XCDRVersion2, 4, func(size uint32) error { return nil }); err == nil {
+		t.Fatalf("le=%v appendable bound exceed accepted", le)
+	}
+}
+
+// checkTryConstructRealPaths pins TRIM/USE_DEFAULT plus bound plus unknown must-understand on real decode.
+func checkTryConstructRealPaths(t *testing.T, le bool) {
+	t.Helper()
+	checkTryStringReal(t, le)
+	checkTrySequenceReal(t, le)
+	checkBoundExceedReal(t, le)
+	checkUnknownMustUnderstandReal(t, le)
+}
+
+// checkTryStringReal verifies TRIM and USE_DEFAULT strings on decode.
+func checkTryStringReal(t *testing.T, le bool) {
+	t.Helper()
+	enc := NewEncoder(le)
+	if err := enc.WriteString("abcdef"); err != nil {
+		t.Fatalf("le=%v write long string failed: %v", le, err)
+	}
+	dec, err := NewDecoder(enc.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v decode failed: %v", le, err)
+	}
+	got, discard, err := dec.ReadBoundedStringWithTryConstruct(TryConstructTrim, 3)
+	if err != nil || discard || got != "abc" {
+		t.Fatalf("le=%v trim string got %q discard %v err %v", le, got, discard, err)
+	}
+	enc2 := NewEncoder(le)
+	if err := enc2.WriteString("abcdef"); err != nil {
+		t.Fatalf("le=%v write2 failed: %v", le, err)
+	}
+	dec2, err := NewDecoder(enc2.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v decode2 failed: %v", le, err)
+	}
+	got, discard, err = dec2.ReadBoundedStringWithTryConstruct(TryConstructUseDefault, 3)
+	if err != nil || discard || got != "" {
+		t.Fatalf("le=%v default string got %q discard %v", le, got, discard)
+	}
+}
+
+// checkTrySequenceReal verifies DISCARD, TRIM, USE_DEFAULT sequences on decode.
+func checkTrySequenceReal(t *testing.T, le bool) {
+	t.Helper()
+	checkDiscardSequenceReal(t, le)
+	checkTrimSequenceReal(t, le)
+	checkDefaultSequenceReal(t, le)
+}
+
+// checkDiscardSequenceReal verifies DISCARD reports discard.
+func checkDiscardSequenceReal(t *testing.T, le bool) {
+	t.Helper()
+	enc3 := NewEncoder(le)
+	if err := enc3.WriteSequenceLength(8); err != nil {
+		t.Fatalf("le=%v seq len failed: %v", le, err)
+	}
+	dec3, err := NewDecoder(enc3.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v decode3 failed: %v", le, err)
+	}
+	_, discard, err := dec3.ReadBoundedSequenceLengthWithTryConstruct(TryConstructDiscard, 4)
+	if err != nil || !discard {
+		t.Fatalf("le=%v discard seq must discard", le)
+	}
+}
+
+// checkTrimSequenceReal verifies TRIM returns bound.
+func checkTrimSequenceReal(t *testing.T, le bool) {
+	t.Helper()
+	encTrim := NewEncoder(le)
+	if err := encTrim.WriteSequenceLength(8); err != nil {
+		t.Fatalf("le=%v trim seq len failed: %v", le, err)
+	}
+	for range 8 {
+		encTrim.WriteUint8(0xAA)
+	}
+	decTrim, err := NewDecoder(encTrim.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v trim decode failed: %v", le, err)
+	}
+	n, discard, err := decTrim.ReadBoundedSequenceLengthWithTryConstruct(TryConstructTrim, 4)
+	if err != nil || discard || n != 4 {
+		t.Fatalf("le=%v trim seq got %d discard %v err %v", le, n, discard, err)
+	}
+}
+
+// checkDefaultSequenceReal verifies USE_DEFAULT returns zero.
+func checkDefaultSequenceReal(t *testing.T, le bool) {
+	t.Helper()
+	encDef := NewEncoder(le)
+	if err := encDef.WriteSequenceLength(8); err != nil {
+		t.Fatalf("le=%v default seq len failed: %v", le, err)
+	}
+	for range 8 {
+		encDef.WriteUint8(0xBB)
+	}
+	decDef, err := NewDecoder(encDef.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v default decode failed: %v", le, err)
+	}
+	n, discard, err := decDef.ReadBoundedSequenceLengthWithTryConstruct(TryConstructUseDefault, 4)
+	if err != nil || discard || n != 0 {
+		t.Fatalf("le=%v default seq got %d discard %v", le, n, discard)
+	}
+}
+
+// checkBoundExceedReal verifies over-bound fails without policy.
+func checkBoundExceedReal(t *testing.T, le bool) {
+	t.Helper()
+	enc4 := NewEncoder(le)
+	if err := enc4.WriteSequenceLength(8); err != nil {
+		t.Fatalf("le=%v seq len4 failed: %v", le, err)
+	}
+	dec4, err := NewDecoder(enc4.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v decode4 failed: %v", le, err)
+	}
+	if _, err := dec4.ReadBoundedSequenceLength(4); err == nil {
+		t.Fatalf("le=%v over-bound sequence accepted", le)
+	}
+}
+
+// checkUnknownMustUnderstandReal verifies unknown must-understand fails.
+func checkUnknownMustUnderstandReal(t *testing.T, le bool) {
+	t.Helper()
+	enc5 := NewEncoderWithExtVersioned(ExtAppendable, XCDRVersion2, le)
+	err := enc5.WriteStructFramed(ExtAppendable, XCDRVersion2, func() error {
+		if err := enc5.WriteEMHeader(99, true, 4); err != nil {
+			return err
+		}
+		enc5.WriteUint32(0)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("le=%v unknown enc failed: %v", le, err)
+	}
+	dec5, err := NewDecoder(enc5.Bytes())
+	if err != nil {
+		t.Fatalf("le=%v unknown decode failed: %v", le, err)
+	}
+	err = dec5.ReadStructFramed(ExtAppendable, XCDRVersion2, 0, func(size uint32) error {
+		hdr, err := dec5.ReadEMHeader()
+		if err != nil {
+			return err
+		}
+		return SkipUnknownxt6bMember(dec5, hdr.MustUnderstand, hdr.MemberID, hdr.Size)
+	})
+	if err == nil {
+		t.Fatalf("le=%v unknown must-understand accepted", le)
 	}
 }
 
@@ -144,6 +511,7 @@ func structRefxt6a(names ...string) TypeRefxt6a {
 
 	return TypeRefxt6a{
 		Kind:   Kindxt6aStruct,
+		Ext:    ExtAppendable,
 		Struct: &Structxt6aShape{Ext: ExtAppendable, Members: members},
 	}
 }

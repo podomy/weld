@@ -5,6 +5,7 @@ package types
 import (
 	"encoding/binary"
 	"fmt"
+	"reflect"
 )
 
 // Extensibility names the XTypes extensibility kind of an aggregated type.
@@ -754,6 +755,52 @@ func (d *Decoder) ReadDHeaderWithBound(bound uint32) (uint32, error) {
 	return size, nil
 }
 
+// WriteStructFramed frames one struct body per extensibility and version.
+//
+// Final types carry no delimiter: the body runs directly. Appendable
+// types carry a DHEADER delimiter only under XCDR2 (NeedsDHeader); under
+// V1 they are plain. Mutable types carry a DHEADER delimiter only under
+// XCDR2; under V1 the caller writes PID members plus a sentinel with no
+// outer delimiter. For V2 mutable the caller writes EMHeader members
+// inside the delimited body. This is the engine framing dispatcher so
+// production encoders never hard-code appendable.
+func (e *Encoder) WriteStructFramed(ext Extensibility, ver EncodingVersion, body func() error) error {
+	if err := ver.Validate(); err != nil {
+		return err
+	}
+	if !ext.NeedsDHeader(ver) {
+		if body == nil {
+			return nil
+		}
+		return body()
+	}
+	return e.WriteStructxt6bDelimited(body)
+}
+
+// ReadStructFramed reads one struct body per extensibility and version.
+//
+// Undelimited kinds (final, V1 appendable, V1 mutable) run the body with
+// size 0 and no DHEADER. Delimited kinds (V2 appendable, any mutable V2)
+// read a DHEADER with an optional appendable bound then run the body with
+// the content size. Unknown trailing members are skipped by the body via
+// SkipUnknownxt6bMember (V2) or SkipPIDMemberContent (V1).
+func (d *Decoder) ReadStructFramed(ext Extensibility, ver EncodingVersion, bound uint32, body func(size uint32) error) error {
+	if err := ver.Validate(); err != nil {
+		return err
+	}
+	if !ext.NeedsDHeader(ver) {
+		if body == nil {
+			return nil
+		}
+		err := body(0)
+		if err != nil {
+			return fmt.Errorf("types: framed body: %w", err)
+		}
+		return nil
+	}
+	return d.ReadStructxt6bDelimitedWithBound(bound, body)
+}
+
 // TypeConsistencyxt6aKind selects the overall assignability mode.
 type TypeConsistencyxt6aKind int
 
@@ -857,6 +904,10 @@ func MinimalEquivalentxt6a(reader, writer TypeRefxt6a, policy TypeConsistencyxt6
 // applies the policy kind via Evaluatext6aConsistency. Both sides reach
 // the same verdict from the same inputs.
 func CheckTypeConsistencyxt6a(policy TypeConsistencyxt6aPolicy, reader, writer TypeRefxt6a, readerName, writerName string) error {
+	if reflect.DeepEqual(reader, writer) {
+		return nil
+	}
+
 	assignable := IsAssignablext6aFrom(reader, writer, policy) == nil
 	minimal := assignable && IsAssignablext6aFrom(writer, reader, policy) == nil
 

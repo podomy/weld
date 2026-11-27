@@ -252,9 +252,14 @@ func IsUnionxt6aAssignable(t1, t2 Unionxt6aShape, ignoreMemberNames bool) error 
 }
 
 // checkxt6aUnionMemberTypes requires recursive assignability for common labels.
+//
+// Nil member type maps fail closed: without type detail the checker cannot
+// verify recursive assignability, so it refuses instead of passing leniently.
+// When both sides carry maps, every common label must have entries on both
+// sides and those entries must assign.
 func checkxt6aUnionMemberTypes(t1, t2 Unionxt6aShape, ignoreMemberNames bool) error {
 	if t1.MemberTypes == nil || t2.MemberTypes == nil {
-		return nil
+		return fmt.Errorf("types: union member types missing, cannot verify: %w", ErrInvalid)
 	}
 	policy := Defaultxt6aConsistency()
 	policy.IgnoreMemberNames = ignoreMemberNames
@@ -266,7 +271,7 @@ func checkxt6aUnionMemberTypes(t1, t2 Unionxt6aShape, ignoreMemberNames bool) er
 		r1, ok1 := t1.MemberTypes[m1]
 		r2, ok2 := t2.MemberTypes[m2]
 		if !ok1 || !ok2 {
-			continue
+			return fmt.Errorf("types: union label %d misses member type detail: %w", label, ErrInvalid)
 		}
 		if err := IsAssignablext6aFrom(r1, r2, policy); err != nil {
 			return fmt.Errorf("types: union label %d member not assignable: %w", label, err)

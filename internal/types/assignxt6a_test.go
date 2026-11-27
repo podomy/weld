@@ -274,6 +274,10 @@ func TestUnionxt6aTable(t *testing.T) {
 			Labels:         map[int64]uint{1: 0, 2: 1},
 			MemberNames:    map[uint]string{0: "x", 1: "y"},
 			MustUnderstand: map[uint]bool{},
+			MemberTypes: map[uint]TypeRefxt6a{
+				0: {Kind: Kindxt6aPrimitive, Base: FieldTypeInt32},
+				1: {Kind: Kindxt6aPrimitive, Base: FieldTypeInt32},
+			},
 		}
 	}
 	err := IsUnionxt6aAssignable(mkUnion(ExtAppendable), mkUnion(ExtAppendable), false)
@@ -290,7 +294,7 @@ func TestUnionxt6aTable(t *testing.T) {
 	if err == nil {
 		t.Fatal("discriminator mismatch accepted, want rejection")
 	}
-	disjoint := Unionxt6aShape{Ext: ExtAppendable, DiscKind: FieldTypeInt32, Labels: map[int64]uint{9: 0}}
+	disjoint := Unionxt6aShape{Ext: ExtAppendable, DiscKind: FieldTypeInt32, Labels: map[int64]uint{9: 0}, MemberTypes: map[uint]TypeRefxt6a{0: {Kind: Kindxt6aPrimitive, Base: FieldTypeInt32}}}
 	err = IsUnionxt6aAssignable(disjoint, mkUnion(ExtAppendable), false)
 	if err == nil {
 		t.Fatal("label disjoint unions accepted, want rejection")

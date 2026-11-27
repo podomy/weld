@@ -3,6 +3,7 @@
 package types
 
 import (
+	"crypto/md5" //nolint:gosec // G501: MD5 is mandated by DDS-XTypes 7.3.3.5 for minimal name hash
 	"fmt"
 )
 
@@ -173,9 +174,13 @@ func UnmarshalTypeIdentifier(data []byte, littleEndian bool) (TypeIdentifier, er
 
 // MinimalMember is one member of a spec minimal struct.
 type MinimalMember struct {
-	MemberID uint32
-	Kind     uint8
-	NameHash [4]byte
+	MemberID       uint32
+	Kind           uint8
+	NameHash       [4]byte
+	Capacity       uint64
+	StringCapacity uint64
+	NestedTypeName string
+	Units          string
 }
 
 // CompleteMember is one member of a spec complete struct.
@@ -185,18 +190,36 @@ type CompleteMember struct {
 	Name           string
 	Optional       bool
 	MustUnderstand bool
+	Capacity       uint64
+	StringCapacity uint64
+	NestedTypeName string
+	Units          string
 }
 
 // MinimalTypeObject is one spec minimal struct body.
 type MinimalTypeObject struct {
 	TypeName string
+	Ext      Extensibility
 	Members  []MinimalMember
 }
 
 // CompleteTypeObject is one spec complete struct body.
 type CompleteTypeObject struct {
 	TypeName string
+	Ext      Extensibility
 	Members  []CompleteMember
+}
+
+// ComputeMinimalNameHash returns the minimal member name hash per 7.3.3.5.
+//
+// It is the first 4 bytes of MD5 over the member name. The raw-prefix form
+// (first 4 name bytes) is rejected: it collides on long names sharing a
+// prefix and disagrees across implementations.
+func ComputeMinimalNameHash(name string) [4]byte {
+	sum := md5.Sum([]byte(name)) //nolint:gosec // G501: MD5 is mandated by DDS-XTypes 7.3.3.5
+	var out [4]byte
+	copy(out[:], sum[:4])
+	return out
 }
 
 // TypeObject is one spec TypeObject union value.
@@ -226,6 +249,7 @@ func writeMinimalTypeObjectBody(enc *Encoder, obj *MinimalTypeObject) error {
 	if err != nil {
 		return err
 	}
+	enc.WriteUint8(uint8(obj.Ext)) //nolint:gosec // G115: Ext is 0-2 per Validate
 	err = enc.WriteSequenceLength(len(obj.Members))
 	if err != nil {
 		return err
@@ -235,6 +259,16 @@ func writeMinimalTypeObjectBody(enc *Encoder, obj *MinimalTypeObject) error {
 		enc.WriteUint8(m.Kind)
 		for _, b := range m.NameHash {
 			enc.WriteUint8(b)
+		}
+		enc.WriteUint64(m.Capacity)
+		enc.WriteUint64(m.StringCapacity)
+		err = enc.WriteString(m.NestedTypeName)
+		if err != nil {
+			return err
+		}
+		err = enc.WriteString(m.Units)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -246,6 +280,7 @@ func writeCompleteTypeObjectBody(enc *Encoder, obj *CompleteTypeObject) error {
 	if err != nil {
 		return err
 	}
+	enc.WriteUint8(uint8(obj.Ext)) //nolint:gosec // G115: Ext is 0-2 per Validate
 	err = enc.WriteSequenceLength(len(obj.Members))
 	if err != nil {
 		return err
@@ -265,6 +300,16 @@ func writeCompleteTypeObjectBody(enc *Encoder, obj *CompleteTypeObject) error {
 		if err != nil {
 			return err
 		}
+		enc.WriteUint64(m.Capacity)
+		enc.WriteUint64(m.StringCapacity)
+		err = enc.WriteString(m.NestedTypeName)
+		if err != nil {
+			return err
+		}
+		err = enc.WriteString(m.Units)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -274,7 +319,13 @@ func writeCompleteTypeObjectBody(enc *Encoder, obj *CompleteTypeObject) error {
 // The output holds DHEADER plus discriminator plus body without any
 // outer encapsulation header, matching the hash input of 7.3.4.5 and
 // the vendor streams pinned there. Little endian selects the DHEADER
-// byte order.
+// byte order. The outer is always delimited (appendable framing) so
+// TypeObjectSeq can split elements via their DHEADER sizes; this is
+// correct for the TypeObject type itself and does not depend on the
+// described type's extensibility (which is carried explicitly in the
+// body Ext byte plus framing-independent detail). User-data structs use
+// WriteStructFramed for per-kind final/plain, appendable/delimited, and
+// mutable/PL framing.
 func MarshalTypeObject(o TypeObject, littleEndian bool) ([]byte, error) {
 	disc, err := o.Discriminator()
 	if err != nil {
@@ -341,7 +392,7 @@ func (o TypeObject) DiscriminatorEqual(other TypeObject) bool {
 
 // minimalEqual compares two minimal bodies field by field.
 func minimalEqual(a, b MinimalTypeObject) bool {
-	if a.TypeName != b.TypeName || len(a.Members) != len(b.Members) {
+	if a.TypeName != b.TypeName || a.Ext != b.Ext || len(a.Members) != len(b.Members) {
 		return false
 	}
 	for i := range a.Members {
@@ -354,7 +405,7 @@ func minimalEqual(a, b MinimalTypeObject) bool {
 
 // completeEqual compares two complete bodies field by field.
 func completeEqual(a, b CompleteTypeObject) bool {
-	if a.TypeName != b.TypeName || len(a.Members) != len(b.Members) {
+	if a.TypeName != b.TypeName || a.Ext != b.Ext || len(a.Members) != len(b.Members) {
 		return false
 	}
 	for i := range a.Members {
@@ -418,67 +469,114 @@ func unmarshalTypeObjectWithLE(data []byte, littleEndian bool) (TypeObject, erro
 // readMinimalBody reads a minimal struct body after the discriminator.
 func readMinimalBody(dec *Decoder) (MinimalTypeObject, error) {
 	var out MinimalTypeObject
-	name, err := dec.ReadString()
+	typeName, ext, n, seen, err := readTypeObjectHeader(dec, "minimal")
 	if err != nil {
 		return out, err
 	}
-	out.TypeName = name
-	n, err := dec.ReadSequenceLength()
-	if err != nil {
-		return out, err
-	}
-	err = dec.CheckSequenceAllocation(n, 8)
-	if err != nil {
-		return out, err
-	}
+	out.TypeName = typeName
+	out.Ext = ext
 	out.Members = make([]MinimalMember, 0, n)
-	seen := make(map[uint32]bool, n)
 	for range n {
-		var m MinimalMember
-		id, err := dec.ReadUint32()
+		m, err := readMinimalMember(dec, seen)
 		if err != nil {
 			return out, err
-		}
-		if seen[id] {
-			return out, fmt.Errorf("types: duplicate minimal member id %d: %w", id, ErrInvalid)
-		}
-		seen[id] = true
-		m.MemberID = id
-		kind, err := dec.ReadUint8()
-		if err != nil {
-			return out, err
-		}
-		m.Kind = kind
-		for i := range m.NameHash {
-			b, err := dec.ReadUint8()
-			if err != nil {
-				return out, err
-			}
-			m.NameHash[i] = b
 		}
 		out.Members = append(out.Members, m)
 	}
 	return out, nil
 }
 
-// readCompleteBody reads a complete struct body after the discriminator.
-func readCompleteBody(dec *Decoder) (CompleteTypeObject, error) {
-	var out CompleteTypeObject
+// readTypeObjectHeader reads the shared TypeName plus Ext plus member count.
+func readTypeObjectHeader(dec *Decoder, what string) (string, Extensibility, int, map[uint32]bool, error) {
 	name, err := dec.ReadString()
 	if err != nil {
-		return out, err
+		return "", ExtFinal, 0, nil, err
 	}
-	out.TypeName = name
+	ext, err := readTypeObjectExt(dec, what)
+	if err != nil {
+		return "", ExtFinal, 0, nil, err
+	}
 	n, err := dec.ReadSequenceLength()
 	if err != nil {
-		return out, err
+		return "", ExtFinal, 0, nil, err
 	}
 	err = dec.CheckSequenceAllocation(n, 8)
 	if err != nil {
+		return "", ExtFinal, 0, nil, err
+	}
+	seen := make(map[uint32]bool, n)
+	return name, ext, n, seen, nil
+}
+
+// readTypeObjectExt reads and validates the extensibility byte.
+func readTypeObjectExt(dec *Decoder, what string) (Extensibility, error) {
+	ext, err := dec.ReadUint8()
+	if err != nil {
+		return ExtFinal, err
+	}
+	if ext != uint8(ExtFinal) && ext != uint8(ExtAppendable) && ext != uint8(ExtMutable) {
+		return ExtFinal, fmt.Errorf("types: %s extensibility %d invalid: %w", what, ext, ErrInvalid)
+	}
+	return Extensibility(ext), nil
+}
+
+// readMinimalMember reads one minimal member with duplicate checks.
+func readMinimalMember(dec *Decoder, seen map[uint32]bool) (MinimalMember, error) {
+	var m MinimalMember
+	id, err := dec.ReadUint32()
+	if err != nil {
+		return m, err
+	}
+	if seen[id] {
+		return m, fmt.Errorf("types: duplicate minimal member id %d: %w", id, ErrInvalid)
+	}
+	seen[id] = true
+	m.MemberID = id
+	kind, err := dec.ReadUint8()
+	if err != nil {
+		return m, err
+	}
+	m.Kind = kind
+	for i := range m.NameHash {
+		b, err := dec.ReadUint8()
+		if err != nil {
+			return m, err
+		}
+		m.NameHash[i] = b
+	}
+	capacity, err := dec.ReadUint64()
+	if err != nil {
+		return m, err
+	}
+	m.Capacity = capacity
+	scap, err := dec.ReadUint64()
+	if err != nil {
+		return m, err
+	}
+	m.StringCapacity = scap
+	nested, err := dec.ReadString()
+	if err != nil {
+		return m, err
+	}
+	m.NestedTypeName = nested
+	units, err := dec.ReadString()
+	if err != nil {
+		return m, err
+	}
+	m.Units = units
+	return m, nil
+}
+
+// readCompleteBody reads a complete struct body after the discriminator.
+func readCompleteBody(dec *Decoder) (CompleteTypeObject, error) {
+	var out CompleteTypeObject
+	typeName, ext, n, seen, err := readTypeObjectHeader(dec, "complete")
+	if err != nil {
 		return out, err
 	}
+	out.TypeName = typeName
+	out.Ext = ext
 	out.Members = make([]CompleteMember, 0, n)
-	seen := make(map[uint32]bool, n)
 	for range n {
 		m, err := readCompleteMember(dec, seen)
 		if err != nil {
@@ -520,5 +618,25 @@ func readCompleteMember(dec *Decoder, seen map[uint32]bool) (CompleteMember, err
 		return m, err
 	}
 	m.Name = nm
+	capacity, err := dec.ReadUint64()
+	if err != nil {
+		return m, err
+	}
+	m.Capacity = capacity
+	scap, err := dec.ReadUint64()
+	if err != nil {
+		return m, err
+	}
+	m.StringCapacity = scap
+	nested, err := dec.ReadString()
+	if err != nil {
+		return m, err
+	}
+	m.NestedTypeName = nested
+	units, err := dec.ReadString()
+	if err != nil {
+		return m, err
+	}
+	m.Units = units
 	return m, nil
 }

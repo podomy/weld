@@ -358,59 +358,87 @@ func (r *Registry) RegisterFull(desc TypeDescription, sources []TypeSource) (Typ
 }
 
 // individualToMinimalTypeObject converts one stored individual to a minimal body.
+//
+// The name hash is MD5(name) first 4 bytes per 7.3.3.5. Bounds, nested
+// names, units, and extensibility are preserved so distinct types differing
+// only in these produce distinct wire hashes.
 func individualToMinimalTypeObject(ind IndividualTypeDescription) MinimalTypeObject {
-	out := MinimalTypeObject{TypeName: ind.TypeName}
+	out := MinimalTypeObject{TypeName: ind.TypeName, Ext: ind.Extensibility}
 	for i := range ind.Fields {
-		var h [4]byte
-		copy(h[:], ind.Fields[i].Name)
-		out.Members = append(out.Members, MinimalMember{MemberID: ind.Fields[i].MemberID, Kind: uint8(ind.Fields[i].Type.TypeID), NameHash: h})
+		h := ComputeMinimalNameHash(ind.Fields[i].Name)
+		out.Members = append(out.Members, MinimalMember{
+			MemberID:       ind.Fields[i].MemberID,
+			Kind:           uint8(ind.Fields[i].Type.TypeID),
+			NameHash:       h,
+			Capacity:       ind.Fields[i].Type.Capacity,
+			StringCapacity: ind.Fields[i].Type.StringCapacity,
+			NestedTypeName: ind.Fields[i].Type.NestedTypeName,
+			Units:          ind.Fields[i].Units,
+		})
 	}
 	return out
 }
 
 // individualToCompleteTypeObject converts one stored individual to a complete body.
+//
+// MustUnderstand is carried from the field so the complete wire preserves
+// it. Bounds, nested names, units, and extensibility are preserved like
+// the minimal arm.
 func individualToCompleteTypeObject(ind IndividualTypeDescription) CompleteTypeObject {
-	out := CompleteTypeObject{TypeName: ind.TypeName}
+	out := CompleteTypeObject{TypeName: ind.TypeName, Ext: ind.Extensibility}
 	for i := range ind.Fields {
-		out.Members = append(out.Members, CompleteMember{MemberID: ind.Fields[i].MemberID, Kind: uint8(ind.Fields[i].Type.TypeID), Name: ind.Fields[i].Name, Optional: ind.Fields[i].Optional})
+		out.Members = append(out.Members, CompleteMember{
+			MemberID:       ind.Fields[i].MemberID,
+			Kind:           uint8(ind.Fields[i].Type.TypeID),
+			Name:           ind.Fields[i].Name,
+			Optional:       ind.Fields[i].Optional,
+			MustUnderstand: ind.Fields[i].MustUnderstand,
+			Capacity:       ind.Fields[i].Type.Capacity,
+			StringCapacity: ind.Fields[i].Type.StringCapacity,
+			NestedTypeName: ind.Fields[i].Type.NestedTypeName,
+			Units:          ind.Fields[i].Units,
+		})
 	}
 	return out
 }
 
 // wireHashForIndividual returns the wire EquivalenceHash for one individual.
 //
-// The hash is MD5 over the TypeObjectSeq CDR containing the single
-// DHEADER-framed TypeObject per 7.3.3.10. Minimal selects the minimal arm,
-// complete the complete arm. LittleEndian selects the seq byte order.
+// The hash is canonical per 7.3.3.10: it is MD5 over the TypeObjectSeq CDR
+// containing the single DHEADER-framed TypeObject encoded little-endian,
+// regardless of the littleEndian hint. The hint is retained for
+// compatibility but ignored for hashing so LE and BE wires hash
+// identically. Minimal selects the minimal arm, complete the complete arm.
 func wireHashForIndividual(ind IndividualTypeDescription, minimal bool, littleEndian bool) (EquivalenceHash, error) {
+	_ = littleEndian
 	var raw []byte
 	var err error
 	if minimal {
-		raw, err = MarshalTypeObject(TypeObject{Minimal: func() *MinimalTypeObject { m := individualToMinimalTypeObject(ind); return &m }()}, littleEndian)
+		raw, err = MarshalTypeObject(TypeObject{Minimal: func() *MinimalTypeObject { m := individualToMinimalTypeObject(ind); return &m }()}, true)
 	} else {
-		raw, err = MarshalTypeObject(TypeObject{Complete: func() *CompleteTypeObject { c := individualToCompleteTypeObject(ind); return &c }()}, littleEndian)
+		raw, err = MarshalTypeObject(TypeObject{Complete: func() *CompleteTypeObject { c := individualToCompleteTypeObject(ind); return &c }()}, true)
 	}
 	if err != nil {
 		return EquivalenceHash{}, err
 	}
-	return ComputeWireEquivalenceHash([][]byte{raw}, littleEndian)
+	return ComputeWireEquivalenceHash([][]byte{raw}, true)
 }
 
-// indexWireIndividualLocked stores minimal and complete wire hashes for both endians.
+// indexWireIndividualLocked stores minimal and complete canonical wire hashes.
 //
-// The caller must hold the write lock. Colliding hashes from different type
+// The caller must hold the write lock. One canonical (little-endian) hash
+// per arm is indexed; LE and BE transports share the same entry so
+// discovery is endian-independent. Colliding hashes from different type
 // names are kept first-wins to preserve exact lookup determinism.
 func indexWireIndividualLocked(r *Registry, ind IndividualTypeDescription) {
 	clone := cloneIndividual(ind)
 	for _, minimal := range []bool{true, false} {
-		for _, le := range []bool{true, false} {
-			h, err := wireHashForIndividual(ind, minimal, le)
-			if err != nil {
-				continue
-			}
-			if _, ok := r.wireByHash[h.Digest]; !ok {
-				r.wireByHash[h.Digest] = clone
-			}
+		h, err := wireHashForIndividual(ind, minimal, true)
+		if err != nil {
+			continue
+		}
+		if _, ok := r.wireByHash[h.Digest]; !ok {
+			r.wireByHash[h.Digest] = clone
 		}
 	}
 }
@@ -677,15 +705,18 @@ func (s *TypeLookupServer) HandleDependencies(wire []byte) ([]byte, error) {
 
 // dependencyFor maps one RIHS01 hash to a strongly connected identifier.
 //
-// The returned hash is the wire EquivalenceHash (TypeObjectSeq CDR MD5)
-// for the root individual, not the model JSON MD5. The RIHS01 index stays
-// for ROS interop; the SCC digest is the wire form per 7.3.3.10.
+// The returned hash is the canonical wire EquivalenceHash (TypeObjectSeq
+// CDR MD5 over little-endian canonical bytes) for the root individual,
+// not the model JSON MD5. The RIHS01 index stays for ROS interop; the SCC
+// digest is the wire form per 7.3.3.10. The le hint selects transport
+// framing only and never affects the digest.
 func (s *TypeLookupServer) dependencyFor(hash TypeHash, le bool) (TypeIdentifier, error) {
+	_ = le
 	s.reg.mu.RLock()
 	defer s.reg.mu.RUnlock()
 	for key, full := range s.reg.fullByNameHash {
 		if key.hash.Equal(hash) {
-			wire, err := wireHashForIndividual(full.Description, true, le)
+			wire, err := wireHashForIndividual(full.Description, true, true)
 			if err != nil {
 				return TypeIdentifier{}, err
 			}
@@ -747,16 +778,33 @@ func (s *TypeLookupServer) objectFor(id TypeIdentifier, le bool) ([]byte, error)
 	if !ok {
 		return nil, fmt.Errorf("types: lookup unknown equivalence hash %x: %w", id.Hash, ErrInvalid)
 	}
+	var raw []byte
+	var err error
 	switch id.Kind {
 	case EKMinimal, TIStrongComp:
 		minimal := individualToMinimalTypeObject(ind)
-		return MarshalTypeObject(TypeObject{Minimal: &minimal}, le)
+		raw, err = MarshalTypeObject(TypeObject{Minimal: &minimal}, le)
 	case EKComplete:
 		complete := individualToCompleteTypeObject(ind)
-		return MarshalTypeObject(TypeObject{Complete: &complete}, le)
+		raw, err = MarshalTypeObject(TypeObject{Complete: &complete}, le)
 	default:
 		return nil, fmt.Errorf("types: lookup kind %#02x unsupported: %w", id.Kind, ErrInvalid)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// Aliasing guard: the returned object's recomputed canonical seq-MD5
+	// must equal the requested digest. A transport-endian remarshal or a
+	// colliding entry that no longer matches fails closed instead of
+	// serving the wrong type.
+	recomputed, err := ComputeWireEquivalenceHash([][]byte{raw}, true)
+	if err != nil {
+		return nil, fmt.Errorf("types: lookup recompute: %w", err)
+	}
+	if recomputed.Digest != id.Hash {
+		return nil, fmt.Errorf("types: lookup hash mismatch: recomputed %x vs requested %x: %w", recomputed.Digest, id.Hash, ErrInvalid)
+	}
+	return raw, nil
 }
 
 // TypeLookupClient exchanges CDR request and reply bytes with a server.

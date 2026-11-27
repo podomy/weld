@@ -163,6 +163,8 @@ func TestTypeLookupMultiType(t *testing.T) {
 	for _, le := range []bool{true, false} {
 		checkMultiTypeRoundTrip(t, le)
 	}
+	checkSCCCanonical(t)
+	checkObjectForVerify(t)
 }
 
 // checkMultiTypeRoundTrip registers A plus B and verifies each fetch.
@@ -218,5 +220,116 @@ func checkOneMultiType(t *testing.T, cli *TypeLookupClient, r *Registry, name st
 	}
 	if obj.Minimal == nil || obj.Minimal.TypeName != name {
 		t.Fatalf("le=%v want %s got %+v", le, name, obj)
+	}
+}
+
+// TestUnionNilMapFailClosed pins fail-closed nil member types.
+func TestUnionNilMapFailClosed(t *testing.T) {
+	u := Unionxt6aShape{
+		Ext:         ExtAppendable,
+		DiscKind:    FieldTypeInt32,
+		Labels:      map[int64]uint{1: 0},
+		MemberNames: map[uint]string{0: "x"},
+	}
+	if err := IsUnionxt6aAssignable(u, u, false); err == nil {
+		t.Fatal("nil member types accepted, want rejection")
+	}
+	partial := Unionxt6aShape{
+		Ext:         ExtAppendable,
+		DiscKind:    FieldTypeInt32,
+		Labels:      map[int64]uint{1: 0, 2: 1},
+		MemberNames: map[uint]string{0: "x", 1: "y"},
+		MemberTypes: map[uint]TypeRefxt6a{0: {Kind: Kindxt6aPrimitive, Base: FieldTypeInt32}},
+	}
+	if err := IsUnionxt6aAssignable(partial, partial, false); err == nil {
+		t.Fatal("partial member types accepted, want rejection")
+	}
+}
+
+// TestWrapperShapeExtConsistency pins wrapper versus shape agreement.
+func TestWrapperShapeExtConsistency(t *testing.T) {
+	policy := Defaultxt6aConsistency()
+	good := TypeRefxt6a{
+		Kind:   Kindxt6aStruct,
+		Ext:    ExtAppendable,
+		Struct: &Structxt6aShape{Ext: ExtAppendable, Members: []Structxt6aMember{{Name: "x", MemberID: 0, Type: FieldTypeInt32}}},
+	}
+	if err := IsAssignablext6aFrom(good, good, policy); err != nil {
+		t.Fatalf("consistent wrapper rejected: %v", err)
+	}
+	bad := good
+	bad.Ext = ExtFinal
+	if err := IsAssignablext6aFrom(bad, good, policy); err == nil {
+		t.Fatal("wrapper versus shape mismatch accepted, want rejection")
+	}
+	uguard := TypeRefxt6a{
+		Kind:  Kindxt6aUnion,
+		Ext:   ExtAppendable,
+		Union: &Unionxt6aShape{Ext: ExtFinal, DiscKind: FieldTypeInt32, Labels: map[int64]uint{1: 0}, MemberNames: map[uint]string{0: "x"}, MemberTypes: map[uint]TypeRefxt6a{0: {Kind: Kindxt6aPrimitive, Base: FieldTypeInt32}}},
+	}
+	if err := IsAssignablext6aFrom(uguard, uguard, policy); err == nil {
+		t.Fatal("union wrapper versus shape mismatch accepted, want rejection")
+	}
+}
+
+// checkSCCCanonical pins SCC digests unified on canonical hash.
+func checkSCCCanonical(t *testing.T) {
+	t.Helper()
+	r := NewRegistry()
+	h := registerLookupFixture(t, r)
+	srv := NewTypeLookupServer(r)
+	idLE, err := srv.dependencyFor(h, true)
+	if err != nil {
+		t.Fatalf("scc le failed: %v", err)
+	}
+	idBE, err := srv.dependencyFor(h, false)
+	if err != nil {
+		t.Fatalf("scc be failed: %v", err)
+	}
+	if idLE.Hash != idBE.Hash {
+		t.Fatalf("scc LE %x vs BE %x differ, want canonical equal", idLE.Hash, idBE.Hash)
+	}
+	if idLE.Kind != TIStrongComp {
+		t.Fatalf("scc kind %#02x want SCC", idLE.Kind)
+	}
+}
+
+// checkObjectForVerify pins recomputed digest verification.
+func checkObjectForVerify(t *testing.T) {
+	t.Helper()
+	r := NewRegistry()
+	registerLookupFixture(t, r)
+	srv := NewTypeLookupServer(r)
+	ind, ok := r.LookupType("pkg/msg/A")
+	if !ok {
+		t.Fatalf("lookup A missed")
+	}
+	wire, err := wireHashForIndividual(ind, true, true)
+	if err != nil {
+		t.Fatalf("wire hash failed: %v", err)
+	}
+	raw, err := srv.objectFor(TypeIdentifier{Kind: EKMinimal, Hash: wire.Digest}, true)
+	if err != nil {
+		t.Fatalf("objectFor valid failed: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("objectFor empty")
+	}
+	var bad [14]byte
+	bad[0] = wire.Digest[0] ^ 0xFF
+	if _, err := srv.objectFor(TypeIdentifier{Kind: EKMinimal, Hash: bad}, true); err == nil {
+		t.Fatal("objectFor bad hash accepted, want rejection")
+	}
+	// BE transport serves the same canonical digest.
+	rawBE, err := srv.objectFor(TypeIdentifier{Kind: EKMinimal, Hash: wire.Digest}, false)
+	if err != nil {
+		t.Fatalf("objectFor BE transport failed: %v", err)
+	}
+	recomputed, err := ComputeWireEquivalenceHash([][]byte{rawBE}, true)
+	if err != nil {
+		t.Fatalf("recompute BE failed: %v", err)
+	}
+	if recomputed.Digest != wire.Digest {
+		t.Fatal("BE transport recomputed hash mismatch")
 	}
 }

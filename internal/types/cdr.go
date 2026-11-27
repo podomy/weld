@@ -1978,6 +1978,11 @@ func validateFixedDecimal(s string) error {
 // passes them to ReadFixedDecimal. Example "-12.34" with digits=4 scale=2
 // encodes as octets 0x01 0x23 0x4D with no length prefix. Validation
 // rejects malformed decimals without writing. Octets need no alignment.
+//
+// This is the single-infer API: digits and scale are inferred from the
+// string (digits count excluding sign and dot, scale count after dot).
+// To enforce a declaration, use WriteFixedDecimalChecked which rejects
+// inferred values that differ from the declared digits and scale.
 func (e *Encoder) WriteFixedDecimal(s string) error {
 	err := validateFixedDecimal(s)
 	if err != nil {
@@ -1999,6 +2004,48 @@ func (e *Encoder) WriteFixedDecimal(s string) error {
 	}
 	if scale > nDigits {
 		return fmt.Errorf("cdr: fixed scale %d above digits %d: %w", scale, nDigits, ErrInvalid)
+	}
+	octets := encodeFixedBCD(body, negative)
+	e.buf = append(e.buf, octets...)
+	return nil
+}
+
+// WriteFixedDecimalChecked writes a fixed-point value checked against its declaration.
+//
+// digits counts decimal digits excluding sign and dot; scale counts
+// fractional digits, both from the IDL fixed<digits,scale> declaration per
+// DDS-XTypes 7.2.3.4. The inferred digits and scale from s must exactly
+// match the declaration; otherwise the write fails without mutating the
+// buffer. This mirrors ReadFixedDecimal(digits, scale) so writer and
+// reader share one declaration. Use WriteFixedDecimal for the
+// single-infer form when the declaration is not available.
+func (e *Encoder) WriteFixedDecimalChecked(s string, digits, scale int) error {
+	if digits <= 0 {
+		return fmt.Errorf("cdr: fixed digits %d must be positive: %w", digits, ErrInvalid)
+	}
+	if scale < 0 || scale > digits {
+		return fmt.Errorf("cdr: fixed scale %d outside 0 to digits %d: %w", scale, digits, ErrInvalid)
+	}
+	err := validateFixedDecimal(s)
+	if err != nil {
+		return err
+	}
+	negative := len(s) > 0 && s[0] == '-'
+	body := s
+	if negative {
+		body = body[1:]
+	}
+	inferScale := 0
+	if idx := indexByte(body, '.'); idx >= 0 {
+		inferScale = len(body) - idx - 1
+		body = body[:idx] + body[idx+1:]
+	}
+	inferDigits := len(body)
+	if inferDigits == 0 {
+		return fmt.Errorf("cdr: fixed decimal %q misses digits: %w", s, ErrInvalid)
+	}
+	if inferDigits != digits || inferScale != scale {
+		return fmt.Errorf("cdr: fixed %q digits %d scale %d vs declared %d %d: %w", s, inferDigits, inferScale, digits, scale, ErrInvalid)
 	}
 	octets := encodeFixedBCD(body, negative)
 	e.buf = append(e.buf, octets...)

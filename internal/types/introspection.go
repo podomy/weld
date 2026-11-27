@@ -2062,9 +2062,23 @@ func checkxt6aBitmaskRef(t1, t2 TypeRefxt6a) error {
 }
 
 // checkxt6aStructRef delegates to the struct table with primitive equality.
+//
+// The wrapper Ext and the shape Ext must agree on each side and across
+// sides: a ref whose wrapper says final but whose shape says appendable is
+// malformed and fails instead of silently picking one. This threads the
+// wrapper everywhere like the enum and bitmask paths.
 func checkxt6aStructRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
 	if t1.Struct == nil || t2.Struct == nil {
 		return fmt.Errorf("types: struct ref misses shape: %w", ErrInvalid)
+	}
+	if t1.Ext != t1.Struct.Ext {
+		return fmt.Errorf("types: struct T1 wrapper %s vs shape %s: %w", t1.Ext.String(), t1.Struct.Ext.String(), ErrInvalid)
+	}
+	if t2.Ext != t2.Struct.Ext {
+		return fmt.Errorf("types: struct T2 wrapper %s vs shape %s: %w", t2.Ext.String(), t2.Struct.Ext.String(), ErrInvalid)
+	}
+	if t1.Ext != t2.Ext {
+		return fmt.Errorf("types: struct wrapper extensibility %s vs %s: %w", t1.Ext.String(), t2.Ext.String(), ErrInvalid)
 	}
 	err := IsStructxt6aAssignable(*t1.Struct, *t2.Struct, policy, IsPrimitivext6aAssignable)
 	if err != nil {
@@ -2074,9 +2088,22 @@ func checkxt6aStructRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) er
 }
 
 // checkxt6aUnionRef delegates to the union helper.
+//
+// The wrapper Ext and the shape Ext must agree on each side and across
+// sides, threading the wrapper everywhere for consistency with struct,
+// enum, and bitmask paths.
 func checkxt6aUnionRef(t1, t2 TypeRefxt6a, policy TypeConsistencyxt6aPolicy) error {
 	if t1.Union == nil || t2.Union == nil {
 		return fmt.Errorf("types: union ref misses shape: %w", ErrInvalid)
+	}
+	if t1.Ext != t1.Union.Ext {
+		return fmt.Errorf("types: union T1 wrapper %s vs shape %s: %w", t1.Ext.String(), t1.Union.Ext.String(), ErrInvalid)
+	}
+	if t2.Ext != t2.Union.Ext {
+		return fmt.Errorf("types: union T2 wrapper %s vs shape %s: %w", t2.Ext.String(), t2.Union.Ext.String(), ErrInvalid)
+	}
+	if t1.Ext != t2.Ext {
+		return fmt.Errorf("types: union wrapper extensibility %s vs %s: %w", t1.Ext.String(), t2.Ext.String(), ErrInvalid)
 	}
 	err := IsUnionxt6aAssignable(*t1.Union, *t2.Union, policy.IgnoreMemberNames)
 	if err != nil {

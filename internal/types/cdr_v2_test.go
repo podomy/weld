@@ -308,3 +308,54 @@ func TestEnumRangeFailClosed(t *testing.T) {
 		}
 	}
 }
+
+// TestFixedDecimalChecked pins declaration enforcement symmetry.
+func TestFixedDecimalChecked(t *testing.T) {
+	for _, le := range []bool{true, false} {
+		checkFixedDecimalCheckedRoundTrip(t, le)
+		checkFixedDecimalCheckedReject(t, le)
+	}
+}
+
+// checkFixedDecimalCheckedRoundTrip verifies checked write plus read.
+func checkFixedDecimalCheckedRoundTrip(t *testing.T, le bool) {
+	t.Helper()
+	enc := NewEncoder(le)
+	if err := enc.WriteFixedDecimalChecked("-12.34", 4, 2); err != nil {
+		t.Fatalf("le=%v checked write rejected: %v", le, err)
+	}
+	wire := enc.Bytes()
+	dec, err := NewDecoder(wire)
+	if err != nil {
+		t.Fatalf("le=%v decode failed: %v", le, err)
+	}
+	got, err := dec.ReadFixedDecimal(4, 2)
+	if err != nil {
+		t.Fatalf("le=%v read failed: %v", le, err)
+	}
+	if got != "-12.34" {
+		t.Fatalf("le=%v got %q want -12.34", le, got)
+	}
+}
+
+// checkFixedDecimalCheckedReject verifies declaration mismatches fail closed.
+func checkFixedDecimalCheckedReject(t *testing.T, le bool) {
+	t.Helper()
+	enc := NewEncoder(le)
+	if err := enc.WriteFixedDecimalChecked("-12.34", 4, 2); err != nil {
+		t.Fatalf("le=%v setup failed: %v", le, err)
+	}
+	before := enc.Len()
+	if err := enc.WriteFixedDecimalChecked("-12.34", 5, 2); err == nil {
+		t.Fatalf("le=%v wrong digits accepted", le)
+	}
+	if enc.Len() != before {
+		t.Fatalf("le=%v reject mutated buffer", le)
+	}
+	if err := enc.WriteFixedDecimalChecked("-12.34", 4, 3); err == nil {
+		t.Fatalf("le=%v wrong scale accepted", le)
+	}
+	if err := enc.WriteFixedDecimalChecked("1.0", 0, 0); err == nil {
+		t.Fatalf("le=%v zero digits accepted", le)
+	}
+}

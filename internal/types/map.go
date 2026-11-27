@@ -3,7 +3,6 @@
 package types
 
 import (
-	"bytes"
 	"fmt"
 )
 
@@ -120,22 +119,6 @@ func IsPortablext6aRosMapKey(kind RosTypeID) bool {
 	default:
 		return false
 	}
-}
-
-// CheckSortedxt6aMapKeys verifies strictly increasing key byte order.
-//
-// Deprecated: byte lexicographic order is endian-dependent for multi-byte
-// integer keys (LE bytes sort differently from numeric values). For new
-// code use CheckMapKeysxt6bOrdered (typed numeric order) or
-// CheckSortedxt6aMapKeysNumeric (decoded numeric order). This helper is
-// kept for single-byte and string keys where byte and numeric orders agree.
-func CheckSortedxt6aMapKeys(keys [][]byte) error {
-	for i := 1; i < len(keys); i++ {
-		if bytes.Compare(keys[i-1], keys[i]) >= 0 {
-			return fmt.Errorf("types: map keys not strictly sorted at index %d: %w", i, ErrInvalid)
-		}
-	}
-	return nil
 }
 
 // CheckSortedxt6aMapKeysNumeric verifies strictly increasing numeric key order.

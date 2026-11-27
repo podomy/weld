@@ -159,10 +159,11 @@ type FieldType struct {
 //
 // MemberID carries the XTypes member id; HasMemberID distinguishes an
 // explicit 0 from unset. Unset skips the uniqueness check. Optional marks
-// XTypes optional members. Units carries the 7.2.2.9 unit string; empty
-// means unspecified. MemberID, HasMemberID, Optional, and Units are additive
-// metadata ignored by the Minimal hash in hash.go, so existing RIHS01
-// vectors never change.
+// XTypes optional members. MustUnderstand marks XTypes must-understand
+// members carried in complete TypeObjects. Units carries the 7.2.2.9 unit
+// string; empty means unspecified. MemberID, HasMemberID, Optional,
+// MustUnderstand, and Units are additive metadata ignored by the Minimal
+// hash in hash.go, so existing RIHS01 vectors never change.
 type Field struct {
 	Name         string    `json:"name"`
 	Type         FieldType `json:"type"`
@@ -170,9 +171,10 @@ type Field struct {
 	MemberID     uint32    `json:"member_id"`
 	// HasMemberID marks an explicit member id, including explicit 0.
 	// Zero MemberID with false HasMemberID means unset.
-	HasMemberID bool   `json:"has_member_id,omitempty"`
-	Optional    bool   `json:"optional"`
-	Units       string `json:"units"`
+	HasMemberID    bool   `json:"has_member_id,omitempty"`
+	Optional       bool   `json:"optional"`
+	MustUnderstand bool   `json:"must_understand"`
+	Units          string `json:"units"`
 }
 
 // IndividualTypeDescription is one type with its fields in IDL order.

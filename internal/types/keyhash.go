@@ -219,15 +219,19 @@ func writeKeyInt16(enc *Encoder, f KeyField) error {
 
 // writeKeyUint64 encodes 64 bit key fields.
 func writeKeyUint64(enc *Encoder, f KeyField) error {
+	if f.Kind == RosTypeInt64 {
+		v, ok := toInt64(f.Value)
+		if !ok {
+			return fmt.Errorf("types: key field %q wants int64 value: %w", f.Name, ErrInvalid)
+		}
+		enc.WriteInt64(v)
+		return nil
+	}
 	v, ok := toUint64(f.Value)
 	if !ok {
 		return fmt.Errorf("types: key field %q wants 64 bit value: %w", f.Name, ErrInvalid)
 	}
-	if f.Kind == RosTypeInt64 {
-		enc.WriteInt64(int64(v)) //nolint:gosec // G115: two's complement reinterpret is IDL defined
-	} else {
-		enc.WriteUint64(v)
-	}
+	enc.WriteUint64(v)
 	return nil
 }
 
@@ -408,19 +412,57 @@ func toInt32(v any) (int32, bool) {
 	}
 }
 
-// toUint64 converts integer Go values to uint64 for key encoding.
+// toUint64 converts integer Go values to uint64 for unsigned key encoding.
+//
+// Signed inputs must be non-negative; negative values fail instead of
+// reinterpreting as two's complement. This keeps unsigned key fields
+// fail-closed: a negative int never aliases a large uint64 on the wire.
 func toUint64(v any) (uint64, bool) {
 	switch x := v.(type) {
 	case uint64:
 		return x, true
 	case int64:
-		return uint64(x), true //nolint:gosec // G115: two's complement reinterpret is IDL defined
+		if x < 0 {
+			return 0, false
+		}
+		return uint64(x), true
 	case uint32:
 		return uint64(x), true
 	case int32:
-		return uint64(uint32(x)), true //nolint:gosec // G115: two's complement reinterpret is IDL defined
+		if x < 0 {
+			return 0, false
+		}
+		return uint64(x), true
 	case int:
-		return uint64(x), true //nolint:gosec // G115: int to uint64 reinterpret for key hashing
+		if x < 0 {
+			return 0, false
+		}
+		return uint64(x), true
+	default:
+		return 0, false
+	}
+}
+
+// toInt64 converts integer Go values to int64 for signed key encoding.
+//
+// Unsigned inputs must fit in MaxInt64; larger uint64 values fail instead
+// of reinterpreting as negative. Signed inputs keep their value with
+// sign extension.
+func toInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int32:
+		return int64(x), true
+	case int:
+		return int64(x), true
+	case uint64:
+		if x > 0x7FFFFFFFFFFFFFFF {
+			return 0, false
+		}
+		return int64(x), true
+	case uint32:
+		return int64(x), true
 	default:
 		return 0, false
 	}

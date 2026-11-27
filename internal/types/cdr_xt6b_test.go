@@ -413,6 +413,10 @@ func TestEncapsulationxt6b(t *testing.T) {
 }
 
 // checkxt6bRepresentationTable verifies Table 32 selection vectors.
+//
+// All six V1/V2 IDs plus both endians are pinned: V1 final and appendable
+// share PLAIN_CDR (0x0000/0x0001), V1 mutable uses PL_CDR (0x0002/0x0003),
+// V2 final uses CDR2, appendable D_CDR2, mutable PL_CDR2.
 func checkxt6bRepresentationTable(t *testing.T) {
 	t.Helper()
 	cases := []struct {
@@ -424,10 +428,15 @@ func checkxt6bRepresentationTable(t *testing.T) {
 		{ExtFinal, XCDRVersion1, true, Repxt6bCDRLE},
 		{ExtFinal, XCDRVersion1, false, Repxt6bCDRBE},
 		{ExtAppendable, XCDRVersion1, true, Repxt6bCDRLE},
+		{ExtAppendable, XCDRVersion1, false, Repxt6bCDRBE},
 		{ExtMutable, XCDRVersion1, true, Repxt6bPLCDRLE},
+		{ExtMutable, XCDRVersion1, false, Repxt6bPLCDRBE},
 		{ExtFinal, XCDRVersion2, true, Repxt6bCDR2LE},
+		{ExtFinal, XCDRVersion2, false, Repxt6bCDR2BE},
 		{ExtAppendable, XCDRVersion2, true, Repxt6bDCDR2LE},
+		{ExtAppendable, XCDRVersion2, false, Repxt6bDCDR2BE},
 		{ExtMutable, XCDRVersion2, true, Repxt6bPLCDR2LE},
+		{ExtMutable, XCDRVersion2, false, Repxt6bPLCDR2BE},
 	}
 	for _, c := range cases {
 		got, err := RepresentationForxt6b(c.ext, c.ver, c.le)

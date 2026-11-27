@@ -68,7 +68,7 @@ build-in-jazzy: go-ffi-shared
 	docker cp $(CURDIR)/src/weld_cdr.h $(CONTAINER):$(JAZZY_SRC_DIR)/weld_cdr.h
 	docker cp $(FFI_REAL_SO) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.so
 	docker cp $(FFI_REAL_HDR) $(CONTAINER):$(JAZZY_SRC_DIR)/libweld_ffi.h
-	docker exec $(CONTAINER) bash -lc "source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) -I/opt/ros/jazzy/include $$(for d in /opt/ros/jazzy/include/*/; do case "$$d" in */dds/|*/idl/) continue;; *) printf -- "-I%s " "$$d";; esac; done) $$(pkg-config --cflags rmw rcl rcutils rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c 2>/dev/null) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread"
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && gcc -std=$(CSTD) $(WARN) -fPIC -shared -o $(JAZZY_SO) $(JAZZY_SRC_DIR)/rmw_weld.c $(JAZZY_SRC_DIR)/weld_cdr.c -I$(JAZZY_SRC_DIR) -I/opt/ros/jazzy/include $$(for d in /opt/ros/jazzy/include/*/; do case "$$d" in */dds/|*/idl/) continue;; *) printf -- "-I%s " "$$d";; esac; done) $$(pkg-config --cflags rmw rcl rcutils rosidl_runtime_c rosidl_typesupport_c rosidl_typesupport_introspection_c 2>/dev/null) -L$(JAZZY_SRC_DIR) -L/opt/ros/jazzy/lib -lweld_ffi -lrmw -lrcl -lrcutils -lrosidl_runtime_c -lrosidl_typesupport_c -lrosidl_typesupport_introspection_c -Wl,-rpath,$(JAZZY_LIBDIR):$(JAZZY_SRC_DIR) -pthread'
 
 # install-in-jazzy publishes the container build to a ROS-visible path.
 #
@@ -85,7 +85,7 @@ install-in-jazzy: build-in-jazzy
 # a working RMW now, not a refusal stub. A silent pass with no output
 # fails, a signal exit (crash) fails, and a hang past timeout fails.
 smoke-in-jazzy: install-in-jazzy
-	docker exec $(CONTAINER) bash -lc "source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=$(SMOKE_DOMAIN) RMW_IMPLEMENTATION=rmw_weld LD_LIBRARY_PATH=$(JAZZY_LIBDIR):$$LD_LIBRARY_PATH timeout 30 ros2 topic pub $(SMOKE_TOPIC) std_msgs/msg/String '{data: smoke}' --once > /tmp/rmw_weld_smoke.log 2>&1; rc=$$?; cat /tmp/rmw_weld_smoke.log; if [ $$rc -eq 124 ]; then echo 'smoke: rmw_weld probe timed out, failing'; exit 1; fi; if [ $$rc -ge 128 ]; then echo \"smoke: rmw_weld crashed with exit $$rc, failing\"; exit 1; fi; if [ $$rc -ne 0 ]; then echo 'smoke: rmw_weld pub exited non-zero, failing'; exit 1; fi; echo 'smoke: rmw_weld pub ok'"
+	docker exec $(CONTAINER) bash -lc 'source /opt/ros/jazzy/setup.bash && ROS_DOMAIN_ID=$(SMOKE_DOMAIN) RMW_IMPLEMENTATION=rmw_weld LD_LIBRARY_PATH=$(JAZZY_LIBDIR):$$LD_LIBRARY_PATH timeout 30 ros2 topic pub $(SMOKE_TOPIC) std_msgs/msg/String "{data: smoke}" --once > /tmp/rmw_weld_smoke.log 2>&1; rc=$$?; cat /tmp/rmw_weld_smoke.log; if [ $$rc -eq 124 ]; then echo "smoke: rmw_weld probe timed out, failing"; exit 1; fi; if [ $$rc -ge 128 ]; then echo "smoke: rmw_weld crashed with exit $$rc, failing"; exit 1; fi; if [ $$rc -ne 0 ]; then echo "smoke: rmw_weld pub exited non-zero, failing"; exit 1; fi; echo "smoke: rmw_weld pub ok"'
 
 FFI_REAL_DIR ?= /tmp/weld_ffi_real
 FFI_REAL_SO ?= $(FFI_REAL_DIR)/libweld_ffi.so

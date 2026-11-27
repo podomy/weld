@@ -27,7 +27,7 @@ Weld can bridge topics and services across transports on request, so DDS data ca
 
 ## ROS 2
 
-Weld runs ROS 2 nodes through `rmw_weld` (`RMW_IMPLEMENTATION=rmw_weld`): init, node, pub, sub, QoS, services, guard conditions, and waitsets are live against the Weld backend. Loans are owned-heap with tracking, not zero-copy shared memory. The following are explicitly out, with reasons: network flow endpoints (per-endpoint socket data not exposed); event types other than message-lost (no DDS source wired); publisher GID and sequence numbers in take info (takes carry no writer identity, sequences untracked); remote endpoint QoS and node names (unavailable from SEDP); N servers on one service name (requests race, use one server with N clients).
+Weld runs ROS 2 nodes through `rmw_weld` (`RMW_IMPLEMENTATION=rmw_weld`): init, node, pub, sub, QoS, services, guard conditions, waitsets, loans, content filters, liveliness, dynamic types, graph, and events are live against the Weld backend. Loans are zero-copy in-process with a copying wire fallback. The following remain limited, with reasons: network flow endpoints report real local socket data with best-effort remotes; take info carries per-subscription sequence numbers and in-memory publisher GIDs (wire takes carry no writer GUID); remote endpoint QoS comes from SEDP where announced with first-local fallback, remote node names stay empty (peers do not announce them); event totals are real except liveliness not-alive count, always 0; N servers on one name share a work queue.
 
 ## Commercial Licensing
 

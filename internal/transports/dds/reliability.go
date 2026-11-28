@@ -2580,8 +2580,15 @@ func (b *Backend) queueFragRepair(writer rtps.EntityID, seq uint64, fragNums []u
 // queueUserAck queues one ACKNACK send through the per-backend worker.
 //
 // It is used by the demux heartbeat path instead of inline sends so a slow
-// peer cannot block demux. A full queue reports ErrRepairBackpressure loudly
-// so the caller counts a demux error. It self-locks and is safe for concurrent use.
+// peer cannot block demux. Checks run request-validity first (base 0 fails
+// loudly), then backend state (closed stays loud as ErrBackendClosed and a
+// missing queue reports ErrDataPathNotWired, matching repairFromAck and
+// queueFragRepair), then endpoint relevance: a reader of EntityUnknown means
+// no local reader exists for the writer's topic, so the ACK names no one and
+// CycloneDDS disregards it; it drops quietly instead of filling the queue
+// with self-perpetuating base-1 NACKs from reader-less participants. A full
+// queue reports ErrRepairBackpressure loudly so the caller counts a demux
+// error. It self-locks and is safe for concurrent use.
 func (b *Backend) queueUserAck(remote WriterGUID, reader rtps.EntityID, base uint64, numBits uint32, bitmap []uint32) error {
 	if base == 0 {
 		return fmt.Errorf("dds: user nack base 0: %w", ErrInvalidFrame)
@@ -2599,6 +2606,10 @@ func (b *Backend) queueUserAck(remote WriterGUID, reader rtps.EntityID, base uin
 
 	if q == nil {
 		return fmt.Errorf("dds: user ack without queue: %w", ErrDataPathNotWired)
+	}
+
+	if reader == rtps.EntityUnknown {
+		return nil
 	}
 
 	cp := append([]uint32(nil), bitmap...)

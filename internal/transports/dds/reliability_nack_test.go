@@ -534,6 +534,34 @@ func TestEvictedSeqYieldsGapWithLostAccounting(t *testing.T) {
 	}
 }
 
+// attachPromptReader wires a local reader plus the matching remote
+// writer into a prompt-NACK test backend, so ACKs resolve a reader
+// entity instead of dropping quietly as reader-less. It installs the
+// same SEDP index on the backend and a fresh data receiver.
+func attachPromptReader(t *testing.T, b *Backend, remote WriterGUID) {
+	t.Helper()
+
+	var prefix [12]byte
+	copy(prefix[:], remote[:12])
+	idx := mustSEDPIndexWithPrefix(t, 0x71)
+	if _, err := idx.DeclareReader("/prompt_gap", "std_msgs__msg__String", "RIHS01_prompt", nil); err != nil {
+		t.Fatalf("declare reader: %v", err)
+	}
+	peer := mustSEDPIndexWithPrefix(t, 0x72)
+	writer := mustSEDPWriter(t, peer, "/prompt_gap", "RIHS01_prompt")
+	var writerPrefix SEDPGUIDPrefix
+	copy(writerPrefix[:], prefix[:])
+	writer.ID.Prefix = writerPrefix
+	copy(writer.ID.Entity[:], remote[12:])
+	if err := idx.UpsertRemote(writer); err != nil {
+		t.Fatalf("upsert remote writer: %v", err)
+	}
+	b.sedp = idx
+	recv := NewDataReceiver()
+	recv.SetSEDPIndex(idx)
+	b.receiver = recv
+}
+
 // TestPromptNackOnInitialGapBounded checks prompt NACK caps retries and bounds base.
 //
 //nolint:cyclop // test pins prompt, base, queue, and data breadth in one run, splitting would obscure intent
@@ -566,6 +594,12 @@ func TestPromptNackOnInitialGapBounded(t *testing.T) {
 	remote[13] = writerEntityUserB13
 	remote[14] = writerEntityUserB14
 	remote[15] = writerEntityUserB15
+
+	// Prompt NACKs need a local reader: reader-less ACKs drop quietly
+	// instead of filling the repair queue, so declare one plus the
+	// matching remote writer. Without them the queue stays empty by
+	// design and the count assertions below cannot observe the cap.
+	attachPromptReader(t, backend, remote)
 
 	resetPromptNackForTest(backend, remote)
 

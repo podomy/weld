@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -51,6 +52,8 @@ const (
 	legacySEDPrefix = "SEDP"
 	// maxRoutesPerPrefix caps stored unicast ports per SPDP prefix.
 	maxRoutesPerPrefix = 16
+	// maxPeerHosts caps learned unicast hosts for cross host fanout.
+	maxPeerHosts = 32
 	// fallbackAckInterval is the minimum gap between fallback broadcasts.
 	fallbackAckInterval = 100 * time.Millisecond
 	// demuxDropLogEvery samples high-volume drop logs every Nth drop.
@@ -342,6 +345,9 @@ type Backend struct {
 	// Scoping routes by partition would duplicate one participant's ports per
 	// partition and break wire compat with peers that announce no partition.
 	routes map[GUIDPrefix][]int
+	// peerHosts holds extra unicast hosts learned from incoming datagrams
+	// plus the configured initial peer. Empty means loopback only.
+	peerHosts map[string]struct{}
 	// spdpCh carries demultiplexed SPDP bytes.
 	spdpCh chan []byte
 	// sedpCh carries demultiplexed SEDP bytes.
@@ -444,6 +450,11 @@ func NewBackendWithClock(cfg PeerConfig, clock Clock) (*Backend, error) {
 		return nil, fmt.Errorf("dds: invalid backend config: %w", err)
 	}
 
+	hosts := make(map[string]struct{})
+	if host := normalizePeerHost(normed.PeerAddress); host != "" {
+		hosts[host] = struct{}{}
+	}
+
 	return &Backend{
 		cfg:             normed,
 		domainID:        normed.DomainID,
@@ -455,6 +466,7 @@ func NewBackendWithClock(cfg PeerConfig, clock Clock) (*Backend, error) {
 		spdpInterval:    defaultSPDPInterval,
 		sedpInterval:    defaultSEDPInterval,
 		routes:          make(map[GUIDPrefix][]int),
+		peerHosts:       hosts,
 		rtpsSeq:         FirstSequenceNumber,
 		rtpsSeqByWriter: make(map[WriterGUID]uint64),
 	}, nil
@@ -1348,12 +1360,12 @@ func (s *spdpSender) Send(ctx context.Context, data []byte) error {
 	multicastOK, last := sendSPDPMulticast(ctx, sender, patched)
 	ports := s.backend.snapshotRoutes()
 
-	routeSent, routeErr := sendSPDPRoutes(ctx, uni, patched, ports)
+	routeSent, routeErr := s.backend.sendSPDPRoutes(ctx, uni, patched, ports)
 	if routeErr != nil {
 		return routeErr
 	}
 
-	probeErr := sendSPDPProbe(ctx, uni, patched, domain, ports)
+	probeErr := s.backend.sendSPDPProbe(ctx, uni, patched, domain, ports)
 	if probeErr != nil {
 		return probeErr
 	}
@@ -1395,82 +1407,88 @@ func sendSPDPMulticast(
 	return true, nil
 }
 
-// sendOneUnicastBestEffort sends one datagram and maps context cancel.
+// sendOneUnicastToHost sends one datagram to one host and maps context cancel.
 //
 // It returns true when the datagram was sent. Context cancellation
 // returns an error; other send failures return false plus nil so the
-// caller continues best effort to remaining ports.
-func sendOneUnicastBestEffort(
+// caller continues best effort to remaining targets.
+func (b *Backend) sendOneUnicastToHost(
 	ctx context.Context,
 	uni *rtps.UnicastConn,
+	host string,
 	port int,
 	data []byte,
 ) (bool, error) {
-	err := uni.SendTo(ctx, loopbackHost, port, data)
+	err := uni.SendTo(ctx, host, port, data)
 	if err != nil {
 		cerr := ctx.Err()
 		if cerr != nil {
 			return false, fmt.Errorf("dds: spdp send context: %w", cerr)
 		}
-
 		return false, nil
 	}
-
 	return true, nil
 }
 
-// sendSPDPRoutes unicasts one packet to each known route.
-func sendSPDPRoutes(
+// sendSPDPRoutes unicasts one packet to each known route on every host.
+func (b *Backend) sendSPDPRoutes(
 	ctx context.Context,
 	uni *rtps.UnicastConn,
 	patched []byte,
 	ports []int,
 ) (int, error) {
+	hosts := b.unicastSendHosts()
 	sent := 0
-
 	for _, port := range ports {
 		err := ctx.Err()
 		if err != nil {
 			return sent, fmt.Errorf("dds: spdp send context: %w", err)
 		}
-
-		ok, err := sendOneUnicastBestEffort(ctx, uni, port, patched)
-		if err != nil {
-			return sent, err
-		}
-
-		if ok {
-			sent++
+		for _, host := range hosts {
+			err := ctx.Err()
+			if err != nil {
+				return sent, fmt.Errorf("dds: spdp send context: %w", err)
+			}
+			ok, err := b.sendOneUnicastToHost(ctx, uni, host, port, patched)
+			if err != nil {
+				return sent, err
+			}
+			if ok {
+				sent++
+			}
 		}
 	}
-
 	return sent, nil
 }
 
-// sendSPDPProbe unicasts one packet to bootstrap participant ports.
-func sendSPDPProbe(
+// sendSPDPProbe unicasts one packet to bootstrap ports on every host.
+func (b *Backend) sendSPDPProbe(
 	ctx context.Context,
 	uni *rtps.UnicastConn,
 	patched []byte,
 	domain uint32,
 	known []int,
 ) error {
+	hosts := b.unicastSendHosts()
 	for _, port := range spdpBootstrapPorts(domain, uni.LocalPort()) {
 		err := ctx.Err()
 		if err != nil {
 			return fmt.Errorf("dds: spdp send context: %w", err)
 		}
-
 		if slices.Contains(known, port) {
 			continue
 		}
-
-		_, err = sendOneUnicastBestEffort(ctx, uni, port, patched)
-		if err != nil {
-			return err
+		for _, host := range hosts {
+			err := ctx.Err()
+			if err != nil {
+				return fmt.Errorf("dds: spdp send context: %w", err)
+			}
+			_, err = b.sendOneUnicastToHost(ctx, uni, host, port, patched)
+			if err != nil {
+				return err
+			}
 		}
 	}
-
 	return nil
 }
 
@@ -1613,6 +1631,7 @@ func (b *Backend) snoopAnnouncement(
 	ports, truncated := filterAnnouncementPorts(ann)
 
 	b.storeAnnouncementWithTableAdvancewir10(ann, ports, b.backendNow())
+	b.noteAnnouncementHosts(ann)
 
 	if truncated {
 		b.bumpDemuxError()
@@ -1817,7 +1836,7 @@ func (s *sedpSender) SendSEDP(ctx context.Context, data []byte) error {
 
 	cp := append([]byte(nil), data...)
 
-	sent, last := sendToPorts(ctx, uni, ports, cp)
+	sent, last := s.backend.sendToPorts(ctx, uni, ports, cp)
 	if sent == 0 && last != nil {
 		return fmt.Errorf("dds: sedp send: %w", last)
 	}
@@ -2078,31 +2097,140 @@ func (b *Backend) snapshotUnicast() *rtps.UnicastConn {
 	return b.uni
 }
 
-// sendToPorts unicasts bytes to each port best effort without holding mu.
+// isLoopbackHost reports whether host names loopback.
+func isLoopbackHost(host string) bool {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" {
+		return true
+	}
+	if trimmed == "localhost" {
+		return true
+	}
+	parsed := net.ParseIP(trimmed)
+	if parsed != nil {
+		return parsed.IsLoopback()
+	}
+	return false
+}
+
+// normalizePeerHost trims and validates one unicast host.
+//
+// It returns empty for loopback, empty, or non-IP input so the backend
+// stays loopback only unless a remote IP is configured or observed.
+func normalizePeerHost(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if isLoopbackHost(trimmed) {
+		return ""
+	}
+	parsed := net.ParseIP(trimmed)
+	if parsed != nil {
+		return trimmed
+	}
+	host, _, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return ""
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if isLoopbackHost(host) {
+		return ""
+	}
+	if net.ParseIP(host) == nil {
+		return ""
+	}
+	return host
+}
+
+// notePeerHost records one remote unicast host for fanout.
+//
+// It self-locks and is safe for concurrent use. Loopback and invalid
+// hosts stay untracked so the default path sends loopback only.
+func (b *Backend) notePeerHost(host string) {
+	trimmed := normalizePeerHost(host)
+	if trimmed == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.peerHosts == nil {
+		b.peerHosts = make(map[string]struct{})
+	}
+	if _, ok := b.peerHosts[trimmed]; ok {
+		return
+	}
+	if len(b.peerHosts) >= maxPeerHosts {
+		return
+	}
+	b.peerHosts[trimmed] = struct{}{}
+}
+
+// snapshotPeerHosts returns extra unicast hosts for fanout.
+//
+// It self-locks with RLock and is safe for concurrent use.
+func (b *Backend) snapshotPeerHosts() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if len(b.peerHosts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(b.peerHosts))
+	for host := range b.peerHosts {
+		out = append(out, host)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// noteAnnouncementHosts records hosts advertised in one SPDP announcement.
+//
+// It lets multicast discovery teach unicast fanout: the announcement
+// carries the peer LAN address, so later sends reach that host in
+// addition to loopback.
+func (b *Backend) noteAnnouncementHosts(ann Announcement) {
+	for _, host := range ann.Hosts {
+		b.notePeerHost(host)
+	}
+}
+
+// unicastSendHosts returns loopback plus learned hosts.
+//
+// It snapshots without holding the lock across sends.
+func (b *Backend) unicastSendHosts() []string {
+	extra := b.snapshotPeerHosts()
+	out := make([]string, 0, len(extra)+1)
+	out = append(out, loopbackHost)
+	out = append(out, extra...)
+	return out
+}
+
+// sendToPorts unicasts bytes to each port on loopback plus peers.
 //
 // It is the single shared helper for SEDP and DATA unicast fanout.
 // Context cancellation aborts with an error; other send failures are
-// recorded as last and skipped so remaining ports still receive.
-func sendToPorts(ctx context.Context, uni *rtps.UnicastConn, ports []int, data []byte) (int, error) {
+// recorded as last and skipped so remaining targets still receive.
+func (b *Backend) sendToPorts(ctx context.Context, uni *rtps.UnicastConn, ports []int, data []byte) (int, error) {
+	hosts := b.unicastSendHosts()
 	sent := 0
 	var last error
-
 	for _, port := range ports {
-		err := uni.SendTo(ctx, loopbackHost, port, data)
-		if err != nil {
-			cerr := ctx.Err()
-			if cerr != nil {
-				return sent, fmt.Errorf("dds: send ports context: %w", cerr)
+		for _, host := range hosts {
+			err := uni.SendTo(ctx, host, port, data)
+			if err != nil {
+				cerr := ctx.Err()
+				if cerr != nil {
+					return sent, fmt.Errorf("dds: send ports context: %w", cerr)
+				}
+				last = err
+				continue
 			}
-
-			last = err
-
-			continue
+			sent++
 		}
-
-		sent++
 	}
-
 	return sent, last
 }
 
@@ -2377,7 +2505,7 @@ func (b *Backend) sendData(
 		return err
 	}
 
-	sent, last := sendToPorts(ctx, uni, ports, msg)
+	sent, last := b.sendToPorts(ctx, uni, ports, msg)
 	if sent > 0 {
 		b.mu.RLock()
 		history := b.repairHistory
@@ -2550,7 +2678,7 @@ func (b *Backend) sendFragTerminalHeartbeat(ctx context.Context, uni *rtps.Unica
 	if herr != nil {
 		return herr
 	}
-	sent, last := sendToPorts(ctx, uni, ports, hb)
+	sent, last := b.sendToPorts(ctx, uni, ports, hb)
 	if sent > 0 {
 		return nil
 	}
@@ -2794,7 +2922,7 @@ func (b *Backend) validateWriteFrag(guid WriterGUID, seq uint64, fragNum, total 
 
 // reportFragSend sends one fragment message and maps send failures.
 func reportFragSend(ctx context.Context, b *Backend, uni *rtps.UnicastConn, ports []int, msg []byte) error {
-	sent, last := sendToPorts(ctx, uni, ports, msg)
+	sent, last := b.sendToPorts(ctx, uni, ports, msg)
 	if sent > 0 {
 		return nil
 	}
@@ -2929,7 +3057,7 @@ func (b *Backend) sendPlainFragHeartbeat(ctx context.Context, uni *rtps.UnicastC
 	if err != nil {
 		return err
 	}
-	sent, last := sendToPorts(ctx, uni, ports, hb)
+	sent, last := b.sendToPorts(ctx, uni, ports, hb)
 	if sent > 0 {
 		return nil
 	}
@@ -3126,6 +3254,7 @@ func (b *Backend) handleSpdpBytesOnce(data []byte, domain uint32, local *LocalPa
 	ports, truncated := filterAnnouncementPorts(ann)
 
 	b.storeAnnouncementWithTableAdvancewir10(ann, ports, now)
+	b.noteAnnouncementHosts(ann)
 
 	if truncated {
 		b.bumpDemuxError()
@@ -3520,31 +3649,31 @@ func (b *Backend) snapshotDemux() (*rtps.UnicastConn, chan []byte, chan []byte, 
 }
 
 // receiveDemux reads one unicast datagram. False means exit the loop.
+//
+// It records the sender host for cross host fanout so a peer that
+// reaches us over unicast becomes a send target for replies.
 func (b *Backend) receiveDemux(ctx context.Context, uni *rtps.UnicastConn) ([]byte, bool) {
-	_, _, data, err := uni.Receive(ctx)
+	host, _, data, err := uni.Receive(ctx)
 	if err != nil {
 		cerr := ctx.Err()
 		if cerr != nil {
 			return nil, false
 		}
-
 		if b.isClosed() {
 			return nil, false
 		}
-
 		b.bumpDemuxError()
 		log.Printf("dds: demux receive failed: %v", err)
-
 		return nil, true
 	}
-
+	if host != "" {
+		b.notePeerHost(host)
+	}
 	if len(data) < 4 {
 		b.bumpDemuxError()
 		sampleDropLog("dds: demux dropped short %d byte datagram", len(data))
-
 		return nil, true
 	}
-
 	return data, true
 }
 
@@ -3876,7 +4005,7 @@ func (b *Backend) sendSedpAck(ctx context.Context, sender GUIDPrefix, ack rtps.R
 		log.Printf("dds: demux sedp ack encode: %v", err)
 		return
 	}
-	sent, last := sendToPorts(ctx, uni, ports, msg)
+	sent, last := b.sendToPorts(ctx, uni, ports, msg)
 	if sent == 0 && last != nil {
 		b.bumpDemuxError()
 		log.Printf("dds: demux sedp ack send: %v", last)
@@ -5059,7 +5188,7 @@ func (b *Backend) announceWriterOnce(ctx context.Context, ep SEDPEndpoint) error
 		return fmt.Errorf("dds: sedp announce without transport: %w", ErrDataPathNotWired)
 	}
 
-	sent, last := sendToPorts(ctx, uni, ports, data)
+	sent, last := b.sendToPorts(ctx, uni, ports, data)
 	if sent == 0 && last != nil {
 		return fmt.Errorf("dds: sedp announce send: %w", last)
 	}
@@ -6244,7 +6373,7 @@ func (b *Backend) sendSecureTriple(ctx context.Context, msg transports.OutgoingM
 		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
 		return err
 	}
-	sent, last := sendToPorts(ctx, uni, ports, encoded)
+	sent, last := b.sendToPorts(ctx, uni, ports, encoded)
 	if sent == 0 {
 		b.rollbackSecureSend(snap, writer, pubSeq, rtpsSeq)
 		if last != nil {

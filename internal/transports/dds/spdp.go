@@ -165,6 +165,8 @@ type Announcement struct {
 	Lease time.Duration
 	// Ports holds all UDPv4 unicast locator ports in wire order, empty for dispose.
 	Ports []uint16
+	// Hosts holds the UDPv4 unicast locator IPs in wire order, empty for dispose.
+	Hosts []string
 	// AvailableBuiltinEndpoints is the parsed 0x0058 mask.
 	AvailableBuiltinEndpoints uint32
 	// ManualLivelinessCount is the participant manual liveliness count, zero when absent.
@@ -1241,14 +1243,14 @@ func ParseAnnouncement(data []byte) (Announcement, error) {
 	return *best, nil
 }
 
-// announcementAliveFields fills lease, ports, manual count, and QoS.
+// announcementAliveFields fills lease, ports, hosts, manual count, and QoS.
 func announcementAliveFields(params []rtps.Param, out *Announcement) error {
 	lease, err := findLeaseParam(params)
 	if err != nil {
 		return err
 	}
 
-	ports, err := findUnicastPortsParam(params)
+	ports, hosts, err := findUnicastPortsParam(params)
 	if err != nil {
 		return err
 	}
@@ -1270,6 +1272,7 @@ func announcementAliveFields(params []rtps.Param, out *Announcement) error {
 
 	out.Lease = lease
 	out.Ports = ports
+	out.Hosts = hosts
 	out.ManualLivelinessCount = manual
 	out.BuiltinEndpointQos = qos
 	out.AvailableBuiltinEndpoints = set
@@ -1656,14 +1659,17 @@ func spdp2DecodeDomainTag(value []byte) (string, error) {
 	return "", fmt.Errorf("dds: domain tag misses NUL terminator: %w", ErrInvalidSPDP)
 }
 
-// findUnicastPortsParam returns all UDPv4 unicast locator ports in wire order.
+// findUnicastPortsParam returns all UDPv4 unicast locator ports and hosts.
 //
 // Metatraffic, standard default, and discovery brief unicast ids all
 // count in wire order. Multicast locators never count. Only the length
 // is validated; any IPv4 address is accepted so off host captures
 // parse, and the ports are the routes stored on the announcement.
-func findUnicastPortsParam(params []rtps.Param) ([]uint16, error) {
+// Hosts carry the locator IPs in the same wire order for cross host
+// fanout; loopback entries stay and filter at send time.
+func findUnicastPortsParam(params []rtps.Param) ([]uint16, []string, error) {
 	var out []uint16
+	var hosts []string
 
 	for _, p := range params {
 		if p.ID != rtps.PIDMetatrafficUnicastLocator &&
@@ -1672,9 +1678,9 @@ func findUnicastPortsParam(params []rtps.Param) ([]uint16, error) {
 			continue
 		}
 
-		kind, port, _, err := rtps.DecodeLocator(p.Value)
+		kind, port, ip, err := rtps.DecodeLocator(p.Value)
 		if err != nil {
-			return nil, fmt.Errorf("dds: decode locator: %w", errors.Join(err, ErrInvalidSPDP))
+			return nil, nil, fmt.Errorf("dds: decode locator: %w", errors.Join(err, ErrInvalidSPDP))
 		}
 
 		if kind != rtps.LocatorKindUDPv4 {
@@ -1682,17 +1688,20 @@ func findUnicastPortsParam(params []rtps.Param) ([]uint16, error) {
 		}
 
 		if port > math.MaxUint16 {
-			return nil, fmt.Errorf("dds: locator port %d above maximum: %w", port, ErrInvalidSPDP)
+			return nil, nil, fmt.Errorf("dds: locator port %d above maximum: %w", port, ErrInvalidSPDP)
 		}
 
 		out = append(out, uint16(port))
+		if ip != nil {
+			hosts = append(hosts, ip.String())
+		}
 	}
 
 	if len(out) == 0 {
-		return nil, fmt.Errorf("dds: missing unicast locator: %w", ErrInvalidSPDP)
+		return nil, nil, fmt.Errorf("dds: missing unicast locator: %w", ErrInvalidSPDP)
 	}
 
-	return out, nil
+	return out, hosts, nil
 }
 
 // encodeSPDPMessage frames one DATA submessage in an RTPS message.

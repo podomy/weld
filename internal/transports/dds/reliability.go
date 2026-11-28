@@ -1859,7 +1859,7 @@ func (b *Backend) sendUserAckNack(ctx context.Context, remote WriterGUID, reader
 		return err
 	}
 
-	sent, last := sendToPorts(ctx, uni, ports, msg)
+	sent, last := b.sendToPorts(ctx, uni, ports, msg)
 	if sent > 0 {
 		return nil
 	}
@@ -1931,7 +1931,7 @@ func (b *Backend) sendUserControl(
 		)
 	}
 
-	sent, last := sendToPorts(ctx, uni, ports, msg)
+	sent, last := b.sendToPorts(ctx, uni, ports, msg)
 	if sent > 0 {
 		return nil
 	}

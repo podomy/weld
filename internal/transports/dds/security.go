@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Package dds holds the CycloneDDS sidecar contract.
+// Package dds implements the DDS/RTPS wire transport.
 //
 // SECURITY_GAP: this file is honest tolerance only. It is NOT security.
 // Weld implements no DDS Security crypto and must never be described as

@@ -701,7 +701,7 @@ func TestBootstrapLivePatchAndProbe(t *testing.T) {
 		}
 	}()
 
-	backend, err := dds.NewBackend(dds.SidecarConfig{DomainID: domain, PeerAddress: "127.0.0.1"})
+	backend, err := dds.NewBackend(dds.PeerConfig{DomainID: domain, PeerAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}

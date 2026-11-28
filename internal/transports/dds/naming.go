@@ -1,28 +1,17 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Package dds holds the CycloneDDS sidecar contract.
-//
-// CycloneDDS runs as a sidecar process over localhost, not linked into
-// Weld. This package contains the contract only: configuration, topic and
-// type naming rules, and a stub Sidecar whose Connect and backend methods
-// return an explicit not implemented error until the backend lands, except
-// Close which performs idempotent teardown. There is no cgo here and no C
-// toolchain is required to build Weld.
+// Package dds implements the DDS/RTPS topic and type naming.
 package dds
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
-
-	"github.com/podomy/weld/internal/transports"
 )
 
-// Topic prefix constants for the DDS sidecar mapping.
+// Topic prefix constants for the DDS topic mapping.
 const (
 	// TopicPrefix carries normal topics such as rt/chatter.
 	TopicPrefix = "rt"
@@ -30,7 +19,7 @@ const (
 	RequestPrefix = "rq"
 	// ReplyPrefix carries service replies such as rr/add_two_intsReply.
 	ReplyPrefix = "rr"
-	// DefaultPeerAddress is the default sidecar peer address.
+	// DefaultPeerAddress is the default peer address.
 	DefaultPeerAddress = "127.0.0.1"
 )
 
@@ -63,235 +52,6 @@ const (
 	// TopicKindReply is a service reply topic.
 	TopicKindReply TopicKind = "reply"
 )
-
-// ErrSidecarNotImplemented reports that the sidecar backend is not yet present.
-var ErrSidecarNotImplemented = errors.New("dds: sidecar backend not implemented")
-
-// SidecarConfig configures the CycloneDDS sidecar peer.
-//
-// The sidecar speaks to Weld over a peer address that defaults to
-// localhost. PeerAddress accepts any address: the loopback default covers
-// production and remote addresses cover tests that run the sidecar on
-// another host. Range is the discovery range wired into
-// DiscoveryInfo.Range on JoinDiscovery. Range is explicit config only. No
-// environment variable is read for it because vendors share no single
-// stable env contract for discovery range.
-type SidecarConfig struct {
-	// DomainID is the DDS domain the sidecar joins.
-	DomainID uint32
-	// PeerAddress is the address of the sidecar process.
-	PeerAddress string
-	// Range is the discovery range for JoinDiscovery.
-	Range transports.DiscoveryRange
-}
-
-// DefaultSidecarConfig returns a SidecarConfig with localhost defaults.
-func DefaultSidecarConfig() SidecarConfig {
-	return SidecarConfig{
-		DomainID:    0,
-		PeerAddress: DefaultPeerAddress,
-		Range:       transports.DiscoveryRangeSystemDefault,
-	}
-}
-
-// Validate checks the sidecar configuration for usable values.
-//
-// It rejects a domain above transports.MaxDomainID, an empty peer, and
-// an unknown discovery range. DiscoveryRangeNotSet is accepted here and
-// normalized to SystemDefault by NewSidecar so the zero value config
-// still joins with a concrete range.
-func (c SidecarConfig) Validate() error {
-	if c.DomainID > transports.MaxDomainID {
-		return fmt.Errorf("dds: domain id %d above maximum %d", c.DomainID, transports.MaxDomainID)
-	}
-
-	if strings.TrimSpace(c.PeerAddress) == "" {
-		return errors.New("dds: peer address is empty") //nolint:wrapcheck // new error, nothing to wrap
-	}
-
-	switch c.Range {
-	case transports.DiscoveryRangeNotSet,
-		transports.DiscoveryRangeOff,
-		transports.DiscoveryRangeLocalhost,
-		transports.DiscoveryRangeSubnet,
-		transports.DiscoveryRangeSystemDefault:
-	default:
-		return fmt.Errorf("dds: unknown discovery range %v", c.Range)
-	}
-
-	return nil
-}
-
-// EffectivePeer returns the configured peer or the localhost default.
-//
-// The result is trimmed of surrounding whitespace so config with
-// accidental spaces still dials the intended address.
-func (c SidecarConfig) EffectivePeer() string {
-	trimmed := strings.TrimSpace(c.PeerAddress)
-	if trimmed == "" {
-		return DefaultPeerAddress
-	}
-
-	return trimmed
-}
-
-// ResolveDiscoveryRange returns the configured discovery range.
-//
-// It mirrors transports.ResolveDiscoveryRange so callers have one domain
-// and one range resolve path. No environment variable is consulted. NotSet
-// passes through unchanged here; NewSidecar normalizes it to
-// SystemDefault for the stored config.
-func (c SidecarConfig) ResolveDiscoveryRange() transports.DiscoveryRange {
-	return transports.ResolveDiscoveryRange(c.Range)
-}
-
-// Sidecar is a stub for the CycloneDDS sidecar process handle.
-//
-// Lifecycle order is Connect then JoinDiscovery then PublishBytes and
-// TakeBytes then Close. PublishBytes, TakeBytes, and ReportLiveliness
-// before a successful JoinDiscovery report an error in a real backend.
-// The stub exists so callers can be written against the contract before
-// the backend lands. Connect and all Backend data path methods return an
-// explicit not implemented error until the backend is available. Close
-// performs idempotent teardown and returns nil. The stub is safe for
-// concurrent use.
-type Sidecar struct {
-	mu     sync.Mutex
-	config SidecarConfig
-	closed bool
-}
-
-// NewSidecar validates the configuration and returns a stub Sidecar.
-//
-// It validates the peer, the domain range, and the discovery range,
-// resolves the domain through transports.ResolveDomainID so ROS_DOMAIN_ID
-// overrides the caller value, trims the peer, and normalizes
-// DiscoveryRangeNotSet to DiscoveryRangeSystemDefault. A caller DomainID
-// above transports.MaxDomainID is rejected even when the environment is
-// unset.
-func NewSidecar(cfg SidecarConfig) (*Sidecar, error) {
-	err := cfg.Validate()
-	if err != nil {
-		return nil, fmt.Errorf("dds: invalid sidecar config: %w", err)
-	}
-
-	resolved, err := transports.ResolveDomainID(cfg.DomainID)
-	if err != nil {
-		return nil, fmt.Errorf("dds: resolve domain: %w", err)
-	}
-
-	cfg.DomainID = resolved
-	cfg.PeerAddress = cfg.EffectivePeer()
-	if cfg.Range == transports.DiscoveryRangeNotSet {
-		cfg.Range = transports.DiscoveryRangeSystemDefault
-	}
-
-	return &Sidecar{config: cfg}, nil
-}
-
-// Config returns a copy of the sidecar configuration.
-func (s *Sidecar) Config() SidecarConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.config
-}
-
-// Closed reports whether Close has been called.
-func (s *Sidecar) Closed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.closed
-}
-
-// Connect dials the sidecar process.
-//
-// Lifecycle is Connect first, then JoinDiscovery, then PublishBytes and
-// TakeBytes, then Close. The stub always returns ErrSidecarNotImplemented
-// until the backend lands. The stub returns immediately without blocking,
-// so ctx cancellation has no observable effect on the stub; this is a
-// stub exception. The real backend must honor ctx cancellation and return
-// ctx.Err when ctx ends before dialing completes.
-func (s *Sidecar) Connect(ctx context.Context) error {
-	_ = ctx
-
-	return fmt.Errorf("dds: connect domain %d peer %s: %w", s.config.DomainID, s.config.EffectivePeer(), ErrSidecarNotImplemented)
-}
-
-// Close releases the sidecar handle.
-//
-// It is idempotent per the transports.Backend contract. The first call
-// marks the handle closed and later calls return nil. It never returns
-// ErrSidecarNotImplemented.
-func (s *Sidecar) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.closed = true
-
-	return nil
-}
-
-// PublishBytes publishes one serialized message through the sidecar.
-//
-// It always returns ErrSidecarNotImplemented until the backend lands.
-// The stub returns immediately without blocking, so ctx cancellation has
-// no observable effect yet; this is a stub exception. The real backend
-// must honor ctx deadlines and return ctx.Err on cancellation, copy
-// retained payloads per the transports ownership rules, require a prior
-// JoinDiscovery (ErrNotJoined otherwise), and report ErrBackendClosed
-// after Close. Nil payload means an empty sample.
-func (s *Sidecar) PublishBytes(ctx context.Context, msg transports.OutgoingMessage) error {
-	_ = ctx
-	_ = msg
-
-	return fmt.Errorf("dds: publish domain %d peer %s: %w", s.config.DomainID, s.config.EffectivePeer(), ErrSidecarNotImplemented)
-}
-
-// TakeBytes receives one serialized message through the sidecar.
-//
-// It always returns ErrSidecarNotImplemented until the backend lands.
-// The stub returns immediately without blocking, so ctx cancellation has
-// no observable effect yet; this is a stub exception. The real backend
-// must block until a message arrives or ctx ends, return ctx.Err on
-// cancellation, require a prior JoinDiscovery, and report
-// ErrBackendClosed after Close.
-func (s *Sidecar) TakeBytes(ctx context.Context) (transports.IncomingMessage, error) {
-	_ = ctx
-
-	return transports.IncomingMessage{}, fmt.Errorf("dds: take domain %d peer %s: %w", s.config.DomainID, s.config.EffectivePeer(), ErrSidecarNotImplemented)
-}
-
-// JoinDiscovery joins discovery with the given participant info.
-//
-// It always returns ErrSidecarNotImplemented until the backend lands.
-// The stub returns immediately without blocking, so ctx cancellation has
-// no observable effect yet; this is a stub exception. The real backend
-// announces on the SPDP path, honors ctx deadlines, and reports
-// ErrBackendClosed after Close.
-func (s *Sidecar) JoinDiscovery(ctx context.Context, info transports.DiscoveryInfo) error {
-	_ = ctx
-	_ = info
-
-	return fmt.Errorf("dds: join discovery domain %d peer %s: %w", s.config.DomainID, s.config.EffectivePeer(), ErrSidecarNotImplemented)
-}
-
-// ReportLiveliness reports local endpoint liveliness through the sidecar.
-//
-// It always returns ErrSidecarNotImplemented until the backend lands.
-// The stub returns immediately without blocking, so ctx cancellation has
-// no observable effect yet; this is a stub exception. The real backend
-// asserts on the SEDP path, honors ctx deadlines, enforces the
-// Generation ordering in transports.LivelinessReport (stale returns an
-// error), requires a prior JoinDiscovery, and reports ErrBackendClosed
-// after Close.
-func (s *Sidecar) ReportLiveliness(ctx context.Context, report transports.LivelinessReport) error {
-	_ = ctx
-	_ = report
-
-	return fmt.Errorf("dds: report liveliness domain %d peer %s: %w", s.config.DomainID, s.config.EffectivePeer(), ErrSidecarNotImplemented)
-}
 
 // trimSlashes removes leading and trailing slashes only.
 func trimSlashes(name string) string {
@@ -678,9 +438,3 @@ func DemangleTypeName(ddsName string) (string, error) {
 
 	return ns + "__" + right, nil
 }
-
-// Compile time check that the stub exposes the Backend contract. The
-// methods stay stubbed with ErrSidecarNotImplemented until the backend
-// lands as a separate type or this stub grows a real implementation.
-// Close already performs idempotent teardown and returns nil.
-var _ transports.Backend = (*Sidecar)(nil)

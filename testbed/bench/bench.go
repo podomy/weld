@@ -338,7 +338,7 @@ func (r *benchRun) openBackend(t *testing.T, ctx context.Context, domain int, pa
 	if err != nil {
 		t.Fatalf("bench domain invalid: %v", err)
 	}
-	cfg := dds.SidecarConfig{
+	cfg := dds.PeerConfig{
 		DomainID:    uint32(domain), //nolint:gosec // G115: ValidateDomain pins 0 through 101
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

@@ -153,10 +153,6 @@ func cliHandleRunError(err error, stderr *bytes.Buffer) int {
 	if err == nil {
 		return 0
 	}
-	if errors.Is(err, dds.ErrSidecarNotImplemented) {
-		_, _ = fmt.Fprintln(stderr, "weld: DDS sidecar stub returned not-implemented (unexpected with the live backend): "+cliOneLine(err)) //nolint:errcheck // best-effort test log, write failure is not actionable
-		return 1
-	}
 	if errors.Is(err, dds.ErrDataPathNotWired) {
 		_, _ = fmt.Fprintln(stderr, "weld: DDS data path is not wired yet: "+cliOneLine(err)) //nolint:errcheck // best-effort test log, write failure is not actionable
 		return 1

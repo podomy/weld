@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Package dds holds the CycloneDDS sidecar contract.
+// Package dds implements the DDS/RTPS wire transport.
 //
 // This file implements DDS partition QoS for discovery: name validation,
 // POSIX fnmatch style wildcard matching, the PID_PARTITION parameter codec,

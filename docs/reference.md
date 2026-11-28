@@ -7,7 +7,6 @@ Short answers plus terms. Details in `docs/design.md`, `docs/wire.md`, `docs/con
 - Why IDL constants? Labels only; only the field value travels. Pins in `internal/types/bounds.go`.
 - What is the identity quaternion? No rotation: `x=0, y=0, z=0, w=1`; the one IDL default Weld applies.
 - Why one binary for Humble, Jazzy, Rolling? No C ABI; negotiate per peer by name plus type hash. Live gates, not CI.
-- Why no CycloneDDS sidecar process? `Sidecar` is a config validator stub; data path returns `ErrSidecarNotImplemented`. Backend speaks RTPS directly.
 - Why only CycloneDDS transport? One transport keeps matching and routing identical with no vendor drift.
 - Why loud mismatch? Silent pubs/subs that never connect were the top interop cost; Weld surfaces topic, endpoints, and policy in logs, metrics, CLI.
 - Why drop oldest with lost counter? Bounded topics keep the freshest sample for control loops and make loss visible.

@@ -137,7 +137,7 @@ func validUserDataSubForFixes(t *testing.T) rtps.RawSubmessage {
 func TestEnqueueUserSubsInvalidControlDropsRest(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 	backend.dataCh = make(chan dataItem, 4)
 	var hdrPrefix [12]byte
 	hdrPrefix[0] = 0xAA
@@ -260,7 +260,7 @@ func TestSecureEgressWithoutKeysDenies(t *testing.T) {
 func TestPartitionIsolationSameTopic(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 	idx := mustSEDPIndexWithPrefix(t, 0x71)
 	peer := mustSEDPIndexWithPrefix(t, 0x72)
 	writer := mustSEDPWriter(t, peer, "/iso", "RIHS01_iso")

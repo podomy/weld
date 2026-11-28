@@ -89,7 +89,7 @@ func OpenLiveBackend(ctx context.Context, domain int, participant, label string)
 	if domain < 0 || domain > 101 {
 		return nil, fmt.Errorf("helpers: %s domain %d out of range 0 through 101", label, domain)
 	}
-	cfg := dds.SidecarConfig{
+	cfg := dds.PeerConfig{
 		DomainID:    uint32(domain),
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

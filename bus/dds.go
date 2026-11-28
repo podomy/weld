@@ -22,7 +22,7 @@ const (
 	TopicKindReply = dds.TopicKindReply
 )
 
-// Topic prefix constants for the DDS sidecar mapping.
+// Topic prefix constants for the DDS topic mapping.
 const (
 	// TopicPrefix carries normal topics such as rt/chatter.
 	TopicPrefix = dds.TopicPrefix
@@ -58,9 +58,9 @@ func NewBackendWithClock(cfg DDSConfig, clock Clock) (Backend, error) {
 	return backend, nil
 }
 
-// DefaultSidecarConfig returns a DDS config with localhost defaults.
-func DefaultSidecarConfig() DDSConfig {
-	return dds.DefaultSidecarConfig()
+// DefaultPeerConfig returns a DDS config with localhost defaults.
+func DefaultPeerConfig() DDSConfig {
+	return dds.DefaultPeerConfig()
 }
 
 // EffectivePeer returns the configured peer or the localhost default.

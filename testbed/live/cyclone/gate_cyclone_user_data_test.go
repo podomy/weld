@@ -69,7 +69,7 @@ func TestCycloneUserDataReceiptToWeld(t *testing.T) {
 	if err != nil {
 		t.Fatalf("context ended before join: %v", err)
 	}
-	cfg := dds.SidecarConfig{
+	cfg := dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

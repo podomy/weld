@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Package dds holds the CycloneDDS sidecar contract.
+// Package dds implements the DDS/RTPS wire transport.
 //
 // This file implements SPDP participant discovery for first contact as
 // genuine RTPS: announcements are RTPS messages with our 12 byte GUID

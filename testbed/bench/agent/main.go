@@ -734,7 +734,7 @@ func execute(cfg args, res *resultDoc) int {
 		log.Printf("resolve domain: %v", err)
 		return exitBadArgs
 	}
-	backend, err := dds.NewBackend(dds.SidecarConfig{
+	backend, err := dds.NewBackend(dds.PeerConfig{
 		DomainID:    requested,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

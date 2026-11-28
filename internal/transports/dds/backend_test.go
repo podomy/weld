@@ -38,7 +38,7 @@ func clearBackendEnv(t *testing.T) {
 }
 
 // newTestBackend returns a backend with short intervals for loop tests.
-func newTestBackend(t *testing.T, cfg SidecarConfig) *Backend {
+func newTestBackend(t *testing.T, cfg PeerConfig) *Backend {
 	t.Helper()
 
 	clearBackendEnv(t)
@@ -115,11 +115,11 @@ func TestBackendImplementsContract(t *testing.T) {
 	var _ transports.Backend = (*Backend)(nil)
 }
 
-// TestNewBackendRejectsBadConfig checks validation follows NewSidecar rules.
+// TestNewBackendRejectsBadConfig checks validation follows the shared config rules.
 func TestNewBackendRejectsBadConfig(t *testing.T) {
 	clearBackendEnv(t)
 
-	cases := []SidecarConfig{
+	cases := []PeerConfig{
 		{DomainID: 999, PeerAddress: "127.0.0.1"},
 		{DomainID: 0, PeerAddress: "   "},
 		{DomainID: 0, PeerAddress: "127.0.0.1", Range: transports.DiscoveryRange(99)},
@@ -132,7 +132,7 @@ func TestNewBackendRejectsBadConfig(t *testing.T) {
 		}
 	}
 
-	_, err := NewBackendWithClock(SidecarConfig{PeerAddress: "127.0.0.1"}, nil)
+	_, err := NewBackendWithClock(PeerConfig{PeerAddress: "127.0.0.1"}, nil)
 	if err == nil {
 		t.Fatalf("NewBackendWithClock with nil clock succeeded, want error")
 	}
@@ -142,7 +142,7 @@ func TestNewBackendRejectsBadConfig(t *testing.T) {
 func TestNewBackendNormalizes(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(SidecarConfig{
+	backend, err := NewBackend(PeerConfig{
 		DomainID:    0,
 		PeerAddress: "  127.0.0.1  ",
 		Range:       transports.DiscoveryRangeNotSet,
@@ -182,7 +182,7 @@ func TestNewBackendNormalizes(t *testing.T) {
 func TestNewBackendResolvesDomain(t *testing.T) {
 	t.Setenv(transports.DomainEnvVar, "42")
 
-	backend, err := NewBackend(SidecarConfig{DomainID: 7, PeerAddress: "127.0.0.1"})
+	backend, err := NewBackend(PeerConfig{DomainID: 7, PeerAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestNewBackendResolvesDomain(t *testing.T) {
 func TestBackendRequiresJoin(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestBackendRequiresJoin(t *testing.T) {
 func TestBackendJoinCanceledContext(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestBackendJoinCanceledContext(t *testing.T) {
 
 // TestBackendDataPathNotWired checks the unwired path reports explicitly.
 func TestBackendDataPathNotWired(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -307,7 +307,7 @@ func TestBackendDataPathNotWired(t *testing.T) {
 func TestBackendCloseIdempotent(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestBackendCloseIdempotent(t *testing.T) {
 
 // TestBackendPostCloseErrors checks all methods fail after Close.
 func TestBackendPostCloseErrors(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	err := backend.JoinDiscovery(context.Background(), transports.DiscoveryInfo{ParticipantName: "p"})
 	if err != nil {
@@ -376,7 +376,7 @@ func TestBackendPostCloseErrors(t *testing.T) {
 
 // TestBackendReportGenerationMatrix checks stale and idempotent cases.
 func TestBackendReportGenerationMatrix(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -454,7 +454,7 @@ func TestBackendLeaseClock(t *testing.T) {
 	stub := &fakeClock{}
 	stub.setNow(time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC))
 
-	backend, err := NewBackendWithClock(DefaultSidecarConfig(), stub)
+	backend, err := NewBackendWithClock(DefaultPeerConfig(), stub)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestBackendLeaseClock(t *testing.T) {
 func TestBackendDialError(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestBackendDialError(t *testing.T) {
 func TestBackendJoinDialsPeer(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -587,7 +587,7 @@ func waitForAnnounce(t *testing.T, backend *Backend) {
 
 // TestBackendAnnouncementLoopsTick checks SPDP and SEDP loops advance.
 func TestBackendAnnouncementLoopsTick(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -610,7 +610,7 @@ func TestBackendAnnouncementLoopsTick(t *testing.T) {
 
 // TestBackendCloseStopsLoops checks cancel stops announcement ticks.
 func TestBackendCloseStopsLoops(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	err := backend.JoinDiscovery(context.Background(), transports.DiscoveryInfo{ParticipantName: "p"})
 	if err != nil {
@@ -650,7 +650,7 @@ func TestBackendCloseStopsLoops(t *testing.T) {
 
 // TestBackendContextCancelStopsJoin checks canceled ctx never starts loops.
 func TestBackendContextCancelStopsJoin(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -679,7 +679,7 @@ func TestBackendContextCancelStopsJoin(t *testing.T) {
 func TestBackendConcurrentJoinCloseRace(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -741,7 +741,7 @@ func checkAllowedErr(t *testing.T, err error, op string, allowed ...error) {
 
 // TestBackendConcurrentUse checks concurrent data path and close stay safe.
 func TestBackendConcurrentUse(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	err := backend.JoinDiscovery(context.Background(), transports.DiscoveryInfo{ParticipantName: "p"})
 	if err != nil {
@@ -812,7 +812,7 @@ func newLiveBackend(t *testing.T, domain uint32, name string) *Backend {
 
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(SidecarConfig{
+	backend, err := NewBackend(PeerConfig{
 		DomainID:    domain,
 		PeerAddress: DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,
@@ -1389,7 +1389,7 @@ func checkSnapshotContainsPorts(t *testing.T, snap []int, wantPorts []uint16) {
 func TestBackendSnoopAnnouncementRoutes(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -1453,7 +1453,7 @@ func TestBackendSnoopAnnouncementRoutes(t *testing.T) {
 func TestBackendSnoopTombstoneBlocksStaleRoute(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -1518,7 +1518,7 @@ func TestBackendSnoopTombstoneBlocksStaleRoute(t *testing.T) {
 
 // TestBackendGenerationBumps checks discovery plus SPDP plus SEDP counters.
 func TestBackendGenerationBumps(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -1600,7 +1600,7 @@ func TestBackendRouteErrorTable(t *testing.T) {
 
 // TestBackendCancelPaths checks canceled contexts report context errors without transport.
 func TestBackendCancelPaths(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -1639,7 +1639,7 @@ func TestBackendCancelPaths(t *testing.T) {
 
 // TestBackendSnapshotPublishStruct checks live flag and struct copy behavior.
 func TestBackendSnapshotPublishStruct(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -1669,7 +1669,7 @@ func TestBackendSnapshotPublishStruct(t *testing.T) {
 
 // TestBackendSedpIntervalIndependence checks SPDP and SEDP intervals stay separate.
 func TestBackendSedpIntervalIndependence(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	defer func() {
 		err := backend.Close()
@@ -1710,7 +1710,7 @@ func TestBackendSedpIntervalIndependence(t *testing.T) {
 
 // TestBackendCloseNilsTransport checks Close clears unicast plus multicast under lock.
 func TestBackendCloseNilsTransport(t *testing.T) {
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 
 	backend.mu.Lock()
 	backend.uni = nil
@@ -1742,7 +1742,7 @@ func TestBackendCloseNilsTransport(t *testing.T) {
 func TestBackendSendGoodbyeBestEffortNoLive(t *testing.T) {
 	clearBackendEnv(t)
 
-	backend, err := NewBackend(DefaultSidecarConfig())
+	backend, err := NewBackend(DefaultPeerConfig())
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -2165,7 +2165,7 @@ func TestBackendPublishPlainNoMatchFailsLoudly(t *testing.T) {
 func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 	defer func() {
 		if err := backend.Close(); err != nil {
 			t.Errorf("close: %v", err)
@@ -2207,7 +2207,7 @@ func TestBackendSweepOnceExpiresPendingEvict(t *testing.T) {
 func TestBackendSameSeqAliveRefreshesRoute(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	clock := &fakeClock{}
 	base := time.Unix(7000, 0).UTC()
@@ -2266,7 +2266,7 @@ func TestBackendSameSeqAliveRefreshesRoute(t *testing.T) {
 func TestBackendRepairLargeSampleUsesFrags(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	var guid WriterGUID
 	for i := range guid {
@@ -2303,7 +2303,7 @@ func TestBackendRepairLargeSampleUsesFrags(t *testing.T) {
 func TestBackendQueueFragRepairContracts(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	local, err := NewLocalParticipant(72, DefaultLeaseDuration)
 	if err != nil {
@@ -2332,7 +2332,7 @@ func TestBackendQueueFragRepairContracts(t *testing.T) {
 func TestBackendQueueFragRepairBackpressure(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 73, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 73, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	local, err := NewLocalParticipant(73, DefaultLeaseDuration)
 	if err != nil {
@@ -2365,7 +2365,7 @@ func TestBackendQueueFragRepairBackpressure(t *testing.T) {
 func TestServeRepairWindowContinuesPastFailedSeq(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 74, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 74, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	local, err := NewLocalParticipant(74, DefaultLeaseDuration)
 	if err != nil {
@@ -2403,7 +2403,7 @@ func TestServeRepairWindowContinuesPastFailedSeq(t *testing.T) {
 func TestServePathsSkipQuietlyAfterClose(t *testing.T) {
 	t.Parallel()
 
-	cfg := SidecarConfig{DomainID: 75, PeerAddress: DefaultPeerAddress, Range: 0}
+	cfg := PeerConfig{DomainID: 75, PeerAddress: DefaultPeerAddress, Range: 0}
 	backend := newTestBackend(t, cfg)
 	local, err := NewLocalParticipant(75, DefaultLeaseDuration)
 	if err != nil {
@@ -2432,7 +2432,7 @@ func TestServePathsSkipQuietlyAfterClose(t *testing.T) {
 func TestBackendwir10RouteAtomicStaleNeverInstalls(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
+	backend := newTestBackend(t, PeerConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
 	clock := &fakeClock{}
 	base := time.Unix(7100, 0).UTC()
 	clock.setNow(base)
@@ -2480,7 +2480,7 @@ func TestBackendwir10RouteAtomicStaleNeverInstalls(t *testing.T) {
 func TestBackendwir10RouteAtomicSameSeqLeaseOnly(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, SidecarConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
+	backend := newTestBackend(t, PeerConfig{DomainID: 70, PeerAddress: DefaultPeerAddress, Range: 0})
 	clock := &fakeClock{}
 	base := time.Unix(7200, 0).UTC()
 	clock.setNow(base)
@@ -2522,7 +2522,7 @@ func TestBackendwir10RouteAtomicSameSeqLeaseOnly(t *testing.T) {
 func TestBackendwir10SelfLoopbackDropsBeforeTake(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, SidecarConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0})
+	backend := newTestBackend(t, PeerConfig{DomainID: 71, PeerAddress: DefaultPeerAddress, Range: 0})
 	local, err := NewLocalParticipant(71, DefaultLeaseDuration)
 	if err != nil {
 		t.Fatalf("local: %v", err)
@@ -2560,7 +2560,7 @@ func TestBackendwir10SelfLoopbackDropsBeforeTake(t *testing.T) {
 func TestBackendwir10StrictMatchHonesty(t *testing.T) {
 	t.Parallel()
 
-	backend := newTestBackend(t, SidecarConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0})
+	backend := newTestBackend(t, PeerConfig{DomainID: 72, PeerAddress: DefaultPeerAddress, Range: 0})
 	defer func() {
 		err := backend.Close()
 		if err != nil {
@@ -2669,7 +2669,7 @@ func TestBackendwir10NilSuiteNegativePins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plain DATA err = %v, want nil byte-identical", err)
 	}
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 	defer func() {
 		cerr := backend.Close()
 		if cerr != nil {

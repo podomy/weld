@@ -25,7 +25,7 @@ import (
 // waits for matched readers, filters replies on the client handle, and
 // checks server availability from graph counts plus userdata service IDs.
 //
-// Topic naming follows the sidecar rules. Normal names use rq plus rr
+// Topic naming follows the DDS topic rules. Normal names use rq plus rr
 // prefixes with Request plus Reply suffixes: rq/<name>Request plus
 // rr/<name>Reply. Bare names drop the prefix when avoid-namespace
 // conventions is set. Type names use Request_ plus Response_ suffixes:

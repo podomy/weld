@@ -91,6 +91,4 @@ Types: `::` for double underscore, then `<ns>::dds_::<Name>_` with `Request_` an
 - After first `Close`, other methods report `ErrBackendClosed`
 - Backends must be safe for concurrent use
 
-`Sidecar` is a validator stub, not a running peer: `NewSidecar` validates config and resolves domain, but `Connect` and every data path return `ErrSidecarNotImplemented`; only `Close` works. The live backend speaks RTPS directly over UDP with no cgo and no sidecar process. Core never imports transport packages; the interface stays the only crossing.
-
-Code: `internal/transports/transport.go`, `internal/transports/dds/sidecar.go`, `internal/transports/dds/backend.go`.
+Code: `internal/transports/transport.go`, `internal/transports/dds/config.go`, `internal/transports/dds/backend.go`.

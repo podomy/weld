@@ -233,7 +233,7 @@ func TestAnnounceInitialSendsTopics(t *testing.T) {
 	if len(topics) == 0 {
 		t.Fatalf("topics snapshot empty, want one")
 	}
-	backend := newTestBackend(t, DefaultSidecarConfig())
+	backend := newTestBackend(t, DefaultPeerConfig())
 	recorder := &recordingSEDPSender{}
 	if err := backend.announceInitial(context.Background(), recorder, idx, idx.LocalEndpoints(), topics, []int{1234}); err != nil {
 		t.Fatalf("announce initial: %v", err)

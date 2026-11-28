@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Forge Universal LLC.
 // SPDX-License-Identifier: BUSL-1.1
 
-// Package dds holds the CycloneDDS sidecar contract.
+// Package dds implements the DDS/RTPS wire transport.
 //
 // This file maps the standard ROS parameter services to a config store.
 // The standard services stay on the wire for ros2cli and are served from

@@ -115,7 +115,7 @@ type DiscoveryRange int
 
 const (
 	// DiscoveryRangeNotSet means no explicit range was configured.
-	// Transports pass it through unchanged. Sidecar construction
+	// Transports pass it through unchanged. NormalizePeerConfig
 	// normalizes it to DiscoveryRangeSystemDefault so a zero value
 	// config still joins with a concrete range.
 	DiscoveryRangeNotSet DiscoveryRange = iota
@@ -182,9 +182,9 @@ func ParseDiscoveryRange(s string) (DiscoveryRange, error) {
 // Unlike ResolveDomainID it reads no environment variable. There is no
 // single stable env contract for discovery range, so the
 // range stays explicit config. NotSet passes through unchanged here.
-// Sidecar construction normalizes NotSet to SystemDefault so the join
-// path always carries a concrete range. Callers that need a concrete
-// range without a Sidecar must map NotSet explicitly.
+// NormalizePeerConfig normalizes NotSet to SystemDefault so the join
+// path always carries a concrete range. Callers that bypass
+// NormalizePeerConfig must map NotSet explicitly.
 func ResolveDiscoveryRange(configured DiscoveryRange) DiscoveryRange {
 	return configured
 }
@@ -312,8 +312,7 @@ type IncomingMessage struct {
 // Backend is the small contract every transport bus implements.
 //
 // Lifecycle order is JoinDiscovery then PublishBytes and TakeBytes then
-// Close. For sidecar based buses the process level Connect dials first,
-// then JoinDiscovery, then data path, then Close. PublishBytes, TakeBytes,
+// Close. PublishBytes, TakeBytes,
 // and ReportLiveliness before a successful JoinDiscovery report
 // ErrNotJoined in a real backend. The fake used in tests enforces the
 // same order.

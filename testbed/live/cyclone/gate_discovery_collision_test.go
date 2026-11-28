@@ -147,7 +147,7 @@ func closeUnicastPair(t *testing.T, first, second *rtps.UnicastConn) {
 // checkCollisionBackends joins two backends on fixed collision domain 58.
 func checkCollisionBackends(t *testing.T, ctx context.Context, runID string, domain uint32) (*dds.Backend, *dds.Backend) {
 	t.Helper()
-	firstBackend, err := dds.NewBackend(dds.SidecarConfig{
+	firstBackend, err := dds.NewBackend(dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,
@@ -167,7 +167,7 @@ func checkCollisionBackends(t *testing.T, ctx context.Context, runID string, dom
 	if !firstBackend.Joined() {
 		t.Fatalf("first backend not joined")
 	}
-	secondBackend, err := dds.NewBackend(dds.SidecarConfig{
+	secondBackend, err := dds.NewBackend(dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

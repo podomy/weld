@@ -319,14 +319,14 @@ func TestNegativeBadDomainRejected(t *testing.T) {
 		t.Fatalf("domain config 200 succeeded, want error")
 	}
 
-	sideCfg := dds.SidecarConfig{
+	peerCfg := dds.PeerConfig{
 		DomainID:    102,
 		PeerAddress: "127.0.0.1",
 		Range:       transports.DiscoveryRangeLocalhost,
 	}
-	_, err = dds.NewSidecar(sideCfg)
+	_, err = dds.NormalizePeerConfig(peerCfg)
 	if err == nil {
-		t.Fatalf("sidecar domain 102 succeeded, want error")
+		t.Fatalf("peer domain 102 succeeded, want error")
 	}
 
 	_, err = dds.NewLocalParticipant(102, time.Second)

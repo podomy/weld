@@ -52,7 +52,7 @@ type Leg = transports.Leg
 type RouterConfig = transports.RouterConfig
 
 // DDSConfig configures one DDS backend.
-type DDSConfig = dds.SidecarConfig
+type DDSConfig = dds.PeerConfig
 
 // MQTTConfig configures one MQTT backend.
 type MQTTConfig = mqtt.MqttConfig
@@ -93,7 +93,7 @@ var (
 
 // DefaultDDSConfig returns a DDS config with localhost defaults.
 func DefaultDDSConfig() DDSConfig {
-	return dds.DefaultSidecarConfig()
+	return dds.DefaultPeerConfig()
 }
 
 // DefaultMQTTConfig returns an MQTT config with in-memory defaults.

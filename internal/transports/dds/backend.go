@@ -246,9 +246,8 @@ type dataItem struct {
 
 // Backend is the DDS lifecycle and discovery plumbing.
 //
-// Lifecycle order follows the Backend contract: for sidecar based buses
-// the process level Connect dials first, then JoinDiscovery, then the
-// data path, then Close. JoinDiscovery dials unicast plus a send-only
+// Lifecycle order follows the Backend contract: JoinDiscovery dials
+// unicast plus a send-only
 // multicast sender on the resolved domain, so no receive bind exists and
 // EADDRINUSE is impossible. Reception runs over unicast only: directed
 // SPDP from peers such as CycloneDDS arrives on the advertised unicast
@@ -262,8 +261,8 @@ type dataItem struct {
 // writers hold Lock.
 type Backend struct {
 	mu sync.RWMutex
-	// cfg is the normalized sidecar configuration.
-	cfg SidecarConfig
+	// cfg is the normalized peer configuration.
+	cfg PeerConfig
 	// domainID is the resolved domain from DomainConfig.
 	domainID uint32
 	// joined is true after a successful JoinDiscovery.
@@ -418,7 +417,7 @@ type publishSnapshot struct {
 }
 
 // NewBackend validates the config and returns a lifecycle Backend.
-func NewBackend(cfg SidecarConfig) (*Backend, error) {
+func NewBackend(cfg PeerConfig) (*Backend, error) {
 	backend, err := NewBackendWithClock(cfg, SystemClock())
 	if err != nil {
 		return nil, err
@@ -428,7 +427,7 @@ func NewBackend(cfg SidecarConfig) (*Backend, error) {
 }
 
 // NewBackendWithClock validates the config and returns a Backend with a clock.
-func NewBackendWithClock(cfg SidecarConfig, clock Clock) (*Backend, error) {
+func NewBackendWithClock(cfg PeerConfig, clock Clock) (*Backend, error) {
 	if clock == nil {
 		return nil, errors.New("dds: clock is nil") //nolint:wrapcheck // new error, nothing to wrap
 	}
@@ -440,12 +439,10 @@ func NewBackendWithClock(cfg SidecarConfig, clock Clock) (*Backend, error) {
 		return nil, fmt.Errorf("dds: resolve domain: %w", err)
 	}
 
-	side, err := NewSidecar(cfg)
+	normed, err := NormalizePeerConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("dds: invalid backend config: %w", err)
 	}
-
-	normed := side.Config()
 
 	return &Backend{
 		cfg:             normed,
@@ -463,10 +460,10 @@ func NewBackendWithClock(cfg SidecarConfig, clock Clock) (*Backend, error) {
 	}, nil
 }
 
-// Config returns a copy of the normalized sidecar configuration.
+// Config returns a copy of the normalized peer configuration.
 //
 // It self-locks with RLock and is safe for concurrent use.
-func (b *Backend) Config() SidecarConfig {
+func (b *Backend) Config() PeerConfig {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -940,7 +937,6 @@ func (b *Backend) closePeerBestEffort(peer UDPPeer, reason string) {
 
 // JoinDiscovery joins discovery and starts SPDP and SEDP announcement loops.
 //
-// For sidecar buses the process level Connect dials first, then
 // JoinDiscovery dials unicast plus a send-only multicast sender on the
 // resolved domain, then the data path, then Close. No multicast receive
 // bind exists, so EADDRINUSE is impossible and reception runs over

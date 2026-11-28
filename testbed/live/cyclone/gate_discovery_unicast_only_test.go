@@ -220,7 +220,7 @@ func checkUnicastBackends(t *testing.T, ctx context.Context, got []byte, metaPor
 	t.Helper()
 	_ = got
 	runID := helpers.LiveID("unicast-only")
-	first, err := dds.NewBackend(dds.SidecarConfig{
+	first, err := dds.NewBackend(dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,
@@ -238,7 +238,7 @@ func checkUnicastBackends(t *testing.T, ctx context.Context, got []byte, metaPor
 	if err != nil {
 		t.Fatalf("join first: %v", err)
 	}
-	second, err := dds.NewBackend(dds.SidecarConfig{
+	second, err := dds.NewBackend(dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

@@ -116,7 +116,7 @@ func weldDiscardBackend(backend *dds.Backend) {
 // detected under weldMu and its backend is closed instead of stored. It
 // never panics.
 func weldAttachRTPS(bridgeID int64, participant string, domain uint32) {
-	cfg := dds.SidecarConfig{
+	cfg := dds.PeerConfig{
 		DomainID:    domain,
 		PeerAddress: dds.DefaultPeerAddress,
 		Range:       transports.DiscoveryRangeSystemDefault,

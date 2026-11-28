@@ -141,7 +141,7 @@ type WriterGUID [16]byte
 
 // Writer is a byte sink for encoded DATA frames.
 //
-// The backend wires this later to the sidecar transport. WriteFrame must not
+// The backend wires this later to the live transport. WriteFrame must not
 // retain the frame beyond the call without copying, per copy once alignment
 // with transports.Backend. Implementations must be safe for concurrent use.
 type Writer interface {
